@@ -3,6 +3,7 @@
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> Wi-Fi / Bluetooth on iOS 18 (branch `wifi-bt18`, 2026-10-24): docs/WIFI_BT_IOS18.md <<<
+* **2026-10-24 16:05: BLUETOOTH WORKS on combo9** (GPU session's local kernel = develop + 0238 + 0239 v7, ADT gpufwz-bt, BT boot-args): bluetoothd stays up, PoweredOn, Settings lists nearby devices (user-checked). Fix chain per boot in docs/WIFI_BT_IOS18.md 2.2-2.11. Not merged to develop yet.
 * Why Control Center showed both Off: bluetoothd exits 0 ("Unable to match bluetooth service in device tree") because the GPU ADT `beryllium-hi-3x-gpufwz.adt` has no `/arm-io/bluetooth`, and no current image sets `sweetwlan=2 sweetbt=1` (the WCN3990 is never powered); wifid never starts (`_LimitLoadToDeviceTree` wlan/marconi-wifi, no such node, and no WLAN driver exists at all).
 * Fixes: `tools/adt-bluetooth.py` (-> `../ios-beryllium/shim/out/beryllium-hi-3x-gpufwz-bt.adt`); BT firmware (linux-firmware crbtfw21.tlv/crnv21.bin) copied to the phone's `/usr/standalone/firmware/sweet/` and `RENEGADE_BT_FW=DIR` for root builds; xnu **0238** AKS key wrap/unwrap (securityd keychain adds failed for everyone; bluetoothd's readRootKeys then aborts "LeSecurityManager hit a keychain problem").
 * Images: `research/ios18/bt-0236.img` (local-0236 kernel + gpufwz-bt ADT + `sweetwlan=2 sweetbt=1 sweetbtfast=1 sweetbtibs=1 sweetwlandelay=30`), user-approved and queued 20:51 UTC; the auto reboot did not reach fastboot, phone offline (battery 1 %): not booted. CI run 40132191870 builds 0238 on wifi-bt18.

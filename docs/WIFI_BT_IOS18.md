@@ -1,6 +1,6 @@
 # Wi-Fi and Bluetooth on iOS 18.7.8 (Heartwood xnu-11215, Poco F1 / WCN3990)
 
-Date 2026-10-24. What was found on the phone, why Control Center showed Wi-Fi and Bluetooth "Off", what was
+Date 2026-10-24. **Result: Bluetooth works (boot combo9: on, scanning, Settings lists nearby devices); Wi-Fi is blocked (section 3).** What was found on the phone, why Control Center showed Wi-Fi and Bluetooth "Off", what was
 fixed, and what still blocks. Background: `docs/WIFI_BT_PLAN.md` (WCN3990 chain), `docs/BT_IOS_TRANSPORT.md`
 (how bluetoothd reaches its controller), `docs/WIFI_KEXT_STUDY.md` (IO80211 contract).
 Tags: **[V]** seen on the phone or in a file, **[U]** inference.
@@ -187,3 +187,26 @@ parameters while scanning, which bluetoothd does (Broadcom firmware tolerates it
 
 Fix, 0239 v7 (compile-checked): Command Disallowed for LE 0x2006/0x2007/0x200a/0x200b/0x200c is answered as success,
 return parameters kept (the running scan/advertising keeps its old parameters).
+
+### 2.10 Boot combo9 (0239 v7, 2026-10-24): BLUETOOTH WORKS
+
+[V] One client connect for the whole boot: bluetoothd (pid 253) stays up (> 2 min, checked several times), log
+`Power state changed. PowerState:1 managerState:5` (PoweredOn), `Scan start`, `BLE advertiser activated`. Kernel:
+0x200b/0x200c (28/55x) and 0x2007 (1x) Command Disallowed answered as success, vendor commands rewritten as before,
+watchdog never fired. **User-checked on the phone: Settings -> Bluetooth shows nearby devices.**
+
+### 2.11 Everything Bluetooth needs on iOS 18 (summary)
+
+| Piece | Where |
+|---|---|
+| `/arm-io/bluetooth` ADT node (local-mac-address, transport-encoding 3, transport-speed 3000000) | `tools/adt-bluetooth.py` on the GPU ADT -> `beryllium-hi-3x-gpufwz-bt.adt` |
+| Boot-args `sweetwlan=2 sweetbt=1 sweetbtfast=1 sweetbtibs=1 sweetwlandelay=30` | boot image cmdline (601 of 608 bytes with the current set) |
+| WCN3990 firmware `crbtfw21.tlv` / `crnv21.bin` (linux-firmware) in `/usr/standalone/firmware/sweet/` | root: `RENEGADE_BT_FW=DIR` (root_tweaks18 `bluetooth()`); on this phone copied by hand |
+| bluetoothd `BT_HCI_TRANSPORT=H4BC:POSIX:com.apple.uart.bluetooth,3000000`, BlueTool stub | root (already in renegade root, bt18) |
+| Kernel transport, firmware download, IBS: 0104-0136 | xnu/patches-11215 |
+| Keychain: AKS key wrap/unwrap | **0238** |
+| HCI compat for Apple's Broadcom-assuming stack | **0239** (v7): 0x0c5b listed + answered locally; 0x01 Unknown Command -> success (+ sub-opcode/param byte and zero padding for vendor replies); LE Command Disallowed -> success; 800 ms command watchdog |
+
+Open points: classic pairing/connections and audio not tested; the vendor features answered as "success" do
+nothing (Apple's LE offloads, multi-advertising instances); `/dev/btwake` absent (logged, harmless); the 64-line
+HCI trace budget (`sweetbtlog`) is too small to see a whole session.
