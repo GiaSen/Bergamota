@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/beryllium_bt_hci.c b/bsd/dev/beryllium_bt_hci.c
-index ac42481..48cd8e6 100644
+index ac42481..0c187c4 100644
 --- a/bsd/dev/beryllium_bt_hci.c
 +++ b/bsd/dev/beryllium_bt_hci.c
 @@ -86,6 +86,7 @@ static struct {
@@ -10,7 +10,7 @@ index ac42481..48cd8e6 100644
  } bt;
  
  static uint8_t bt_ring[BT_RING_SIZE];
-@@ -136,6 +137,106 @@ bt_hci_connected(void)
+@@ -136,16 +137,173 @@ bt_hci_connected(void)
  	return os_atomic_load(&bt.connected, relaxed);
  }
  
@@ -25,6 +25,34 @@ index ac42481..48cd8e6 100644
 + * a read that needs its parameters still fails in bluetoothd and shows up in the log. Every rewrite and every other non-zero status is logged (own budget), so the
 + * next missing command shows up even after the packet trace budget is spent.
 + */
++#define BT_COMPAT_PAD   16u             /* parameter bytes in a rewritten Command Complete */
++
++/* First parameter byte of the last few commands sent, by opcode (for rewritten replies). */
++static struct { uint16_t op; uint8_t p0; } bt_last_cmd[8];
++static unsigned bt_last_cmd_next;
++
++static void
++bt_cmd_note(const uint8_t *cmd, unsigned len)
++{
++	if (len >= 4 && cmd[0] == 1) {
++		unsigned i = bt_last_cmd_next++ % (sizeof(bt_last_cmd) / sizeof(bt_last_cmd[0]));
++
++		bt_last_cmd[i].op = (uint16_t)(cmd[1] | (cmd[2] << 8));
++		bt_last_cmd[i].p0 = cmd[3] != 0 && len >= 5 ? cmd[4] : 0;
++	}
++}
++
++static unsigned
++bt_cmd_param0(unsigned op)
++{
++	for (unsigned i = 0; i < sizeof(bt_last_cmd) / sizeof(bt_last_cmd[0]); i++) {
++		if (bt_last_cmd[i].op == op) {
++			return bt_last_cmd[i].p0;
++		}
++	}
++	return 0;
++}
++
 +/*
 + * Commands bluetoothd's init sends unconditionally and fails on when the controller does not list
 + * them (Read Local Supported Commands): { opcode, octet, bit } of the supported-commands mask. They
@@ -69,13 +97,13 @@ index ac42481..48cd8e6 100644
 +	return true;
 +}
 +
-+static void
++static unsigned
 +bt_hci_compat(uint8_t *p, unsigned len)
 +{
 +	unsigned op, st;
 +
 +	if (len < 7 || p[0] != 4) {
-+		return;
++		return len;
 +	}
 +	if (p[1] == 0x0e) {                     /* Command Complete: 04 0e plen ncmd op op status */
 +		op = p[4] | (p[5] << 8);
@@ -84,7 +112,7 @@ index ac42481..48cd8e6 100644
 +		op = p[5] | (p[6] << 8);
 +		st = p[3];
 +	} else {
-+		return;
++		return len;
 +	}
 +	if (st == 0) {
 +		if (bt.compat && p[1] == 0x0e && op == 0x1002 && len >= 7 + 64) {
@@ -98,55 +126,77 @@ index ac42481..48cd8e6 100644
 +				    bt_local_cmds[i].octet, was, *b, bt_local_cmds[i].op);
 +			}
 +		}
-+		return;
++		return len;
 +	}
-+	if (bt.compat && p[1] == 0x0e && st == 0x01 && op != 0 && ((op >> 10) != 0x3f || bt.compat >= 2)) {
++	if (bt.compat && p[1] == 0x0e && len == 7 && op != 0 &&
++	    ((st == 0x01 && ((op >> 10) != 0x3f || bt.compat >= 2)) || (st == 0x0c && op == 0x2007))) {
++		/*
++		 * Success instead of Unknown HCI Command (0x01), or Command Disallowed (0x0c) for LE Read
++		 * Advertising Physical Channel Tx Power. bluetoothd's reply parsers read return
++		 * parameters on success: bcm_vsc.c's sub-opcode checker compares the first byte with the
++		 * command's sub-opcode (its first parameter), _BCM_CreateMultiAdvInstParser (0xfd48) reads a
++		 * 1-byte instance, LE 0x2007 a 1-byte Tx power; the generic status-only parser ignores the
++		 * rest. So the reply carries the command's first parameter byte followed by zeros
++		 * (BT_COMPAT_PAD bytes in all). Boot combo5-0243-bt0239v3: an empty success for 0xfd48
++		 * tripped "ByteStream_NumReadBytesAvail(*pBs) >= 1" (abort in bcm_vsc.c:827).
++		 */
++		unsigned i, p0 = op == 0x2007 ? 0 : bt_cmd_param0(op);
++
++		p[2] = 4 + BT_COMPAT_PAD;
 +		p[6] = 0;
++		p[7] = (uint8_t)p0;
++		for (i = 1; i < BT_COMPAT_PAD; i++) {
++			p[7 + i] = 0;
++		}
 +		bt.compat_fixed++;
-+		printf("SWEET BT: compat: opcode %#06x (OGF %#x OCF %#05x) unknown to the controller, answered as success (%u so far)\n",
-+		    op, op >> 10, op & 0x3ff, bt.compat_fixed);
-+		return;
++		printf("SWEET BT: compat: opcode %#06x (OGF %#x OCF %#05x) status %#04x from the controller, answered as success "
++		    "with %u parameter bytes (first %#04x) (%u so far)\n", op, op >> 10, op & 0x3ff, st, BT_COMPAT_PAD, p0,
++		    bt.compat_fixed);
++		return 7 + BT_COMPAT_PAD;
 +	}
 +	if (bt.err_budget) {
 +		bt.err_budget--;
 +		printf("SWEET BT: %s for opcode %#06x (OGF %#x OCF %#05x): status %#04x\n",
 +		    p[1] == 0x0e ? "Command Complete" : "Command Status", op, op >> 10, op & 0x3ff, st);
 +	}
++	return len;
 +}
 +
  /* Called by the UART RX path (under the UART lock) with one complete, IBS-free H4 packet. */
  void
  bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
-@@ -156,6 +257,17 @@ bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
- 	for (i = 0; i < len; i++) {
- 		bt_ring[(bt.wr + i) & BT_RING_MASK] = pkt[i];
+ {
++	uint8_t ev[3 + 255];
+ 	unsigned used, i;
+ 
+ 	if (!os_atomic_load(&bt.connected, relaxed)) {
+ 		bt.rx_drop_nc++;
+ 		return;
  	}
 +	if (pkt[0] == 4 && len >= 7 && len <= 3 + 255 && (pkt[1] == 0x0e || pkt[1] == 0x0f)) {
-+		uint8_t ev[3 + 255];
-+
++		/* Command Complete / Status: bt_hci_compat may rewrite it (and make it longer) */
 +		for (i = 0; i < len; i++) {
 +			ev[i] = pkt[i];
 +		}
-+		bt_hci_compat(ev, len);
-+		for (i = 0; i < len; i++) {
-+			bt_ring[(bt.wr + i) & BT_RING_MASK] = ev[i];
-+		}
++		len = bt_hci_compat(ev, len);
++		pkt = ev;
 +	}
- 	bt.wr += len;
- 	if (used + len > bt.ring_peak) {
- 		bt.ring_peak = used + len;
-@@ -266,7 +378,9 @@ bt_tx_feed(const uint8_t *p, size_t n)
+ 	lck_mtx_lock(&bt_lock);
+ 	used = bt.wr - bt.rd;
+ 	if (BT_RING_SIZE - used < len) {
+@@ -266,7 +424,10 @@ bt_tx_feed(const uint8_t *p, size_t n)
  		}
  		if (bt.txtotal != 0 && bt.txn == bt.txtotal) {
  			bt_log_pkt("TX", bt.txb, bt.txn);
 -			if (bt.ops->tx(bt.txb, bt.txn)) {
++			bt_cmd_note(bt.txb, bt.txn);
 +			if (bt_hci_local_answer(bt.txb, bt.txn)) {
 +				bt.tx_pkts++;
 +			} else if (bt.ops->tx(bt.txb, bt.txn)) {
  				bt.tx_pkts++;
  				bt.tx_bytes += bt.txn;
  			} else {
-@@ -451,6 +565,11 @@ bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_bu
+@@ -451,6 +612,11 @@ bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_bu
  	}
  	bt.ops = ops;
  	bt.log_budget = log_budget;

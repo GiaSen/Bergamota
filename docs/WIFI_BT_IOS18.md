@@ -132,3 +132,17 @@ reply then carries no return parameters; `_BCM_SubOpcodeChecker` (0x100035580, u
 on an empty reply, so at least those pass. [U] whether every one of them tolerates an empty reply.
 Not done: the unified log of this boot (`sweetlog` returns nothing after the clock jump), so the stack's own
 "restarting { reason=... }" line for this failure was not read; the crash report has no reason string.
+
+### 2.6 Boot combo5-0243-bt0239v3 (develop through 0243 + 0238 + 0239 v3, 2026-10-24)
+
+[V] 0xfce9, 0xfce2, 0xfd48 now answered as success (empty), bluetoothd still crashes (6 connects), a different
+abort: `abort()` from the bcm_vsc.c assert helper (0x10018b54c) in `_BCM_CreateMultiAdvInstParser` (0x1001eb574,
+bcm_vsc.c:827 "ByteStream_NumReadBytesAvail(*pBs) >= 1"): 0xfd48 is `_BCM_CreateMultipleAdvInstance` (OCF 0x148)
+and its success reply must carry the instance byte. What the other vendor commands are (static, IDA):
+0xfce2 = `_BCM_OlympicRSSIThreshold` (sub-opcoded writes, generic status-only parser 0x100085e74), 0xfce9 (and
+0xfd23) checked by `_BCM_SubOpcodeChecker` (first reply byte = sub-opcode), 0xfd47 =
+`_BCM_EnableExtendedDuplicateFilter` (generic parser).
+
+Fix, 0239 v4 (compile-checked): a rewritten success carries 16 parameter bytes: the command's first parameter byte
+(remembered per opcode on TX), then zeros. That satisfies the sub-opcode checker, gives 0xfd48 an instance byte and is
+ignored by the generic parser. LE 0x2007 (Command Disallowed) is answered the same way (Tx power 0 dBm).
