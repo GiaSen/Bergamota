@@ -215,8 +215,14 @@ def main():
         if not is_simg(simg):
             sys.exit(f'{simg} is not a sparse image (already consumed by a failed run? then resume with the raw image)')
         if os.path.exists(raw):
-            sys.exit(f'{raw} exists: a previous run failed after consuming the simg. Resume with `renegade update {raw}` '
-                     f'(or delete it only if you are sure you do not need it)')
+            # The simg is intact, so no run consumed it (that case is the check above). A raw image older than the simg is the
+            # work copy `renegade root` leaves next to the simg it wrote: replaced. A newer one may hold edits of a run that
+            # stopped before the expansion: kept, the user decides.
+            if os.path.getmtime(raw) > os.path.getmtime(simg):
+                sys.exit(f'{raw} is newer than {simg}: it may hold the edits of an interrupted run. Resume with '
+                         f'`renegade update {raw}` (after moving the simg away), or delete it to start from the simg')
+            log(f'{raw}: older than the simg (the work copy `renegade root` leaves behind): replaced')
+            os.unlink(raw)
     else:
         if not os.path.exists(raw):
             sys.exit(f'{raw} not found')
