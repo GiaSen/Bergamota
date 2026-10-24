@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/beryllium_bt_hci.c b/bsd/dev/beryllium_bt_hci.c
-index ac42481..5c25d81 100644
+index ac42481..48cd8e6 100644
 --- a/bsd/dev/beryllium_bt_hci.c
 +++ b/bsd/dev/beryllium_bt_hci.c
 @@ -86,6 +86,7 @@ static struct {
@@ -10,18 +10,19 @@ index ac42481..5c25d81 100644
  } bt;
  
  static uint8_t bt_ring[BT_RING_SIZE];
-@@ -136,6 +137,105 @@ bt_hci_connected(void)
+@@ -136,6 +137,106 @@ bt_hci_connected(void)
  	return os_atomic_load(&bt.connected, relaxed);
  }
  
 +/*
-+ * bluetoothd's HCI init (OI stack) treats any failed standard command as fatal ("HCI
-+ * initialization failed", restart reason 108). The WCN3990 rejects some commands Apple's
-+ * Broadcom controllers know, e.g. 0x0c5b Write Default Erroneous Data Reporting, with a
-+ * Command Complete of status 0x01 (Unknown HCI Command). With sweetbtcompat=1 (default) such
-+ * an answer to a non-vendor command (OGF != 0x3f) is turned into success: for write commands
-+ * that is exactly "accepted", read commands get no return parameters and still fail in
-+ * bluetoothd. Every rewrite and every other non-zero status is logged (own budget), so the
++ * bluetoothd's HCI init (OI stack) treats any failed command as fatal ("HCI initialization
++ * failed"; with 0238+0239 v2 a SIGABRT in Stack_Init). The WCN3990 answers Command Complete with
++ * status 0x01 (Unknown HCI Command) to commands Apple's Broadcom controllers know: the Broadcom
++ * vendor commands of bluetoothd's bcm_vsc.c (0xfce2, 0xfce9, 0xfd47, 0xfd48 on boot
++ * combo2-0240b-bt0239v2). sweetbtcompat=1 turns such an answer into success for standard
++ * commands (OGF != 0x3f), =2 (default) also for vendor commands: the reply then has no return
++ * parameters, which bcm_vsc.c's sub-opcode checker accepts (it returns true on an empty reply);
++ * a read that needs its parameters still fails in bluetoothd and shows up in the log. Every rewrite and every other non-zero status is logged (own budget), so the
 + * next missing command shows up even after the packet trace budget is spent.
 + */
 +/*
@@ -99,7 +100,7 @@ index ac42481..5c25d81 100644
 +		}
 +		return;
 +	}
-+	if (bt.compat && p[1] == 0x0e && st == 0x01 && (op >> 10) != 0x3f && op != 0) {
++	if (bt.compat && p[1] == 0x0e && st == 0x01 && op != 0 && ((op >> 10) != 0x3f || bt.compat >= 2)) {
 +		p[6] = 0;
 +		bt.compat_fixed++;
 +		printf("SWEET BT: compat: opcode %#06x (OGF %#x OCF %#05x) unknown to the controller, answered as success (%u so far)\n",
@@ -116,7 +117,7 @@ index ac42481..5c25d81 100644
  /* Called by the UART RX path (under the UART lock) with one complete, IBS-free H4 packet. */
  void
  bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
-@@ -156,6 +256,17 @@ bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
+@@ -156,6 +257,17 @@ bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
  	for (i = 0; i < len; i++) {
  		bt_ring[(bt.wr + i) & BT_RING_MASK] = pkt[i];
  	}
@@ -134,7 +135,7 @@ index ac42481..5c25d81 100644
  	bt.wr += len;
  	if (used + len > bt.ring_peak) {
  		bt.ring_peak = used + len;
-@@ -266,7 +377,9 @@ bt_tx_feed(const uint8_t *p, size_t n)
+@@ -266,7 +378,9 @@ bt_tx_feed(const uint8_t *p, size_t n)
  		}
  		if (bt.txtotal != 0 && bt.txn == bt.txtotal) {
  			bt_log_pkt("TX", bt.txb, bt.txn);
@@ -145,14 +146,15 @@ index ac42481..5c25d81 100644
  				bt.tx_pkts++;
  				bt.tx_bytes += bt.txn;
  			} else {
-@@ -451,6 +564,10 @@ bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_bu
+@@ -451,6 +565,11 @@ bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_bu
  	}
  	bt.ops = ops;
  	bt.log_budget = log_budget;
-+	bt.compat = 1;
++	bt.compat = 2;
 +	bt.err_budget = 64;
 +	(void)PE_parse_boot_argn("sweetbtcompat", &bt.compat, sizeof(bt.compat));
-+	printf("SWEET BT: compat (unknown standard commands answered as success): %s\n", bt.compat ? "on" : "off");
++	printf("SWEET BT: compat %u (unknown commands answered as success: %s)\n", bt.compat,
++	    bt.compat >= 2 ? "standard and Broadcom vendor" : bt.compat ? "standard only" : "off");
  	/* raw mode as bluetoothd would set it (cfmakeraw, 8N1, hw flow control); the speed is filled in on get */
  	bt.tio.c_cflag = 0x38B00ul;
  	bt.tio.c_ispeed = bt.tio.c_ospeed = ops->baud(0);

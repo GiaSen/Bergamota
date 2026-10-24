@@ -115,3 +115,20 @@ Fix, 0239 reworked (compile-checked with `tools/xnu-cc.py` on the run 4013375206
 (0x1002) and answers the commands itself with Command Complete / success, without sending them to the WCN3990
 (`SWEET BT: compat: opcode 0x0c5b answered by the kernel`). The unknown-command rewrite and the error-status log
 stay, so the next missing command shows up in one boot either way.
+
+### 2.5 Boot combo2-0240b-bt0239v2 (0237 + 0240 + 0238 + 0239 v2, 2026-10-24)
+
+[V] `compat: supported commands octet 18 0x83 -> 0x8b`, `opcode 0x0c5b answered by the kernel`, and the whole
+standard HCI init passes (0x0c5b, 0x0c7a, 0x080f, 0x0c16/18/1c/1e/26/2a/2c/3c all status 0). Next come Broadcom
+vendor commands from bluetoothd's `Stack/vsc/bcm/bcm_vsc.c`, which the WCN3990 answers with Command Complete status
+0x01: 0xfce9, 0xfce2 (x3), 0xfd48, 0xfd47; also LE 0x2007 (Read Advertising Channel Tx Power) status 0x0c (Command
+Disallowed). The client disconnects right after the last 0xfce2. bluetoothd now **crashes** (SIGABRT, "Application
+Triggered Fault", ~10 s after launch, crash reports in `.../osanalytics/DiagnosticReports/bluetoothd-*.ips`):
+thread `com.apple.bluetooth.root`, Stack_Init (0x1001491c4) -> stack init (0x1001bf5e0) -> fatal handler -> abort.
+launchd respawns it.
+
+Fix, 0239 v3: `sweetbtcompat=2` (default) also turns 0x01 answers to vendor (OGF 0x3f) commands into success. The
+reply then carries no return parameters; `_BCM_SubOpcodeChecker` (0x100035580, used for 0xfce9/0xfd23) returns true
+on an empty reply, so at least those pass. [U] whether every one of them tolerates an empty reply.
+Not done: the unified log of this boot (`sweetlog` returns nothing after the clock jump), so the stack's own
+"restarting { reason=... }" line for this failure was not read; the crash report has no reason string.
