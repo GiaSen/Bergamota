@@ -210,3 +210,19 @@ watchdog never fired. **User-checked on the phone: Settings -> Bluetooth shows n
 Open points: classic pairing/connections and audio not tested; the vendor features answered as "success" do
 nothing (Apple's LE offloads, multi-advertising instances); `/dev/btwake` absent (logged, harmless); the 64-line
 HCI trace budget (`sweetbtlog`) is too small to see a whole session.
+
+### 2.12 "Connect" drops at once: Skywalk privileges (0250)
+
+[V] Boot combo9, connecting a device from Settings: bluetoothd dies every time and then on every start (it reconnects
+the device), 11 crashes `SIGSEGV KERN_INVALID_ADDRESS at 0x0` on queue `com.apple.bluetooth.media` in
+`os_channel_get_fd` <- 0x1005395a4 (AudioSkywalkPipe start) <- 0x1003239e8 (audio device publish: "Device supports
+Skywalk Path"). The audio pipe constructor (0x100539b10) registers a user-pipe nexus "com.apple.bluetooth.AudioPipe"
+and opens a channel on it without checking errors; the kernel had logged `SK[5]: __nexus_register bluetoothd:
+nxprov_create: 1` = EPERM: `PRIV_SKYWALK_REGISTER_USER_PIPE` is checked with priv_check_cred, and our Sandbox
+stand-in (sweet_amfi.c) grants only PRIV_WORK_INTERVAL (its denial log is capped at 64 entries, so this one was never
+printed).
+
+Fix, xnu **0250** `sweet-sandbox-skywalk-privileges` (compile-checked, applies on the series): the Skywalk privileges
+12000-12011 are granted to a process holding the matching `com.apple.private.skywalk.*` entitlement
+(IOCurrentTaskHasEntitlement), as AMFI does. bluetoothd has register-user-pipe. [U] whether the audio path then works
+end to end (A2DP over the WCN3990, the audio HAL side of the channel).
