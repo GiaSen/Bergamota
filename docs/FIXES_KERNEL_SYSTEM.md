@@ -1,0 +1,70 @@
+# Kernel, display and system fixes (iOS 18 on the Poco F1)
+
+What went wrong, why, and what fixed it, one entry per bug. Each entry has the symptom, the cause, the fix (patch in
+`xnu/patches-11215`, or phone-side state) and how to check it. The GPU rendering fixes in Chlorophyll (Metal on the
+Adreno 630) are in Chlorophyll's own repository: `gpu/metal/docs/FIXES.md`.
+
+---
+
+## Kernel (`xnu/patches-11215`)
+
+### Locally built kernels: the GPU never comes up (0236)
+
+- **Why.** clang 21 (Xcode 27) turned a volatile MMIO read loop into a post-indexed `ldr w, [x], #4` on the SMMU context
+  banks. An access with writeback has no valid syndrome (ESR.ISV = 0), so the trapping hypervisor cannot emulate it and
+  the bring-up stalls. CI's clang 16 used a register offset, so CI kernels worked.
+- **Fix.** `gpu_rd`/`gpu_wr` (and the TTBR0 write) are single-instruction asm with a bare base register.
+- **Check.** After a local build, scan the driver disassembly for `ldr/str w.., [x..], #` near a `dmb`.
+  `SweetFramebuffer`'s plain C MMIO could hit the same thing with a newer compiler.
+
+### Tearing at the bottom of the screen (0235)
+
+- **Why.** CoreAnimation's IOMFBFlipBook keeps one swap in flight and recycles the surface of swap N-1 as soon as swap N
+  completes. With swapdepth 1, SwapWait waits for the latch (~10 ms of every frame). With swapdepth 2, CA draws into the
+  surface still on the panel, which tears.
+- **Fix.** Every frame is copied into one of three framebuffer-owned buffers, which are scanned instead; the swap
+  completes when the copy does (`sweetfb_scancopy=1`). Cost: ~6.5 ms per copy, which is what holds the panel at ~30 fps
+  today.
+- **Check.** `sysctl` stats `scancopy`, `scan_copies`, `scan_copy_us`.
+
+### Black wedges in the lock-screen editor; SMMU faults just past a surface (0234)
+
+- **Why.** The Adreno writes render targets in whole tiles, so on a surface whose height is not a tile multiple it
+  writes up to a tile of rows past the end. That ran into the next BO, or faulted on the guard page; three faults and
+  the GPU is lost.
+- **Fix.** The tails of surface BOs map to one shared, zeroed, writable page.
+
+### A stale frame for a vsync on every wake (0227, 0233)
+
+- **Why.** CA's first swap after the display comes back has no layer, so the copy path scanned the back buffer as it
+  was: the last frame drawn, possibly long ago.
+- **Fix.** An empty swap means black (0227); only the first per wake is honoured (0233).
+
+### Half-drawn frames scanned out with asynchronous commits (0229)
+
+- **Why.** With async command buffers, the compositor swaps a framebuffer the GPU may still be writing. Apple's display
+  waits on the GPU write fence; ours did not.
+- **Fix.** A swap is held until the newest submitted fence passes (stats `gpuHolds`, `gpuHoldTimeouts`).
+
+---
+
+## System (phone-side state)
+
+### SpringBoard crashed on Motion access
+
+- **Why.** SpringBoard asked for Core Motion without a TCC grant, and its Info.plist had no `NSMotionUsageDescription`.
+- **Fix.** A `kTCCServiceMotion` grant for `com.apple.springboard` in TCC.db (backup in `/private/var/tmp/tcc-backup/`),
+  and the key added to SpringBoard's Info.plist (original kept at `/private/var/tmp/SpringBoard-Info.plist.orig`).
+
+### coreduetd at high CPU
+
+- **Why.** The `_DKEvent.Dasd.WidgetView` Biome stream and dasd's widget prediction cache
+  (`widgetRefreshBudgets.plist`) kept coreduetd busy.
+- **Fix.** Both were backed up to `/private/var/tmp/dasd-widget-backup/` and deleted.
+
+### A dylib replaced in place crashed its users
+
+- **Why.** `cp` over a mapped, signed dylib changes pages under a running process, which fails code-signing
+  (CS_INVALID); SpringBoard went into a TCC crash loop.
+- **Fix (procedure).** Install to a temp file and `mv` it over the original. The scripts (`bgairpush.sh`, the inject
+  deploy) do this.
