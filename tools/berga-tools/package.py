@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Collect the prebuilt on-device binaries into berga-tools.zip (+ berga-tools.zip.sha256). Standard library only.
 
-  package.py [--version N] [--out DIR] [--sweetnet DIR] [--bgl DIR] [--bgl-commit SHA]
+  package.py [--version N] [--out DIR] [--sweetnet DIR] [--bgl DIR] [--ssh DIR] [--bgl-commit SHA]
 
 Inputs (nothing is built here; tools/berga-tools/package.sh runs tools/sweetnet/build.sh first):
   --sweetnet  research/sweetnet     build.sh output
   --bgl       research/bergamota-gl the gpu-eagl branch's gpu/eagl/make-payload.sh output ($RENEGADE_BGL, or the gpu-eagl worktree)
+  --ssh       research/ssh-build/out tools/ssh/build.sh output (this checkout, else the main checkout)
 Layout of the zip (what `renegade fetch-tools` extracts, and root_tweaks18.py searches):
   berga-tools.json   manifest: version, tag, commit, per-file sha256/size/arch
   sweetnet/...       same relative paths as research/sweetnet
   bergamota-gl/...   same relative paths as research/bergamota-gl
+  ssh/...            dropbear, dash, toybox (iOS builds only) from research/ssh-build/out
   LICENSES/...       NOTICE.txt, Mesa-MIT.txt, libdrm-MIT.txt
 
 Only the files in the ALLOWLIST below can go in. Everything is checked before the zip is written (a Mach-O of the right CPU,
@@ -38,13 +40,15 @@ SWEETNET = [
     ('sweetreboot', 'macho'), ('sweetuicache', 'macho'),
     ('ios18/sweetprefs', 'macho'), ('ios18/sweetuicache', 'macho'), ('ios18/sweetfp.dylib', 'macho'),
     ('ios18/sweetmetrics', 'macho'), ('ios18/sweetposterset', 'macho'), ('ios18/sweeticonstyle', 'macho'),
-    ('ios18/sweetopen', 'macho'),
+    ('ios18/sweetopen', 'macho'), ('ios18/sweetshot', 'macho'), ('ios18/sweettouch', 'macho'),
     ('ios18/SweetRun.app/SweetRun', 'macho'), ('ios18/SweetRun.app/Info.plist', 'data'),
     ('ios18/SweetRun.app/_CodeSignature/CodeResources', 'data'),
 ]
 BGL = [('bgl-launch', 'macho'), ('OpenGLES.framework/OpenGLES', 'macho'), ('libOSMesa.8.dylib', 'macho'),
        ('libdrm.2.dylib', 'macho')]
-LICENSES = ['NOTICE.txt', 'Mesa-MIT.txt', 'libdrm-MIT.txt']
+# third-party, unmodified apart from tools/ssh/*.patch: dropbear 2026.94, dash 0.5.13.5, toybox 0.8.15 (licenses below)
+SSH = [('dropbear', 'macho'), ('dash', 'macho'), ('toybox', 'macho')]
+LICENSES = ['NOTICE.txt', 'Mesa-MIT.txt', 'libdrm-MIT.txt', 'dropbear-LICENSE.txt', 'dash-COPYING.txt', 'toybox-LICENSE.txt']
 # Names that mean "not ours": Qualcomm GPU/vendor firmware, images, caches, dumps. Checked on every path that goes in.
 DENY = re.compile(r'(zap|gmu|sqe|\.mbn|\.fw$|\.elf$|\.bin$|\.mdt|a6\d\d|dyld_shared_cache|\.dsc|\.ipsw|\.dmg|\.img|\.simg|\.dtb|'
                   r'\.adt|\.im4p|\.aea|persist|modemst|fsg|serial|\.kc$|kernelcache|firmware)', re.I)
@@ -98,10 +102,10 @@ def check_name(rel):
     berga_tools.safe_rel(rel)
 
 
-def collect(sweetnet, bgl):
+def collect(sweetnet, bgl, ssh):
     """[(zip path, source path, role, arch(s) or 'data', [libs])] for every allowlisted file; dies on anything unexpected."""
     out = []
-    for prefix, base, items in (('sweetnet', sweetnet, SWEETNET), ('bergamota-gl', bgl, BGL)):
+    for prefix, base, items in (('sweetnet', sweetnet, SWEETNET), ('bergamota-gl', bgl, BGL), ('ssh', ssh, SSH)):
         if not base or not os.path.isdir(base):
             die('%s directory not found: %s' % (prefix, base))
         for rel, kind in items:
@@ -144,7 +148,7 @@ def sha256(data):
 
 
 def build(args):
-    items = collect(args.sweetnet, args.bgl)
+    items = collect(args.sweetnet, args.bgl, args.ssh)
     commit = git('rev-parse', 'HEAD')
     dirty = bool(git('status', '--porcelain', '--untracked-files=no'))
     bgl_commit = args.bgl_commit or git('rev-parse', 'HEAD', cwd=os.path.abspath(os.path.join(args.bgl, '..', '..')))
@@ -218,6 +222,9 @@ def main():
     ap.add_argument('--out', default=os.path.join(REPO, 'research', 'berga-tools-out'))
     ap.add_argument('--sweetnet', default=os.path.join(REPO, 'research', 'sweetnet'))
     ap.add_argument('--bgl', default=os.environ.get('RENEGADE_BGL') or os.path.join(REPO, 'research', 'bergamota-gl'))
+    ap.add_argument('--ssh', default=next((d for d in (os.path.join(REPO, 'research', 'ssh-build', 'out'),
+                                                       os.path.join(REPO, '..', 'ios-beryllium', 'research', 'ssh-build', 'out'))
+                                            if os.path.isdir(d)), None))
     ap.add_argument('--bgl-commit', help='commit of the gpu-eagl checkout the payload was built from (default: HEAD of the checkout '
                                          'two levels above --bgl)')
     args = ap.parse_args()

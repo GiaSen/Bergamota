@@ -396,7 +396,7 @@ def stage_tweaks(a, root):
     spec = importlib.util.spec_from_file_location('root_tweaks18', os.path.join(HERE, 'root_tweaks18.py'))
     rt = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rt)
-    rt.SSH_OUT = os.path.join(MAIN_CHECKOUT, 'research/ssh-build/out')
+    rt.SSH_OUT = rt.ssh_out()          # this checkout, the main checkout, then the berga-tools cache
     rt.NETCFG = rt.find_sweetnet('sweetnetcfg') or os.path.join(MAIN_CHECKOUT, 'research/sweetnet/sweetnetcfg')
     rt.REBOOT_TOOL = rt.find_sweetnet('sweetreboot') or os.path.join(MAIN_CHECKOUT, 'research/sweetnet/sweetreboot')
     # BlueTool stub, hcitest, ios18/sweetuicache and ios18/sweetfp.dylib: rt.find_sweetnet() (this checkout's
@@ -643,6 +643,8 @@ def stage_verify(a, img, rootmnt):
                 if not os.path.exists(p):               # moved by a tweak (VirtualAudio.plugin -> HAL.disabled)
                     continue
                 new = pacstrip.cs_identity(p)
+                if new and new[0].startswith('bluetool-stub-'):     # replaced on purpose by the bluetooth tweak
+                    continue
                 n += 1
                 lost = (int(fl, 16) & ~new[2]) & ~pacstrip.CS_FLAG_IGNORED if new else 1
                 if not new or new[0] != ident or new[1] != team or lost:

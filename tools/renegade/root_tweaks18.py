@@ -412,9 +412,8 @@ def ssh(root):
                 print('ssh: host key kept', os.path.basename(kf))
                 continue
             if not keytool:
-                print('ssh: no dropbearkey for the host (Linux: apt install dropbear-bin, or add dropbear-linux next to the '
-                      'binaries): host key %s NOT generated, dropbear will not start without it' % typ)
-                note_skip('ssh host key (' + typ + ')', 'no dropbearkey on this host (apt install dropbear-bin)')
+                print('ssh: no dropbearkey for the host (Linux: apt install dropbear-bin): host key %s left to dropbear -R, '
+                      'which generates it on the phone at the first connection' % typ)
                 continue
             subprocess.run([tool, '-t', typ, '-f', kf], check=True, capture_output=True)
             os.chown(kf, 0, 0)
@@ -422,10 +421,11 @@ def ssh(root):
             print('ssh: host key generated', os.path.basename(kf))
 
     # launchd job: -s no password logins; '-p 22' listens on IPv4 and IPv6 (the link-local address still answers when
-    # configd/IPConfiguration drops the static IPv4); the only network is the USB link
+    # configd/IPConfiguration drops the static IPv4); the only network is the USB link. Without a host key generated here
+    # (a Linux host with no dropbearkey), -R makes dropbear create its keys in /etc/dropbear on the phone instead
     job = {'Label': DROPBEAR_LABEL,
-           'ProgramArguments': ['/usr/local/bin/dropbear', '-F', '-E', '-s', '-p', '22',
-                                '-r', DROPBEAR_KEY],
+           'ProgramArguments': ['/usr/local/bin/dropbear', '-F', '-E', '-s', '-p', '22'] +
+                               (['-r', DROPBEAR_KEY] if os.path.exists(os.path.join(root, DROPBEAR_KEY.lstrip('/'))) else ['-R']),
            'RunAtLoad': True, 'KeepAlive': True, 'UserName': 'root',
            'StandardErrorPath': '/dev/console'}
     jpath = '/System/Library/LaunchDaemons/%s.plist' % DROPBEAR_LABEL
@@ -1206,14 +1206,20 @@ def tool_gaps(feats):
     return gaps
 
 
+def ssh_out():
+    """Where dropbear/dash/toybox are: tools/ssh/build.sh output in this checkout or the main one, else the berga-tools
+    cache (renegade fetch-tools, berga-tools-v2 and later), else the default path (the ssh tweak then reports them missing)."""
+    main = os.path.join(REPO, '..', 'ios-beryllium')
+    for d in (os.path.join(REPO, 'research/ssh-build/out'), os.path.join(main, 'research/ssh-build/out'), berga_tools.ssh_dir()):
+        if d and os.path.isfile(os.path.join(d, 'dash')):
+            return d
+    return SSH_OUT
+
+
 def configure_paths():
     """Tool locations for the build and for `renegade update`: this checkout first, then the main checkout."""
     global SSH_OUT, NETCFG, REBOOT_TOOL
-    main = os.path.join(REPO, '..', 'ios-beryllium')
-    for d in (os.path.join(REPO, 'research/ssh-build/out'), os.path.join(main, 'research/ssh-build/out')):
-        if os.path.isdir(d):
-            SSH_OUT = d
-            break
+    SSH_OUT = ssh_out()
     NETCFG = find_sweetnet('sweetnetcfg') or NETCFG
     REBOOT_TOOL = find_sweetnet('sweetreboot') or REBOOT_TOOL
 

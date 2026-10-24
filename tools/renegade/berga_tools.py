@@ -80,6 +80,13 @@ def search_dirs(cache=None):
     return (sn if os.path.isdir(sn) else None), (gl if os.path.isdir(gl) else None)
 
 
+def ssh_dir(cache=None):
+    """The ssh/ dir (dropbear, dash, toybox; berga-tools-v2 and later) of the berga-tools in use, or None."""
+    d = current_dir(cache)
+    d = d and os.path.join(d, 'ssh')
+    return d if d and os.path.isdir(d) else None
+
+
 # ---------------------------------------------------------------------------------------------------- network
 
 def _get(url, headers=None, opener=None):
@@ -309,6 +316,7 @@ def status(cache=None, log=print):
     sn, gl = search_dirs(cache)
     log('  sweetnet     -> %s' % (sn or 'absent'))
     log('  bergamota-gl -> %s' % (gl or 'absent'))
+    log('  ssh          -> %s' % (ssh_dir(cache) or 'absent (berga-tools-v2 and later: dropbear, dash = /bin/sh, toybox)'))
     return 0
 
 
