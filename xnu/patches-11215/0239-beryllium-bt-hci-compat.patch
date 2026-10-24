@@ -1,8 +1,16 @@
 diff --git a/bsd/dev/beryllium_bt_hci.c b/bsd/dev/beryllium_bt_hci.c
-index ac42481..0c187c4 100644
+index ac42481..ed84033 100644
 --- a/bsd/dev/beryllium_bt_hci.c
 +++ b/bsd/dev/beryllium_bt_hci.c
-@@ -86,6 +86,7 @@ static struct {
+@@ -23,6 +23,7 @@
+ #include <sys/kern_control.h>
+ #include <sys/kpi_mbuf.h>
+ #include <kern/locks.h>
++#include <kern/clock.h>
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
+ #include <pexpert/pexpert.h>
+@@ -86,6 +87,7 @@ static struct {
  	unsigned tx_pkts, tx_fail, tx_garbage, tios_get, tios_set, baud_req_ignored;
  	unsigned connects;
  	unsigned last_rx_pkts, last_tx_pkts;
@@ -10,7 +18,7 @@ index ac42481..0c187c4 100644
  } bt;
  
  static uint8_t bt_ring[BT_RING_SIZE];
-@@ -136,16 +137,173 @@ bt_hci_connected(void)
+@@ -136,16 +138,257 @@ bt_hci_connected(void)
  	return os_atomic_load(&bt.connected, relaxed);
  }
  
@@ -51,6 +59,89 @@ index ac42481..0c187c4 100644
 +		}
 +	}
 +	return 0;
++}
++
++/*
++ * Command watchdog. Boot combo6-0244-bt0239v4: the WCN3990 never answered 0xfce9 sub-opcode 1
++ * (Broadcom LE Meta Enable Features, while it answers the other 0xfce9 sub-opcodes with 0x01), and
++ * bluetoothd gave up: "BD_VSC_LE_META_ENA_FEATURES timedout waiting for controller", "Notifying BT
++ * Firmware Crashed", restart reason 3602. A command sent to the controller that gets neither Command
++ * Complete nor Command Status within BT_CMD_WATCHDOG_MS is answered here like a rewritten one
++ * (success, first parameter byte + zeros). Only one command is tracked (bluetoothd keeps one in
++ * flight: Num_HCI_Command_Packets 1); a late real answer just arrives as an extra event.
++ */
++#define BT_CMD_WATCHDOG_MS      800u
++
++static struct {
++	uint16_t op;
++	uint8_t p0;
++	bool on;
++	uint64_t t;             /* mach_absolute_time of the transmit */
++} bt_pend;
++static unsigned bt_watchdog_fired;
++
++static void
++bt_pend_set(const uint8_t *cmd, unsigned len)
++{
++	if (len >= 4 && cmd[0] == 1) {
++		bt_pend.op = (uint16_t)(cmd[1] | (cmd[2] << 8));
++		bt_pend.p0 = cmd[3] != 0 && len >= 5 ? cmd[4] : 0;
++		bt_pend.t = mach_absolute_time();
++		os_atomic_store(&bt_pend.on, true, release);
++	}
++}
++
++static void
++bt_pend_answered(const uint8_t *p, unsigned len)
++{
++	unsigned op;
++
++	if (len < 7 || p[0] != 4 || !os_atomic_load(&bt_pend.on, acquire)) {
++		return;
++	}
++	if (p[1] == 0x0e) {
++		op = p[4] | (p[5] << 8);
++	} else if (p[1] == 0x0f) {
++		op = p[5] | (p[6] << 8);
++	} else {
++		return;
++	}
++	if (op == bt_pend.op) {
++		os_atomic_store(&bt_pend.on, false, relaxed);
++	}
++}
++
++static void
++bt_pend_check(void)
++{
++	uint64_t ns;
++	uint8_t ev[7 + 16];
++	unsigned i;
++
++	if (!bt.compat || !os_atomic_load(&bt_pend.on, acquire)) {
++		return;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - bt_pend.t, &ns);
++	if (ns < (uint64_t)BT_CMD_WATCHDOG_MS * 1000000ull) {
++		return;
++	}
++	os_atomic_store(&bt_pend.on, false, relaxed);
++	ev[0] = 4;
++	ev[1] = 0x0e;
++	ev[2] = 4 + 16;
++	ev[3] = 1;
++	ev[4] = (uint8_t)bt_pend.op;
++	ev[5] = (uint8_t)(bt_pend.op >> 8);
++	ev[6] = 0;
++	ev[7] = bt_pend.p0;
++	for (i = 8; i < sizeof(ev); i++) {
++		ev[i] = 0;
++	}
++	bt_watchdog_fired++;
++	printf("SWEET BT: compat: opcode %#06x (OGF %#x OCF %#05x, first parameter %#04x) not answered by the controller "
++	    "within %u ms, answered as success by the kernel (%u so far)\n", bt_pend.op, bt_pend.op >> 10,
++	    bt_pend.op & 0x3ff, bt_pend.p0, BT_CMD_WATCHDOG_MS, bt_watchdog_fired);
++	bt_hci_rx_packet(ev, sizeof(ev));
 +}
 +
 +/*
@@ -174,6 +265,7 @@ index ac42481..0c187c4 100644
  		return;
  	}
 +	if (pkt[0] == 4 && len >= 7 && len <= 3 + 255 && (pkt[1] == 0x0e || pkt[1] == 0x0f)) {
++		bt_pend_answered(pkt, len);
 +		/* Command Complete / Status: bt_hci_compat may rewrite it (and make it longer) */
 +		for (i = 0; i < len; i++) {
 +			ev[i] = pkt[i];
@@ -184,7 +276,15 @@ index ac42481..0c187c4 100644
  	lck_mtx_lock(&bt_lock);
  	used = bt.wr - bt.rd;
  	if (BT_RING_SIZE - used < len) {
-@@ -266,7 +424,10 @@ bt_tx_feed(const uint8_t *p, size_t n)
+@@ -174,6 +417,7 @@ bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
+ void
+ bt_hci_rx_service(void)
+ {
++	bt_pend_check();
+ 	for (unsigned loops = 0; loops < 16; loops++) {
+ 		kern_ctl_ref ref;
+ 		uint32_t unit, rd;
+@@ -266,7 +510,10 @@ bt_tx_feed(const uint8_t *p, size_t n)
  		}
  		if (bt.txtotal != 0 && bt.txn == bt.txtotal) {
  			bt_log_pkt("TX", bt.txb, bt.txn);
@@ -192,11 +292,11 @@ index ac42481..0c187c4 100644
 +			bt_cmd_note(bt.txb, bt.txn);
 +			if (bt_hci_local_answer(bt.txb, bt.txn)) {
 +				bt.tx_pkts++;
-+			} else if (bt.ops->tx(bt.txb, bt.txn)) {
++			} else if ((bt_pend_set(bt.txb, bt.txn), bt.ops->tx(bt.txb, bt.txn))) {
  				bt.tx_pkts++;
  				bt.tx_bytes += bt.txn;
  			} else {
-@@ -451,6 +612,11 @@ bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_bu
+@@ -451,6 +698,11 @@ bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_bu
  	}
  	bt.ops = ops;
  	bt.log_budget = log_budget;

@@ -146,3 +146,19 @@ and its success reply must carry the instance byte. What the other vendor comman
 Fix, 0239 v4 (compile-checked): a rewritten success carries 16 parameter bytes: the command's first parameter byte
 (remembered per opcode on TX), then zeros. That satisfies the sub-opcode checker, gives 0xfd48 an instance byte and is
 ignored by the generic parser. LE 0x2007 (Command Disallowed) is answered the same way (Tx power 0 dBm).
+
+### 2.7 Boot combo6-0244-bt0239v4 (develop through 0244 + 0238 + 0239 v4, 2026-10-24): the stack starts
+
+[V] No crash reports any more. Kernel: rewritten successes for 0xfce2, 0xfce9 (sub-opcodes 0 and 3), 0xfd48, 0xfd47,
+0xfd4e, 0xfd1b; LE 0x2007 still Command Disallowed (its reply has a parameter byte, so the `len == 7` rule did not
+apply; harmless). bluetoothd, run by hand while the launchd copy was paused with SIGSTOP (no launchctl on this
+root; script in the session notes): `Stack did start`, `Power state change - {powerstate: 1}`, `Update Dynamic Store
+with state On`, `Starting passive scan (300.00ms/30.00ms) with duplicate filter enabled`; it identifies the chip as
+"BCM_4357" from its own table. About 20 s later: `BD_VSC_LE_META_ENA_FEATURES timedout waiting for controller`,
+`Notifying BT Firmware Crashed`, `Bluetooth error - restarting { reason=3602 }`. 0xfce9 sub-opcode 1 (LE Meta
+Enable Features, `_BCM_LEMetaEnableFeatures`, generic parser) is the one vendor command the WCN3990 does not
+answer at all. launchd's copies live 15-60 s each for the same reason.
+
+Fix, 0239 v5 (compile-checked): a command watchdog. A command sent to the controller with no Command Complete /
+Status within 800 ms is answered by the kernel with success (first parameter byte + zeros) and logged
+(`SWEET BT: compat: opcode ... not answered by the controller within 800 ms`).
