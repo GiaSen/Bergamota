@@ -40,8 +40,18 @@ kernel control registered, `hcitest` got HCI Reset / Read Local Version (Qualcom
 ### 2.2 Boots
 
 * `bt-0236.img` = `local-0236.img`'s kernel (`ios-beryllium-combined/xnu/out-0236local`) + `beryllium-hi-3x-gpufwz-bt.adt`
-  + the cmdline above (fixes 1-3, not 4). Queued 2026-10-24 20:51 UTC; Bergamota's automatic reboot did not reach
-  fastboot and the phone went offline (battery was at 1 %): **not booted yet**.
+  + the cmdline above (fixes 1-3, not 4). Queued 2026-10-24 20:51 UTC; Bergamota's automatic reboot went back to
+  iOS instead of fastboot, `bergamota reboot bergamota` reached Bergamota fastboot, flashed and verified 21:01:59 UTC.
+  Result [V]:
+  * Kernel: firmware downloaded at 3 Mbaud (patch + 19 NVM segments acknowledged), HCI Reset ok, QCA patch version
+    0x0002, Read Local Version HCI 9 / Qualcomm 0x001d, BD_ADDR set to 02:00:5e:77:b0:01 with 0xfc14,
+    `kernel control com.apple.uart.bluetooth registered: 0`, `transport up` 65 s after boot.
+  * `/arm-io/bluetooth` is in IODeviceTree and IOService (IOPlatformDevice).
+  * bluetoothd (run by hand with `OS_ACTIVITY_DT_MODE=YES`): `bluetooth: Got local-mac-address: 02:00:5e:77:b0:01`,
+    `Searching for transport: "H4BC"` / driver `POSIX`, then `Failed to add attributes to keychain for device Identity
+    Root with result -25291` (errSecNotAvailable), `Failed to set new identity root!`, `Bluetooth error - restarting
+    { reason=130 }`. The kernel log shows `SWEET AKS: securityd sel 10 ... -> 0xe00002c7` at the same time. It never
+    reaches the transport open, so fix 4 (0238) is the next step, as predicted from the disassembly.
 * CI run 40132191870 (branch `wifi-bt18`): kernel with 0238. Next image = that kernel + the same ADT and cmdline.
 
 ### 2.3 Still to do for Bluetooth
