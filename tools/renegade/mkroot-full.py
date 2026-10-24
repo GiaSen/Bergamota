@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Renegade root build (`renegade root`): build the FULL iOS 18.7.8 (iPhone11,8, 22H352) root as a flashable HFS+ image for the userdata partition.
+"""Renegade root build (`renegade root`): build the FULL iOS root of the Renegade target (targets.py: 26.6.2 iPhone12,1 by default, RENEGADE_TARGET=ios18 for 18.7.8 iPhone11,8) as a flashable HFS+ image for the userdata partition.
 
   mkroot-full.py [--ipsw-dir DIR] [--out IMG] [--size 20g] [--stages copy,macho,cache,tweaks,seal] [--simg OUT.simg]
 
@@ -41,10 +41,11 @@ ROOT = os.path.abspath(os.path.join(HERE, '..', '..'))
 sys.path.insert(0, HERE)
 import pacstrip  # noqa: E402
 import renegade_platform as rplat  # noqa: E402
+from targets import T as TARGET  # noqa: E402
 
 MAGICS = {b'\xcf\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf'}
 MIN_FREE = 5 << 30
-W = os.path.join(ROOT, 'research/ios18/full')              # work dir (mount points, map)
+W = os.path.join(ROOT, TARGET['work'], 'full')             # work dir (mount points, map)
 
 
 def log(*a):
@@ -362,7 +363,7 @@ def stage_macho(a, root):
     log(f'{len(idents)} re-signed Mach-Os, identities recorded ({sum(1 for i in idents.values() if not i)} were unsigned)')
     if failed:
         open(os.path.join(W, 'macho-failed.txt'), 'w').write('\n'.join(f'{p}\t{s}' for p, s in failed))
-        sys.exit(f'{len(failed)} Mach-O files failed (research/ios18/full/macho-failed.txt): the build must not continue')
+        sys.exit(f'{len(failed)} Mach-O files failed ({W}/macho-failed.txt): the build must not continue')
 
 
 # --- stage: cache ---------------------------------------------------------------------------------------------------
@@ -415,7 +416,7 @@ def stage_tweaks(a, root):
             rt.quiet(root)
         rt.containers(root)
         chowned[os.path.join(root, 'private/var/containers/Bundle')] = (33, 33)
-        rt.event_timing(root)       # D22.{Default,Touch}.plist from N841: UIKit's 'Misconfigured Device' alert otherwise
+        rt.event_timing(root)       # <ADT target>.{Default,Touch}.plist when the ADT claims another device (ios18: D22 from N841)
         rt.usbnet(root)
         rt.netcfg(root)
         rt.sweetreboot(root)
@@ -760,8 +761,8 @@ def dry_plan(a, img, rootmnt, dmgs, stages):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
-    ap.add_argument('--ipsw-dir', default=os.path.join(ROOT, 'research/ios18/ipsw/22H352__iPhone11,8'))
-    ap.add_argument('--out', default=os.path.join(ROOT, 'research/ios18/ios18-root-full.img'))
+    ap.add_argument('--ipsw-dir', default=os.path.join(ROOT, TARGET['ipsw_dir']))
+    ap.add_argument('--out', default=os.path.join(ROOT, TARGET['root_img']))
     ap.add_argument('--size', default='20g')
     ap.add_argument('--stages', default='copy,macho,cache,tweaks,seal,verify,simg')
     ap.add_argument('--simg', default=None)
