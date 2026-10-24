@@ -101,3 +101,17 @@ phone's own signed image and is loaded by the modem's MBA, not by us, and the re
 is the size of the two missing drivers. **Next step:** phase P0/P1 of `WIFI_BT_PLAN.md` on xnu-11215 (`sweetwlan=1`
 and `=3`, read-only probe and modem-partition inventory; 0104 already carries them), then P3 (MBA load, stop at
 "MBA alive") as its own gated patch, with the user present for the first run.
+
+### 2.4 Boot combo-0240b-bt0239 (GPU session's local kernel: 0237 + 0240 + 0238 + 0239, 2026-10-24)
+
+[V] Transport up, `compat ... on`, bluetoothd connects 6 times; **no** `compat:` rewrite and no error status: the
+controller answered every command it got. The first session ends after `0x0c31` (Set Controller To Host Flow
+Control, ok) and the client disconnects: 0x0c5b was **never sent**. The "status=628" is the OI stack refusing it
+itself: bluetoothd logged the Supported Commands mask, octet 18 = 0x83, bit 3 (Write Default Erroneous Data
+Reporting) clear. The earlier [U] guess (controller answers 0x01) was wrong.
+
+Fix, 0239 reworked (compile-checked with `tools/xnu-cc.py` on the run 40133752064 build tree): a small table
+`bt_local_cmds` {opcode, mask octet, bit}; the kernel sets those bits in the Read Local Supported Commands reply
+(0x1002) and answers the commands itself with Command Complete / success, without sending them to the WCN3990
+(`SWEET BT: compat: opcode 0x0c5b answered by the kernel`). The unknown-command rewrite and the error-status log
+stay, so the next missing command shows up in one boot either way.

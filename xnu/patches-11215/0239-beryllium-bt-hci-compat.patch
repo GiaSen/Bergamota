@@ -1,16 +1,16 @@
 diff --git a/bsd/dev/beryllium_bt_hci.c b/bsd/dev/beryllium_bt_hci.c
-index ac42481..0f71c3d 100644
+index ac42481..5c25d81 100644
 --- a/bsd/dev/beryllium_bt_hci.c
 +++ b/bsd/dev/beryllium_bt_hci.c
 @@ -86,6 +86,7 @@ static struct {
  	unsigned tx_pkts, tx_fail, tx_garbage, tios_get, tios_set, baud_req_ignored;
  	unsigned connects;
  	unsigned last_rx_pkts, last_tx_pkts;
-+	unsigned compat, compat_fixed, err_budget;     /* sweetbtcompat; unknown-command answers rewritten */
++	unsigned compat, compat_fixed, compat_local, err_budget;       /* sweetbtcompat; rewritten / kernel-answered commands */
  } bt;
  
  static uint8_t bt_ring[BT_RING_SIZE];
-@@ -136,6 +137,50 @@ bt_hci_connected(void)
+@@ -136,6 +137,105 @@ bt_hci_connected(void)
  	return os_atomic_load(&bt.connected, relaxed);
  }
  
@@ -24,6 +24,50 @@ index ac42481..0f71c3d 100644
 + * bluetoothd. Every rewrite and every other non-zero status is logged (own budget), so the
 + * next missing command shows up even after the packet trace budget is spent.
 + */
++/*
++ * Commands bluetoothd's init sends unconditionally and fails on when the controller does not list
++ * them (Read Local Supported Commands): { opcode, octet, bit } of the supported-commands mask. They
++ * are answered here with success and never reach the WCN3990. Boot 2026-10-24 combo-0240b-bt0239:
++ * mask octet 18 = 0x83, so bit 3 (Write Default Erroneous Data Reporting) was clear and the OI stack
++ * failed locally: "OI_HCICMD_WriteDefaultErroneousDataReporting (status=628)", "HCI initialization
++ * failed", restart reason 108, without sending the command.
++ */
++static const struct { uint16_t op; uint8_t octet, bit; } bt_local_cmds[] = {
++	{ 0x0c5b, 18, 3 },      /* Write Default Erroneous Data Reporting */
++};
++
++static bool
++bt_hci_local_answer(const uint8_t *cmd, unsigned len)
++{
++	unsigned op, i;
++	uint8_t ev[7];
++
++	if (!bt.compat || len < 4 || cmd[0] != 1) {
++		return false;
++	}
++	op = cmd[1] | (cmd[2] << 8);
++	for (i = 0; i < sizeof(bt_local_cmds) / sizeof(bt_local_cmds[0]); i++) {
++		if (bt_local_cmds[i].op == op) {
++			break;
++		}
++	}
++	if (i == sizeof(bt_local_cmds) / sizeof(bt_local_cmds[0])) {
++		return false;
++	}
++	ev[0] = 4;
++	ev[1] = 0x0e;                   /* Command Complete */
++	ev[2] = 4;
++	ev[3] = 1;                      /* Num_HCI_Command_Packets */
++	ev[4] = cmd[1];
++	ev[5] = cmd[2];
++	ev[6] = 0;                      /* success */
++	bt.compat_local++;
++	printf("SWEET BT: compat: opcode %#06x answered by the kernel (not sent to the controller, %u so far)\n",
++	    op, bt.compat_local);
++	bt_hci_rx_packet(ev, sizeof(ev));
++	return true;
++}
++
 +static void
 +bt_hci_compat(uint8_t *p, unsigned len)
 +{
@@ -42,6 +86,17 @@ index ac42481..0f71c3d 100644
 +		return;
 +	}
 +	if (st == 0) {
++		if (bt.compat && p[1] == 0x0e && op == 0x1002 && len >= 7 + 64) {
++			/* Read Local Supported Commands: list the commands answered by bt_hci_local_answer */
++			for (unsigned i = 0; i < sizeof(bt_local_cmds) / sizeof(bt_local_cmds[0]); i++) {
++				uint8_t *b = &p[7 + bt_local_cmds[i].octet];
++				uint8_t was = *b;
++
++				*b |= (uint8_t)(1u << bt_local_cmds[i].bit);
++				printf("SWEET BT: compat: supported commands octet %u %#04x -> %#04x (opcode %#06x)\n",
++				    bt_local_cmds[i].octet, was, *b, bt_local_cmds[i].op);
++			}
++		}
 +		return;
 +	}
 +	if (bt.compat && p[1] == 0x0e && st == 0x01 && (op >> 10) != 0x3f && op != 0) {
@@ -61,23 +116,36 @@ index ac42481..0f71c3d 100644
  /* Called by the UART RX path (under the UART lock) with one complete, IBS-free H4 packet. */
  void
  bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
-@@ -156,6 +201,15 @@ bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
+@@ -156,6 +256,17 @@ bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
  	for (i = 0; i < len; i++) {
  		bt_ring[(bt.wr + i) & BT_RING_MASK] = pkt[i];
  	}
-+	if (len >= 7 && pkt[0] == 4 && (pkt[1] == 0x0e || pkt[1] == 0x0f)) {
-+		uint8_t ev[8];
++	if (pkt[0] == 4 && len >= 7 && len <= 3 + 255 && (pkt[1] == 0x0e || pkt[1] == 0x0f)) {
++		uint8_t ev[3 + 255];
 +
-+		for (i = 0; i < 7; i++) {
++		for (i = 0; i < len; i++) {
 +			ev[i] = pkt[i];
 +		}
 +		bt_hci_compat(ev, len);
-+		bt_ring[(bt.wr + 6) & BT_RING_MASK] = ev[6];    /* the only byte bt_hci_compat rewrites */
++		for (i = 0; i < len; i++) {
++			bt_ring[(bt.wr + i) & BT_RING_MASK] = ev[i];
++		}
 +	}
  	bt.wr += len;
  	if (used + len > bt.ring_peak) {
  		bt.ring_peak = used + len;
-@@ -451,6 +505,10 @@ bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_bu
+@@ -266,7 +377,9 @@ bt_tx_feed(const uint8_t *p, size_t n)
+ 		}
+ 		if (bt.txtotal != 0 && bt.txn == bt.txtotal) {
+ 			bt_log_pkt("TX", bt.txb, bt.txn);
+-			if (bt.ops->tx(bt.txb, bt.txn)) {
++			if (bt_hci_local_answer(bt.txb, bt.txn)) {
++				bt.tx_pkts++;
++			} else if (bt.ops->tx(bt.txb, bt.txn)) {
+ 				bt.tx_pkts++;
+ 				bt.tx_bytes += bt.txn;
+ 			} else {
+@@ -451,6 +564,10 @@ bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_bu
  	}
  	bt.ops = ops;
  	bt.log_budget = log_budget;
