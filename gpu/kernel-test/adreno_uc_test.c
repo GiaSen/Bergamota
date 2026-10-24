@@ -106,9 +106,9 @@ main(int argc, char **argv)
 	memset(&info, 0, sizeof(info));
 	kr = call(SWEET_GPU_SEL_INFO, &info, 0, sizeof(info));
 	CHECK(kr == 0 && info.abi_version == SWEET_GPU_ABI_VERSION, "INFO abi %u (want %u) kr %#x", info.abi_version, SWEET_GPU_ABI_VERSION, kr);
-	CHECK(info.flags == 1, "INFO flags %#x (1 = ready, 2 = lost) chip %#x va %#llx+%#llx last_fence %u",
+	CHECK((info.flags & 3) == 1, "INFO flags %#x (1 = ready, 2 = lost) chip %#x va %#llx+%#llx last_fence %u",
 	    info.flags, info.chip_id, info.va_start, info.va_size, info.last_fence);
-	if (info.flags != 1) {
+	if ((info.flags & 3) != 1) {
 		return 1;
 	}
 
@@ -410,6 +410,30 @@ main(int argc, char **argv)
 					CHECK((wb.flags & SWEET_GPU_SBO_WRAPPED) && (wb.flags & SWEET_GPU_SBO_READONLY) && (wb.flags & SWEET_GPU_SBO_CPU_CACHEABLE),
 					    "wrapped flags WRAPPED|READONLY|CPU_CACHEABLE (%#x)", wb.flags);
 					CHECK(wb.offset == 16, "pixel (0,0) is %u bytes into the first page (client address +16)", wb.offset);
+					/* minor 2: writable CPU alias (the owner's memory here is RW, so the alias must show through the owner's mapping) */
+					if (inf2.abi_minor >= 2 && (inf2.flags & SWEET_GPU_INFO_CAP_SBO_ALIAS)) {
+						struct sweet_gpu_surface_bo ab = wb;
+						ab.flags = SWEET_GPU_SBO_IN_WRITABLE_ALIAS;
+						kr = call(SWEET_GPU_SEL_SURFACE_BO, &ab, sizeof(ab), sizeof(ab));
+						CHECK(kr == 0 && ab.handle == wb.handle && (ab.flags & SWEET_GPU_SBO_ALIAS) && ab.alias_addr != 0 && ab.alias_size == wb.size,
+						    "SURFACE_BO writable alias: handle %u addr %#llx size %llu flags %#x kr %#x", ab.handle, ab.alias_addr, ab.alias_size, ab.flags, kr);
+						if (kr == 0 && ab.alias_addr != 0) {
+							volatile uint8_t *al = (volatile uint8_t *)(uintptr_t)ab.alias_addr;
+							for (unsigned i = 0; i < 64; i++) {
+								al[ab.offset + i] = (uint8_t)(0xa0 + i);
+							}
+							struct sweet_gpu_bo_sync sy = { .handle = ab.handle, .offset = 0, .size = 0 };
+							kr = call(SWEET_GPU_SEL_BO_SYNC, &sy, sizeof(sy), 0);
+							int bad = 0;
+							for (unsigned i = 0; i < 64; i++) {
+								bad += ((volatile uint8_t *)mem)[16 + i] != (uint8_t)(0xa0 + i);
+							}
+							CHECK(kr == 0 && bad == 0, "alias stores visible through the owner's mapping after BO_SYNC (kr %#x, %d bad bytes)", kr, bad);
+							struct sweet_gpu_surface_bo again2 = ab;
+							kr = call(SWEET_GPU_SEL_SURFACE_BO, &again2, sizeof(again2), sizeof(again2));
+							CHECK(kr == 0 && again2.alias_addr == ab.alias_addr, "alias is idempotent (same address %#llx)", again2.alias_addr);
+						}
+					}
 					struct sweet_gem_close wc = { .handle = wb.handle };
 					(void)call(SWEET_GPU_SEL_GEM_CLOSE, &wc, sizeof(wc), 0);
 				}
@@ -428,7 +452,7 @@ main(int argc, char **argv)
 	CHECK(kr != 0, "GEM_CLOSE again -> %#x (expected error)", kr);
 	memset(&info, 0, sizeof(info));
 	kr = call(SWEET_GPU_SEL_INFO, &info, 0, sizeof(info));
-	CHECK(kr == 0 && info.flags == 1 && info.last_fence == g_last_fence, "INFO after the run: flags %#x last_fence %u (want %u)", info.flags, info.last_fence, g_last_fence);
+	CHECK(kr == 0 && (info.flags & 3) == 1 && info.last_fence == g_last_fence, "INFO after the run: flags %#x last_fence %u (want %u)", info.flags, info.last_fence, g_last_fence);
 	IOServiceClose(g_conn);
 	printf("%s: %d failure(s)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
 	return g_fail;

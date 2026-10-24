@@ -1,16 +1,16 @@
 #!/bin/sh
 # Build and ad-hoc sign the on-device tools for iOS 16 -> research/sweetnet/
-# (sweetnetcfg, cscheck, hcitest, bluetool-stub, sweetreboot; set TOOLS="hcitest" to build a subset; sweetreboot = reboot-to-fastboot, kernel 0137)
+# (sweetnetcfg, cscheck, hcitest, bluetool-stub, sweetreboot, sweetdur = UFS durability test, kernel 0221; set TOOLS="hcitest" to build a subset; sweetreboot = reboot-to-fastboot, kernel 0137)
 # iOS 18: also research/sweetnet/ios18/{sweetuicache,sweetfp.dylib} (arm64e + pacstrip --sign)
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 out=$here/../../research/sweetnet
 mkdir -p "$out"
-for t in ${TOOLS:-sweetnetcfg cscheck hcitest bluetool-stub sweetreboot}; do
+for t in ${TOOLS:-sweetnetcfg cscheck hcitest bluetool-stub sweetreboot sweetdur}; do
 	ents=$here/entitlements.plist
 	case $t in
 	cscheck) frameworks="-framework CoreFoundation -framework Security" ;;
-	hcitest|sweetreboot) frameworks="" ;;
+	hcitest|sweetreboot|sweetdur) frameworks="" ;;
 	bluetool-stub) frameworks=""; ents=$here/bluetool.entitlements ;;
 	*) frameworks="-framework CoreFoundation" ;;
 	esac
@@ -35,6 +35,10 @@ if [ "${IOS18:-1}" = 1 ]; then
 		"$here/sweetprefs.c" -o "$out18/sweetprefs"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetprefs"
 	python3 -I "$pacstrip" --sign "$out18/sweetprefs"
+	# sweetdur: UFS/HFS durability test (kernel patch 0221)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetdur.c" -o "$out18/sweetdur"
+	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetdur"
+	python3 -I "$pacstrip" --sign "$out18/sweetdur"
 	# sweetuicache: LaunchServices registration, run by the first-boot job (root_tweaks18.firstboot)
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -fobjc-arc \
 		-framework Foundation "$here/sweetuicache.m" -o "$out18/sweetuicache"

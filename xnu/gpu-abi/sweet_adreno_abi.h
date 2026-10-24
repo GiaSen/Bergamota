@@ -166,8 +166,12 @@ struct sweet_gpu_info {
 	uint64_t va_start;      /* GPU address range the kernel places BOs in */
 	uint64_t va_size;
 	uint32_t last_fence;    /* last submitted sequence number */
-	uint32_t abi_minor;     /* 1: SURFACE_BO accepts client-memory surfaces (read-only mappings), is idempotent, returns planes */
+	uint32_t abi_minor;     /* 1: SURFACE_BO accepts client-memory surfaces (read-only mappings), is idempotent, returns planes
+	                         * 2: SURFACE_BO can make a writable CPU alias of a client-memory surface (SBO_IN_WRITABLE_ALIAS),
+	                         *    see SWEET_GPU_INFO_CAP_SBO_ALIAS */
 };
+/* INFO.flags capability bits (bit0/bit1 above are ready/lost; capabilities start at bit 4). */
+#define SWEET_GPU_INFO_CAP_SBO_ALIAS    0x10    /* minor 2: SBO_IN_WRITABLE_ALIAS works (absent when boot-arg sweetgpualias=0) */
 
 /* IOSurface memory as a BO: the pages of the surface (pixels from byte 0 of its memory) are entered into the
  * GPU address space. On input handle = SWEET_GPU_DESCRIBE_ONLY asks only for the geometry (no BO is made). */
@@ -175,11 +179,24 @@ struct sweet_gpu_info {
 /* Minor 1 (INFO.abi_minor >= 1) added everything after `planes`; a caller may pass/accept only the first
  * SWEET_GPU_SURFACE_BO_V1_SIZE bytes (minor 0 layout). */
 #define SWEET_GPU_SURFACE_BO_V1_SIZE    48
+/* Minor 2 appended `alias_addr`/`alias_size`. A minor 1 caller (112 bytes in, 112 bytes out) is answered with 112 bytes. */
+#define SWEET_GPU_SURFACE_BO_MINOR1_SIZE 112
+#define SWEET_GPU_SURFACE_BO_MINOR2_SIZE 128
 #define SWEET_GPU_SBO_IN_SYNC           0x1     /* in flags: clean+invalidate the CPU alias of the whole BO before returning */
 #define SWEET_GPU_SBO_READONLY          0x1     /* out flags: GPU mapping is read-only (client-memory surface) */
 #define SWEET_GPU_SBO_CPU_CACHEABLE     0x2     /* out: the CPU maps it cacheable: BO_SYNC after CPU writes / before CPU reads */
 #define SWEET_GPU_SBO_WRAPPED           0x4     /* out: the surface is client (another process') memory, pinned */
 #define SWEET_GPU_SBO_EXISTING          0x8     /* out: this surface already had a BO for this connection: same handle returned */
+/* Minor 2. Input bit (in flags, needs >= 128 input bytes in and out; kIOReturnUnsupported when sweetgpualias=0): also map
+ * the pages of the BO READ-WRITE into the calling task and return the address in alias_addr. Any surface: client-memory
+ * (wrapped) surfaces get a cacheable alias of their wired pages (their own mappings are read-only), kernel surfaces
+ * (the sweetfb low pool, kernel buffers; these BOs are GPU-writable) the ordinary mapping with the surface's cache
+ * attribute (write-back for the pool, write-combined otherwise). The mapping lives exactly as long as the BO (GEM_CLOSE or connection close unmaps it; do not munmap it
+ * yourself) and is the CPU's door to a surface whose own mapping is read-only. A wrapped surface's GPU mapping stays read-only. Idempotent.
+ * After writing through it call BO_SYNC on the written range (clean to the point of coherency) before the surface is
+ * used by the GPU, by CoreAnimation's consumer or by the display. */
+#define SWEET_GPU_SBO_IN_WRITABLE_ALIAS 0x2     /* in flags */
+#define SWEET_GPU_SBO_ALIAS             0x10    /* out: alias_addr/alias_size are valid (a RW CPU mapping exists) */
 struct sweet_gpu_surface_plane {
 	uint32_t offset;        /* byte offset of the plane in the BO (includes the client-memory start delta) */
 	uint32_t stride;        /* bytes per row of the plane */
@@ -203,7 +220,11 @@ struct sweet_gpu_surface_bo {
 	uint32_t ubwc;          /* out: 0 = no UBWC (IOSurfaces here are never compressed) */
 	uint32_t reserved;
 	struct sweet_gpu_surface_plane plane[3];        /* out: first three planes (planes == 0: plane 0 describes the surface) */
+	/* ---- minor 2 ---- */
+	uint64_t alias_addr;    /* out: SBO_ALIAS: address in the calling task of byte 0 of the BO (pixel (0,0) is at + offset) */
+	uint64_t alias_size;    /* out: SBO_ALIAS: bytes mapped (== size) */
 };
+_Static_assert(sizeof(struct sweet_gpu_surface_bo) == SWEET_GPU_SURFACE_BO_MINOR2_SIZE, "sweet_gpu_surface_bo is 128 bytes (minor 2)");
 
 struct sweet_gpu_bo_sync {
 	uint32_t handle;
