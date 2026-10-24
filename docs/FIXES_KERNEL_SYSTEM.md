@@ -8,6 +8,21 @@ Adreno 630) are in Chlorophyll's own repository: `gpu/metal/docs/FIXES.md`.
 
 ## Kernel (`xnu/patches-11215`)
 
+### Frames serialized behind the GPU (0241, and Chlorophyll's "scheduled")
+
+- **Why.** Each frame waited for the previous frame's GPU work twice over: Chlorophyll reported "scheduled" to the render
+  server only once the GPU had finished, and the kernel held each swap until the GPU fence passed (0229). Only then was
+  the scan-out copied and the swap completed, and only then did CoreAnimation start the next frame. CPU encode (~11 ms)
+  and GPU work (~6-8 ms) ran one after the other instead of overlapping.
+- **Fix.** Chlorophyll reports "scheduled" at submit again; `bgmtl-bb.defersched` restores the old behaviour. With the
+  GPU copy, the kernel no longer holds the swap: the blit is queued behind the frame's GPU work on the same ring. The swap
+  completes as soon as the blit is queued, because anything CA submits later runs after the blit has read the surface.
+  The frame is scanned once the blit's fence passes (`scanBlitPoll`, 100 ms cap). A newer frame arriving first reuses
+  the in-flight buffer, and a CPU fallback waits for the frame's work and for any blit in flight.
+- **Result.** Same swipe test, async commits: 28.4 fps (0240b), 29.4 (no deferral), **38.6 (0241)**. The CPU cost
+  of the scan-out path is now 18 us per frame. The home screen renders correctly. Tearing still has to be checked by
+  eye on the panel; screenshots read the frame, not the glass.
+
 ### ~30 fps cap from the CPU scan-out copy (0240)
 
 - **Why.** 0235 copied every frame on the CPU: about 6.5 ms per frame (memcpy of 11 MB plus a cache clean of the
