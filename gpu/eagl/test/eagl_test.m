@@ -313,6 +313,120 @@ static void test_sampling(void) {
     [EAGLContext setCurrentContext:nil]; [ctx release];
 }
 
+// Alpha masks as CoreAnimation uses them (tab-bar / SF Symbol glyphs, text): an 'A008' IOSurface uploaded with GL_ALPHA, sampled as .a (what iOS GLES gives
+// for ALPHA textures); the mask must reach the framebuffer. Control: the same pixels uploaded with glTexImage2D. Also the LA08 pair.
+static void test_alpha_mask(void) {
+    EAGLContext *ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
+    [EAGLContext setCurrentContext:ctx];
+    GLuint fbo, rb;
+    glGenFramebuffers(1, &fbo); glGenRenderbuffers(1, &rb);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo); glBindRenderbuffer(GL_RENDERBUFFER, rb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 64, 64);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rb);
+    const char *vs = "attribute vec2 pos; varying vec2 uv; void main(){ uv = pos*0.5+0.5; gl_Position = vec4(pos,0.0,1.0); }";
+    const char *fs = "precision mediump float; uniform sampler2D t; varying vec2 uv; void main(){ vec4 c = texture2D(t, uv); gl_FragColor = vec4(c.a, c.r, c.g, 1.0); }";
+    GLuint prog = program(vs, fs);
+    static const GLfloat quad[] = { -1,-1, 1,-1, -1,1, 1,1 };
+    glViewport(0, 0, 64, 64);
+    glUseProgram(prog); glUniform1i(glGetUniformLocation(prog, "t"), 0);
+    glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
+    for (int variant = 0; variant < 3; variant++) {     // 0: A008 surface, 1: glTexImage2D ALPHA control, 2: LA08 surface (luminance 200, alpha = mask)
+        const int W = 41, H = 41, bpp = variant == 2 ? 2 : 1;
+        uint8_t *pix = calloc(1, (size_t)W * H * bpp);
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            uint8_t m = x < W / 2 ? 255 : 0;
+            if (bpp == 1) pix[y * W + x] = m; else { pix[(y * W + x) * 2] = 200; pix[(y * W + x) * 2 + 1] = m; }
+        }
+        GLuint t; glGenTextures(1, &t); glBindTexture(GL_TEXTURE_2D, t);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        BOOL ok = YES;
+        if (variant == 1) { glPixelStorei(GL_UNPACK_ALIGNMENT, 1); glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, W, H, 0, GL_ALPHA, GL_UNSIGNED_BYTE, pix); }
+        else {
+            size_t bpr = 64 * bpp;      // padded rows like CoreAnimation's (41x41 'A008' has bpr 64)
+            NSDictionary *d = @{ (id)kIOSurfaceWidth : @(W), (id)kIOSurfaceHeight : @(H), (id)kIOSurfaceBytesPerElement : @(bpp),
+                                 (id)kIOSurfacePixelFormat : @(variant == 2 ? 0x4c413038u : 0x41303038u), (id)kIOSurfaceBytesPerRow : @(bpr) };
+            IOSurfaceRef sf = IOSurfaceCreate((CFDictionaryRef)d);
+            ok = sf != NULL;
+            if (sf) {
+                IOSurfaceLock(sf, 0, NULL); uint8_t *b = IOSurfaceGetBaseAddress(sf); size_t rb2 = IOSurfaceGetBytesPerRow(sf);
+                for (int y = 0; y < H; y++) memcpy(b + y * rb2, pix + (size_t)y * W * bpp, (size_t)W * bpp);
+                IOSurfaceUnlock(sf, 0, NULL);
+                ok = [ctx texImageIOSurface:sf target:GL_TEXTURE_2D internalFormat:variant == 2 ? GL_LUMINANCE_ALPHA : GL_ALPHA width:W height:H
+                                    format:variant == 2 ? GL_LUMINANCE_ALPHA : GL_ALPHA type:GL_UNSIGNED_BYTE plane:0 invert:YES];
+                CFRelease(sf);
+            }
+        }
+        glClearColor(0, 0, 1, 1); glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        uint8_t l[4], r[4]; glReadPixels(8, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, l); glReadPixels(56, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, r);
+        // output = (a, r, g, 1): left half has alpha 255, right half 0; the ALPHA texture's .r/.g must be 0
+        printf("      alpha variant %d: left RGBA %d %d %d %d, right RGBA %d %d %d %d, upload %d\n", variant, l[0], l[1], l[2], l[3], r[0], r[1], r[2], r[3], ok);
+        CHECK(ok && l[0] > 240 && r[0] < 10, "alpha mask %s reaches the shader as .a (left %d right %d)", variant == 0 ? "A008 surface" : variant == 1 ? "glTexImage2D ALPHA" : "LA08 surface", l[0], r[0]);
+        free(pix);
+    }
+    // live surface: a producer writes the IOSurface AFTER the upload (zeros first); binding the texture again must show the new pixels
+    {
+        const int W = 41, H = 41;
+        NSDictionary *d = @{ (id)kIOSurfaceWidth : @(W), (id)kIOSurfaceHeight : @(H), (id)kIOSurfaceBytesPerElement : @(1), (id)kIOSurfacePixelFormat : @(0x41303038u), (id)kIOSurfaceBytesPerRow : @(64) };
+        IOSurfaceRef sf = IOSurfaceCreate((CFDictionaryRef)d);
+        GLuint t; glGenTextures(1, &t); glBindTexture(GL_TEXTURE_2D, t);
+        BOOL ok = sf && [ctx texImageIOSurface:sf target:GL_TEXTURE_2D internalFormat:GL_ALPHA width:W height:H format:GL_ALPHA type:GL_UNSIGNED_BYTE plane:0 invert:YES];
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glClearColor(0, 0, 1, 1); glClear(GL_COLOR_BUFFER_BIT); glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        uint8_t before[4]; glReadPixels(32, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, before);
+        if (sf) { IOSurfaceLock(sf, 0, NULL); memset(IOSurfaceGetBaseAddress(sf), 255, 64 * H); IOSurfaceUnlock(sf, 0, NULL); }
+        glBindTexture(GL_TEXTURE_2D, 0); glBindTexture(GL_TEXTURE_2D, t);       // CoreAnimation binds before it draws with a texture
+        glClear(GL_COLOR_BUFFER_BIT); glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        uint8_t after[4]; glReadPixels(32, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, after);
+        printf("      live surface: before write alpha-as-red %d, after write + rebind %d (upload %d)\n", before[0], after[0], ok);
+        CHECK(ok && before[0] < 10 && after[0] > 240, "live IOSurface texture follows a write after the upload (%d -> %d)", before[0], after[0]);
+        if (sf) CFRelease(sf);
+    }
+    // biplanar 4:2:0 (video-like snapshots): plane 0 = Y (R8), plane 1 = CbCr (RG8 at half size). A refused plane 1 left the chroma texture empty: solid green.
+    {
+        const int W = 64, H = 48;
+        NSArray *planes = @[ @{ (id)kIOSurfacePlaneWidth : @(W), (id)kIOSurfacePlaneHeight : @(H), (id)kIOSurfacePlaneBytesPerRow : @(W), (id)kIOSurfacePlaneOffset : @(0), (id)kIOSurfacePlaneSize : @(W * H) },
+                             @{ (id)kIOSurfacePlaneWidth : @(W / 2), (id)kIOSurfacePlaneHeight : @(H / 2), (id)kIOSurfacePlaneBytesPerRow : @(W), (id)kIOSurfacePlaneOffset : @(W * H), (id)kIOSurfacePlaneSize : @(W * H / 2) } ];
+        NSDictionary *d = @{ (id)kIOSurfaceWidth : @(W), (id)kIOSurfaceHeight : @(H), (id)kIOSurfacePixelFormat : @(0x34323076u), (id)kIOSurfacePlaneInfo : planes };
+        IOSurfaceRef sf = IOSurfaceCreate((CFDictionaryRef)d);
+        BOOL ok0 = NO, ok1 = NO;
+        if (sf && IOSurfaceGetPlaneCount(sf) == 2) {
+            IOSurfaceLock(sf, 0, NULL);
+            memset(IOSurfaceGetBaseAddressOfPlane(sf, 0), 90, (size_t)W * H); memset(IOSurfaceGetBaseAddressOfPlane(sf, 1), 128, (size_t)W * H / 2);
+            IOSurfaceUnlock(sf, 0, NULL);
+            GLuint ty, tc; glGenTextures(1, &ty); glBindTexture(GL_TEXTURE_2D, ty);
+            ok0 = [ctx texImageIOSurface:sf target:GL_TEXTURE_2D internalFormat:GL_LUMINANCE width:W height:H format:GL_LUMINANCE type:GL_UNSIGNED_BYTE plane:0 invert:YES];
+            glGenTextures(1, &tc); glBindTexture(GL_TEXTURE_2D, tc);
+            ok1 = [ctx texImageIOSurface:sf target:GL_TEXTURE_2D internalFormat:GL_LUMINANCE_ALPHA width:W / 2 height:H / 2 format:GL_LUMINANCE_ALPHA type:GL_UNSIGNED_BYTE plane:1 invert:YES];
+        }
+        printf("      biplanar 420 surface %s, plane 0 %d plane 1 %d\n", sf ? "created" : "not created", ok0, ok1);
+        CHECK(!sf || (ok0 && ok1), "biplanar surface: Y and CbCr planes upload");
+        if (sf) CFRelease(sf);
+    }
+    [EAGLContext setCurrentContext:nil]; [ctx release];
+}
+
+// Which compressed texture formats does the GL under the shim accept? (the render server uploads the wallpaper as ASTC 4x4)
+static void test_compressed_formats(void) {
+    EAGLContext *ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES3];
+    [EAGLContext setCurrentContext:ctx];
+    const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+    printf("      ASTC ldr advertised: %s, PVRTC: %s, ETC2 (core ES3): yes\n", ext && strstr(ext, "astc_ldr") ? "yes" : "NO", ext && strstr(ext, "pvrtc") ? "yes" : "NO");
+    static const struct { GLenum fmt; const char *name; int bw, bh, bytes; } f[] = {
+        { 0x93B0, "ASTC 4x4", 4, 4, 16 }, { 0x93B4, "ASTC 6x6", 6, 6, 16 }, { 0x93B7, "ASTC 8x8", 8, 8, 16 }, { 0x9274, "ETC2 RGB8", 4, 4, 8 },
+        { 0x8C01, "PVRTC 4bpp RGB", 8, 8, 32 }, { 0x8C02, "PVRTC 2bpp RGBA", 8, 8, 32 } };
+    uint8_t zero[256]; memset(zero, 0, sizeof zero);
+    GLuint t; glGenTextures(1, &t); glBindTexture(GL_TEXTURE_2D, t);
+    for (unsigned i = 0; i < sizeof f / sizeof *f; i++) {
+        glGetError();
+        glCompressedTexImage2D(GL_TEXTURE_2D, 0, f[i].fmt, f[i].bw, f[i].bh, 0, f[i].bytes, zero);
+        GLenum e = glGetError();
+        printf("      glCompressedTexImage2D %-16s -> GL error 0x%x%s\n", f[i].name, e, e ? "  (REJECTED)" : "");
+    }
+    [EAGLContext setCurrentContext:nil]; [ctx release];
+}
+
 static void bench(void) {
     EAGLContext *ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES3];
     [EAGLContext setCurrentContext:ctx];
@@ -359,6 +473,8 @@ int main(int argc, char **argv) {
         test_attach_and_texture();
         test_macro_context();
         test_sampling();
+        test_alpha_mask();
+        test_compressed_formats();
         {   // OpenGL ES 1.1 context (fixed function): creation and one fixed-function call
             EAGLContext *c1 = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES1];
             CHECK(c1 != nil && [EAGLContext setCurrentContext:c1], "[ES1] context");

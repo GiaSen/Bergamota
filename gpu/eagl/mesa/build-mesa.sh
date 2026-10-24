@@ -78,7 +78,7 @@ if [ ! -d "$BLD" ]; then
     -Dosmesa=true -Dopengl=true -Dgles1=enabled -Dgles2=enabled -Dshared-glapi=enabled \
     -Dvalgrind=disabled -Dlibunwind=disabled -Dzstd=disabled -Dxmlconfig=disabled -Dbuild-tests=false \
     -Dglvnd=disabled -Dlmsensors=disabled -Dgallium-opencl=disabled -Dgallium-rusticl=false \
-    -Dshader-cache=disabled -Dprefix=/)
+    -Dshader-cache=enabled -Dshader-cache-max-size=128M -Dprefix=/)
 fi
 ninja -C "$BLD"
 ls -l "$BLD/src/gallium/targets/osmesa/libOSMesa.8.dylib"
