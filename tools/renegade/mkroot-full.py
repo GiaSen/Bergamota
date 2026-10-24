@@ -44,7 +44,7 @@ import renegade_platform as rplat  # noqa: E402
 from targets import T as TARGET  # noqa: E402
 
 MAGICS = {b'\xcf\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf'}
-MIN_FREE = 5 << 30
+MIN_FREE = int(os.environ.get('RENEGADE_MIN_FREE_GB', '5')) << 30     # free-space floor kept on the host disk
 W = os.path.join(ROOT, TARGET['work'], 'full')             # work dir (mount points, map)
 
 
@@ -65,7 +65,7 @@ def need_free(what):
     fb = free_bytes()
     log(f'free disk: {fb / 2**30:.1f} GiB ({what})')
     if fb < MIN_FREE:
-        sys.exit(f'STOP: only {fb / 2**30:.1f} GiB free (< 5 GiB) before {what}')
+        sys.exit(f'STOP: only {fb / 2**30:.1f} GiB free (< {MIN_FREE >> 30} GiB) before {what}')
 
 
 def attach(img, mnt, readonly=True, owners=False):
@@ -192,7 +192,7 @@ def stage_copy(a, img, rootmnt, dmgs):
             detach(dev)             # macOS: owners-on mounts hide root-only files, so the copy uses a second, noowners mount
         log(f'owner map: {name} {n} entries, {size / 2**30:.2f} GiB apparent')
         if free_bytes() < size + MIN_FREE:
-            sys.exit(f'STOP: copying {name} ({size / 2**30:.1f} GiB) would leave < 5 GiB free '
+            sys.exit(f'STOP: copying {name} ({size / 2**30:.1f} GiB) would leave < {MIN_FREE >> 30} GiB free '
                      f'({free_bytes() / 2**30:.1f} GiB free now)')
         if not rplat.is_linux():
             dev = rplat.attach_ipsw(dmgs[name], mnt, owners=False)
@@ -653,6 +653,11 @@ def stage_verify(a, img, rootmnt):
                     badl.append((rel, ident, new))
             chk(bad == 0, f'identity (identifier/team/CS flags) unchanged on all {n} re-signed Mach-Os, {bad} mismatches {badl[:3]}')
         boot_task_audit(R, chk)
+        if not rplat.is_linux():
+            # the owners-on mount hides root-only files (0600 root: /private/etc/master.passwd, ...) from this user;
+            # the content checks below read every file, so they run on a read-only noowners mount
+            detach(dev)
+            dev = attach(img, rootmnt, readonly=True, owners=False)
         # every Mach-O's chained fixups against its own bytes, as the kernel's dyld pager walks them at page-in: a file that
         # was damaged on its way into the image panics the phone at boot ("fixupPageAuth64(): chain ... out of range")
         import fixupcheck
