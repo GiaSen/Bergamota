@@ -15,6 +15,9 @@ on:
       machine_config:
         description: xnu MACHINE_CONFIG
         default: SWEET
+      use_kdk:
+        description: 26.x only - download the KDK (true) or build without it with CoreEntitlements V2 type stubs (false)
+        default: "false"
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -75,6 +78,15 @@ jobs:
               cp "$f" "dxb/patches/26.0/sweet-$(basename "$f")"
             done
             PDIR=dxb/patches/26.0
+            if [ "${{ inputs.use_kdk || 'false' }}" != "true" ]; then
+              # SWEET needs nothing from the KDK (link_kdk only force-loads closed libs for Apple SoCs,
+              # kernel collections are not built): drop dxb's KDK header copy (our
+              # 0027-stage-coreentitlements-v2-stub.sh stands in) and point KDKROOT at an empty dir so
+              # build.sh does not download one.
+              rm "$PDIR/00_setup_coreentitlements.sh"
+              mkdir -p "$RUNNER_TEMP/no-kdk"
+              echo "KDKROOT=$RUNNER_TEMP/no-kdk" >> "$GITHUB_ENV"
+            fi
           elif [[ "$MACOS_VERSION" == 15.* ]]; then
             # xnu-11215 series (docs/XNU11215_MIGRATION.md). dxb applies patches/15.0/*.sh, then
             # patches/15.0/*.patch in name order: its own fixes (disable_bti, entitlements, iokit,

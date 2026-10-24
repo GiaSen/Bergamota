@@ -200,19 +200,19 @@ index 3ad743fc3efb5254343074eab8edb91b55725f3d..4ec6989e35081be6af5a2db5bc8df7f7
  #else
  void
 diff --git a/pexpert/pexpert/arm64/Makefile b/pexpert/pexpert/arm64/Makefile
-index 75938b564825729a2554521c05b5c8d36f599bd9..104bff8bf191eedeb51be3bb7da5a0d1e8980c9a 100644
+index 75938b564825729a2554521c05b5c8d36f599bd9..1561d807e9fd426cde913e35605160ce06552a18 100644
 --- a/pexpert/pexpert/arm64/Makefile
 +++ b/pexpert/pexpert/arm64/Makefile
-@@ -17,7 +17,8 @@ PRIVATE_DATAFILES = \
- 	vhe_disable.h \
- 	board_config.h \
- 	boot.h \
--	H17.h
-+	H17.h \
+@@ -33,7 +33,8 @@ PRIVATE_KERNELFILES = \
+ 	H15.h \
+ 	H16.h \
+ 	H17.h \
+-	VMAPPLE.h
++	VMAPPLE.h \
 +	SWEET.h
  
  
- PRIVATE_KERNELFILES = \
+ # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..67f234fccc634740a85747fc52b4f134eec7251a
