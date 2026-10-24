@@ -1,0 +1,90 @@
+diff --git a/bsd/dev/beryllium_bt_hci.c b/bsd/dev/beryllium_bt_hci.c
+index ac42481..0f71c3d 100644
+--- a/bsd/dev/beryllium_bt_hci.c
++++ b/bsd/dev/beryllium_bt_hci.c
+@@ -86,6 +86,7 @@ static struct {
+ 	unsigned tx_pkts, tx_fail, tx_garbage, tios_get, tios_set, baud_req_ignored;
+ 	unsigned connects;
+ 	unsigned last_rx_pkts, last_tx_pkts;
++	unsigned compat, compat_fixed, err_budget;     /* sweetbtcompat; unknown-command answers rewritten */
+ } bt;
+ 
+ static uint8_t bt_ring[BT_RING_SIZE];
+@@ -136,6 +137,50 @@ bt_hci_connected(void)
+ 	return os_atomic_load(&bt.connected, relaxed);
+ }
+ 
++/*
++ * bluetoothd's HCI init (OI stack) treats any failed standard command as fatal ("HCI
++ * initialization failed", restart reason 108). The WCN3990 rejects some commands Apple's
++ * Broadcom controllers know, e.g. 0x0c5b Write Default Erroneous Data Reporting, with a
++ * Command Complete of status 0x01 (Unknown HCI Command). With sweetbtcompat=1 (default) such
++ * an answer to a non-vendor command (OGF != 0x3f) is turned into success: for write commands
++ * that is exactly "accepted", read commands get no return parameters and still fail in
++ * bluetoothd. Every rewrite and every other non-zero status is logged (own budget), so the
++ * next missing command shows up even after the packet trace budget is spent.
++ */
++static void
++bt_hci_compat(uint8_t *p, unsigned len)
++{
++	unsigned op, st;
++
++	if (len < 7 || p[0] != 4) {
++		return;
++	}
++	if (p[1] == 0x0e) {                     /* Command Complete: 04 0e plen ncmd op op status */
++		op = p[4] | (p[5] << 8);
++		st = p[6];
++	} else if (p[1] == 0x0f) {              /* Command Status: 04 0f plen status ncmd op op */
++		op = p[5] | (p[6] << 8);
++		st = p[3];
++	} else {
++		return;
++	}
++	if (st == 0) {
++		return;
++	}
++	if (bt.compat && p[1] == 0x0e && st == 0x01 && (op >> 10) != 0x3f && op != 0) {
++		p[6] = 0;
++		bt.compat_fixed++;
++		printf("SWEET BT: compat: opcode %#06x (OGF %#x OCF %#05x) unknown to the controller, answered as success (%u so far)\n",
++		    op, op >> 10, op & 0x3ff, bt.compat_fixed);
++		return;
++	}
++	if (bt.err_budget) {
++		bt.err_budget--;
++		printf("SWEET BT: %s for opcode %#06x (OGF %#x OCF %#05x): status %#04x\n",
++		    p[1] == 0x0e ? "Command Complete" : "Command Status", op, op >> 10, op & 0x3ff, st);
++	}
++}
++
+ /* Called by the UART RX path (under the UART lock) with one complete, IBS-free H4 packet. */
+ void
+ bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
+@@ -156,6 +201,15 @@ bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
+ 	for (i = 0; i < len; i++) {
+ 		bt_ring[(bt.wr + i) & BT_RING_MASK] = pkt[i];
+ 	}
++	if (len >= 7 && pkt[0] == 4 && (pkt[1] == 0x0e || pkt[1] == 0x0f)) {
++		uint8_t ev[8];
++
++		for (i = 0; i < 7; i++) {
++			ev[i] = pkt[i];
++		}
++		bt_hci_compat(ev, len);
++		bt_ring[(bt.wr + 6) & BT_RING_MASK] = ev[6];    /* the only byte bt_hci_compat rewrites */
++	}
+ 	bt.wr += len;
+ 	if (used + len > bt.ring_peak) {
+ 		bt.ring_peak = used + len;
+@@ -451,6 +505,10 @@ bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_bu
+ 	}
+ 	bt.ops = ops;
+ 	bt.log_budget = log_budget;
++	bt.compat = 1;
++	bt.err_budget = 64;
++	(void)PE_parse_boot_argn("sweetbtcompat", &bt.compat, sizeof(bt.compat));
++	printf("SWEET BT: compat (unknown standard commands answered as success): %s\n", bt.compat ? "on" : "off");
+ 	/* raw mode as bluetoothd would set it (cfmakeraw, 8N1, hw flow control); the speed is filled in on get */
+ 	bt.tio.c_cflag = 0x38B00ul;
+ 	bt.tio.c_ispeed = bt.tio.c_ospeed = ops->baud(0);
