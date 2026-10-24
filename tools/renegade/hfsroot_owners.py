@@ -188,6 +188,21 @@ def main():
                 ent = owners.get('') if cnid == ROOT_CNID else None
                 put(d, *(ent if ent else (0, 0, None)))
 
+    # HFSX folder counts: macOS keeps kHFSHasFolderCountMask (0x10 in the folder record's flags) and the number of
+    # subfolders (folderCount, offset 84) on every folder; Linux's hfsplus driver leaves them unset on the root folder,
+    # which fsck_hfs then reports ("HasFolderCount flag needs to be set (id = 2)") and the seal stage refuses
+    subdirs = {}
+    for d, rtype, parent, name, cnid in recs:
+        if rtype == 1:
+            subdirs[parent] = subdirs.get(parent, 0) + 1
+    counted = 0
+    for d, rtype, parent, name, cnid in recs:
+        if rtype == 1 and not struct.unpack_from('>H', cat, d + 2)[0] & 0x10:
+            struct.pack_into('>H', cat, d + 2, struct.unpack_from('>H', cat, d + 2)[0] | 0x10)
+            struct.pack_into('>I', cat, d + 84, subdirs.get(cnid, 0))
+            counted += 1
+    stats['folder_counts_set'] = counted
+
     # write the catalog back, extent by extent
     pos = 0
     for s, c in extents:
