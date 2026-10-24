@@ -51,7 +51,7 @@ index 722a7f4ea14d024a39863e2fa09a8d06d31186e9..8fb90998b4d86dd15f46059bdf7f3c9f
  
  /* I-Cache. */
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 0554aa8021cb07cb3e723009faebd4869b7f6caf..8dc0eff36adab2139836b954ce62df3135d1edec 100644
+index 0554aa8021cb07cb3e723009faebd4869b7f6caf..00575d5113257b18fc1ea721235cb9dc6ff158ca 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
 @@ -33,6 +33,7 @@
@@ -80,9 +80,9 @@ index 0554aa8021cb07cb3e723009faebd4869b7f6caf..8dc0eff36adab2139836b954ce62df31
 +	if (intid == SWEET_VTIMER_INTID) {
 +		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
 +		cdp->cpu_decrementer = -1; /* Large */
-+		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
++		ml_interrupt_masked_debug_start(rtclock_intr, DBG_INTR_TYPE_TIMER);
 +		rtclock_intr(TRUE);
-+		INTERRUPT_MASKED_DEBUG_END();
++		ml_interrupt_masked_debug_end();
 +		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
 +	} else if (intid < 16) {
 +		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);

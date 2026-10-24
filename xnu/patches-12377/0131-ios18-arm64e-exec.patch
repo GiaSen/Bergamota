@@ -30,10 +30,20 @@ index 58769e07a30019937e4d95cfc2508b5895831791..f98445472602930a554a3ccc3724100c
  			break;
  
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 89acb1cb6184f818d14951916167df6b11b54e0d..3665e45cd1657aac3e4932a380047223fa09b2df 100644
+index 89acb1cb6184f818d14951916167df6b11b54e0d..a54c8d240a3381ce9db00a06dc94a9fde8f7a806 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -2195,6 +2195,23 @@ grade:
+@@ -191,6 +191,9 @@
+ 
+ #include <mach/exclaves.h>
+ 
++/* sweetarm64e=1 (iOS arm64e userland on a CPU without PAuth), defined below */
++bool sweet_arm64e_enabled(void);
++
+ #if HAS_MTE
+ #include <arm64/mte_xnu.h>
+ #endif /* HAS_MTE */
+@@ -2195,6 +2198,23 @@ grade:
  		}
  	}
  
@@ -57,7 +67,7 @@ index 89acb1cb6184f818d14951916167df6b11b54e0d..3665e45cd1657aac3e4932a380047223
  #if __has_feature(ptrauth_calls) && defined(XNU_TARGET_OS_OSX)
  	if ((imgp->ip_origcpusubtype & ~CPU_SUBTYPE_MASK) != CPU_SUBTYPE_ARM64E &&
  	    imgp->ip_origcputype == CPU_TYPE_ARM64 &&
-@@ -7050,6 +7067,33 @@ is_arm64e_running_as_arm64(const struct image_params *imgp)
+@@ -7050,6 +7070,33 @@ is_arm64e_running_as_arm64(const struct image_params *imgp)
  }
  #endif /* __has_feature(ptrauth_calls) */
  

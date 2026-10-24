@@ -1,5 +1,5 @@
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 8dc0eff36adab2139836b954ce62df3135d1edec..13a5d7e3ce919109b7e8b31e6c3e89eeda99d9f3 100644
+index 00575d5113257b18fc1ea721235cb9dc6ff158ca..2628eb016dd4e802a00af8513d1167f8629efa71 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
 @@ -3020,7 +3020,7 @@ sleh_irq(arm_saved_state_t *state)
@@ -10,7 +10,7 @@ index 8dc0eff36adab2139836b954ce62df3135d1edec..13a5d7e3ce919109b7e8b31e6c3e89ee
 +	if (intid == sweet_vtimer_intid) {
  		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
  		cdp->cpu_decrementer = -1; /* Large */
- 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		ml_interrupt_masked_debug_start(rtclock_intr, DBG_INTR_TYPE_TIMER);
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 index 4ec6989e35081be6af5a2db5bc8df7f70f0bd26a..6089db9c7043f768cf34dac2b2d3f011dc67e603 100644
 --- a/pexpert/arm/pe_fiq.c

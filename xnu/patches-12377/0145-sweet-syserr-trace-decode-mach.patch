@@ -1,5 +1,5 @@
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 3665e45cd1657aac3e4932a380047223fa09b2df..905018f7af583b9f9710f4d92be2da500491203b 100644
+index a54c8d240a3381ce9db00a06dc94a9fde8f7a806..6797fc3b8394b982d45044c908f70a0555af88c2 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -106,6 +106,10 @@
@@ -13,7 +13,7 @@ index 3665e45cd1657aac3e4932a380047223fa09b2df..905018f7af583b9f9710f4d92be2da50
  #include <sys/reason.h>
  #if SYSV_SHM
  #include <sys/shm_internal.h>           /* shmexec() */
-@@ -8705,6 +8709,7 @@ process_signature(proc_t p, struct image_params *imgp)
+@@ -8708,6 +8712,7 @@ process_signature(proc_t p, struct image_params *imgp)
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  			/* SWEET runs every iOS binary this way: one short line per exec. */
  			printf("exec %s\n", p->p_name);

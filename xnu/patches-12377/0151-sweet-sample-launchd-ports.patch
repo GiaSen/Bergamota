@@ -1,8 +1,8 @@
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index ab3cd060f5c93ee978c5b188cfd88186f48a76e3..42b2734e72744ce319dfac3f9f07ee48bd6d70de 100644
+index cb3bf68410d5852ba893f670adf322b5d291f78a..166ba6246ad79acb7e8e6336505378f77b664685 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -1190,8 +1190,9 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1193,8 +1193,9 @@ sweet_sample_task(const char *name, int pid, task_t task)
  		struct {
  			mach_port_name_t name;
  			uint32_t msgs, seqno, srights, mscount, sorights;
@@ -14,7 +14,7 @@ index ab3cd060f5c93ee978c5b188cfd88186f48a76e3..42b2734e72744ce319dfac3f9f07ee48
  		int nr = 0;
  		uint32_t nrecv = 0;
  
-@@ -1208,10 +1209,15 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1211,10 +1212,15 @@ sweet_sample_task(const char *name, int pid, task_t task)
  					}
  					nrecv++;
  					ipc_object_t obj = entry->ie_object;
@@ -31,10 +31,10 @@ index ab3cd060f5c93ee978c5b188cfd88186f48a76e3..42b2734e72744ce319dfac3f9f07ee48
  					rr[nr].name = MACH_PORT_MAKE(index, IE_BITS_GEN(bits));
  					rr[nr].msgs = port->ip_messages.imq_msgcount;
  					rr[nr].seqno = port->ip_messages.imq_seqno;
-@@ -1221,6 +1227,16 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1224,6 +1230,16 @@ sweet_sample_task(const char *name, int pid, task_t task)
  					rr[nr].knote = SLIST_FIRST(&port->ip_klist) != NULL;
  					rr[nr].nsreq = port->ip_nsrequest != IP_NULL;
- 					rr[nr].kot = (uint8_t)ip_kotype(port);
+ 					rr[nr].kot = (uint8_t)ip_type(port);  /* 12377: kobject type = object type >= __IKOT_FIRST */
 +					rr[nr].pset = ip_in_pset(port);
 +					rr[nr].sls = (uint8_t)port->ip_sync_link_state;
 +					rr[nr].mid = rr[nr].msz = 0;
@@ -48,7 +48,7 @@ index ab3cd060f5c93ee978c5b188cfd88186f48a76e3..42b2734e72744ce319dfac3f9f07ee48
  					nr++;
  				}
  			}
-@@ -1228,8 +1244,9 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1231,8 +1247,9 @@ sweet_sample_task(const char *name, int pid, task_t task)
  		}
  		printf("SMP %s PORTS recv %u listed %d\n", name, nrecv, nr);
  		for (int i = 0; i < nr; i++) {

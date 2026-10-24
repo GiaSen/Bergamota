@@ -47,7 +47,7 @@ index 012a1d000d041ffef683bd5f434e0840c06452e1..3cb72e3eb62a8ef8b161ccd4484e7583
  #include "sweet_board.h"
  #include <kern/locks.h>
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index 42b2734e72744ce319dfac3f9f07ee48bd6d70de..203d47e9ca00cea70e72c9cce1f2dfd668361582 100644
+index 166ba6246ad79acb7e8e6336505378f77b664685..10aa2ba755567e17618c2ab2feae069ce9f56995 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
 @@ -88,6 +88,7 @@
@@ -56,5 +56,5 @@ index 42b2734e72744ce319dfac3f9f07ee48bd6d70de..203d47e9ca00cea70e72c9cce1f2dfd6
  #include <vm/vm_map_xnu.h>
 +#include <vm/vm_map_internal.h>
  #include <vm/vm_map.h>
+ #include <vm/vm_map_lock_internal.h>
  #include <sys/reason.h>
- #include <security/mac_mach_internal.h>

@@ -1,5 +1,5 @@
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 13a5d7e3ce919109b7e8b31e6c3e89eeda99d9f3..7609dfa326f1d71a664aad3137824b61a5fafa8d 100644
+index 2628eb016dd4e802a00af8513d1167f8629efa71..9b59cfad5158f044ad5952e284d5a76ffb9b8ff3 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
 @@ -38,6 +38,7 @@

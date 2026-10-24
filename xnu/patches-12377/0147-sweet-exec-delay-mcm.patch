@@ -1,5 +1,5 @@
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 4cc70be9292032bdb2a74b9d836da9de061b9f62..7cab23d4c87907ef17e0958ce05e7b6804503875 100644
+index d7ff3b8e6a1be503702c608ae23709681f29cac4..df4fc39c2d41281dc9fc799f969d2591dfd20f77 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -109,6 +109,7 @@
@@ -10,7 +10,7 @@ index 4cc70be9292032bdb2a74b9d836da9de061b9f62..7cab23d4c87907ef17e0958ce05e7b68
  #endif
  #include <sys/reason.h>
  #if SYSV_SHM
-@@ -2059,6 +2060,7 @@ grade:
+@@ -2062,6 +2063,7 @@ grade:
  		const char *leaf = strrchr(imgp->ip_startargv, '/');
  		sweet_exec_env_trace(leaf != NULL ? leaf + 1 : imgp->ip_startargv, proc_getpid(current_proc()),
  		    imgp->ip_endargv, imgp->ip_endenvv);

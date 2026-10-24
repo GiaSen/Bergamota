@@ -1,8 +1,8 @@
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index 811f40499d1791faa2f0dacf501d185707009fe9..7b94c253979893cfdc5bb31aeea9265aef4b695c 100644
+index e00b24d665bca37407adfa384a4fb0f786344f7d..10bd1b00ddcdc608e71aaf115c40d65b041d7b0d 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -1180,16 +1180,20 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1183,16 +1183,20 @@ sweet_sample_task(const char *name, int pid, task_t task)
  	task_unlock(task);
  
  	/*
@@ -30,7 +30,7 @@ index 811f40499d1791faa2f0dacf501d185707009fe9..7b94c253979893cfdc5bb31aeea9265a
  
  		if (space != IS_NULL) {
  			is_read_lock(space);
-@@ -1204,30 +1208,29 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1207,30 +1211,29 @@ sweet_sample_task(const char *name, int pid, task_t task)
  					}
  					nrecv++;
  					ipc_object_t obj = entry->ie_object;
@@ -57,7 +57,7 @@ index 811f40499d1791faa2f0dacf501d185707009fe9..7b94c253979893cfdc5bb31aeea9265a
 +					rr[nr].sorights = port->ip_sorights;
 +					rr[nr].knote = SLIST_FIRST(&port->ip_klist) != NULL;
 +					rr[nr].nsreq = port->ip_nsrequest != IP_NULL;
-+					rr[nr].kot = (uint8_t)ip_kotype(port);
++					rr[nr].kot = (uint8_t)ip_type(port);  /* 12377: kobject type = object type >= __IKOT_FIRST */
 +					nr++;
  				}
  			}

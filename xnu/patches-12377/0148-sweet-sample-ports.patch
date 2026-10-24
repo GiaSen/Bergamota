@@ -1,8 +1,8 @@
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index 33d950fd60fe3f8f69e42f106cf651a2df8cf0df..811f40499d1791faa2f0dacf501d185707009fe9 100644
+index a7397000c656bb462bf4b08084fe703702a6213f..e00b24d665bca37407adfa384a4fb0f786344f7d 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -1178,6 +1178,57 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1181,6 +1181,57 @@ sweet_sample_task(const char *name, int pid, task_t task)
  		printf("%s\n", line);
  	}
  	task_unlock(task);

@@ -1,8 +1,8 @@
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index 7b94c253979893cfdc5bb31aeea9265aef4b695c..ab3cd060f5c93ee978c5b188cfd88186f48a76e3 100644
+index 10bd1b00ddcdc608e71aaf115c40d65b041d7b0d..cb3bf68410d5852ba893f670adf322b5d291f78a 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -1231,6 +1231,62 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1234,6 +1234,62 @@ sweet_sample_task(const char *name, int pid, task_t task)
  			printf("SMP %s R 0x%x %u/%u %u/%u/%u %u/%u/%u\n", name, rr[i].name, rr[i].msgs, rr[i].seqno,
  			    rr[i].srights, rr[i].mscount, rr[i].sorights, rr[i].knote, rr[i].nsreq, rr[i].kot);
  		}

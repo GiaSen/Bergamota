@@ -1,8 +1,8 @@
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 905018f7af583b9f9710f4d92be2da500491203b..4cc70be9292032bdb2a74b9d836da9de061b9f62 100644
+index 6797fc3b8394b982d45044c908f70a0555af88c2..d7ff3b8e6a1be503702c608ae23709681f29cac4 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -2053,6 +2053,14 @@ grade:
+@@ -2056,6 +2056,14 @@ grade:
  	if (error) {
  		goto bad;
  	}
@@ -17,7 +17,7 @@ index 905018f7af583b9f9710f4d92be2da500491203b..4cc70be9292032bdb2a74b9d836da9de
  
  	AUDIT_ARG(argv, imgp->ip_startargv, imgp->ip_argc,
  	    imgp->ip_endargv - imgp->ip_startargv);
-@@ -8709,7 +8717,6 @@ process_signature(proc_t p, struct image_params *imgp)
+@@ -8712,7 +8720,6 @@ process_signature(proc_t p, struct image_params *imgp)
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  			/* SWEET runs every iOS binary this way: one short line per exec. */
  			printf("exec %s\n", p->p_name);
