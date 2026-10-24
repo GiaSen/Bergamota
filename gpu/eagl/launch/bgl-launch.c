@@ -18,6 +18,12 @@
  * (boot time, last start, strikes): a start less than 120 s after the previous one in the same boot is a strike; at 3 strikes this
  * boot runs plain. The state is per boot (the boot time is compared), so nothing carries over a reboot. The wrapper's stderr
  * (and with it backboardd's) goes to /private/var/tmp/bgl-backboardd.log (truncated above 1 MiB) while injecting.
+ *
+ * Metal (Chlorophyll as the compositor), checked FIRST and only by files, so it needs no reboot and falls back without a person:
+ * /private/var/tmp/bgmtl-bb.arm exists, bgmtl-bb.off does not, the Chlorophyll inject and its two libraries are readable in
+ * /usr/local/lib/bgmtl, and the previous Metal launch of THIS boot became healthy (bgmtl-bb.state; one that did not writes
+ * bgmtl-bb.off here). Then backboardd gets the Chlorophyll inject instead of the GL shim, BGMTL_BB=1, and bgmtl-bb.state says
+ * alive=0 until the inject marks it healthy. Any doubt: the ES path below, as before.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -207,6 +213,43 @@ static void clean_legibility_pools(void)
 		fprintf(stderr, "bgl-launch: removed %u stale legibility pool file%s\n", n, n == 1 ? "" : "s");
 }
 
+#define BB_ARM    "/private/var/tmp/bgmtl-bb.arm"
+#define BB_OFF    "/private/var/tmp/bgmtl-bb.off"
+#define BB_STATE  "/private/var/tmp/bgmtl-bb.state"
+#define BB_LIBDIR "/usr/local/lib/bgmtl"
+
+static void bb_off(const char *why)
+{
+	FILE *f = fopen(BB_OFF, "w");
+	if (f) { fprintf(f, "%s\n", why); fclose(f); }
+}
+
+/* 1: start backboardd on Chlorophyll (Metal); 0: the ES path */
+static int metal_mode(void)
+{
+	struct stat st;
+	char boot[64] = "", was[64] = "";
+	int alive = 1;
+	if (stat(BB_ARM, &st) != 0 || stat(BB_OFF, &st) == 0)
+		return 0;
+	if (!readable(BB_LIBDIR, "bgmtl-inject.dylib") || !readable(BB_LIBDIR, "libbgair.dylib") || !readable(BB_LIBDIR, "libdrm.2.dylib"))
+		return 0;
+	boot_uuid(boot, sizeof boot);
+	FILE *f = fopen(BB_STATE, "r");
+	if (f) {
+		if (fscanf(f, "alive=%d boot=%63s", &alive, was) != 2)
+			alive = 1;
+		fclose(f);
+	}
+	if (!alive && !strcmp(was, boot)) {
+		bb_off("the previous Metal launch of this boot never became healthy");
+		return 0;
+	}
+	f = fopen(BB_STATE, "w");
+	if (f) { fprintf(f, "alive=0 boot=%s\n", boot[0] ? boot : "-"); fclose(f); }
+	return 1;
+}
+
 int main(int argc, char **argv)
 {
 	char args[1024] = "", mode[16] = "", dbg[16] = "";
@@ -226,6 +269,23 @@ int main(int argc, char **argv)
 		args[0] = 0;
 	args[sizeof args - 1] = 0;
 	clean_legibility_pools();
+
+	if (metal_mode()) {
+		struct stat st;
+		setenv("DYLD_INSERT_LIBRARIES", BB_LIBDIR "/bgmtl-inject.dylib", 1);
+		setenv("BGMTL_BB", "1", 1);
+		if (stat(LOG_PATH, &st) == 0 && st.st_size > (1 << 20))
+			unlink(LOG_PATH);
+		int fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+		if (fd >= 0) {
+			dup2(fd, 2);
+			close(fd);
+			fprintf(stderr, "bgl-launch: Metal mode: injecting %s/bgmtl-inject.dylib (Chlorophyll)\n", BB_LIBDIR);
+		}
+		argv[0] = (char *)REAL_PATH;
+		execv(REAL_PATH, argv);
+		_exit(127);
+	}
 
 	{ char mm[16] = ""; int have_marker = marker_mode(mm, sizeof mm); if (!has_arg(args, "bglrender", mode, sizeof mode) && have_marker) snprintf(mode, sizeof mode, "%s", mm); }   /* boot-arg wins for the mode; the marker may still add debug/nohook */
 	if (mode[0] &&
