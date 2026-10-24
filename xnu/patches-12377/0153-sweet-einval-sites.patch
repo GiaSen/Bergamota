@@ -1,0 +1,343 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 7cab23d4c87907ef17e0958ce05e7b6804503875..d883173d8b5957adc8269b868c11fe5d335064ab 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -196,6 +196,19 @@ void sweet_exec_delay(const char *leaf);
+ 
+ #include <mach/exclaves.h>
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* 0153: every EINVAL return in this file reports its source line ("SWEET EINVAL file:line pid") */
++static inline int
++sweet_einval(int line, const char *file)
++{
++	printf("SWEET EINVAL %s:%d pid %d\n", file, line, proc_getpid(current_proc()));
++	return EINVAL;
++}
++#define SWEET_EINVAL() sweet_einval(__LINE__, __FILE__)
++#else
++#define SWEET_EINVAL() EINVAL
++#endif
++
+ #if HAS_MTE
+ #include <arm64/mte_xnu.h>
+ #endif /* HAS_MTE */
+@@ -2623,7 +2636,7 @@ grade:
+ 				set_proc_name(imgp, p);
+ 				exec_failure_reason->osr_flags |= OS_REASON_FLAG_GENERATE_CRASH_REPORT;
+ 			}
+-			error = EINVAL;
++			error = SWEET_EINVAL();
+ 			goto badtoolate;
+ 		}
+ 	}
+@@ -3278,7 +3291,7 @@ exec_handle_spawnattr_policy(proc_t p, thread_t thread, int psa_apptype, uint64_
+ 		    port_actions->registered_array[0],
+ 		    port_actions->registered_array[1],
+ 		    port_actions->registered_array[2])) {
+-			return EINVAL;
++			return SWEET_EINVAL();
+ 		}
+ 		/* mach_ports_register() consumed the array */
+ 		bzero(port_actions->registered_array,
+@@ -3370,24 +3383,24 @@ exec_handle_port_actions(struct image_params *imgp,
+ 			break;
+ 		case PSPA_IMP_WATCHPORTS:
+ 			if (++actions->portwatch_count > TASK_MAX_WATCHPORT_COUNT) {
+-				ret = EINVAL;
++				ret = SWEET_EINVAL();
+ 				goto done;
+ 			}
+ 			break;
+ 		case PSPA_REGISTERED_PORTS:
+ 			if (++actions->registered_count > TASK_PORT_REGISTER_MAX) {
+-				ret = EINVAL;
++				ret = SWEET_EINVAL();
+ 				goto done;
+ 			}
+ 			break;
+ 		case PSPA_PTRAUTH_TASK_PORT:
+ 			if (++ptrauth_task_port_count > 1) {
+-				ret = EINVAL;
++				ret = SWEET_EINVAL();
+ 				goto done;
+ 			}
+ 			break;
+ 		default:
+-			ret = EINVAL;
++			ret = SWEET_EINVAL();
+ 			goto done;
+ 		}
+ 	}
+@@ -3403,7 +3416,7 @@ exec_handle_port_actions(struct image_params *imgp,
+ 	}
+ 	if (actions->portwatch_count) {
+ 		if (in_exec && task_has_watchport_boost) {
+-			ret = EINVAL;
++			ret = SWEET_EINVAL();
+ 			goto done;
+ 		}
+ 		actions->portwatch_array = kalloc_type(ipc_port_t,
+@@ -3422,7 +3435,7 @@ exec_handle_port_actions(struct image_params *imgp,
+ 			    act->new_port, IOT_ANY, &port);
+ 
+ 			if (kr != KERN_SUCCESS) {
+-				ret = EINVAL;
++				ret = SWEET_EINVAL();
+ 				goto done;
+ 			}
+ 		} else {
+@@ -3435,7 +3448,7 @@ exec_handle_port_actions(struct image_params *imgp,
+ 			kr = task_set_special_port(task, act->which, port);
+ 
+ 			if (kr != KERN_SUCCESS) {
+-				ret = EINVAL;
++				ret = SWEET_EINVAL();
+ 			}
+ 			break;
+ 
+@@ -3492,7 +3505,7 @@ exec_handle_port_actions(struct image_params *imgp,
+ 			ipc_port_release_send(port);
+ 			break;
+ 		default:
+-			ret = EINVAL;
++			ret = SWEET_EINVAL();
+ 			break;
+ 		}
+ 
+@@ -3674,7 +3687,7 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
+ 			int origfd;
+ 
+ 			if (!MACH_PORT_VALID(psfa->psfaa_fileport)) {
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 				break;
+ 			}
+ 
+@@ -3682,7 +3695,7 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
+ 			    psfa->psfaa_fileport, IKOT_FILEPORT, &port);
+ 
+ 			if (kr != KERN_SUCCESS) {
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 				break;
+ 			}
+ 
+@@ -3775,7 +3788,7 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
+ 		break;
+ 
+ 		default:
+-			error = EINVAL;
++			error = SWEET_EINVAL();
+ 			break;
+ 		}
+ 
+@@ -3853,7 +3866,7 @@ exec_spawnattr_validate_policyext_data(const struct ip_px_smpx_s *px_s,
+ 		return EOVERFLOW;
+ 	}
+ 	if (__improbable(dataend > px_s->datalen)) {
+-		return EINVAL;
++		return SWEET_EINVAL();
+ 	}
+ 
+ 	return 0;
+@@ -3911,7 +3924,7 @@ spawn_copyin_macpolicyinfo(const struct user__posix_spawn_args_desc *px_args,
+ 
+ 	if (px_args->mac_extensions_size < PS_MAC_EXTENSIONS_SIZE(1) ||
+ 	    px_args->mac_extensions_size > PAGE_SIZE) {
+-		error = EINVAL;
++		error = SWEET_EINVAL();
+ 		goto bad;
+ 	}
+ 
+@@ -3928,14 +3941,14 @@ spawn_copyin_macpolicyinfo(const struct user__posix_spawn_args_desc *px_args,
+ 
+ 	size_t extsize = PS_MAC_EXTENSIONS_SIZE(psmx->psmx_count);
+ 	if (extsize == 0 || extsize > px_args->mac_extensions_size) {
+-		error = EINVAL;
++		error = SWEET_EINVAL();
+ 		goto bad;
+ 	}
+ 
+ 	for (int i = 0; i < psmx->psmx_count; i++) {
+ 		_ps_mac_policy_extension_t *extension = &psmx->psmx_extensions[i];
+ 		if (extension->datalen == 0 || extension->datalen > PAGE_SIZE) {
+-			error = EINVAL;
++			error = SWEET_EINVAL();
+ 			goto bad;
+ 		}
+ 		if (__improbable(os_add_overflow(datalen, extension->datalen, &datalen))) {
+@@ -4007,7 +4020,7 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
+ 
+ 	if (px_persona->pspi_flags & POSIX_SPAWN_PERSONA_GROUPS) {
+ 		if (px_persona->pspi_ngroups > NGROUPS_MAX) {
+-			return EINVAL;
++			return SWEET_EINVAL();
+ 		}
+ 	}
+ 
+@@ -4492,7 +4505,7 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
+ 
+ 			if (px_args.file_actions_size < PSF_ACTIONS_SIZE(1) ||
+ 			    maxfa_size == 0 || px_args.file_actions_size > maxfa_size) {
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 				goto bad;
+ 			}
+ 
+@@ -4511,7 +4524,7 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
+ 			/* Verify that the action count matches the struct size */
+ 			size_t psfsize = PSF_ACTIONS_SIZE(px_sfap->psfa_act_count);
+ 			if (psfsize == 0 || psfsize != px_args.file_actions_size) {
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 				goto bad;
+ 			}
+ 		}
+@@ -4519,7 +4532,7 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
+ 			/* Limit port_actions to one page of data */
+ 			if (px_args.port_actions_size < PS_PORT_ACTIONS_SIZE(1) ||
+ 			    px_args.port_actions_size > PAGE_SIZE) {
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 				goto bad;
+ 			}
+ 
+@@ -4538,7 +4551,7 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
+ 			/* Verify that the action count matches the struct size */
+ 			size_t pasize = PS_PORT_ACTIONS_SIZE(px_spap->pspa_count);
+ 			if (pasize == 0 || pasize != px_args.port_actions_size) {
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 				goto bad;
+ 			}
+ 		}
+@@ -4594,7 +4607,7 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
+ 
+ 			if (px_pcred_info->pspci_flags & POSIX_SPAWN_POSIX_CRED_GROUPS) {
+ 				if (px_pcred_info->pspci_ngroups > NGROUPS_MAX) {
+-					error = EINVAL;
++					error = SWEET_EINVAL();
+ 					goto bad;
+ 				}
+ 			}
+@@ -4799,7 +4812,7 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
+ 			 */
+ 			if (coal[COALITION_TYPE_RESOURCE] == COALITION_NULL) {
+ 				spawn_coalitions_release_all(coal);
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 				goto bad;
+ 			}
+ 		}
+@@ -4821,7 +4834,7 @@ do_fork1:
+ 		if (error == 0) {
+ 			kr = coalitions_set_roles(coal, new_task, coal_role);
+ 			if (kr != KERN_SUCCESS) {
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 			}
+ 			if (kdebug_debugid_enabled(MACHDBG_CODE(DBG_MACH_COALITION,
+ 			    MACH_COALITION_ADOPT))) {
+@@ -6617,7 +6630,7 @@ exec_copyout_strings(struct image_params *imgp, user_addr_t *stackp)
+ 	 * should have aligned their sub-area
+ 	 */
+ 	if (imgp->ip_strspace % ptr_size != 0) {
+-		error = EINVAL;
++		error = SWEET_EINVAL();
+ 		goto bad;
+ 	}
+ 
+@@ -8442,7 +8455,7 @@ execargs_free(struct image_params *imgp)
+ 		execargs_wakeup_waiters();
+ 	}
+ 
+-	return kret == KERN_SUCCESS ? 0 : EINVAL;
++	return kret == KERN_SUCCESS ? 0 : SWEET_EINVAL();
+ }
+ 
+ void
+@@ -8551,7 +8564,7 @@ proc_process_signature(proc_t p, os_reason_t *signature_failure_reason)
+ 	kern_return_t kr = machine_task_process_signature(proc_get_task_raw(p), proc_platform(p), proc_sdk(p), &error_msg);
+ 
+ 	if (kr != KERN_SUCCESS) {
+-		error = EINVAL;
++		error = SWEET_EINVAL();
+ 
+ 		if (error_msg != NULL) {
+ 			uint32_t error_msg_len = (uint32_t)strlen(error_msg) + 1;
+@@ -8849,7 +8862,7 @@ done:
+ 		kr = thread_process_signature(imgp->ip_new_thread, proc_get_task_raw(p));
+ 
+ 		if (kr != KERN_SUCCESS) {
+-			error = EINVAL;
++			error = SWEET_EINVAL();
+ 			signature_failure_reason = os_reason_create(OS_REASON_EXEC, EXEC_EXIT_REASON_MACHINE_THREAD);
+ 		}
+ 	}
+diff --git a/bsd/kern/kern_persona.c b/bsd/kern/kern_persona.c
+index 44f92f58b75d194ff613b5490dab33053cde57a9..4cda09e7994d52a9c3a10c89138d20d7a02a9be4 100644
+--- a/bsd/kern/kern_persona.c
++++ b/bsd/kern/kern_persona.c
+@@ -52,6 +52,20 @@
+ #include <security/audit/audit.h>
+ 
+ #include <os/log.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* 0153: every EINVAL return in this file reports its source line ("SWEET EINVAL file:line pid") */
++static inline int
++sweet_einval(int line, const char *file)
++{
++	printf("SWEET EINVAL %s:%d pid %d\n", file, line, proc_getpid(current_proc()));
++	return EINVAL;
++}
++#define SWEET_EINVAL() sweet_einval(__LINE__, __FILE__)
++#else
++#define SWEET_EINVAL() EINVAL
++#endif
++
+ #define pna_err(fmt, ...) \
+ 	os_log_error(OS_LOG_DEFAULT, "ERROR: " fmt, ## __VA_ARGS__)
+ 
+@@ -176,7 +190,7 @@ persona_init_begin(struct persona *persona)
+ 	uid_t id;
+ 
+ 	if (!persona || (persona->pna_valid != PERSONA_ALLOC_TOKEN)) {
+-		return EINVAL;
++		return SWEET_EINVAL();
+ 	}
+ 
+ 	id = persona->pna_id;
+@@ -457,11 +471,11 @@ persona_find_all(const char *login, uid_t uid, persona_type_t persona_type,
+ 	if ((persona_type > PERSONA_INVALID) && (persona_type <= PERSONA_TYPE_MAX)) {
+ 		match++;
+ 	} else if (persona_type != PERSONA_INVALID) {
+-		return EINVAL;
++		return SWEET_EINVAL();
+ 	}
+ 
+ 	if (match == 0) {
+-		return EINVAL;
++		return SWEET_EINVAL();
+ 	}
+ 
+ 	persona_dbg("Searching with %d parameters (l:\"%s\", u:%d)",
+@@ -720,7 +734,7 @@ persona_proc_adopt(
+ 	struct persona *old_persona;
+ 
+ 	if (!persona) {
+-		return EINVAL;
++		return SWEET_EINVAL();
+ 	}
+ 
+ 	persona_dbg("%d adopting Persona %d (%s)", proc_pid(p),
+@@ -730,7 +744,7 @@ persona_proc_adopt(
+ 	if (!persona_valid(persona)) {
+ 		persona_dbg("Invalid persona (%s)!", persona_desc(persona, 1));
+ 		persona_put_and_unlock(persona);
+-		return EINVAL;
++		return SWEET_EINVAL();
+ 	}
+ 
+ 	/*

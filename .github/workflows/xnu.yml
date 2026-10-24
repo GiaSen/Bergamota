@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       macos_version:
-        description: macOS release whose xnu to build (13.5 = xnu-8796 / iOS 16 era; 15.3 = xnu-11215.81.4 / iOS 18.3 era)
+        description: macOS release whose xnu to build (13.5 = xnu-8796 / iOS 16 era; 15.3 = xnu-11215.81.4 / iOS 18.3 era; 26.5 = xnu-12377.121.6 / iOS 26.5 era)
         default: "15.3"
       xcode_version:
-        description: Xcode on the runner (empty = oldest installed for 13.x/14.x, 16.2 for 15.x)
+        description: Xcode on the runner (empty = oldest installed for 13.x/14.x, 16.2 for 15.x, 26.1 for 26.x)
         default: ""
       kernel_config:
         description: RELEASE / DEVELOPMENT / DEBUG
@@ -19,10 +19,11 @@ on:
         description: make -k (collect all compile errors in one run)
         default: "true"
   push:
-    branches: [main, develop, xnu11215]
+    branches: [main, develop, xnu11215, ios26]
     paths:
       - "xnu/patches/**"
       - "xnu/patches-11215/**"
+      - "xnu/patches-12377/**"
       - ".github/workflows/xnu.yml"
 
 concurrency:
@@ -32,7 +33,7 @@ concurrency:
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
-  MACOS_VERSION: ${{ inputs.macos_version || (github.ref_name == 'main' && '13.5' || '15.3') }}
+  MACOS_VERSION: ${{ inputs.macos_version || (github.ref_name == 'main' && '13.5' || (github.ref_name == 'ios26' && '26.5' || '15.3')) }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
   # Bump to throw away every cache (host tools + ccache) at once. See docs/CI_CACHE.md.
@@ -55,7 +56,8 @@ jobs:
     # 13.x/14.x sources: macos-14 still ships Xcode 15.x, whose iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which that xnu lacks).
     # 15.x sources (xnu-11215): macos-15 with Xcode 16.2 (the macOS 15.2/15.3 era toolchain).
-    runs-on: ${{ startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || '15.3'), '15.') && 'macos-15' || 'macos-14' }}
+    # 26.x sources (xnu-12377): macos-26 with Xcode 26.1 (what dxb's own CI builds 26.5 with).
+    runs-on: ${{ startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || (github.ref_name == 'ios26' && '26.5' || '15.3')), '26.') && 'macos-26' || (startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || '15.3'), '15.') && 'macos-15' || 'macos-14') }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -65,7 +67,15 @@ jobs:
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
-          if [[ "$MACOS_VERSION" == 15.* ]]; then
+          if [[ "$MACOS_VERSION" == 26.* ]]; then
+            # xnu-12377 series (docs/XNU12377_MIGRATION.md): same scheme as 15.x, dxb's patches/26.0
+            # (its 00_setup_coreentitlements.sh and fixes) first, ours after them.
+            for f in xnu/patches-12377/*.patch xnu/patches-12377/*.sh; do
+              [ -e "$f" ] || continue
+              cp "$f" "dxb/patches/26.0/sweet-$(basename "$f")"
+            done
+            PDIR=dxb/patches/26.0
+          elif [[ "$MACOS_VERSION" == 15.* ]]; then
             # xnu-11215 series (docs/XNU11215_MIGRATION.md). dxb applies patches/15.0/*.sh, then
             # patches/15.0/*.patch in name order: its own fixes (disable_bti, entitlements, iokit,
             # link_kdk, skywalk, ...) come first and ours ("sweet-" prefix) after them.
@@ -104,6 +114,9 @@ jobs:
           ls -d /Applications/Xcode*.app
           if [ -n "${{ inputs.xcode_version }}" ]; then
             XC=$(ls -d /Applications/Xcode_${{ inputs.xcode_version }}*.app | sort -V | tail -1)
+          elif [[ "$MACOS_VERSION" == 26.* ]]; then
+            XC=$(ls -d /Applications/Xcode_26.1*.app 2>/dev/null | sort -V | tail -1)
+            [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_26.*.app | sort -V | head -1)
           elif [[ "$MACOS_VERSION" == 15.* ]]; then
             XC=$(ls -d /Applications/Xcode_16.2*.app 2>/dev/null | sort -V | tail -1)
             [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_16.*.app | sort -V | head -1)
