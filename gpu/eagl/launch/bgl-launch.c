@@ -4,8 +4,10 @@
  * with the Bergamota GL shim injected only when the kernel boot-args ask for it. Minimal and fail-safe: on ANY doubt it
  * execs plain /usr/libexec/backboardd, exactly as without this wrapper.
  *
- *   boot-arg bglrender=1     inject the shim; GPU (freedreno) if the kernel offers it, else softpipe
- *   boot-arg bglrender=soft  inject the shim, force softpipe (SWEET_GPU=0)
+ *   boot-arg bglrender=es    inject the GL shim (DEPRECATED ES renderer, explicit only); GPU if the kernel offers it, else softpipe
+ *   boot-arg bglrender=soft  inject the GL shim, force softpipe (SWEET_GPU=0)
+ *   boot-arg bglrender=1     NO LONGER the ES renderer (2026-10-24): Metal (Chlorophyll) when armed, else plain backboardd, whose
+ *                            render server then draws with CoreAnimation's own CPU renderer
  *   boot-arg bgldebug=1      additionally EAGL_SHIM_DEBUG=1 (shim logging to the log file below)
  *   (anything else / no boot-arg)  plain backboardd
  *
@@ -289,7 +291,7 @@ int main(int argc, char **argv)
 
 	{ char mm[16] = ""; int have_marker = marker_mode(mm, sizeof mm); if (!has_arg(args, "bglrender", mode, sizeof mode) && have_marker) snprintf(mode, sizeof mode, "%s", mm); }   /* boot-arg wins for the mode; the marker may still add debug/nohook */
 	if (mode[0] &&
-	    (!strcmp(mode, "1") || !strcmp(mode, "soft")) &&
+	    (!strcmp(mode, "es") || !strcmp(mode, "soft")) &&
 	    readable(LIBDIR, "OpenGLES.framework/OpenGLES") && readable(LIBDIR, "libOSMesa.8.dylib") &&
 	    readable(LIBDIR, "libdrm.2.dylib") && guard()) {
 		char lib[600];
