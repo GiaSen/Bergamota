@@ -106,6 +106,11 @@ def merge_pref(root, name, values):
     print('pref', name, sorted(values))
 
 
+# Jobs that only serve the cellular modem the Poco F1 does not expose: CommCenter (crash loop) and vmd (Visual Voicemail,
+# spins at ~80% of a core with no telephony, which costs SpringBoard/backboardd frames)
+NO_BASEBAND_JOBS = ('com.apple.CommCenter', 'com.apple.voicemail.vmd')
+
+
 def launchd(root):
     path = os.path.join(root, 'System/Library/xpc/launchd.plist')
     st = os.stat(path)
@@ -116,11 +121,14 @@ def launchd(root):
         if '_PanicOnCrash' in job:
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
             renamed += 1
-    removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
-    for k in removed:
-        del jobs[k]
+    removed = []
+    for sect in plist.values():                 # LaunchDaemons and the per-domain agent sections
+        if not isinstance(sect, dict):
+            continue
+        for k in [k for k, j in sect.items() if isinstance(j, dict) and j.get('Label') in NO_BASEBAND_JOBS]:
+            removed.append(sect.pop(k)['Label'])
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, removed (no baseband) {sorted(removed)}')
 
 
 BT_LABEL = 'com.apple.bluetoothd'
