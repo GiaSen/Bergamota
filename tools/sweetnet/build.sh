@@ -71,6 +71,8 @@ if [ "${IOS18:-1}" = 1 ]; then
 	# remote testing over SSH: screenshot of the panel (PNG) and synthetic touch/buttons
 	b18 sweetshot sweetshot.m touch.entitlements -framework CoreGraphics -framework ImageIO -framework IOSurface \
 		-framework QuartzCore
+	# the unified log over SSH (no `log` tool on iOS)
+	b18 sweetlog sweetlog.m log.entitlements -framework OSLog
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework CoreFoundation -framework IOKit \
 		"$here/sweettouch.c" -o "$out18/sweettouch"
 	codesign -s - -f --entitlements "$here/touch.entitlements" "$out18/sweettouch"

@@ -17,8 +17,9 @@ turned the plain mkiosroot.sh output into the images that reach the home
 screen (image versions v8-v14 in NOTES.md):
 
   launchd.plist   _PanicOnCrash -> _PanicOnCrasX (a crashing daemon must not
-                  panic the system); CommCenter jobs removed (no baseband: it
-                  crash-loops and Setup blocks on its CoreTelephony XPC)
+                  panic the system); CommCenter replaced by its non-cellular job (without it
+                  SpringBoard retries it every second and the lock screen never sleeps), vmd
+                  removed (Visual Voicemail spins with no baseband)
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
@@ -106,9 +107,14 @@ def merge_pref(root, name, values):
     print('pref', name, sorted(values))
 
 
-# Jobs that only serve the cellular modem the Poco F1 does not expose: CommCenter (crash loop) and vmd (Visual Voicemail,
-# spins at ~80% of a core with no telephony, which costs SpringBoard/backboardd frames)
+# Jobs that only serve the cellular modem the Poco F1 does not expose: vmd (Visual Voicemail, spins at ~80% of a core with
+# no telephony, which costs SpringBoard/backboardd frames). CommCenter is NOT one of them: without it SpringBoard's
+# SBTelephonyManager looks up com.apple.commcenter.xpc about once a second, fails, and refreshes the idle timer each time,
+# so the lock screen never sleeps and replays its wake sequence (wallpaper zoom, lock glyph, "Swipe up to open") in a loop.
+# Both stock CommCenter jobs are replaced by the non-cellular variant (what Wi-Fi-only devices run) without its
+# _LimitLoadFromDeviceTree condition; it idles at 0% here.
 NO_BASEBAND_JOBS = ('com.apple.CommCenter', 'com.apple.voicemail.vmd')
+COMMCENTER_NONCELL = '/System/Library/LaunchDaemons/com.apple.CommCenter-noncellular.plist'
 
 
 def launchd(root):
@@ -127,8 +133,15 @@ def launchd(root):
             continue
         for k in [k for k, j in sect.items() if isinstance(j, dict) and j.get('Label') in NO_BASEBAND_JOBS]:
             removed.append(sect.pop(k)['Label'])
+    cc = os.path.join(root, COMMCENTER_NONCELL.lstrip('/'))
+    if os.path.exists(cc):
+        job = load(cc)
+        job.pop('_LimitLoadFromDeviceTree', None)
+        job.pop('_PanicOnCrash', None)
+        jobs[COMMCENTER_NONCELL] = job
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, removed (no baseband) {sorted(removed)}')
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, removed (no baseband) {sorted(removed)}, '
+          f'CommCenter: {"non-cellular job" if os.path.exists(cc) else "absent (no " + COMMCENTER_NONCELL + ")"}')
 
 
 BT_LABEL = 'com.apple.bluetoothd'
