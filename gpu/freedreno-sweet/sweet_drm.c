@@ -169,6 +169,13 @@ sweet_call(uint32_t sel, void *data, size_t size)
 	if (want == 0 || want > sizeof(in)) {
 		return -ENOSYS;
 	}
+	if (sel == SWEET_GPU_SEL_GEM_MADVISE) {
+		/* The kernel never purges a BO: its MADVISE only checks the handle and answers retained = 1. Mesa's BO cache
+		 * calls it on every cached allocation and free (WILLNEED/DONTNEED), a kernel round trip each: 43 % of the
+		 * GPU calls in backboardd's profile during a home-screen swipe. Answered here, as the kernel would. */
+		((struct sweet_msm_gem_madvise *)data)->retained = 1;
+		return 0;
+	}
 	memset(in, 0, sizeof(in));
 	memcpy(in, data, size < want ? size : want);
 	if (sel == SWEET_GPU_SEL_GEM_SUBMIT) {
