@@ -1,8 +1,24 @@
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index a7397000c656bb462bf4b08084fe703702a6213f..e00b24d665bca37407adfa384a4fb0f786344f7d 100644
+index a7397000c656bb462bf4b08084fe703702a6213f..90ae07ebbee1f8417b7eb8ab5f9ecf829001f5df 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -1181,6 +1181,57 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1137,6 +1137,15 @@ sweet_crash_strings(const char *name)
+  * SWEET process sampler (bsd/dev/sweet_sample.c): user pc/lr/sp and a frame
+  * pointer backtrace of every thread of a task, from the saved user state.
+  */
++/*
++ * xnu-12377 removed IO_NULL and io_otype(): every port is now one of many IOT_*_PORT object types.
++ * The samplers only ask "port or port set", which is what these give back.
++ */
++#ifndef IO_NULL
++#define IO_NULL IPC_OBJECT_NULL
++#define io_otype(io) (io_is_pset_type(io_type(io)) ? IOT_PORT_SET : IOT_PORT)
++#endif
++
+ void sweet_sample_task(const char *name, int pid, task_t task);
+ 
+ void
+@@ -1181,6 +1190,57 @@ sweet_sample_task(const char *name, int pid, task_t task)
  		printf("%s\n", line);
  	}
  	task_unlock(task);

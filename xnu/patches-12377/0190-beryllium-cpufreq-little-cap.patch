@@ -588,7 +588,7 @@ index f2f409f1617212a6e6c42ca8f96c6eadf18b46a9..954b5fc46e57e76a50652270c1dba516
 +    "Poco F1 cpufreq governor state per cluster (see bsd/dev/sweet_cpufreq.c)");
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/osfmk/kern/processor.c b/osfmk/kern/processor.c
-index 3e35085f6d47c6517a929c12eb4369935b39fe41..b4e3cd733006c9fa22ae7486498da78439be00ff 100644
+index 3e35085f6d47c6517a929c12eb4369935b39fe41..f5fad63638227b400d59c6252090b643ffbe3c79 100644
 --- a/osfmk/kern/processor.c
 +++ b/osfmk/kern/processor.c
 @@ -865,6 +865,26 @@ processor_cpu_load_info(processor_t processor,
@@ -604,7 +604,7 @@ index 3e35085f6d47c6517a929c12eb4369935b39fe41..b4e3cd733006c9fa22ae7486498da784
 +uint64_t
 +sweet_processor_idle_time(int cpu)
 +{
-+	processor_t processor = (cpu >= 0 && cpu < MAX_SCHED_CPUS) ? processor_array[cpu] : PROCESSOR_NULL;
++	processor_t processor = (cpu >= 0 && cpu < MAX_CPUS) ? processor_array[cpu] : PROCESSOR_NULL;
 +	struct recount_usage usage = { 0 };
 +	uint64_t idle_time = 0;
 +

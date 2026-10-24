@@ -47,7 +47,7 @@ index 012a1d000d041ffef683bd5f434e0840c06452e1..3cb72e3eb62a8ef8b161ccd4484e7583
  #include "sweet_board.h"
  #include <kern/locks.h>
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index 166ba6246ad79acb7e8e6336505378f77b664685..10aa2ba755567e17618c2ab2feae069ce9f56995 100644
+index 899be6a60ead2a03c83a0d67577a86d4e4fd6a96..64aa984ecc98156738c995c3a580fc3024afe258 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
 @@ -88,6 +88,7 @@

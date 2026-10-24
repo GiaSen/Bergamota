@@ -1,8 +1,8 @@
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index e00b24d665bca37407adfa384a4fb0f786344f7d..10bd1b00ddcdc608e71aaf115c40d65b041d7b0d 100644
+index 90ae07ebbee1f8417b7eb8ab5f9ecf829001f5df..867e947effae0213d57a030cb9606b671241514a 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -1183,16 +1183,20 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1192,16 +1192,20 @@ sweet_sample_task(const char *name, int pid, task_t task)
  	task_unlock(task);
  
  	/*
@@ -30,7 +30,7 @@ index e00b24d665bca37407adfa384a4fb0f786344f7d..10bd1b00ddcdc608e71aaf115c40d65b
  
  		if (space != IS_NULL) {
  			is_read_lock(space);
-@@ -1207,30 +1211,29 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1216,30 +1220,29 @@ sweet_sample_task(const char *name, int pid, task_t task)
  					}
  					nrecv++;
  					ipc_object_t obj = entry->ie_object;
