@@ -132,8 +132,9 @@ bolog_call(uint32_t sel, const uint8_t *in, const uint8_t *out, size_t outsz)
 		if (outsz < sizeof(o->iova) + 16 || o->handle == 0) {
 			return;
 		}
-		n = snprintf(b, sizeof(b), "%llu sbo h=%u surf=%u size=%llu iova=0x%llx\n", bolog_us(), o->handle, o->surface_id,
-		    (unsigned long long)o->size, (unsigned long long)o->iova);
+		n = snprintf(b, sizeof(b), "%llu sbo h=%u surf=%u size=%llu iova=0x%llx w=%u h=%u bpr=%u off=%u fmt=0x%x planes=%u\n",
+		    bolog_us(), o->handle, o->surface_id, (unsigned long long)o->size, (unsigned long long)o->iova, o->width, o->height,
+		    o->bytes_per_row, o->offset, o->pixel_format, o->planes);
 		break;
 	}
 	case SWEET_GPU_SEL_GEM_INFO: {
