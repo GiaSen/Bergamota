@@ -194,7 +194,26 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        # the full log is hundreds of MB of warnings: keep it as a file, summarise the errors
+        run: |
+          set +e
+          bash build.sh > build.log 2>&1
+          rc=$?
+          grep -aE "error:|our patch does not apply|Staged|Applying patch|Skipping patch" build.log | grep -v "warning" | head -300
+          tail -40 build.log
+          exit $rc
+
+      - name: Error summary
+        if: always()
+        run: |
+          mkdir -p out
+          grep -aoE "[A-Za-z0-9_./+-]+\.(c|cpp|h|hpp|s|exports|iig)(:[0-9]+){1,2}: (fatal )?error: .*" dxb/build.log \
+            | sed 's|.*/dxb/||' | sort | uniq -c | sort -rn > out/errors.txt || true
+          grep -aE "^ld: |Undefined symbols|ld: symbol|error: linker" -A3 dxb/build.log | head -200 > out/link-errors.txt || true
+          wc -l out/errors.txt out/link-errors.txt
+          head -100 out/errors.txt
+          { echo '### compile errors (first 60)'; echo '```'; head -60 out/errors.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          gzip -c dxb/build.log > out/build.log.gz || true
 
       - name: ccache stats
         if: always()
