@@ -652,6 +652,15 @@ def stage_verify(a, img, rootmnt):
                     badl.append((rel, ident, new))
             chk(bad == 0, f'identity (identifier/team/CS flags) unchanged on all {n} re-signed Mach-Os, {bad} mismatches {badl[:3]}')
         boot_task_audit(R, chk)
+        # every Mach-O's chained fixups against its own bytes, as the kernel's dyld pager walks them at page-in: a file that
+        # was damaged on its way into the image panics the phone at boot ("fixupPageAuth64(): chain ... out of range")
+        import fixupcheck
+        nfx = 0
+        badfx = []
+        for name, data in fixupcheck.walk_dir(R, '/'):
+            nfx += 1
+            badfx += fixupcheck.check_bytes(data, name)
+        chk(not badfx, f'chained fixups of {nfx} Mach-Os walk inside their pages: {len(badfx)} problems {badfx[:3]}')
         # no PAC left in a sample (+ every launchd/dyld/SpringBoard)
         left = Counter()
         for p in sample + [os.path.join(R, 'sbin/launchd'), os.path.join(R, 'usr/lib/dyld')]:
