@@ -541,14 +541,35 @@ def flash_partition(dev, part, image_path, mode=None, bs=HASH_BS, verify=True, d
             if not changed:
                 pool.shutdown()
                 return f"{part} already identical to the image ({img.padded >> 20} MiB compared in {time.time() - t0:.0f} s), nothing sent"
-            tmpdir = tempfile.mkdtemp(prefix="bergamota-delta-")
-            delta = keep_delta or os.path.join(tmpdir, "delta.simg")
-            build_delta(img, changed, bs, delta)
-            sent_path = delta
-            sent_bytes = os.path.getsize(delta)
-            log(f"delta image {delta}: {sent_bytes >> 20} MiB")
+            # The delta is a file of about changed_bytes and it has to fit somewhere: /tmp is often a RAM-backed tmpfs on Linux
+            # (ENOSPC there with a 16 GiB delta), so it goes next to the image when that disk has room, else the temp dir.
+            # Only when neither has room is the image itself sent ("full"): its DONT_CARE regions then keep the partition's
+            # old contents instead of becoming zeros (for an HFS root image they are free space).
+            where = None
+            if not keep_delta:
+                need = changed_bytes + (64 << 20)
+                for d in (os.path.dirname(os.path.abspath(image_path)), tempfile.gettempdir()):
+                    try:
+                        if os.access(d, os.W_OK) and shutil.disk_usage(d).free > need:
+                            where = d
+                            break
+                    except OSError:
+                        pass
+            if not keep_delta and where is None:
+                log(f"sending the image itself: no writable directory with {need >> 20} MiB free for the delta "
+                    f"(DONT_CARE regions keep their old contents)")
+                mode = "full"
+            else:
+                tmpdir = tempfile.mkdtemp(prefix="bergamota-delta-", dir=where)
+                delta = keep_delta or os.path.join(tmpdir, "delta.simg")
+                build_delta(img, changed, bs, delta)
+                sent_path = delta
+                sent_bytes = os.path.getsize(delta)
+                log(f"delta image {delta}: {sent_bytes >> 20} MiB")
             if dry_run:
                 pool.shutdown()
+                if mode == "full":
+                    return f"dry run: the whole image ({img.padded >> 20} MiB) would be sent ({len(changed)} blocks differ)"
                 return f"dry run: {len(changed)} blocks / {changed_bytes >> 20} MiB would be sent"
         else:
             say(f"DELTA {img.padded} {img.padded}")
