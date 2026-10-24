@@ -1,8 +1,9 @@
 # Migration from xnu-11215 to xnu-12377 (branch `ios26`)
 
 Target: iOS 26.7.1 (23H30) userland, identity iPhone12,1 (N104AP, A13). Why and what was measured: `docs/IOS26_FEASIBILITY.md`.
-Status: the series `xnu/patches-12377/` applies to `xnu-12377.121.6` (macOS/iOS 26.5, newest published xnu-12377 tag);
-first CI builds in progress. Nothing booted.
+Status (2026-10-24): `xnu/patches-12377/` (198 patches, 0001-0235) on `xnu-12377.121.6` (macOS/iOS 26.5, newest published
+xnu-12377 tag) **builds and links** locally: `kernel.development.sweet`, arm64, "Darwin Kernel Version 25.5.0 ... xnu-12377.121.6"
+(`tools/xnu-local-build.sh`, Xcode 27.1 + KDK 26.5). Nothing booted.
 
 ## 1. Source, toolchain, CI
 
@@ -35,10 +36,27 @@ first CI builds in progress. Nothing booted.
 | 0043 crash log | `proc_prepareexit` context (Apple fixed the `\|\|` -> `&&` EXC_CRASH test) | re-anchored |
 | 0065, 0082, 0131, 0135, 0141, 0153, 0170, 0191 | context drift only | hunks re-anchored on unique neighbouring lines and reviewed (0135 `#if HAS_APPLE_PAC` balance checked) |
 
-Compile-level API drift is found by the CI build; fixes go into the patch that owns the file, or a new `0235+` patch.
+Compile and link fixes (CI runs 3-6 and the local build), each in the patch that owns the code:
+
+| Patch | 12377 change | Fix |
+| --- | --- | --- |
+| 0004 | `SWEET.h` lacked `MPIDR_CORETYPE_ACC_M` (new M_CORE); `INTERRUPT_MASKED_DEBUG_*` gone; the closed per-SoC library `lib<SoC>.os.<config>.a` is now force-loaded for every machine config; the KDK's `libTightbeam.a` (x86_64/arm64e only) is linked and exported when found | `ACC_M` defined; `ml_interrupt_masked_debug_start/end()`; SWEET skips both libraries (its asm/pmap come from the open-source build, 0006) |
+| 0006 | `files.arm64` lists `osfmk/arm64/amcc_rorgn_pv_ctrr.c`, which is not published | line commented out (PV-CTRR is for Apple VMs) |
+| 0009 | 30 SPTM gen3 DART / IOMMU / `IOUnifiedAddressTranslator` exports only exist in Apple-SoC builds | removed from `Private.arm64.exports` |
+| 0065 | `sysreg_restore` gone (secondaries load `TCR_EL1_BOOT`) | its cache clean dropped |
+| 0066 | `vm_map_lock_read`/`vm_map_lookup_entry` replaced by the lock-context API | shared interlock + `vm_map_lookup_or_next` |
+| 0131 | call before definition | prototype |
+| 0148-0151 | `IO_NULL`, `io_otype`, `ip_kotype` gone (kobject types are object types) | shim in 0148, `ip_type` in 0149 |
+| 0190 | `MAX_SCHED_CPUS` gone | `MAX_CPUS` |
+| 0235 (new) | `ml_device_is_prod_fused()` lives in the closed `machine_routines_apple`; Tightbeam startup compiles because the KDK has its headers | SWEET definition (not prod fused, like the ADT); Tightbeam startup off for SWEET |
+| 0027 (new, .sh) | CoreEntitlements V2 headers are KDK-only | type stubs when no KDK (`use_kdk=false`); with the KDK it does nothing |
+
+**KDK:** still needed for headers only (`TrustCache/API.h` and friends are closed and not in any SDK). Nothing from the KDK is linked.
 
 ## 3. Open items
 
-* The local build path (sccache, `BOUND_CHECKS=0`) is not recorded in the repo; the Mac has Xcode 27.1 and no KDK 26.5.
+* Local build: `USE_KDK=1 tools/xnu-local-build.sh 26.5` (full: dxb, pinned commit, our series, sccache, `BOUND_CHECKS=0`), then
+  `USE_KDK=1 tools/xnu-local-build.sh --remake [-j1] 26.5` to rebuild after editing `research/xnu-local/dxb/xnu` in place (`-j1`
+  serialises xnu's own parallelism, for readable errors). Needs KDK 26.5 (25F71) installed; works with Xcode 27.1. About 8 GB.
 * `tools/mkadt.py` needs the N104AP tree (`research/ios26/n104ap.adt`) as identity source; patch 0059 identity strings for iPhone12,1.
 * Renegade root for the 26.7.1 OTA (`tools/renegade`), then first boot.

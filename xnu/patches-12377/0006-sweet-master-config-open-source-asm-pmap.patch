@@ -123,3 +123,17 @@ index 0000000000000000000000000000000000000000..af06151c016de189d842805888cbb8a3
 +options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
 +options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 +options   CONFIG_KERNEL_TAGGING		# <kernel_tagging>
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index 878b5154e7044006ff31563dfb5fcab6056af963..b4b600d4efd0b074859268848490e4c593ece1eb 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -38,7 +38,8 @@ osfmk/arm64/lz4_encode_arm64.s  standard
+ osfmk/arm64/amcc_rorgn_ppl.c optional nos_arm_asm config_pmap_ppl
+ osfmk/arm64/amcc_rorgn_ppl_amcc.c optional nos_arm_asm config_pmap_ppl
+ osfmk/arm64/amcc_rorgn_common.c optional nos_arm_asm
+-osfmk/arm64/amcc_rorgn_pv_ctrr.c optional nos_arm_asm
++# SWEET: amcc_rorgn_pv_ctrr.c (paravirtualized CTRR, Apple VMs) is listed but not published in xnu-12377.121.6
++# osfmk/arm64/amcc_rorgn_pv_ctrr.c optional nos_arm_asm
+ osfmk/arm64/bcopy.s standard
+ osfmk/arm64/bzero.s standard
+ osfmk/arm/caches.c		standard

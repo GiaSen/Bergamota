@@ -305,10 +305,10 @@ index 0000000000000000000000000000000000000000..fbbc827560fd6e411bc134a8b039260b
 +
 +#endif
 diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
-index 878b5154e7044006ff31563dfb5fcab6056af963..defad01a3f7529090c4c36ed92c4dfbcf3d7facb 100644
+index b4b600d4efd0b074859268848490e4c593ece1eb..0915133002909e902eb7039aa4d0886ee963f98d 100644
 --- a/osfmk/conf/files.arm64
 +++ b/osfmk/conf/files.arm64
-@@ -52,6 +52,7 @@ osfmk/arm64/dbgwrap.c		standard
+@@ -53,6 +53,7 @@ osfmk/arm64/dbgwrap.c		standard
  osfmk/arm/arm_timer.c		standard
  osfmk/arm/arm_init.c	optional config_pmap_ppl
  osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl

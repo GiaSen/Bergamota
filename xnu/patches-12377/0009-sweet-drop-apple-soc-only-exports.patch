@@ -1,8 +1,8 @@
 diff --git a/config/Private.arm64.exports b/config/Private.arm64.exports
-index f767c86c8277a10b4e1b1ae75e07b135a3ecab74..fce39d9e42d069e3fd1aaa48725fe125f104cf19 100644
+index f767c86c8277a10b4e1b1ae75e07b135a3ecab74..0555efe804e3f18c5f0796f0584cc63449e0fc55 100644
 --- a/config/Private.arm64.exports
 +++ b/config/Private.arm64.exports
-@@ -90,13 +90,6 @@ _mach_bridge_recv_timestamps
+@@ -90,82 +90,14 @@ _mach_bridge_recv_timestamps
  _mach_bridge_init_timestamp
  _mach_bridge_set_params
  _vfs_resolver_result
@@ -13,12 +13,15 @@ index f767c86c8277a10b4e1b1ae75e07b135a3ecab74..fce39d9e42d069e3fd1aaa48725fe125
 -_pmap_iommu_iovmfree
 -_pmap_iommu_ioctl
 -_pmap_iommu_alloc_contiguous_pages
- _pmap_acquire_iommu_scratch_area
- _pmap_alloc_iommu_page
- _pmap_free_iommu_page
-@@ -107,16 +100,6 @@ _pmap_register_iommu_mapping
- _pmap_release_iommu_scratch_area
- _pmap_unregister_iommu_mapping
+-_pmap_acquire_iommu_scratch_area
+-_pmap_alloc_iommu_page
+-_pmap_free_iommu_page
+-_pmap_create_aligned_buffer
+-_pmap_destroy_aligned_buffer
+-_pmap_ref_iommu_table
+-_pmap_register_iommu_mapping
+-_pmap_release_iommu_scratch_area
+-_pmap_unregister_iommu_mapping
  _pmap_cache_attributes
 -_nvme_ppl_get_desc
 -_sart_get_desc
@@ -30,13 +33,25 @@ index f767c86c8277a10b4e1b1ae75e07b135a3ecab74..fce39d9e42d069e3fd1aaa48725fe125
 -_t8110dart_max_translation_levels
 -_t8110dart_vo_tte
 -_t8110dart_vo_tt_index
- _sptm_gen3dart_init
- _sptm_gen3dart_map_table
- _sptm_gen3dart_unmap_table
-@@ -136,36 +119,15 @@ _sptm_gen3dart_set_smmu_window
- _sptm_gen3dart_read_smmu_stt_index
- _sptm_gen3dart_clamp_tlimits
- _sptm_gen3dart_test_translation
+-_sptm_gen3dart_init
+-_sptm_gen3dart_map_table
+-_sptm_gen3dart_unmap_table
+-_sptm_gen3dart_map
+-_sptm_gen3dart_unmap
+-_sptm_gen3dart_powerdown
+-_sptm_gen3dart_powerup
+-_sptm_gen3dart_disable_translation
+-_sptm_gen3dart_enable_translation
+-_sptm_gen3dart_clear_err
+-_sptm_gen3dart_clear_perf_interrupts
+-_sptm_gen3dart_clear_all_interrupts
+-_sptm_gen3dart_disable_all_interrupts
+-_sptm_gen3dart_clear_exception
+-_sptm_gen3dart_query_tlb
+-_sptm_gen3dart_set_smmu_window
+-_sptm_gen3dart_read_smmu_stt_index
+-_sptm_gen3dart_clamp_tlimits
+-_sptm_gen3dart_test_translation
 -_ml_amcc_error_inject_register
 -_ml_dcs_error_inject_register
 -_ml_mem_fault_report_enable_register
@@ -54,8 +69,8 @@ index f767c86c8277a10b4e1b1ae75e07b135a3ecab74..fce39d9e42d069e3fd1aaa48725fe125
 -__ZN26IOUnifiedAddressTranslator18setClientContextIDEjb
 -__ZN26IOUnifiedAddressTranslator21removeClientContextIDEv
 -__ZN26IOUnifiedAddressTranslator19isPageFaultExpectedEyj
- __ZN26IOUnifiedAddressTranslator7getModeEv
- __ZN26IOUnifiedAddressTranslator29getFirmwareAddressSpaceHandleEv
+-__ZN26IOUnifiedAddressTranslator7getModeEv
+-__ZN26IOUnifiedAddressTranslator29getFirmwareAddressSpaceHandleEv
 -__ZN26IOUnifiedAddressTranslator22registerTaskForServiceEP4taskP9IOService
 -__ZN26IOUnifiedAddressTranslator23createMappingInApertureEjP18IOMemoryDescriptorjym
 -__ZN26IOUnifiedAddressTranslator23getTotalPageTableMemoryEv

@@ -1,5 +1,5 @@
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
-index e37762bce3521599e63edd354f1edc8ac506c7b8..b068f7eff111fca4e135fc6a439f2e3f3c7d109d 100644
+index e37762bce3521599e63edd354f1edc8ac506c7b8..3fd8a91d91c1e5ac8836712d2e40fcc9356de0ce 100644
 --- a/makedefs/MakeInc.def
 +++ b/makedefs/MakeInc.def
 @@ -29,7 +29,7 @@ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
@@ -31,6 +31,34 @@ index e37762bce3521599e63edd354f1edc8ac506c7b8..b068f7eff111fca4e135fc6a439f2e3f
  
  endif
  
+@@ -1150,8 +1154,9 @@ LDFILES_KERNEL_ONLY = $(TARGET)/all-kpi.exp $(TARGET)/all-alias.exp $(TARGET)/sy
+ LD_KERNEL_LIBS	   = -lcc_kext
+ LD_KERNEL_ARCHIVES = $(LDFLAGS_KERNEL_SDK) -lfirehose_kernel
+ 
+-# Link binary support library
+-ifneq ($(CURRENT_MACHINE_CONFIG),NONE)
++# Link binary support library (the KDK's closed lib<SoC>.os.<config>.a). SWEET builds those objects from the
++# open-source asm/pmap instead (nos_arm_asm, nos_arm_pmap; MASTER.arm64.sweet) and the KDK has no libSWEET.
++ifeq ($(filter NONE SWEET,$(CURRENT_MACHINE_CONFIG)),)
+         LDFLAGS_KERNEL_ONLY += -rdynamic -Wl,-force_load,$(KDKROOT)/System/Library/KernelSupport/lib$(CURRENT_MACHINE_CONFIG).os.$(CURRENT_KERNEL_CONFIG).a
+ endif
+ 
+@@ -1190,12 +1195,15 @@ ifeq ($(EXCLAVES_ENABLED),1)
+ endif # !EXCLAVES_ENABLED
+ 
+ 
++# SWEET: the KDK's libTightbeam.a is x86_64/arm64e only and SWEET has no exclaves; never link or export it.
++ifneq ($(CURRENT_MACHINE_CONFIG),SWEET)
+ ifneq ($(wildcard $(SDKROOT)/usr/local/lib/kernel/platform/libTightbeam.a),)
+ XNU_CONFIG_TIGHTBEAM := 1
+ TIGHTBEAM_IN_SDK := 1
+ else ifneq ($(wildcard $(KDKROOT)/usr/local/lib/kernel/platform/libTightbeam.a),)
+ XNU_CONFIG_TIGHTBEAM := 1
+ endif
++endif # !SWEET
+ ifeq ($(XNU_CONFIG_TIGHTBEAM),1)
+   ifeq ($(TIGHTBEAM_IN_SDK),1)
+     # Force-import the Tightbeam static lib so that all of its symbols can be exported to kexts
 diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
 index 722a7f4ea14d024a39863e2fa09a8d06d31186e9..8fb90998b4d86dd15f46059bdf7f3c9f13b5c612 100644
 --- a/osfmk/arm64/proc_reg.h
