@@ -8,6 +8,22 @@ Adreno 630) are in Chlorophyll's own repository: `gpu/metal/docs/FIXES.md`.
 
 ## Kernel (`xnu/patches-11215`)
 
+### Control Center without its backdrop, a flat wallpaper, black boxes: big GPU buffers refused (0237)
+
+- **Symptom.** A while into each boot, full-screen render targets could no longer be allocated: Chlorophyll's log said
+  "the GPU driver would not allocate a 1127x2438 ... BGRA8Unorm" (also 1125x2436, 2052x3054). CoreAnimation then drew
+  without that layer: Control Center over a sharp home screen, a flat pale wallpaper. Small buffers kept working.
+- **Why.** The GPU address window is 2 GiB (0x80000000-0x100000000), but its page tables came from a fixed pool of 256
+  4 KiB tables: 2 L2 + 254 L3, each L3 mapping 2 MiB, so at most 508 MiB of the window could ever be mapped. Tables are
+  taken on first touch of a 2 MiB region and never returned, and first-fit placement keeps reaching new regions as
+  buffers are freed and reallocated. Once the pool was used up, small buffers still landed in regions that had tables,
+  but a 10-24 MB target needed a fresh range, `gvm_slot` found no table page, and GEM_NEW failed. Separately, a full
+  free list (512 ranges) silently dropped freed ranges, leaking address space.
+- **Fix.** 1028 table pages (4 MiB: enough for every 2 MiB of the window) and a 4096-range free list.
+  `kern.sweet_gpu` now reports `gvm_tables=used/total` and `gvm_free_ranges`.
+- **Check.** `sysctl kern.sweet_gpu`: `gvm_tables` stays below its total; no "would not allocate" lines in
+  `bgmtl.log`/traces; Control Center keeps its backdrop after long use.
+
 ### Locally built kernels: the GPU never comes up (0236)
 
 - **Why.** clang 21 (Xcode 27) turned a volatile MMIO read loop into a post-indexed `ldr w, [x], #4` on the SMMU context
