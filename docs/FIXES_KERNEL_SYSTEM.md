@@ -8,6 +8,22 @@ Adreno 630) are in Chlorophyll's own repository: `gpu/metal/docs/FIXES.md`.
 
 ## Kernel (`xnu/patches-11215`)
 
+### ~30 fps cap from the CPU scan-out copy (0240)
+
+- **Why.** 0235 copied every frame on the CPU: about 6.5 ms per frame (memcpy of 11 MB plus a cache clean of the
+  source), while the GPU sat 13-17 % busy.
+- **Fix.** With `sweetfb_scancopy=2`, the framebuffer's low pool (252 MiB) is mapped into the GPU once, and each frame
+  is one 2D-engine blit (`CP_BLIT`) submitted from the kernel. It uses freedreno's linear RGBA8 sequence, with register
+  values from Mesa's `a6xx.xml.h` for chip 630 and the CCU switched to sysmem bypass first. The swap completes when the
+  blit's fence passes. A CPU draw still dirty in the pool is cleaned first. After 3 failed blits in a row, the next
+  120 frames are copied on the CPU and then the GPU is tried again. The first version stayed off for the whole boot
+  after a few backboardd restarts.
+- **Result.** About 1.3 ms per frame. `kern.sweet_fb` reports `scan_gpu` (1 on, 2 resting), `scan_gpu_copies` and
+  `scan_gpu_fallbacks`. Needs 0237 (126 page tables for the pool alone).
+- **Then, async commits.** With the GPU copy and the 0229 scan-out gate, `bgmtl-bb.sync` is no longer needed. A/B over
+  the same swipe script: sync 20.8 fps, async 28.4, dirty regions 22.7, both 25.0. The phone runs async with full
+  redraws; Control Center and the home screen render correctly.
+
 ### Control Center without its backdrop, a flat wallpaper, black boxes: big GPU buffers refused (0237)
 
 - **Symptom.** A while into each boot, full-screen render targets could no longer be allocated: Chlorophyll's log said
