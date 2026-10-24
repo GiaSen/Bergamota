@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/beryllium_bt_hci.c b/bsd/dev/beryllium_bt_hci.c
-index ac42481..ed84033 100644
+index ac42481..da1430e 100644
 --- a/bsd/dev/beryllium_bt_hci.c
 +++ b/bsd/dev/beryllium_bt_hci.c
 @@ -23,6 +23,7 @@
@@ -18,7 +18,7 @@ index ac42481..ed84033 100644
  } bt;
  
  static uint8_t bt_ring[BT_RING_SIZE];
-@@ -136,16 +138,257 @@ bt_hci_connected(void)
+@@ -136,16 +138,271 @@ bt_hci_connected(void)
  	return os_atomic_load(&bt.connected, relaxed);
  }
  
@@ -42,12 +42,20 @@ index ac42481..ed84033 100644
 +static void
 +bt_cmd_note(const uint8_t *cmd, unsigned len)
 +{
-+	if (len >= 4 && cmd[0] == 1) {
-+		unsigned i = bt_last_cmd_next++ % (sizeof(bt_last_cmd) / sizeof(bt_last_cmd[0]));
++	const unsigned n = sizeof(bt_last_cmd) / sizeof(bt_last_cmd[0]);
++	unsigned op, i;
 +
-+		bt_last_cmd[i].op = (uint16_t)(cmd[1] | (cmd[2] << 8));
-+		bt_last_cmd[i].p0 = cmd[3] != 0 && len >= 5 ? cmd[4] : 0;
++	if (len < 4 || cmd[0] != 1) {
++		return;
 +	}
++	op = cmd[1] | (cmd[2] << 8);
++	for (i = 0; i < n && bt_last_cmd[i].op != op; i++) {
++	}
++	if (i == n) {                   /* one slot per opcode: the newest command wins */
++		i = bt_last_cmd_next++ % n;
++	}
++	bt_last_cmd[i].op = (uint16_t)op;
++	bt_last_cmd[i].p0 = cmd[3] != 0 && len >= 5 ? cmd[4] : 0;
 +}
 +
 +static unsigned
@@ -231,7 +239,13 @@ index ac42481..ed84033 100644
 +		 * (BT_COMPAT_PAD bytes in all). Boot combo5-0243-bt0239v3: an empty success for 0xfd48
 +		 * tripped "ByteStream_NumReadBytesAvail(*pBs) >= 1" (abort in bcm_vsc.c:827).
 +		 */
-+		unsigned i, p0 = op == 0x2007 ? 0 : bt_cmd_param0(op);
++		/*
++		 * The sub-opcode byte must be the one of the command this answers: bcm_vsc.c matches
++		 * 0xfce9/0xfd23 replies to their pending command by it. Combo7: an older 0xfce9 entry gave
++		 * 0x32 instead of 0x01 for LE Meta Enable Features, its completion never ran and
++		 * bluetoothd restarted after 15 s ("timedout waiting for controller", reason 3602).
++		 */
++		unsigned i, p0 = op == 0x2007 ? 0 : op == bt_pend.op ? bt_pend.p0 : bt_cmd_param0(op);
 +
 +		p[2] = 4 + BT_COMPAT_PAD;
 +		p[6] = 0;
@@ -276,7 +290,7 @@ index ac42481..ed84033 100644
  	lck_mtx_lock(&bt_lock);
  	used = bt.wr - bt.rd;
  	if (BT_RING_SIZE - used < len) {
-@@ -174,6 +417,7 @@ bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
+@@ -174,6 +431,7 @@ bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
  void
  bt_hci_rx_service(void)
  {
@@ -284,7 +298,7 @@ index ac42481..ed84033 100644
  	for (unsigned loops = 0; loops < 16; loops++) {
  		kern_ctl_ref ref;
  		uint32_t unit, rd;
-@@ -266,7 +510,10 @@ bt_tx_feed(const uint8_t *p, size_t n)
+@@ -266,7 +524,10 @@ bt_tx_feed(const uint8_t *p, size_t n)
  		}
  		if (bt.txtotal != 0 && bt.txn == bt.txtotal) {
  			bt_log_pkt("TX", bt.txb, bt.txn);
@@ -296,7 +310,7 @@ index ac42481..ed84033 100644
  				bt.tx_pkts++;
  				bt.tx_bytes += bt.txn;
  			} else {
-@@ -451,6 +698,11 @@ bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_bu
+@@ -451,6 +712,11 @@ bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_bu
  	}
  	bt.ops = ops;
  	bt.log_budget = log_budget;

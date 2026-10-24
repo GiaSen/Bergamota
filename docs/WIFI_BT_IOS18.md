@@ -162,3 +162,16 @@ answer at all. launchd's copies live 15-60 s each for the same reason.
 Fix, 0239 v5 (compile-checked): a command watchdog. A command sent to the controller with no Command Complete /
 Status within 800 ms is answered by the kernel with success (first parameter byte + zeros) and logged
 (`SWEET BT: compat: opcode ... not answered by the controller within 800 ms`).
+
+### 2.8 Boot combo7 (0239 v5, 2026-10-24): correction to 2.7, sub-opcode byte
+
+[V] The watchdog never fired: the controller answers every command, 0xfce9 sub-opcode 1 included (28 rewrites with
+first byte 0x01). bluetoothd (hand run, 60 s) still: `Stack did start`, power state 1, then `BD_VSC_LE_META_ENA_FEATURES
+timedout waiting for controller`, reason 3602. So 2.7's "the WCN3990 never answers it" was wrong. What times out is
+bluetoothd's synchronous wait (0x100028dfc: 15 s semaphore signalled by the VSC completion 0x10003695c), and the
+completion never runs because `_BCM_SubOpcodeChecker` matches 0xfce9/0xfd23 replies to their pending command by the
+first reply byte = sub-opcode. 0239 took that byte from a small per-opcode table whose lookup returned the *first*
+(oldest) 0xfce9 entry, e.g. 0x32 instead of 0x01, so the reply was never matched.
+
+Fix, 0239 v6 (compile-checked): the sub-opcode byte comes from the command in flight (the watchdog's record of the
+last transmitted command), and the table keeps one entry per opcode (newest wins).
