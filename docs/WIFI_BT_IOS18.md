@@ -65,7 +65,11 @@ kernel control registered, `hcitest` got HCI Reset / Read Local Version (Qualcom
   (non-vendor) opcode is rewritten to success in the kernel, and every rewrite / other error status is logged
   (`SWEET BT: compat: opcode ...`), so one boot lists all missing commands. `sweetbtcompat=0` turns it off.
   [U] that 0x0c5b is answered with 0x01 (the 64-line trace budget ended before it); the log line settles it.
-  CI run 40133385972. The phone was handed back to the GPU session (local-0240-gpublit) after this boot.
+  The phone was handed back to the GPU session (local-0240-gpublit) after this boot.
+* `bt-0239ci.img` (built, **not flashed**: the phone is charging): CI run 40133752064 = develop 5692744 (0237 GPU
+  page tables, 0240 GPU scan-out copy) + 0238 + 0239, ADT gpufwz-bt, boot-args of local-0240 (`sweetfb_scancopy=2`)
+  + the BT set. What to look for: `SWEET BT: compat: opcode ...` lines, then whether bluetoothd logs `Bluetooth
+  server started` with the stack up (`fStackStarted:1`) and stays running; then the Control Center toggle.
 
 ### 2.3 Still to do for Bluetooth
 
