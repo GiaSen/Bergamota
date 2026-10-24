@@ -2,7 +2,7 @@ diff --git a/config/Private.Tightbeam.exports b/config/Private.Tightbeam.exports
 index 204b4abb49bf6f1ff18dcd033957bcab92460fea..3b2d5c1da71de4e5df7de94d4392dbf156fb68a7 100644
 --- a/config/Private.Tightbeam.exports
 +++ b/config/Private.Tightbeam.exports
-@@ -1,116 +1,4 @@
+@@ -1,116 +1,3 @@
  # Tightbeam Kext Interface
  #
  #
@@ -119,7 +119,6 @@ index 204b4abb49bf6f1ff18dcd033957bcab92460fea..3b2d5c1da71de4e5df7de94d4392dbf1
 -_tb_message_size_u64
 -_tb_message_size_u8
 -_tb_message_subrange
-+# sweet: no exclaves/tightbeam (CONFIG_EXCLAVES off); the symbols do not exist
 diff --git a/config/Private.arm64.exports b/config/Private.arm64.exports
 index 126605f192cd7381e73a3a9bc1a689af471dcc3d..635ebbad50a66aba9d4734a840c568674a332b5e 100644
 --- a/config/Private.arm64.exports
