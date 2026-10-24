@@ -52,7 +52,20 @@ kernel control registered, `hcitest` got HCI Reset / Read Local Version (Qualcom
     Root with result -25291` (errSecNotAvailable), `Failed to set new identity root!`, `Bluetooth error - restarting
     { reason=130 }`. The kernel log shows `SWEET AKS: securityd sel 10 ... -> 0xe00002c7` at the same time. It never
     reaches the transport open, so fix 4 (0238) is the next step, as predicted from the disassembly.
-* CI run 40132191870 (branch `wifi-bt18`): kernel with 0238. Next image = that kernel + the same ADT and cmdline.
+* `bt-0238ci.img` = CI run 40132191870 kernel (develop 3f7dfdf + 0238) + same ADT and cmdline, flashed 21:10 UTC.
+  Result [V]: `SWEET AKS: securityd sel 10 ... -> 0x0` (74x) and `sel 11 ... -> 0x0` (254x): keychain works;
+  bluetoothd finds its keychain items, asks the BlueTool stub ("BlueTool finished running boot script" / "init
+  script"), connects to `com.apple.uart.bluetooth` (termios 3000000, cflag 0x38b00) and runs the HCI init: Reset,
+  Read Local Version/Commands/Features/BD_ADDR, LE features, event masks, Write SSP/LE Host Supported, LE buffer
+  size, data length, PHY, ... every command in the trace answered with status 0. Then
+  `OI_HCICMD_WriteDefaultErroneousDataReporting (status=628)`, `HCI initialization failed`, `Bluetooth error -
+  restarting { reason=108 }`; launchd respawns it (11 connects in ~5 min). Also seen, not fatal: `Unable to turn on
+  BT)_WAKE signal` (no /dev/btwake), TCC "Unable to construct an identity" (root run), WiFiManager lookup failures.
+* Fix 5, xnu **0239** `bt-hci-compat`: a Command Complete with status 0x01 (Unknown HCI Command) for a standard
+  (non-vendor) opcode is rewritten to success in the kernel, and every rewrite / other error status is logged
+  (`SWEET BT: compat: opcode ...`), so one boot lists all missing commands. `sweetbtcompat=0` turns it off.
+  [U] that 0x0c5b is answered with 0x01 (the 64-line trace budget ended before it); the log line settles it.
+  CI run 40133385972. The phone was handed back to the GPU session (local-0240-gpublit) after this boot.
 
 ### 2.3 Still to do for Bluetooth
 
