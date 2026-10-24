@@ -175,3 +175,15 @@ first reply byte = sub-opcode. 0239 took that byte from a small per-opcode table
 
 Fix, 0239 v6 (compile-checked): the sub-opcode byte comes from the command in flight (the watchdog's record of the
 last transmitted command), and the table keeps one entry per opcode (newest wins).
+
+### 2.9 Boot combo8 (0239 v6, 2026-10-24): LE scan parameters disallowed
+
+[V] The v6 fix worked: `BD_VSC_LE_META_ENA_FEATURES` now completes (`fEnabledFeatures: 151027`), no timeout, no
+watchdog. bluetoothd (hand run): `Stack did start`, power state 1, `Starting passive scan (300.00ms/30.00ms)`, a second
+scan start after the vendor scan setup, then `Could not start LE scan (leScanParamsLPCoreCb): STATUS 712`, `Scan stopped
+improperly with result 712 -- restart`, `restarting { reason=712 }`. Kernel: LE Set Scan Parameters (0x200b) answered
+with status 0x0c (Command Disallowed) once per session, right before each disconnect: the spec forbids changing scan
+parameters while scanning, which bluetoothd does (Broadcom firmware tolerates it). 712 = the stack's 700 + HCI status 0x0c.
+
+Fix, 0239 v7 (compile-checked): Command Disallowed for LE 0x2006/0x2007/0x200a/0x200b/0x200c is answered as success,
+return parameters kept (the running scan/advertising keeps its old parameters).
