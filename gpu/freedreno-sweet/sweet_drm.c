@@ -55,6 +55,120 @@ static io_connect_t g_conn;
 static dev_t g_null_rdev;
 static int g_trace;
 
+/*
+ * Buffer log (Chlorophyll, GPU fault hunting): when /private/var/tmp/drm-bolog exists at connect time, every BO this
+ * process creates, imports, gets a GPU address for and closes, and every submit (its fence and BO handles), is appended
+ * to /private/var/tmp/drmlog/<process>-<pid>.log, one line each, microseconds since boot first:
+ *   T new h=H size=S | T sbo h=H surf=ID size=S iova=A | T iova h=H A | T close h=H | T submit fence=F bos=H,H,...
+ * A kernel SMMU fault prints the faulting GPU address (FAR) and the last submitted fence: the log names the BO that
+ * covered that address, when it was closed and which submit used it. The file starts over at 32 MiB (the old one is .old).
+ */
+static int g_bolog = -1;
+static int g_bolog_fd = -1;
+static char g_bolog_path[160];
+static pthread_mutex_t g_bolog_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+bolog_open(void)
+{
+	struct stat st;
+
+	g_bolog = stat("/private/var/tmp/drm-bolog", &st) == 0;
+	if (!g_bolog) {
+		return;
+	}
+	char name[64];
+	const char *pn = getprogname();
+	snprintf(name, sizeof(name), "%s", pn ? pn : "proc");
+	mkdir("/private/var/tmp/drmlog", 0777);
+	snprintf(g_bolog_path, sizeof(g_bolog_path), "/private/var/tmp/drmlog/%s-%d.log", name, (int)getpid());
+	g_bolog_fd = open(g_bolog_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+	if (g_bolog_fd < 0) {
+		g_bolog = 0;
+	}
+}
+
+static void
+bolog_line(const char *line, size_t n)
+{
+	struct stat st;
+
+	pthread_mutex_lock(&g_bolog_lock);
+	if (g_bolog_fd >= 0 && fstat(g_bolog_fd, &st) == 0 && st.st_size > (32 << 20)) {
+		char old[176];
+		snprintf(old, sizeof(old), "%s.old", g_bolog_path);
+		rename(g_bolog_path, old);
+		close(g_bolog_fd);
+		g_bolog_fd = open(g_bolog_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644);
+	}
+	if (g_bolog_fd >= 0) {
+		(void)write(g_bolog_fd, line, n);
+	}
+	pthread_mutex_unlock(&g_bolog_lock);
+}
+
+static unsigned long long
+bolog_us(void)
+{
+	return (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000ull);
+}
+
+/* after a successful call: in = what was sent, out = what came back */
+static void
+bolog_call(uint32_t sel, const uint8_t *in, const uint8_t *out, size_t outsz)
+{
+	char b[4096];
+	int n = 0;
+
+	switch (sel) {
+	case SWEET_GPU_SEL_GEM_NEW: {
+		const struct sweet_msm_gem_new *i = (const void *)in, *o = (const void *)out;
+		n = snprintf(b, sizeof(b), "%llu new h=%u size=%llu\n", bolog_us(), outsz >= sizeof(*o) ? o->handle : 0,
+		    (unsigned long long)i->size);
+		break;
+	}
+	case SWEET_GPU_SEL_SURFACE_BO: {
+		const struct sweet_gpu_surface_bo *o = (const void *)out;
+		if (outsz < sizeof(o->iova) + 16 || o->handle == 0) {
+			return;
+		}
+		n = snprintf(b, sizeof(b), "%llu sbo h=%u surf=%u size=%llu iova=0x%llx\n", bolog_us(), o->handle, o->surface_id,
+		    (unsigned long long)o->size, (unsigned long long)o->iova);
+		break;
+	}
+	case SWEET_GPU_SEL_GEM_INFO: {
+		const struct sweet_msm_gem_info *i = (const void *)in, *o = (const void *)out;
+		if (i->info != SWEET_MSM_INFO_GET_IOVA || outsz < sizeof(*o)) {
+			return;
+		}
+		n = snprintf(b, sizeof(b), "%llu iova h=%u 0x%llx\n", bolog_us(), i->handle, (unsigned long long)o->value);
+		break;
+	}
+	case SWEET_GPU_SEL_GEM_CLOSE: {
+		const struct sweet_gem_close *i = (const void *)in;
+		n = snprintf(b, sizeof(b), "%llu close h=%u\n", bolog_us(), i->handle);
+		break;
+	}
+	case SWEET_GPU_SEL_GEM_SUBMIT: {
+		const struct sweet_msm_gem_submit *i = (const void *)in, *o = (const void *)out;
+		const struct sweet_msm_gem_submit_bo *bos = (const void *)(uintptr_t)i->bos;
+		n = snprintf(b, sizeof(b), "%llu submit fence=%u bos=", bolog_us(), outsz >= 8 ? o->fence : 0);
+		for (uint32_t k = 0; k < i->nr_bos && n < (int)sizeof(b) - 16; k++) {
+			n += snprintf(b + n, sizeof(b) - (size_t)n, k ? ",%u" : "%u", bos[k].handle);
+		}
+		if (n < (int)sizeof(b) - 1) {
+			b[n++] = '\n';
+		}
+		break;
+	}
+	default:
+		return;
+	}
+	if (n > 0) {
+		bolog_line(b, (size_t)(n < (int)sizeof(b) ? n : (int)sizeof(b)));
+	}
+}
+
 static struct {
 	void    *addr;
 	uint32_t handle;
@@ -90,6 +204,7 @@ connect_once(void)
 			g_null_rdev = st.st_rdev;
 		}
 		g_trace = getenv("SWEET_DRM_TRACE") != NULL;
+		bolog_open();
 		io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(SWEET_GPU_SERVICE_NAME));
 		if (svc != IO_OBJECT_NULL) {
 			if (IOServiceOpen(svc, mach_task_self(), 0, &g_conn) != KERN_SUCCESS) {
@@ -190,6 +305,9 @@ sweet_call(uint32_t sel, void *data, size_t size)
 	kern_return_t kr = IOConnectCallStructMethod(g_conn, sel, in, want, out, &outsz);
 	if (g_trace && kr != KERN_SUCCESS && sel != SWEET_GPU_SEL_WAIT_FENCE) {
 		fprintf(stderr, "sweet_drm: selector %#x -> %#x\n", sel, kr);
+	}
+	if (kr == KERN_SUCCESS && g_bolog > 0) {
+		bolog_call(sel, in, out, outsz);
 	}
 	if (kr == KERN_SUCCESS && outsz) {
 		memcpy(data, out, outsz < size ? outsz : size);
