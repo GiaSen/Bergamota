@@ -20,8 +20,8 @@ Adreno 630) are in Chlorophyll's own repository: `gpu/metal/docs/FIXES.md`.
   The frame is scanned once the blit's fence passes (`scanBlitPoll`, 100 ms cap). A newer frame arriving first reuses
   the in-flight buffer, and a CPU fallback waits for the frame's work and for any blit in flight.
 - **Result.** Same swipe test, async commits: 28.4 fps (0240b), 29.4 (no deferral), **38.6 (0241)**. The CPU cost
-  of the scan-out path is now 18 us per frame. The home screen renders correctly. Tearing still has to be checked by
-  eye on the panel; screenshots read the frame, not the glass.
+  of the scan-out path is now 18 us per frame. The home screen renders correctly, and no tearing on the panel (checked by
+  eye; screenshots read the frame, not the glass).
 
 ### ~30 fps cap from the CPU scan-out copy (0240)
 
