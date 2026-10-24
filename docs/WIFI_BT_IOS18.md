@@ -1,0 +1,76 @@
+# Wi-Fi and Bluetooth on iOS 18.7.8 (Heartwood xnu-11215, Poco F1 / WCN3990)
+
+Date 2026-10-24. What was found on the phone, why Control Center showed Wi-Fi and Bluetooth "Off", what was
+fixed, and what still blocks. Background: `docs/WIFI_BT_PLAN.md` (WCN3990 chain), `docs/BT_IOS_TRANSPORT.md`
+(how bluetoothd reaches its controller), `docs/WIFI_KEXT_STUDY.md` (IO80211 contract).
+Tags: **[V]** seen on the phone or in a file, **[U]** inference.
+
+## 1. State before this work (boot `local-0236.img`, 2026-10-24)
+
+* Kernel: Heartwood xnu-11215 with the whole BT series compiled in (0104 probe, 0117/0118 rails and UART clock,
+  0124 firmware download, 0125/0128 in-band sleep, 0132/0133 post-NVM fixes, 0136 `com.apple.uart.bluetooth`
+  kernel control) [V strings in the payload]. All of it is off unless `sweetwlan=2 sweetbt=1`, and the boot-args of
+  `local-0236.img` had neither [V payload cmdline], so the WCN3990 was never powered.
+* ADT: `beryllium-hi-3x-gpufwz.adt` (the GPU-firmware ADT every current image uses) has **no `/arm-io/bluetooth`**:
+  `adt-gpufw.py` was run on an ADT made before the rebrand dropped and bt18 restored the node [V].
+* Root: `/usr/sbin/BlueTool` is the stub, `BlueTool.orig` kept, `/usr/local/bin/hcitest` present, bluetoothd's
+  launchd job has `BT_HCI_TRANSPORT=H4BC:POSIX:com.apple.uart.bluetooth,3000000` [V]. No BT firmware under
+  `/usr/standalone/firmware/sweet/` (the directory did not exist) [V].
+* bluetoothd (unified log): `bluetooth: Unable to match bluetooth service in device tree`, `Not a valid MAC address
+  (all 00s)`, `exited due to exit(0), ran for 98ms`, respawned every 10 s by its LaunchEvents [V]. With no
+  bluetoothd, Control Center's Bluetooth module shows Off and cannot be turned on.
+* wifid never ran: its job has `_LimitLoadToDeviceTree = (wlan, marconi-wifi)` and the ADT has neither node [V
+  launchd.plist]. Control Center's Wi-Fi module shows Off.
+
+## 2. Bluetooth
+
+The kernel half had already worked on iOS 16 (logs `usb-20261020-175351.txt`: firmware downloaded at 3 Mbaud, the
+kernel control registered, `hcitest` got HCI Reset / Read Local Version (Qualcomm 0x001d) / Read BD_ADDR through
+`com.apple.uart.bluetooth`). On iOS 18 three things were missing, plus one new userland blocker.
+
+### 2.1 Fixes
+
+| # | Why it failed | Fix |
+|---|---|---|
+| 1 | No `/arm-io/bluetooth` in the GPU ADT, so bluetoothd exits 0 ("Unable to match bluetooth service") | `tools/adt-bluetooth.py IN OUT` adds mkadt's `bluetooth_node` (local-mac-address 02:00:5e:77:b0:01, transport-encoding 3, transport-speed 3000000) to any ADT; `beryllium-hi-3x-gpufwz-bt.adt` = gpufwz + node |
+| 2 | Boot-args never enabled the BT stage | `sweetwlan=2 sweetbt=1 sweetbtfast=1 sweetbtibs=1 sweetwlandelay=30` (the iOS 16 working set: baud change before the download, Linux IBS bits; stage 30 s after boot instead of 90). The payload cmdline field is 608 bytes; the full line is 601 |
+| 3 | No firmware where the stage reads it | `crbtfw21.tlv` (177060 B) + `crnv21.bin` (4587 B), the linux-firmware pair that worked on iOS 16, copied to `/usr/standalone/firmware/sweet/` on the phone (not in git; the root builder should add them, see 2.3) |
+| 4 | **Keychain adds fail for everyone**: securityd's `aks_wrap_key` (AppleKeyStore selector 10, inputs {handle 0, class}, 32-byte key in, class + 40-byte wrapped key out) returned `kIOReturnUnsupported` from our stand-in (`SWEET AKS: securityd sel 10 ... -> 0xe00002c7` on every boot). bluetoothd's `readRootKeys` (0x100711600) stores its LE Identity/Encryption roots and Cloud keys as keychain items (service `BluetoothGlobal`, helper 0x10034e594 -> 0x10034bf9c); when a SecItemAdd fails it logs "LeSecurityManager hit a keychain problem" (0x10071204c) and gives up, which is the abort the bt18 notes saw | xnu **0238** `sweet-aks-key-wrap`: selectors 10/11 implemented. "Wrapped" = 8-byte header {'SWAK', class} + the key; unwrap accepts only that header. Not protection (no SEP, no passcode: item keys are readable on disk), but items now round-trip |
+
+### 2.2 Boots
+
+* `bt-0236.img` = `local-0236.img`'s kernel (`ios-beryllium-combined/xnu/out-0236local`) + `beryllium-hi-3x-gpufwz-bt.adt`
+  + the cmdline above (fixes 1-3, not 4). Queued 2026-10-24 20:51 UTC; Bergamota's automatic reboot did not reach
+  fastboot and the phone went offline (battery was at 1 %): **not booted yet**.
+* CI run 40132191870 (branch `wifi-bt18`): kernel with 0238. Next image = that kernel + the same ADT and cmdline.
+
+### 2.3 Still to do for Bluetooth
+
+* Root builder: done in root_tweaks18 `bluetooth()`: `RENEGADE_BT_FW=DIR` (a directory with the linux-firmware
+  `crbtfw21.tlv`/`crnv21.bin`; Qualcomm firmware, never in git) installs them in `/usr/standalone/firmware/sweet/`.
+* After the transport is up: watch bluetoothd for the BlueTool XPC result, the HCI init sequence in the `SWEET BT:`
+  trace (`sweetbtlog`, 64 lines), and Apple vendor commands the Qualcomm controller rejects (docs/BT_IOS_TRANSPORT.md 3.3).
+
+## 3. Wi-Fi: blocker
+
+There is no Wi-Fi driver of any kind yet, at either end:
+
+1. **Chip side.** On SDM845 the WCN3990 WLAN firmware (`wlanmdsp.mbn`) runs inside the modem DSP (MSS). Nothing
+   of that chain exists in Heartwood: MSS boot by MBA self-authentication (RMB registers, hyp-assign SCM calls),
+   SMEM/SMP2P, GLINK + QRTR, the three host services the modem expects (pd-mapper, tftp, rmtfs with writes dropped),
+   the WLFW QMI handshake (MSA, board data, cal, mission mode), then copy engines / HTC / WMI / HTT, the apps SMMU
+   context for SID 0x40, and a scan API. `docs/WIFI_BT_PLAN.md` sections 1, 2 and 5 (phases P3-P5) have the exact
+   sequence and what ios-topaz (SM6225, patches 0113-0126) contributes; the estimate there is 3-4 weeks to a scan,
+   and phase P3 (first TZ/hypervisor-mediated MSS action) is the riskiest step of the whole project (SoC resets on
+   an unmatched SMMU stream or a bad XPU access). Nothing of P3 onwards has been written or run.
+2. **iOS side.** wifid only starts when the ADT has a `wlan` or `marconi-wifi` node, and then talks to an
+   IO80211Family (Skywalk-era) interface through Apple80211 ioctls. Our kernel has no IO80211Family (closed source,
+   not loadable from the iPhone10,3 kernelcache: `docs/WIFI_KEXT_STUDY.md` 3.4) and no stand-in. Adding only the
+   ADT node would start wifid with nothing to drive, and Control Center would still show Wi-Fi unavailable.
+   An "Apple80211-lite" stand-in is estimated at 4-8 weeks after a working chip driver (`WIFI_KEXT_STUDY.md` 4.4).
+
+Neither half is a signing or hardware-access problem: the modem firmware in the phone's `modem` partition is the
+phone's own signed image and is loaded by the modem's MBA, not by us, and the registers are reachable. The blocker
+is the size of the two missing drivers. **Next step:** phase P0/P1 of `WIFI_BT_PLAN.md` on xnu-11215 (`sweetwlan=1`
+and `=3`, read-only probe and modem-partition inventory; 0104 already carries them), then P3 (MBA load, stop at
+"MBA alive") as its own gated patch, with the user present for the first run.
