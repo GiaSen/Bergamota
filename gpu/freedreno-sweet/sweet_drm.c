@@ -270,6 +270,38 @@ rel_timeout(struct sweet_msm_timespec *t)
 	t->tv_nsec = ns % 1000000000ll;
 }
 
+/* The last failed WAIT_FENCE, for whoever reports the failure (Chlorophyll's "fence timeout" also covers a fence the kernel
+ * refuses as never submitted, and a GPU that is not ready): what the kernel said, and how long the call really took. */
+static char g_wait_err[192];
+static unsigned g_wait_err_n;
+
+static void
+wait_failed(const struct sweet_msm_wait_fence *w, kern_return_t kr, const struct timespec *t0)
+{
+	struct timespec t1;
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	int64_t took = (t1.tv_sec - t0->tv_sec) * 1000000000ll + (t1.tv_nsec - t0->tv_nsec);
+	int64_t asked = w->timeout.tv_sec * 1000000000ll + w->timeout.tv_nsec;
+	struct sweet_gpu_info info;
+	size_t outsz = sizeof(info);
+	memset(&info, 0, sizeof(info));
+	kern_return_t ki = IOConnectCallStructMethod(g_conn, SWEET_GPU_SEL_INFO, NULL, 0, &info, &outsz);
+	snprintf(g_wait_err, sizeof(g_wait_err), "WAIT_FENCE #%u fence %u queue %u: kr %#x (errno %d) after %lld of %lld ms; info kr %#x flags %#x last submitted %u",
+	    ++g_wait_err_n, w->fence, w->queueid, kr, io_errno(kr), (long long)(took / 1000000), (long long)(asked / 1000000), ki, info.flags, info.last_fence);
+}
+
+/* Chlorophyll takes this when a fence wait fails: copies the last WAIT_FENCE failure into buf and forgets it, so an
+ * empty answer means the wait failed without a WAIT_FENCE failing (Mesa's own wait for its submit thread). */
+EXPORT void
+sweet_drm_take_wait_error(char *buf, size_t size)
+{
+	if (size == 0) {
+		return;
+	}
+	snprintf(buf, size, "%s", g_wait_err);
+	g_wait_err[0] = 0;
+}
+
 /* One request: returns 0 or -errno. */
 static int
 sweet_call(uint32_t sel, void *data, size_t size)
@@ -294,7 +326,14 @@ sweet_call(uint32_t sel, void *data, size_t size)
 	} else if (sel == SWEET_GPU_SEL_GEM_CPU_PREP) {
 		rel_timeout(&((struct sweet_msm_gem_cpu_prep *)in)->timeout);
 	}
+	struct timespec t0;
+	if (sel == SWEET_GPU_SEL_WAIT_FENCE) {
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+	}
 	kern_return_t kr = IOConnectCallStructMethod(g_conn, sel, in, want, out, &outsz);
+	if (sel == SWEET_GPU_SEL_WAIT_FENCE && kr != KERN_SUCCESS) {
+		wait_failed((struct sweet_msm_wait_fence *)in, kr, &t0);
+	}
 	if (g_trace && kr != KERN_SUCCESS && sel != SWEET_GPU_SEL_WAIT_FENCE) {
 		fprintf(stderr, "sweet_drm: selector %#x -> %#x\n", sel, kr);
 	}
