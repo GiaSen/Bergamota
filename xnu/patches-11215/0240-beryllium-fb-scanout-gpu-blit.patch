@@ -195,17 +195,19 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  extern "C" bool sweet_gpu_fence_passed(uint32_t fence);                    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_hud (patch 0213) */
  
  /*
-@@ -305,6 +307,9 @@
+@@ -305,6 +307,11 @@
  	 * latched.
  	 */
  	bool          fScanCopy, fScanFailed, fScanForeign, fScanFront;
-+	/* 0240 (sweetfb_scancopy=2): the copy on the GPU's 2D engine instead of the CPU; off for the boot after 3 failures */
++	/* 0240 (sweetfb_scancopy=2): the copy on the GPU's 2D engine instead of the CPU. fScanGpuOff: the pool could not be
++	 * mapped (for the boot). After 3 failed blits in a row (a client killed mid-frame, the GPU asleep or recovering) the
++	 * next 120 frames are copied on the CPU (fScanGpuRest) and then the GPU is tried again. */
 +	bool          fScanGpu, fScanGpuWin, fScanGpuOff;
-+	uint32_t      fScanGpuFails;
++	uint32_t      fScanGpuFails, fScanGpuRest;
  	IOMemoryMap  *fScanMap[3];
  	uint64_t      fScanPA[3];
  	uint32_t      fScanStride;
-@@ -355,6 +360,7 @@
+@@ -355,6 +362,7 @@
  		uint64_t replaceWaits, replaceTimeouts;                 /* 0220: frames that waited for the previous one's latch / gave up */
  		uint64_t emptySwaps, emptyKept;                         /* 0233: swaps with no layer / of those, the ones that kept the frame */
  		uint64_t scanCopies, scanCopyAbs, scanCopyMaxAbs;       /* 0235: frames copied to a scan-out buffer, their time */
@@ -213,7 +215,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	} fSt, fStPrev;
  	/*
  	 * Direct scanout (sweetfb_direct=1, patch 0211): hw scaler + page flipping + zero-copy
-@@ -701,6 +707,7 @@
+@@ -701,6 +709,7 @@
  				int sc = 0;
  				PE_parse_boot_argn("sweetfb_scancopy", &sc, sizeof(sc));
  				fScanCopy = fEarly && sc != 0;
@@ -221,7 +223,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				fScanPanel = fScanQueued = -1;
  				if (fScanCopy) {
  					IOLog("SWEET FB: scan-out copy on (0235): frames are copied to three framebuffer-owned buffers, a swap is complete when copied\n");
-@@ -1082,7 +1089,7 @@
+@@ -1082,7 +1091,7 @@
  	    "pool_used=%u pool_total=%u pool_surfaces=%llu pool_fallbacks=%llu "
  	    "swapsync=%d swap_waits=%llu swap_wait_us=%u.%02u swap_wait_timeouts=%llu replace_waits=%llu replace_timeouts=%llu "
  	    "gpu_holds=%llu gpu_hold_timeouts=%llu empty_swaps=%llu empty_kept=%llu "
@@ -230,17 +232,17 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	    mode, hz, fFlushTicks, fHw ? 1 : 0, fFlip ? 1 : 0, smmu, fZcCleanMode == 0 ? "never" : (fZcCleanMode == 1 ? "always" : (fZcCleanMode == 2 ? "auto" : "tracked")),
  	    sweet_abs_us(now) / 1000000, winUS / 1000,
  	    swaps, SW_F2(PER_S(dSwaps)), coalesced, SW_F2(PER_S(dCoal)),
-@@ -1092,7 +1099,8 @@
+@@ -1092,7 +1101,8 @@
  	    used, total, pallocs, pfails,
  	    fSwapSync ? 1 : 0, c.swapWaits, SW_F2(swAvg), c.swapWaitTimeouts, c.replaceWaits, c.replaceTimeouts,
  	    c.gpuHolds, c.gpuHoldTimeouts, c.emptySwaps, c.emptyKept,
 -	    fScanCopy && !fScanFailed ? 1 : 0, c.scanCopies, SW_F2(scAvg), sweet_abs_us(c.scanCopyMaxAbs));
 +	    fScanCopy && !fScanFailed ? 1 : 0, c.scanCopies, SW_F2(scAvg), sweet_abs_us(c.scanCopyMaxAbs),
-+	    fScanGpu && !fScanGpuOff ? 1 : 0, c.scanGpuCopies, c.scanGpuFallbacks);
++	    fScanGpu && !fScanGpuOff ? (fScanGpuRest ? 2 : 1) : 0, c.scanGpuCopies, c.scanGpuFallbacks);
  	#undef PER_S
  	sweet_fb_stats_publish(line);
  	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
-@@ -2222,16 +2230,62 @@
+@@ -2222,16 +2232,65 @@
  	uint64_t t0 = mach_absolute_time();
  	const uint8_t *src = (const uint8_t *)(kva + s->offset);
  	uint64_t span = (uint64_t)s->bytesPerRow * (fLogicalH - 1) + rowBytes;
@@ -255,7 +257,9 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 -		for (uint32_t y = 0; y < fLogicalH; y++) {
 -			memcpy(dst + (size_t)y * fScanStride, src + (size_t)y * s->bytesPerRow, rowBytes);
 +	bool viaGpu = false;
-+	if (fScanGpu && !fScanGpuOff && s->pooled) {
++	if (fScanGpuRest != 0) {
++		fScanGpuRest--;
++	} else if (fScanGpu && !fScanGpuOff && s->pooled) {
 +		/*
 +		 * 0240: the GPU's 2D engine copies the frame (sweet_gpu_blit). It reads DRAM, so the only cache work left is a
 +		 * CPU draw still dirty in the write-back mapping (a write-unlock since the last look); the GPU's own pixels need
@@ -292,8 +296,9 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +			} else {
 +				fSt.scanGpuFallbacks++;
 +				if (++fScanGpuFails >= 3) {
-+					fScanGpuOff = true;
-+					IOLog("SWEET FB: scan-out blits off after 3 failures in a row; copying on the CPU\n");
++					fScanGpuFails = 0;
++					fScanGpuRest = 120;
++					IOLog("SWEET FB: 3 scan-out blits failed in a row; the next 120 frames are copied on the CPU\n");
 +				}
 +			}
 +		}
