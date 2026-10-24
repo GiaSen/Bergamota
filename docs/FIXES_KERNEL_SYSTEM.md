@@ -8,6 +8,26 @@ Adreno 630) are in Chlorophyll's own repository: `gpu/metal/docs/FIXES.md`.
 
 ## Kernel (`xnu/patches-11215`)
 
+### Every boot started in 1970; coreduetd at ~75 % of a core for the whole boot (0245)
+
+- **Why.** The kernel had no real-time clock: `IOKitInitializeTime` found no `IORTC`, so iOS started at the epoch
+  and jumped to 2026 when timed got network time. coreduetd then re-ingested its Biome history (time-windowed
+  pipelines seeing 56 years of "new" time) and never finished: 5 min of CPU in 7 min of uptime, the little cores
+  pinned, swipes at ~21 fps on the injected-swipe test.
+- **Fix.** The PM8998 RTC (SID 0, 0x6048) counts through reboots but the AP cannot set it (TZ-owned; on this phone
+  it held ~80 days of seconds). 0245 keeps the offset to Unix time in the RTC alarm data registers (0x6140, only
+  while that alarm is disabled, so it cannot wake the phone), publishes `IORTC`, and serves the platform expert's
+  get/setGMTTimeOfDay from raw + offset. iOS's own settimeofday stores the offset (first boot), so from the second
+  boot the clock is right from launch. coreduetd idles (0 %); the same swipe test went 521 -> 849 frames (~35 fps).
+
+### iOS held at 1 frame/s once the backlight service existed (0243, disabled by 0246)
+
+- **Why.** With 0243's `backlight-control` service published, every boot capped presentation at 0.98-0.99 frames/s,
+  touch included (kernel `swaps_s`); boots without it ran 30-55 fps. Bluetooth was ruled out by unloading bluetoothd.
+  The exact iOS-side reason is still being investigated.
+- **Fix (for now).** 0246 publishes the service only with boot-arg `sweetfb_blsvc=1`. Panel on/off (0242) still
+  follows iOS; the brightness slider does not reach the panel yet.
+
 ### Frames serialized behind the GPU (0241, and Chlorophyll's "scheduled")
 
 - **Why.** Each frame waited for the previous frame's GPU work twice over: Chlorophyll reported "scheduled" to the render
