@@ -38,7 +38,7 @@ index f469ff4c2a5530996862ee2c817eef72204ea790..2c4a753636b847b6bb5c25ef79acad05
  		cpu_boot_arg = 1;
  	}
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
-index 3f94204500fbb80d8187447f8df5973e02e4045b..0c7f7850d1670a10da7f2cd8fa08d7c07c4e7471 100644
+index 0790db5a5f26e256095cbb0bbe3c21524bd0b405..a4f56977e80af08f32869ca95b71913547c1ed6a 100644
 --- a/pexpert/pexpert/arm64/SWEET.h
 +++ b/pexpert/pexpert/arm64/SWEET.h
 @@ -17,8 +17,13 @@

@@ -215,10 +215,10 @@ index 75938b564825729a2554521c05b5c8d36f599bd9..1561d807e9fd426cde913e35605160ce
  # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..67f234fccc634740a85747fc52b4f134eec7251a
+index 0000000000000000000000000000000000000000..f4ec0521f6e30fe4418ab96ea47f0b58eec5bc28
 --- /dev/null
 +++ b/pexpert/pexpert/arm64/SWEET.h
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,87 @@
 +/*
 + * Board config for the Redmi Note 10 Pro ("sweet", Qualcomm SM7150 /
 + * Snapdragon 732G): Kryo 470 = Cortex-A76 + Cortex-A55, ARMv8.2, no PAC.
@@ -261,6 +261,7 @@ index 0000000000000000000000000000000000000000..67f234fccc634740a85747fc52b4f134
 +#define MPIDR_CORETYPE_MASK       ((1ULL << MPIDR_CORETYPE_WIDTH) - 1)
 +#define MPIDR_CORETYPE_ACC_E      (0ULL)
 +#define MPIDR_CORETYPE_ACC_P      (1ULL)
++#define MPIDR_CORETYPE_ACC_M      (4ULL)    /* xnu-12377: M_CORE in apple_arm64_cpu.h */
 +
 +#ifndef ASSEMBLER
 +#define PLATFORM_PANIC_LOG_DISABLED

@@ -16,8 +16,8 @@ on:
         description: xnu MACHINE_CONFIG
         default: SWEET
       use_kdk:
-        description: 26.x only - download the KDK (true) or build without it with CoreEntitlements V2 type stubs (false)
-        default: "false"
+        description: 26.x only - download the KDK (true) or build without it (false; CoreEntitlements V2 stubs, but TrustCache/API.h is KDK-only)
+        default: "true"
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -78,7 +78,7 @@ jobs:
               cp "$f" "dxb/patches/26.0/sweet-$(basename "$f")"
             done
             PDIR=dxb/patches/26.0
-            if [ "${{ inputs.use_kdk || 'false' }}" != "true" ]; then
+            if [ "${{ inputs.use_kdk || 'true' }}" != "true" ]; then
               # SWEET needs nothing from the KDK (link_kdk only force-loads closed libs for Apple SoCs,
               # kernel collections are not built): drop dxb's KDK header copy (our
               # 0027-stage-coreentitlements-v2-stub.sh stands in) and point KDKROOT at an empty dir so
@@ -270,6 +270,7 @@ jobs:
         run: |
           mkdir -p out/kdk-libs
           for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+            [ -e "$lib" ] || continue
             b=$(basename "$lib" .a)
             ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
             nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true

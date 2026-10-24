@@ -243,10 +243,10 @@ index bbe65153f1260cfcf96bd1467fbdc8f96cc4ff1c..0da3b8b882bdafa9fc2360dc96f69d34
  
  void
 diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
-index 53f9ce51946f62cc84ae5b25f325978041a6df96..a8cc5f00e626a13ba9c2738c5ea6ac98c1555d5c 100644
+index 53f9ce51946f62cc84ae5b25f325978041a6df96..db3bb0b4215974bbab93ed6c86b991e6babcb00f 100644
 --- a/osfmk/arm64/cpu.c
 +++ b/osfmk/arm64/cpu.c
-@@ -934,6 +934,19 @@ cpu_start(int cpu)
+@@ -934,6 +934,18 @@ cpu_start(int cpu)
  
  		flush_dcache((vm_offset_t)&CpuDataEntries[cpu], sizeof(cpu_data_entry_t), FALSE);
  		flush_dcache((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t), FALSE);
@@ -258,7 +258,6 @@ index 53f9ce51946f62cc84ae5b25f325978041a6df96..a8cc5f00e626a13ba9c2738c5ea6ac98
 +		CleanPoC_DcacheRegion_Force((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t));
 +		CleanPoC_DcacheRegion_Force((vm_offset_t)&ResetHandlerData, sizeof(ResetHandlerData));
 +		CleanPoC_DcacheRegion_Force((vm_offset_t)BootArgs, sizeof(*BootArgs));
-+		CleanPoC_DcacheRegion_Force((vm_offset_t)&sysreg_restore, sizeof(sysreg_restore));
 +		CleanPoC_DcacheRegion_Force((vm_offset_t)&cpu_ttep, sizeof(cpu_ttep));
 +		CleanPoC_DcacheRegion_Force((vm_offset_t)bootstrap_pagetables, BOOTSTRAP_TABLE_SIZE);
 +		__builtin_arm_dsb(DSB_SY);
@@ -266,7 +265,7 @@ index 53f9ce51946f62cc84ae5b25f325978041a6df96..a8cc5f00e626a13ba9c2738c5ea6ac98
  #if CONFIG_SPTM
  		/**
  		 * On SPTM devices, CTRR is configured entirely by the SPTM. Due to this, this logic
-@@ -971,6 +984,21 @@ cpu_start(int cpu)
+@@ -971,6 +983,21 @@ cpu_start(int cpu)
  }
  
  
@@ -412,7 +411,7 @@ index 92f5d4be957d14db4418c5e705b62efb520503f3..2a8e5a0088f43b55f6fb8795784c24f0
  	 * the resume_idle_cpu path.  cpu_ttep should already be
  	 * populated, so just switch to the kernel_pmap now.
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
-index 67f234fccc634740a85747fc52b4f134eec7251a..3f94204500fbb80d8187447f8df5973e02e4045b 100644
+index f4ec0521f6e30fe4418ab96ea47f0b58eec5bc28..0790db5a5f26e256095cbb0bbe3c21524bd0b405 100644
 --- a/pexpert/pexpert/arm64/SWEET.h
 +++ b/pexpert/pexpert/arm64/SWEET.h
 @@ -17,6 +17,9 @@

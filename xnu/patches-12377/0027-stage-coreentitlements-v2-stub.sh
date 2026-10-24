@@ -37,7 +37,7 @@ typedef enum {
 
 typedef struct CEContext CEContext_t;
 typedef struct CEElement CEElement_t;
-typedef struct CEBuffer CEBuffer_t;
+typedef CEBuffer CEBuffer_t;                    /* CEBuffer: CoreEntitlements/Runtime.h (V1) */
 
 #endif /* _SWEET_COREENTITLEMENTS_V2_API_H */
 H
