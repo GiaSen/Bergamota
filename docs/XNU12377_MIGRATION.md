@@ -58,5 +58,6 @@ Compile and link fixes (CI runs 3-6 and the local build), each in the patch that
 * Local build: `USE_KDK=1 tools/xnu-local-build.sh 26.5` (full: dxb, pinned commit, our series, sccache, `BOUND_CHECKS=0`), then
   `USE_KDK=1 tools/xnu-local-build.sh --remake [-j1] 26.5` to rebuild after editing `research/xnu-local/dxb/xnu` in place (`-j1`
   serialises xnu's own parallelism, for readable errors). Needs KDK 26.5 (25F71) installed; works with Xcode 27.1. About 8 GB.
-* `tools/mkadt.py` needs the N104AP tree (`research/ios26/n104ap.adt`) as identity source; patch 0059 identity strings for iPhone12,1.
+* Identity: `tools/mkadt.py --identity n104ap` (needs `research/ios26/n104ap.adt`); the kernel reads hw.model/hw.machine from the ADT
+  root, so patch 0059 needs no change.
 * Renegade root for the 26.7.1 OTA (`tools/renegade`), then first boot.
