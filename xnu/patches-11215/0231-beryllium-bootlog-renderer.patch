@@ -1,7 +1,7 @@
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 --- a/osfmk/console/video_console.c
 +++ b/osfmk/console/video_console.c
-@@ -2876,10 +2876,332 @@
+@@ -2876,10 +2876,333 @@
  		vc_uiscale = kMaxProgressData;
  	} else if (!vc_uiscale) {
  		vc_uiscale = 1;
@@ -92,10 +92,10 @@ diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 +{
 +	if (gx < 0 || gy < 0 || gx >= ISO_CHAR_WIDTH || gy >= ISO_CHAR_HEIGHT) {
 +		return 0;
- 	}
++	}
 +	return (iso_font[ch * ISO_CHAR_HEIGHT + gy] >> gx) & 1;
- }
- 
++}
++
 +/*
 + * Pixel lines [py0, py1): the background (logo or band), and the text t[0..n) whose cell row starts at pixel y ty,
 + * from pixel x bl_left; colours per character (cols) or one for all (fg).
@@ -193,8 +193,9 @@ diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 +	if (bl_cur < bl_rows - 1) {
 +		bl_cur++;
 +	} else {
-+		memmove(bl_text[0], bl_text[1], sizeof(bl_text[0]) * (size_t)(bl_rows - 1));
-+		memmove(&bl_len[0], &bl_len[1], sizeof(bl_len[0]) * (size_t)(bl_rows - 1));
++		/* whole-array pointers: the kernel's checked memmove sees bl_text[0] as a 200-byte object (panicked) */
++		memmove((char *)bl_text, (char *)bl_text + sizeof(bl_text[0]), sizeof(bl_text[0]) * (size_t)(bl_rows - 1));
++		memmove(bl_len, bl_len + 1, sizeof(bl_len[0]) * (size_t)(bl_rows - 1));
 +		bl_scrolled = TRUE;
 +	}
 +	bl_len[bl_cur] = 0;
@@ -291,7 +292,7 @@ diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 +	PE_parse_boot_argn("sweetbootlog_scale", &scale, sizeof(scale));
 +	if (scale < 1 || scale > 4) {
 +		scale = 2;
-+	}
+ 	}
 +	bl_scale = scale;
 +	bl_cols = (int)(vinfo.v_width / (ISO_CHAR_WIDTH * scale)) - 1;
 +	bl_header_y = BL_TOP_MARGIN;
@@ -320,8 +321,8 @@ diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 +	}
 +	bl_started = TRUE;
 +	thread_call_enter(bl_call);
-+}
-+
+ }
+ 
 +/* AppleCLCD, on the GUI's first frame: the boot log stops drawing for good */
  void
 +sweet_bootlog_stop(void)
@@ -334,7 +335,7 @@ diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
  initialize_screen(PE_Video * boot_vinfo, unsigned int op)
  {
  	unsigned int newMapSize = 0;
-@@ -3055,6 +3377,9 @@
+@@ -3055,6 +3378,9 @@
  		gc_enable( !graphics_now );
  		gc_acquired = TRUE;
  		gc_desire_text = FALSE;
