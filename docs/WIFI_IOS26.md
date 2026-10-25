@@ -466,3 +466,37 @@ Console: `research/ios26/logs-wlan/boot37-wlan-full-usb.txt` (main checkout, not
    (proxy votes released), then rmtfs (EFS reads), QRTR over GLINK/SMEM, TFTP for `wlanmdsp.mbn`, then WLFW (QMI) to
    bring up the WCN3990.
 Each step again one boot per user OK, panics visible, same 1.5 s step trace.
+
+### 5.8 P4 written: MPSS load and start (1111, built, NOT run)
+
+`1111-beryllium-mpss-load.patch`, from "MBA alive", only with **`sweetmpss=1`** (`sweetmpsshold=N`, default 15 s, the
+watch time; `sweetmsskeep=1` leaves a modem that reported ready running). Linux v6.6 `q6v5_mpss_load()` /
+`q6v5_mpss_init_image()` / `qcom_mdt_read_metadata()` order, steps traced like 1-8:
+
+| Step | What | Linux |
+|------|------|-------|
+| 9 | read `image/modem.mdt`; metadata = ELF header segment (ph0 `p_filesz`) + hash segment (packed after the header, inside the .mdt, or its `.bNN` file) | qcom_mdt_read_metadata |
+| 10 | `RMB_PMI_CODE_LENGTH = 0`; metadata copied to the fixed low slice **0xe0000000** (RMB_PMI_META_DATA is 32-bit, xnu RAM is above 4 GiB; unmapped before the assign), hyp-assign HLOS -> MSS, `META_DATA_READY`, wait status 3 (1 s), assign back | q6v5_mpss_init_image |
+| 11 | MPSS reclaim (HLOS) then shared (HLOS RWX + MSS RW); each valid segment (PT_LOAD, not hash, memsz != 0) into its own 16K-aligned write-combined window from `modem.bNN` in 1 MiB pieces, tail zeroed; first segment sets `CODE_START` (= 0x8e400000, relocatable) + `LOAD_READY`, every segment the cumulative `CODE_LENGTH`; MBA status < 0 = auth failure | q6v5_mpss_load loop |
+| 12 | MPSS to MSS only, wait `AUTH_COMPLETE` (4, 10 s): `MPSS AUTHENTICATED` | q6v5_mpss_load end |
+| 13 | poll the modem's SMP2P item **435** (inbound; `qcom,smem = <435>, <428>` is [inbound, outbound]) in the apps<->modem SMEM partition every 100 ms for `sweetmpsshold` s, print every entry change; `slave-kernel` bit 1 = `MPSS READY` (then the MBA region goes back to HLOS like q6v5_start), bit 0 = fatal (crash reason = SMEM item 421 in the global partition) | qcom_q6v5_wait_for_start |
+
+Teardown after a load: like Linux, the MPSS carve-out is *not* reclaimed (only possible with an MBA running); it stays
+with the modem until the next reboot. The running modem is stopped the crash-path way (AXI halt + reset), since no
+SMP2P stop handshake exists here. `ms_assign` became `ms_assign_list` (several source/destination VMIDs) plus
+`ms_xfer` = `q6v5_xfer_mem_ownership`; step 7's MPSS assign goes through it (same SCM call as boot 37).
+
+Independent review against the fetched Linux v6.6 sources (qcom_q6v5_mss.c, qcom_q6v5.c, mdt_loader.c, qcom_scm.c,
+smp2p.c, smem.c, sdm845.dtsi): order, register values, SCM layout, ownership flags and SMEM/SMP2P layouts match.
+Fixed from it: the inbound item is 435, not 428 (checked in smp2p.c: `SMP2P_INBOUND 0`); a fatal bit now means "not
+running" even after ready; crash reason from the global partition only. **Open, by choice:** nothing allocates the
+apps-side outbound SMP2P item 428 or rings the modem's doorbell (Linux `qcom_smp2p_alloc_outbound_item`); if the modem
+waits for it, step 13 shows no `slave-kernel` entry and that is the next patch (it writes the shared SMEM allocator
+under the TCSR hwlock).
+
+Image `shim/out/enxerto-boot-ios26full-boot38-wlan-mpss.img` (sha256 `505957b7...`, kernel `657e6e16...` = boot 33b's
+kernel + 1108-1111): boot 33's ADT/Enxerto, boot 33's args without `sweetfb_noconsole=1`, plus `sweetwlan=4 sweetmss=1
+sweetmpss=1 sweetmpsshold=20`. The GPU session has no kernel/boot-arg change pending (combined-image rule), so this is
+the only change. Not booted; needs the phone free and the user's OK. Expected risks: an MBA rejection (status < 0) is
+harmless; a modem that runs may stay with its carve-out until reboot; the forced halt of a running modem is Linux's
+crash path.
