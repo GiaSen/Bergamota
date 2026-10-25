@@ -298,7 +298,7 @@ ios26 + 0251 + 1104-1106, `sweetwlan=4 sweetmss=1 sweetwlandelay=60 sweet80211=2
 1104 the SMEM table is complete: 14 partitions, including **apps<->modem (entry 10, offset 0xb9000, size 0x7c000)**,
 empty (free-uncached 0x20, a cold modem), so boot 30's "no apps<->modem partition" was the probe bug. Then the
 stage-4 banner was the **last line**: no SWEET MSS/RPMH line after it, no panic text, and the USB console went
-silent (11:27 local). Freeze or reboot: being confirmed with the user. Not retried.
+silent (11:27 local). **The user confirms a hard freeze (no reboot).** Not retried; recovered with a boot without stage 4.
 
 Reading: the next line would have followed reading `mba.mbn` (step 2), and no MSS/AOSS/RPMh register is touched
 before that. But the USB console and the persistent log are buffered (the log was last flushed at the banner), so a
@@ -309,3 +309,9 @@ ARC votes are as likely. No SCM call was reached (each logs and flushes before i
 1.5 s for the USB console *before* running, so the last `step N` line names the step that stopped the phone;
 `sweetmssstep=N` stops cleanly before step N+1 (teardown runs) for bisection. Steps: 1 map MMIO, 2 read mba.mbn,
 3 QMP open + load_state, 4 ARC votes, 5 clocks/alt reset, 6 MBA copy, 7 SCM hyp-assign, 8 QDSP6 boot.
+
+A freeze rather than a reset points to a bus access that never completed (a block that is unclocked, unpowered or
+protected without an error response), not a watchdog or an XPU/SMMU fatal error. First suspect is step 3, the first
+new hardware access (AOSS QMP message RAM 0xc300000 and the apss_shared doorbell); then step 4 (RPMh TCS). Less likely:
+step 2's UFS reads (they run under the root's I/O lock, so a hung read would also stop the root, but the console
+thread does not use that lock). The 1107 trace run decides it in one boot.
