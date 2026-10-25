@@ -61,6 +61,25 @@ headers differ from the 11215 files. 0009's 11215 change (Tightbeam exports file
 Numbering: the two series share numbers for the same change; fixes only 12377 needs start at 1000, so new develop patches
 (0251+) never collide again.
 
+**First iOS 26 boots (2026-10-25): fixes found on the phone**, each a 12377-only patch (1000+):
+
+| Patch | Symptom | Cause | Fix |
+| --- | --- | --- | --- |
+| (mkadt) | early panic "Expected 256 seed bytes from bootloader, but got 64" | 12377 asks for 4 x SHA-512 of seed | `/chosen/random-seed` 256 bytes |
+| (mkadt) | assertion `_unsafe_kernel_text_initialized` (machine_routines.c) | iBoot's `kernel-ctrr-to-be-enabled` is now required | written as 1 (text read-only, the 11215 default) |
+| 1001 | alignment fault in `bzero` from `AppleCLCD::flipSetup` | WCOMB outside gDram (the display low pool) became Device-GRE | WCOMB stays Normal non-cacheable on SWEET |
+| 1002, 1005 (debug) | initproc panics left no log / no crash report | flusher not run yet; 12377 panics before 0043's report | flush the sweetlog ring and print the report before the initproc panic |
+| 1003 (debug) | `MACH trap 14 kr=0x2` before launchd's SIGSEGV | - | log refused vm_protect with the entry's prot/max/flags |
+| 1004 | dyld's `vm_protect(RW)` of `__TPRO_CONST` refused (TPRO-less CPU) | task's shared region submap entry is r--/r-- | writable shared region policy, as on x86_64 |
+| 1006 | SIGSEGV in `dyld4::prepare` on a raw slide-info word | 12377 moved the slid-pointer store for auth pointers into ptrauth-only code (v3, v5) | store them unsigned without ptrauth |
+| 1007 | backboardd assertion `matched == (match_result.error_code == AICMR_MATCH)` | AMFI op 0x66 (LWCR match) unknown -> ENOPOLICY | answer AICMR_MATCH |
+| 1008 (debug) | - | - | boot-arg `sweetbootlog_keep=1`: the -v boot log stays on the panel, GUI swaps complete unshown |
+| 1009 | bounds-safety trap in `in_control` (USB network setup) | 0080's trace cast SIOCDIFADDR's 32-byte ifreq to in_aliasreq; 12377 builds in.c with -fbounds-safety | copy the 4 address bytes |
+
+Also in the root: the cache's `TEXT_STUBS` sub-caches held 105678 `BRAA x16, x17` (launchd SIGILL), rewritten with
+`pacstrip_cache.py --stubs` (now part of `mkroot-full.py`). Result (boot 13): iOS 26.6.2 userland up, SpringBoard,
+backboardd, lockdownd, PosterBoard running, SSH on 192.168.7.2.
+
 ## 3. Open items
 
 * Local build: `USE_KDK=1 tools/xnu-local-build.sh 26.5` (full: dxb, pinned commit, our series, sccache, `BOUND_CHECKS=0`), then
