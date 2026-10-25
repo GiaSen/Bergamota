@@ -529,3 +529,30 @@ size/padding, then advance the free offset), header magic/local 0/remote 1/total
 barrier, add the "master-kernel" entry (stop bit for a clean stop later), then the doorbell: apss_shared 0x17990000
 +12, bit 14 (`mboxes = <&apss_shared 14>`). Then poll 435 again for "slave-kernel" ready. First write into shared
 SMEM: gated, traced, one boot with the user present.
+
+### 5.10 1112: apps-side SMP2P (outbound item 428, doorbell, negotiation, clean stop): built, NOT run
+
+`1112-beryllium-mpss-smp2p-outbound.patch`, still only with `sweetmpss=1`. New **step 9** (before the modem.mdt
+work, so the item exists before the MPSS starts, as Linux's smp2p probe does at boot); the old 9-13 are now 10-14.
+
+* **SMEM allocation** (`qcom_smem_alloc` -> `qcom_smem_alloc_private`, the first write into shared SMEM): TCSR mutex
+  3 (0x1f43000; write 1, read back 1, unlock = 0; 1 s timeout), apps<->modem partition, walk the uncached list
+  (canary 0xa5a5; an existing 428 is reused only if it is at least 340 bytes; the walk must end exactly at
+  `offset_free_uncached`), new entry `{0xa5a5 | 428 << 16, 344, padding_data 4, padding_hdr 0}` below
+  `offset_free_cached`, then the free offset advances. Nothing prints while the hwlock is held.
+* **Outbound item** (`qcom_smp2p_alloc_outbound_item` + probe): zeroed, magic `$SMP`, features SSR_ACK, local pid 0,
+  remote pid 1, total 16; `version = 1` written last; doorbell; entries `master-kernel` (bit 0 = stop) and `ipa` in
+  DT order; doorbell again. Doorbell = `qcom,sdm845-apss-shared` +12, `BIT(14)` (`mboxes = <&apss_shared 14>`).
+* **Step 14** now negotiates on every 100 ms poll (`qcom_smp2p_negotiate`: equal versions, `features &= in`) and
+  acknowledges restart-done (bit 0 of the inbound flags -> bit 1 of ours, plus a doorbell), like the interrupt handler.
+* **Clean stop** (`qcom_q6v5_request_stop`), only after ready: set stop (master-kernel bit 0), doorbell, wait up to
+  5 s for stop-ack (slave-kernel bit 3), clear, doorbell; then the AXI halt/reset teardown as before. At the end
+  `valid_entries = 0` (smp2p unwind).
+
+Second independent review against the fetched Linux v6.6 sources (smem.c, smp2p.c, qcom_hwspinlock.c,
+qcom_q6v5.c, qcom-apcs-ipc-mailbox.c, sdm845.dtsi): no must-fix; its three should-fix points (no printf under the
+hwlock, size check on reuse and the walk-end check, unwind of valid_entries) are applied.
+
+Image `shim/out/enxerto-boot-ios26full-boot39-wlan-smp2p.img` (sha256 `c23f2e45...`, kernel `37d1bab0...` = boot 33b's
+kernel + 1108-1112): boot 38's args with `sweetmpsshold=30`. The GPU side needs nothing in the image. Not booted:
+needs the user's OK; afterwards tell the GPU session when iOS is up (backboardd trace).
