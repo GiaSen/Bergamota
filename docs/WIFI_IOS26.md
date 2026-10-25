@@ -695,3 +695,31 @@ the user's OK.
   19:47:44, possibly the GPU session's Apple6 env (BGMTL_FAMILY=6) crash-looping backboardd; the GPU session is
   recovering with boot 39 and removing the env. **Boot 41 is on hold** until the GPU session reports; rerun it as a
   Wi-Fi-only test with nothing else queued.
+
+### 5.15 Boot 41-wlan-tftp (Wi-Fi only, after the recovery): **TFTP works**; no wlanmdsp.mbn request yet
+
+**2026-10-25 20:50Z** (user OK given here; exactly one queue item, the app's auto-reboot delivered it; userdata had
+been reflashed by the GPU session 20:32-20:40Z), `enxerto-boot-ios26full-boot41-wlan-tftp.img` (1114). Stages 1-14 and
+rmtfs exactly as boot 40 (MPSS READY 11 ms, handover 2082 ms, modemst2 2 MiB read, ~40 QMI services, no 0x45). TFTP
+(service 4096 announced with rmtfs after the modem's HELLO), every request:
+
+| Request | Result |
+|---------|--------|
+| WRQ `/readwrite/server_check.txt` (blksize 7680, wsize 10) | 5 bytes, kept in RAM: the modem's server check passed |
+| RRQ `/readwrite/ota_firewall/ruleset` (x2) | not found (as on Linux without it) |
+| RRQ `/readwrite/mcfg.tmp`, WRQ (1 byte), RRQ (stat: ERROR 9 end of transfer), WRQ (512, then DEL_CLIENT before any data) | the modem's mcfg scratch file, RAM only |
+| RRQ `/readonly/firmware/image/modem_pr/mcfg/configs/mcfg_hw/mbn_hw.dig` (stat, then rsize 32) | **32 bytes served** from the modem partition |
+| RRQ `.../mcfg_sw/mbn_sw.dig` (stat, then rsize 32) | **32 bytes served** |
+
+60 s: 92 packets in, 31 out; stop-ack 190 ms; rmtfs buffer back; no panic, phone up (SSH fine). Console:
+`research/ios26/logs-wlan/boot41-wlan-tftp-usb.txt` (main checkout, not in git). The 19:44/19:47Z attempts failed
+because two boot-41 items were queued (the Bergamota app's auto-reboot cut the first boot short) and the GPU session's
+Apple6 test crash-looped backboardd (initproc panic): queue exactly one item.
+
+**Reading:** the TFTP server works with the modem's real client (stat via tsize + ERROR 9, rsize reads, windowed
+writes). The modem does not ask for `wlanmdsp.mbn`: on Linux the WLAN protection domain (`msm/modem/wlan_pd`) is only
+started once the AP answers the modem's **service-locator** queries: `pd-mapper` (QMI SERVREG_LOCATOR, service 0x40)
+tells the modem which PDs exist (`wlan/fw` -> `msm/modem/wlan_pd`, instance 74). The modem already offers
+SERVREG_NOTIFIER (0x42). **Next (1115): a kernel pd-mapper** (service 0x40 v1, GET_DOMAIN_LIST answering from the
+beryllium/sdm845 JSON of linux-msm/pd-mapper); then the WLAN PD should load `wlanmdsp.mbn` over this TFTP server and
+WLFW (0x45) should appear.
