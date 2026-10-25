@@ -315,3 +315,25 @@ protected without an error response), not a watchdog or an XPU/SMMU fatal error.
 new hardware access (AOSS QMP message RAM 0xc300000 and the apss_shared doorbell); then step 4 (RPMh TCS). Less likely:
 step 2's UFS reads (they run under the root's I/O lock, so a hung read would also stop the root, but the console
 thread does not use that lock). The 1107 trace run decides it in one boot.
+
+### 5.4 Boot 34: traced re-run (1107, user present): freeze in the MBA copy
+
+Steps 1-5 completed: mba.mbn read (238304 B); QMP magic 0x4d41494c v1, mcore mailbox 0x128+0x2d8, `load_state on`
+consumed; ARC votes cx.lvl (0x30000, 8 levels, hlvl 7 = vlvl 384), mx.lvl (0x30010, 5 levels, hlvl 4), mss.lvl
+(0x30060, 8 levels, hlvl 7); snoc_axi on, alt reset deassert, GCC vote 0x1619d7b -> 0x163bd7b, mfab CBCR 0x1. The
+last line is **`step 6: copy MBA into its carve-out`** (printed, flushed, 1.5 s wait, then the copy): the CPU hung
+writing the MBA carve-out 0x96900000 (write-combined mapping). User: "the phone is stuck now" (freeze, no reboot).
+
+The carve-out addresses are right: the live DT's node names are stale (`modem_region@0x8e000000`,
+`mba_region@0x96500000`) but their `reg` values are 0x8e400000+0x7800000 and 0x96900000+0x200000, both
+removed-dma-pool, and the phone's own Android kernel (pil-q6v55-mss, `qcom,pil-mba-mem`) copies the MBA into that
+region. What differs from Linux is the **order**: Linux copies the MBA in `q6v5_load()`, which runs before
+`q6v5_start()` powers or releases anything; 1106/1107 copied it after step 5 had taken the MSS out of reset with its
+bus clocks on.
+
+**1108** (compile-checked): the copy is step 3, right after reading mba.mbn and before any MSS power, QMP, vote,
+clock or reset (Linux order), and logs `MBA copied`. Steps now: 1 map, 2 read, 3 copy, 4 QMP, 5 ARC, 6 clocks + alt
+reset, 7 SCM assign, 8 QDSP6 boot. Proposed next run: **`sweetmssstep=3`** first. It touches no modem hardware
+(only the DDR write), so it isolates the question: a freeze means the normal world cannot write that carve-out from
+xnu at all (mapping attributes / hypervisor stage-2); `MBA copied` means the order was the problem, and the full
+stage can be tried next.
