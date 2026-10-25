@@ -500,3 +500,32 @@ sweetmpss=1 sweetmpsshold=20`. The GPU session has no kernel/boot-arg change pen
 the only change. Not booted; needs the phone free and the user's OK. Expected risks: an MBA rejection (status < 0) is
 harmless; a modem that runs may stay with its carve-out until reboot; the forced halt of a running modem is Linux's
 crash path.
+
+### 5.9 Boot 38-wlan-mpss: **MPSS AUTHENTICATED and running**; no SMP2P entries yet
+
+**2026-10-25 17:44:14Z** (user OK, user present; also the GPU session's luma test via a userdata env file, no image
+change), `enxerto-boot-ios26full-boot38-wlan-mpss.img` (1111). Steps 1-8 as boot 37 (PBL 0x1 after 67 ms, MBA 0x1).
+Then:
+
+| Step | Result |
+|------|--------|
+| 9 | `modem.mdt` 8412 B, 30 program headers, hash ph1: metadata 1012 + 7400 = 8412 B (hash packed after the ELF header) |
+| 10 | metadata 0xe0000000+0x3000 HLOS -> MSS (status 0); **MBA status 3 after 7 ms (header authenticated)**; assigned back (status 0) |
+| 11 | MPSS reclaim MSS -> HLOS and share HLOS+MSS (status 0 both); 28 segments ph2..ph29 (`modem.b02`..`b29`; ph14/19/29 memory only) in **918 ms**, code length 0x77300f1, MBA status 3 throughout (no error) |
+| 12 | MPSS HLOS+MSS -> MSS (status 0); **MBA status 4 after 0 ms: `MPSS AUTHENTICATED`** |
+| 13 | first poll: **SMP2P item 435 exists** at SMEM +0xb9030 (apps<->modem partition): magic ok, version 1, features 0x1, pid 1->0, **0 of 16 entries valid**; no entry appeared in 20 s (no `slave-kernel`, so no ready/fatal bit) |
+| teardown | AXI q6 idle, **AXI modem halt ack 0 idle 0** (the modem port was busy: the MPSS was running), nc idle; MBA back to HLOS (status 0); MPSS left with the modem (owners 0x8000) until reboot as designed; mss.lvl 0, cx/mx kept; QMP `load_state off` consumed |
+
+The phone stayed up (SSH fine afterwards). Console: `research/ios26/logs-wlan/boot38-wlan-mpss-usb.txt` (main
+checkout, not in git). Also on this boot (not modem-related): `hfs_mark_inconsistent` on iOSRoot keeps appearing
+(hfs_cnode.c:946, pid 582); the root volume needs an fsck.
+
+**Reading:** the modem firmware booted far enough to create its SMP2P outbound item, so the MBA -> MPSS hand-over
+works. It adds its entries ("slave-kernel" with the ready bit) only after SMP2P negotiation, and the apps side has
+neither its own outbound item (428) nor ever rang the modem's doorbell. **Next (1112):** Linux
+`qcom_smp2p_alloc_outbound_item` + `qcom_smp2p_kick`: allocate item 428 in the apps<->modem partition under the SMEM
+hwlock (TCSR mutex 3; `qcom_smem_alloc` private-partition path: new entry at `offset_free_uncached`, canary 0xa5a5,
+size/padding, then advance the free offset), header magic/local 0/remote 1/total 16/features, `version = 1` after a
+barrier, add the "master-kernel" entry (stop bit for a clean stop later), then the doorbell: apss_shared 0x17990000
++12, bit 14 (`mboxes = <&apss_shared 14>`). Then poll 435 again for "slave-kernel" ready. First write into shared
+SMEM: gated, traced, one boot with the user present.
