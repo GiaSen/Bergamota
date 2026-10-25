@@ -127,6 +127,8 @@ by_count(const void *a, const void *b)
 	return x->count < y->count ? 1 : x->count > y->count ? -1 : 0;
 }
 
+static int all_threads;
+
 int
 main(int argc, char **argv)
 {
@@ -134,6 +136,7 @@ main(int argc, char **argv)
 	pid_t pid = find_pid(argv[1]);
 	double secs = argc > 2 ? atof(argv[2]) : 3;
 	int hz = argc > 3 ? atoi(argv[3]) : 500;
+	all_threads = getenv("SWEETSAMPLE_ALL") && getenv("SWEETSAMPLE_ALL")[0] == '1';
 	if (pid <= 0) { fprintf(stderr, "sweetsample: no process %s\n", argv[1]); return 1; }
 	task_t task;
 	kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
@@ -154,7 +157,9 @@ main(int argc, char **argv)
 		for (mach_msg_type_number_t i = 0; i < nth; i++) {
 			thread_basic_info_data_t bi;
 			mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
-			if (thread_info(th[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &c) != KERN_SUCCESS || bi.run_state != TH_STATE_RUNNING) {
+			/* SWEETSAMPLE_ALL=1: every thread, waiting ones too (where a hung process is blocked) */
+			if (thread_info(th[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &c) != KERN_SUCCESS ||
+			    (!all_threads && bi.run_state != TH_STATE_RUNNING)) {
 				mach_port_deallocate(mach_task_self(), th[i]);
 				continue;
 			}

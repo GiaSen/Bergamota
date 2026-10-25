@@ -2,6 +2,8 @@
  * sweetwallpaper IMAGE          make IMAGE (PNG/JPEG) the lock and home wallpaper: a Photos poster created by PosterBoard
  *                               itself, selected for the lock screen, the same image on the home screen
  * sweetwallpaper --lock IMAGE   lock screen only
+ * sweetwallpaper --home IMAGE   home screen only, for the lock poster that is selected now (after the create succeeded
+ *                               in PosterBoard but the reply failed, and sweetposterset --uuid selected the poster)
  *   e.g. sweetwallpaper /var/mobile/Media/Bergamota/wallpaper.png    (tools/identity/mkwallpaper.sh renders the
  *        Bergamota one)
  * Run as root over SSH or via SweetRun. The image is copied first to /var/mobile/Media/Bergamota/ (mobile-owned), where
@@ -41,11 +43,12 @@ main(int argc, char **argv)
 {
 	@autoreleasepool {
 		setvbuf(stdout, NULL, _IOLBF, 0);
-		BOOL lock_only = NO;
+		BOOL lock_only = NO, home_only = NO;
 		int a = 1;
 		if (argc > 1 && !strcmp(argv[1], "--lock")) { lock_only = YES; a = 2; }
+		if (argc > 1 && !strcmp(argv[1], "--home")) { home_only = YES; a = 2; }
 		if (argc <= a) {
-			fprintf(stderr, "usage: sweetwallpaper [--lock] IMAGE\n");
+			fprintf(stderr, "usage: sweetwallpaper [--lock|--home] IMAGE\n");
 			return 2;
 		}
 
@@ -80,11 +83,17 @@ main(int argc, char **argv)
 		__block id poster = nil;
 		__block NSError *err = nil;
 		dispatch_semaphore_t s = dispatch_semaphore_create(0);
-		[ext createLockScreenPhotosPosterWithImageAtURL:url selectLockScreenPoster:YES completion:^(id p, id er) {
-			poster = p; err = er;
-			dispatch_semaphore_signal(s);
-		}];
-		if (wait_for(s, 30)) { printf("TIMEOUT creating the lock screen poster\n"); return 3; }
+		if (home_only)
+			[[NSClassFromString(@"PRSService") new] fetchSelectedPosterForRole:@"PRPosterRoleLockScreen" completion:^(id p, id er) {
+				poster = p; err = er;
+				dispatch_semaphore_signal(s);
+			}];
+		else
+			[ext createLockScreenPhotosPosterWithImageAtURL:url selectLockScreenPoster:YES completion:^(id p, id er) {
+				poster = p; err = er;
+				dispatch_semaphore_signal(s);
+			}];
+		if (wait_for(s, 30)) { printf("TIMEOUT %s the lock screen poster\n", home_only ? "fetching" : "creating"); return 3; }
 		printf("lock poster: %s\n", describe(poster).UTF8String);
 		if (!poster) {
 			printf("PosterBoard refused: %s\n", describe(err).UTF8String);

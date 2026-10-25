@@ -72,6 +72,13 @@ if [ "${IOS18:-1}" = 1 ]; then
 	b18 sweetposterset sweetposterset.m posterset.entitlements
 	# a picture as the lock and home wallpaper through PosterBoard's Photos poster (tools/identity/mkwallpaper.sh)
 	b18 sweetwallpaper sweetwallpaper.m posterset.entitlements
+	# iOS 26: the Bergamota picture as the legacy wallpaper, drawn by PosterBoard's LegacyPoster (no HEIC, no Photos pipeline)
+	b18 sweetlegacywall sweetlegacywall.m posterset.entitlements -framework UIKit
+	# iOS 26: PosterBoard on the HFS root without data protection (file protection, purgeable, the empty StandBy role)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -fobjc-arc -dynamiclib \
+		-install_name /usr/local/lib/sweetpb26.dylib -framework Foundation "$here/sweetpb26.m" -o "$out18/sweetpb26.dylib"
+	codesign -s - -f "$out18/sweetpb26.dylib"
+	python3 -I "$pacstrip" --sign "$out18/sweetpb26.dylib"
 	b18 sweeticonstyle sweeticonstyle.m iconstyle.entitlements -framework UIKit
 	b18 sweetopen sweetopen.m uicache.entitlements
 	# remote testing over SSH: screenshot of the panel (PNG) and synthetic touch/buttons
