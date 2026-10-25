@@ -585,3 +585,41 @@ ack the halt after a clean stop; Linux only logs that too.
    478/479/480 FIFOs + the same doorbell).
 3. **TFTP/QMI service for `wlanmdsp.mbn`** and the board file, then **WLFW** (QMI service 0x45: capability, BDF
    download, mode on) to bring up the WCN3990 WLAN core; the copy engine rings and the SMMU stream 0x40 come after.
+
+### 5.12 W5 / 1113: rmtfs for the running modem (QRTR over GLINK over SMEM): built, NOT run
+
+The modem reaches rmtfs as QMI service 14 over QRTR, which runs on the GLINK channel "IPCRTR" over SMEM, so the
+"rmtfs step" is four layers in one patch (`1113-beryllium-mpss-rmtfs-qrtr-glink.patch`), gated by **`sweetrmtfs=1`**
+on top of `sweetmpss=1`. With the gate, step 14 waits only for ready (5 s, like `qcom_q6v5_wait_for_start`), then
+**step 15** (Linux starts the GLINK subdevice after the remoteproc started) and a polled service loop for
+`sweetmpsshold` seconds:
+
+* **rmtfs buffer** (`rmtfs_mem.c`): 0xf6301000 + 2 MiB (mainline beryllium `rmtfs_mem`), hyp-assigned HLOS -> HLOS
+  RW + MSS RW, kernel window write-combined; assigned back to HLOS RW in the teardown. The 16 KiB-page window also
+  covers 4 KiB before and 12 KiB after the buffer: plain RAM outside every fixed carve-out and never assigned, so it
+  stays HLOS-owned (review note, kept as is).
+* **GLINK SMEM** (`qcom_glink_smem.c`): we allocate the descriptor (item 478, 32 B: tx tail/head, rx tail/head) and
+  our TX FIFO (479, 16 KiB, its real item size is used), the modem's FIFO is item 480; head aligned to 8, 16-byte TX
+  reserve, doorbell apss_shared +12 bit 12.
+* **GLINK native** (`qcom_glink_native.c`): VERSION/VERSION_ACK with feature INTENT_REUSE; the modem opens
+  "IPCRTR" -> OPEN_ACK with its id, our OPEN (lcid 1), wait for its OPEN_ACK, then 5 x 1 KiB reusable intents;
+  TX_DATA/CONT into our intents, RX_DONE_W_REUSE; RX_INTENT_REQ answered with a one-shot intent + ack; our TX uses
+  the smallest free modem intent, else the packet waits in a small queue and one RX_INTENT_REQ goes out (no nested
+  waiting). Other channels the modem opens are only logged (Linux acks them only when a driver binds).
+* **QRTR** (`af_qrtr.c`, `ns.c`): v1 header out, v1 and v2 in; local node 1; on the modem's HELLO: our HELLO +
+  NEW_SERVER {service 14, instance field 1 (= instance 0 << 8 | version 1), node 1, port 0x4000} (fallback: sent 3 s
+  after the channel opened if no HELLO came); RESUME_TX for confirm_rx; every modem NEW_SERVER/DEL_SERVER is logged
+  (it shows what the modem wants next, e.g. TFTP for wlanmdsp.mbn).
+* **rmtfs server** (linux-msm/rmtfs): OPEN `/boot/modem_fs1|fs2|fsc|fsg` -> modemst1/modemst2/fsc/fsg (caller id =
+  table index), ALLOC_BUFF -> 0xf6301000, RW_IOVEC (sectors of 512 B <-> absolute buffer addresses), CLOSE,
+  GET_DEV_ERROR (status 0). **Reads come from UFS; the first write to a partition makes a RAM copy of it (rmtfs -o) and
+  every later read/write of that partition uses the copy: storage is never written.**
+
+Third independent review against the downloaded Linux v6.6 + linux-msm/rmtfs sources: no must-fix; applied: queued TX
+instead of a nested wait, QRTR v2 parsing, item 479's own size, 64 modem-intent slots, an overflow-safe chunk bound
+and no delivery of dropped payloads, RESUME_TX node from the header.
+
+Image `shim/out/enxerto-boot-ios26full-boot40-wlan-rmtfs.img` (sha256 `7e520fd4...`, kernel `5df7052c...` = boot 33b's
+kernel + 1108-1113): boot 39's args with `sweetrmtfs=1 sweetmpsshold=60`. GPU: the dock-glass change (Chlorophyll
+4a64d87) is userland only and rides along; tell the GPU session once the home screen is up. Not booted: needs the
+user's OK.
