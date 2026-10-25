@@ -658,3 +658,31 @@ service set. Two things are missing for Wi-Fi:
    phone's `modem` partition (read-only), log every request path.
 2. Then **WLFW** (QMI service 0x45) should appear; next comes the WLFW client (indication register, host capability,
    BDF download from `bdwlan.*`, WLAN mode on) to bring up the WCN3990 core.
+
+### 5.14 1114: TFTP over QRTR for the modem's WLAN firmware (read-only): built, NOT run
+
+`1114-beryllium-mpss-tftp.patch`, gate **`sweettftp=1`** (on top of `sweetrmtfs=1`), a kernel copy of linux-msm
+`tqftpserv`:
+* **Service**: QRTR service 4096 version 1 (instance field 1) at 1:0x4001, announced with rmtfs after the modem's
+  HELLO. RRQ/WRQ arrive there; every transfer runs on its own port (`qrtr_open(0)` + `connect()`), errors before a
+  session come from a fresh port.
+* **Protocol**: RFC 1350 + tqftpserv's options (blksize 8-65464, timeoutms, tsize, wsize, rsize, seek; unknown ones
+  ignored), OACK in tqftpserv's order echoing the values; the reader uses tqftpserv's exact arithmetic (window of
+  wsize blocks per ACK, `rsize % blksize` cut of the last block, close once `last * blksize > rsize`; without rsize
+  only block 1, as tqftpserv), ERROR 9 "end of transfer" closes; the window is sent as fast as the GLINK TX queue
+  takes it (no dropped blocks); DEL_CLIENT/BYE end that client's transfers; 8 slots, the oldest is evicted.
+* **Paths** (`translate.c`): `/readonly/firmware/image/X`, `/readonly/vendor/firmware_mnt/image/X`,
+  `/readonly/vendor/firmware/X` and `/readonly/firmware/modem_prX` -> the phone's **`modem` partition `image/...`,
+  read-only** (8.3 names only, the FAT reader's limit); `/readwrite/X` -> **RAM files** (8 x 256 KiB, read back by later
+  RRQs, dropped at teardown). sanitize_path (no empty component, no `..`). **Storage is never written.**
+* GLINK TX now sends messages over 8 KiB in TX_DATA + TX_DATA_CONT chunks into one modem intent
+  (`__qcom_glink_send`), a failed chunk fails the send; queued packets are heap copies.
+
+Fourth independent review against the downloaded tqftpserv + GLINK sources: no must-fix; applied: window pumping
+instead of a burst into a 32-entry queue, failed-chunk handling, writer tsize/timeoutms echoed, the modem_pr prefix,
+case-insensitive mode, slot eviction, 32-bit option checks and a separate seek flag, name length/8.3 checks.
+
+Image `shim/out/enxerto-boot-ios26full-boot41-wlan-tftp.img` (sha256 `09a90d2c...`, kernel `401c6c26...` = boot 33b's
+kernel + 1108-1114): boot 40's args plus `sweettftp=1`. Expected: the modem's WLAN PD asks for `wlanmdsp.mbn`
+(3645892 B in the modem partition), then WLFW (QMI service 0x45) appears among the modem's services. Not booted: needs
+the user's OK.
