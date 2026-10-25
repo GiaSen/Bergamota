@@ -208,7 +208,7 @@ fn root_build_from_a_folder() {
     let r = Command::new(bin()).arg("root").arg(&src).arg(d.join("x.simg")).output().unwrap();
     assert!(!r.status.success());
     let simg = d.join("root.simg");
-    run(Command::new(bin()).arg("root").arg(&src).arg(&simg).args(["--unsigned", "--map", "map.tsv", "--date", "1700000000"]).current_dir(&d));
+    run(Command::new(bin()).arg("root").arg(&src).arg(&simg).args(["--unsigned", "--no-tweaks", "--map", "map.tsv", "--date", "1700000000"]).current_dir(&d));
     assert!(!d.join("root.img").exists(), "raw image consumed");
     let ls = |p: &str| run(py("hfsx.py").arg(&simg).args(["ls", p]));
     assert!(!ls("/").contains(".fseventsd"));
@@ -225,6 +225,51 @@ fn root_build_from_a_folder() {
     assert!(st.contains("uid,gid (0, 0) mode 100755"), "{st}");
     let st = run(py("hfsx.py").arg(&simg).args(["stat", "/usr/lib/hello.txt"]));
     assert!(st.contains("uid,gid (0, 0)"), "unmapped paths become root:wheel: {st}");
+    if have("fsck_hfs") && have("hdiutil") {
+        let raw = d.join("check.img");
+        run(Command::new(bin()).arg("simg2img").arg(&simg).arg(&raw));
+        let dev = attach(&raw, None);
+        let o = Command::new("fsck_hfs").args(["-fn", &dev]).output().unwrap();
+        detach(&dev);
+        assert!(String::from_utf8_lossy(&o.stdout).contains("appears to be OK"), "{}", String::from_utf8_lossy(&o.stdout));
+    }
+}
+
+#[test]
+fn root_build_with_tweaks_matches_root_tweaks18() {
+    if !have("python3") {
+        return;
+    }
+    let d = tmpdir();
+    let (src, py_root, tools) = (d.join("src"), d.join("py"), d.join("tools"));
+    let script = root().join("tests/tweaks_fixture.py");
+    for r in [&src, &py_root] {
+        run(Command::new("python3").arg("-I").arg(&script).arg("make").arg(r).arg(&tools));
+        fs::create_dir_all(r.join("System/Library/Caches/com.apple.dyld")).unwrap();
+        fs::write(r.join("System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e"), b"cache").unwrap();
+    }
+    run(Command::new("python3").arg("-I").arg(&script).arg("run").arg(&py_root).arg(&tools));
+    let simg = d.join("root.simg");
+    run(Command::new(bin()).arg("root").arg(&src).arg(&simg).args(["--unsigned", "--build", "22H352", "--version", "18.7.8", "--board", "N841", "--adt-target", "D22"])
+        .arg("--netcfg").arg(tools.join("sweetnetcfg")).arg("--sweetreboot").arg(tools.join("sweetreboot")));
+    let cat = |p: &str| Command::new("python3").arg("-I").arg(root().join("../renegade/hfsx.py")).arg(&simg).args(["cat", p]).output().unwrap().stdout;
+    for p in [
+        "System/Library/xpc/launchd.plist",
+        "System/Library/LaunchDaemons/org.sweet.netcfg.plist",
+        "private/var/preferences/SystemConfiguration/preferences.plist",
+        "private/var/preferences/SystemConfiguration/NetworkInterfaces.plist",
+        "private/var/mobile/Library/Preferences/com.apple.springboard.plist",
+        "System/Library/Frameworks/MediaToolbox.framework/A/SubServerConfiguration.plist",
+        "usr/local/share/renegade/register-apps",
+        "private/var/keybags/systembag.kb",
+    ] {
+        assert!(cat(&format!("/{p}")) == fs::read(py_root.join(p)).unwrap(), "{p} in the image differs from root_tweaks18.py's");
+    }
+    let stat = |p: &str| run(py("hfsx.py").arg(&simg).args(["stat", p]));
+    assert!(stat("/private/var/mobile/Library/Preferences/com.apple.springboard.plist").contains("uid,gid (501, 501) mode 100600"));
+    assert!(stat("/Applications/Zed.app/Contents/Info.plist").contains("uid,gid (0, 0)"));
+    assert!(stat("/private/var/db/diagnostics/.migrated").contains("uid,gid (272, 272) mode 100644"));
+    assert!(stat("/usr/local/bin/sweetreboot").contains("uid,gid (0, 0) mode 100755"));
     if have("fsck_hfs") && have("hdiutil") {
         let raw = d.join("check.img");
         run(Command::new(bin()).arg("simg2img").arg(&simg).arg(&raw));

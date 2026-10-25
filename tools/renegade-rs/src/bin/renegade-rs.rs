@@ -34,6 +34,8 @@ fn main() -> ExitCode {
         Some("mkhfs") => cmd_mkhfs(&args[1..]),
         Some("rebuild") => cmd_rebuild(&args[1..]),
         Some("root") => cmd_root(&args[1..]),
+        Some("plist") => cmd_plist(&args[1..]),
+        Some("tweaks") => cmd_tweaks(&args[1..]),
         _ => {
             eprintln!("{}", USAGE);
             return ExitCode::from(2);
@@ -181,8 +183,10 @@ fn img2simg_consume(raw: &Path, out: &Path) -> Res<renegade::sparse::Img2SimgSta
 /// The root build from an extracted root folder (the IPSW volumes merged: cryptexes first, OS volume on top):
 /// copy-stage layout fixes, owner map, PAC strip of every Mach-O, HFSX image, sparse image.
 fn cmd_root(args: &[String]) -> Res<ExitCode> {
-    let (pos, opts, flags) = split(args, &["--map", "--size", "--name", "--date", "--raw"]);
-    let [src, out] = &pos[..] else { return Err("root SRC_DIR OUT.simg --unsigned [--map owners.tsv] [--size 20g] [--raw RAW.img] [--keep-raw]".into()) };
+    let (pos, opts, flags) = split(args, &["--map", "--size", "--name", "--date", "--raw", "--build", "--version", "--board", "--adt-target", "--netcfg", "--sweetreboot"]);
+    let [src, out] = &pos[..] else {
+        return Err("root SRC_DIR OUT.simg --unsigned --build B --version V [--board N104 --adt-target N104] [--map owners.tsv] [--size 20g] [--raw RAW.img] [--keep-raw] [--no-tweaks] [--quiet] [--netcfg FILE] [--sweetreboot FILE]".into());
+    };
     if !flags.iter().any(|f| f == "--unsigned") {
         return Err("the Rust root build cannot re-sign the rewritten Mach-Os yet (pacstrip.py --sign does, through codesign/ldid): pass --unsigned to build anyway (the phone refuses unsigned code)".into());
     }
@@ -190,10 +194,41 @@ fn cmd_root(args: &[String]) -> Res<ExitCode> {
     let (mut entries, paths, skipped) = renegade::tree::scan_dir(Path::new(src))?;
     eprintln!("{} entries, {} skipped (not file/folder/symlink)", entries.len(), skipped.len());
     renegade::tree::layout_fixes(&mut entries, date)?;
-    let map = match opts.get("--map") {
+    let mut map = match opts.get("--map") {
         Some(m) => renegade::hfsedit::parse_map(&fs::read_to_string(m)?)?,
         None => Default::default(),
     };
+    // tweaks on the tree (root_tweaks18.py on the mounted image); their chowns override the map like OWNER_EXTRA
+    let base = paths.len();
+    let read_src = |i: usize| fs::read(&paths[i]);
+    let mut tfs = renegade::tweaks::TreeFs::new(entries, base, date, read_src);
+    // SAFETY: getuid/getgid cannot fail
+    tfs.skip_owner = Some(unsafe { (libc::getuid(), libc::getgid()) });
+    if !flags.iter().any(|f| f == "--no-tweaks") {
+        let read = |k: &str| opts.get(k).map(fs::read).transpose();
+        let cfg = renegade::tweaks::Config {
+            build: opts.get("--build").cloned().ok_or("--build is required (or --no-tweaks)")?,
+            version: opts.get("--version").cloned().ok_or("--version is required (or --no-tweaks)")?,
+            board: opts.get("--board").cloned().unwrap_or("N104".into()),
+            adt_target: opts.get("--adt-target").cloned().unwrap_or("N104".into()),
+            quiet: flags.iter().any(|f| f == "--quiet"),
+            netcfg: read("--netcfg")?,
+            sweetreboot: read("--sweetreboot")?,
+            root_display: String::new(),
+        };
+        let mut log = Vec::new();
+        renegade::tweaks::run(&mut tfs, &cfg, &mut log)?;
+        for l in log {
+            eprintln!("tweaks: {l}");
+        }
+        let recorded: Vec<(String, (u32, u32))> = renegade::tweaks::Fs::owners(&tfs).iter().map(|(k, v)| (k.clone(), *v)).collect();
+        for (p, (u, g)) in recorded {
+            let perm = renegade::tweaks::Fs::stat(&tfs, &p).map(|s| s.2).unwrap_or(0o644);
+            use unicode_normalization::UnicodeNormalization;
+            map.insert(p.nfd().collect(), (u, g, perm));
+        }
+    }
+    let renegade::tweaks::TreeFs { mut entries, overlay, .. } = tfs;
     let (mapped, defaulted) = renegade::tree::apply_map(&mut entries, &map, true);
     eprintln!("owners: {mapped} from the map, {defaulted} root:wheel");
     let o = renegade::hfswrite::Options {
@@ -209,6 +244,9 @@ fn cmd_root(args: &[String]) -> Res<ExitCode> {
     let mut totals: BTreeMap<String, u64> = BTreeMap::new();
     let (mut rewritten, mut machos) = (0u64, 0u64);
     let st = renegade::hfswrite::build(&entries, &o, &mut w, &mut |source, sink| {
+        if source >= base {
+            return sink(&overlay[source - base]);
+        }
         let p = &paths[source];
         let mut data = fs::read(p)?;
         if !p.starts_with(&dyld) && looks_like_macho(&data) {
@@ -237,6 +275,48 @@ fn cmd_root(args: &[String]) -> Res<ExitCode> {
         s
     };
     eprintln!("{out}: {} blocks, {} chunks", s.blocks, s.chunks);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// plistlib round trip: load IN (binary or XML), dump OUT as binary (default) or XML.
+fn cmd_plist(args: &[String]) -> Res<ExitCode> {
+    let (pos, opts, _) = split(args, &["--fmt"]);
+    let [src, dst] = &pos[..] else { return Err("plist IN OUT [--fmt binary|xml]".into()) };
+    let v = renegade::plist::parse(&fs::read(src)?)?;
+    let out = match opts.get("--fmt").map(String::as_str) {
+        Some("xml") => renegade::plist::to_xml(&v)?,
+        _ => renegade::plist::to_binary(&v),
+    };
+    fs::write(dst, out)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The ported tweaks on a root folder (what root_tweaks18.py does to the mounted image): prints the same lines,
+/// then the recorded owners ("OWNER path uid gid").
+fn cmd_tweaks(args: &[String]) -> Res<ExitCode> {
+    let (pos, opts, flags) = split(args, &["--build", "--version", "--board", "--adt-target", "--netcfg", "--sweetreboot", "--display"]);
+    let [root] = &pos[..] else { return Err("tweaks ROOT_DIR --build B --version V [--board N841 --adt-target D22] [--quiet] [--netcfg FILE] [--sweetreboot FILE] [--display PATH]".into()) };
+    let read = |k: &str| opts.get(k).map(fs::read).transpose();
+    let cfg = renegade::tweaks::Config {
+        build: opts.get("--build").cloned().ok_or("--build is required")?,
+        version: opts.get("--version").cloned().ok_or("--version is required")?,
+        board: opts.get("--board").cloned().unwrap_or("N104".into()),
+        adt_target: opts.get("--adt-target").cloned().unwrap_or("N104".into()),
+        quiet: flags.iter().any(|f| f == "--quiet"),
+        netcfg: read("--netcfg")?,
+        sweetreboot: read("--sweetreboot")?,
+        root_display: opts.get("--display").cloned().unwrap_or(root.clone()),
+    };
+    let mut f = renegade::tweaks::DirFs::new(root);
+    let mut log = Vec::new();
+    let r = renegade::tweaks::run(&mut f, &cfg, &mut log);
+    for l in &log {
+        println!("{l}");
+    }
+    r?;
+    for (p, (u, g)) in renegade::tweaks::Fs::owners(&f) {
+        println!("OWNER {p} {u} {g}");
+    }
     Ok(ExitCode::SUCCESS)
 }
 

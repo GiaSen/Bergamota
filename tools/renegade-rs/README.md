@@ -22,11 +22,15 @@ the web flasher (`apps/web`, phase 3).
 | `hfs_trim.py` | `hfsedit::free_runs`, `renegade-rs trim IMAGE` | byte-identical image |
 | owners.tsv (`write_map` / `load_map` of mkroot-full.py) | `hfsedit::format_map` / `parse_map` | same text |
 | `newfs_hfs -s` + mount + `ditto` + `hfsroot_owners.py` (no Python writer) | `hfswrite::build`, `renegade-rs mkhfs DIR IMG`, `rebuild SIMG IMG --prefix P` | fsck_hfs clean, mounts, same tree, same owners as the Python way |
-| copy-stage layout fixes, owner map, macho stage (strip), seal, img2simg --consume | `renegade-rs root DIR OUT.simg --unsigned` | stripped Mach-Os identical to pacstrip.py; no re-signing yet |
+| `plistlib.load` / `dump(FMT_BINARY / FMT_XML)` | `plist::parse`, `to_binary`, `to_xml`, `renegade-rs plist IN OUT [--fmt xml]` | byte-identical on 426 plists of the iOS 26 root (852 dumps, incl. launchd.plist's shared containers) and 300 random ones |
+| `root_tweaks18.py`: launchd, quiet, containers, launchservices, event_timing, usbnet, netcfg, sweetreboot, sweetmetrics, audio, activation, prefs, iosroot_dirs, staged apps, the bluetoothd environment, add_job | `tweaks::run` on a folder (`DirFs`, `renegade-rs tweaks DIR`) or on the root build's tree (`TreeFs`) | same files, modes, recorded owners and printed lines as root_tweaks18.py |
+| copy-stage layout fixes, tweaks, owner map (+ the tweaks' owners as OWNER_EXTRA), macho stage (strip), seal, img2simg --consume | `renegade-rs root DIR OUT.simg --unsigned --build B --version V` | tweaked files identical to root_tweaks18.py's, stripped Mach-Os identical to pacstrip.py, fsck_hfs clean; no re-signing yet |
 
 Not ported yet: `pacstrip.py --sign` (ad-hoc re-signing goes through codesign/ldid; the Rust CLI refuses
-`--sign`, and `renegade-rs root` needs `--unsigned` until it can sign), the tweaks stage (`root_tweaks18.py`),
-the jailbreak stage, IPSW/AEA extraction and the APFS volumes (the root build starts from an extracted folder),
+`--sign`, and `renegade-rs root` needs `--unsigned` until it can sign), the tweaks that install prebuilt tools
+with host steps (ssh: dropbear + host-generated keys; the BlueTool stub, hcitest and firmware; PosterBoard +
+sweetfp via addlc.py; bgmtl; bglrender; the first-boot job; sweetprefs), the console bring-up job, the
+jailbreak stage, IPSW/AEA extraction and the APFS volumes (the root build starts from an extracted folder),
 the shared-cache stage (`pacstrip_cache.py`, still changing on the `ios26` branch: `--stubs`),
 `simg_putfile.py`, and the boot images (`mkboot-full.sh`). Reference for the port: branch `ios26` at `6a66010`.
 
