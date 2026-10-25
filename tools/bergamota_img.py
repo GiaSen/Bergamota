@@ -1,4 +1,4 @@
-"""Tiny stdlib-only image helpers shared by mksplash.py and mkbootlogo.py.
+"""Tiny stdlib-only image helpers shared by mksplash.py, mkapplelogo.py and tools/identity/mkidentity.py.
 
 RGB canvases are bytearrays (3 bytes/pixel); RGBA images are (w, h, bytearray) with
 non-premultiplied alpha, as written by tools/make-boot-assets.swift.

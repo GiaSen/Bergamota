@@ -11,7 +11,7 @@ open apps/Bergamota/Bergamota.xcodeproj          # then Run in Xcode
 cd apps/Bergamota && xcodebuild -scheme Bergamota -configuration Debug build
 ```
 
-The project is generated from `project.yml` with [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen && xcodegen generate`); both `project.yml` and the generated `Bergamota.xcodeproj` are committed. The app icon is produced by `swift scripts/make-icon.swift`.
+The project is generated from `project.yml` with [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen && xcodegen generate`); both `project.yml` and the generated `Bergamota.xcodeproj` are committed. The app icon is produced by `tools/identity/mkicon.sh` (the Bergamota identity, `tools/identity/IDENTITY.md`).
 
 ## Usage
 

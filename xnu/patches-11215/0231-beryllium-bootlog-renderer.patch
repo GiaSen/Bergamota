@@ -1,13 +1,10 @@
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 --- a/osfmk/console/video_console.c
 +++ b/osfmk/console/video_console.c
-@@ -2876,10 +2876,333 @@
- 		vc_uiscale = kMaxProgressData;
- 	} else if (!vc_uiscale) {
- 		vc_uiscale = 1;
-+	}
-+}
-+
+@@ -2872,6 +2872,335 @@
+ 	}
+ }
+ 
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +/*
 + * Bergamota boot log (boot-arg -v). The loader starts the kernel in graphics mode (v_display=1), where xnu's text
@@ -26,12 +23,18 @@ diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 +#define BL_MAXROWS      200
 +#define BL_TOP_MARGIN   112             /* the Poco F1 notch */
 +#define BL_HEADER_PAD   12              /* above and below the header text */
-+#define BL_COL_HEADER   0x00141414      /* header band */
-+#define BL_COL_DIM      0x00909090
-+#define BL_COL_TEXT     0x00dcdcdc
-+#define BL_COL_ERROR    0x00ff6b6b
-+#define BL_COL_WARN     0x00ffc857
-+#define BL_COL_OURS     0x009be37f      /* Bergamota's own drivers (sweet*, beryllium, Rootstock) */
++/* tools/identity: a lime header band with ink text; paper-coloured lines on black, Bergamota's own in lime */
++#define BL_COL_HEADER   0x00d7e98a      /* header band: the lime ground */
++#define BL_COL_HDR_INK  0x00161616
++#define BL_COL_HDR_DIM  0x005d6638      /* ink at 55 % over the lime */
++#define BL_COL_HDR_LEAF 0x001a5933
++#define BL_COL_HDR_RED  0x00b3261e
++#define BL_COL_HDR_AMBER 0x008a5a00
++#define BL_COL_DIM      0x008c8b84
++#define BL_COL_TEXT     0x00f4f3ec      /* paper */
++#define BL_COL_ERROR    0x00ff7a66
++#define BL_COL_WARN     0x00f2c14e
++#define BL_COL_OURS     0x00d7e98a      /* Bergamota's own drivers (sweet*, beryllium, Rootstock): the lime */
 +
 +static char             bl_text[BL_MAXROWS][BL_MAXCOLS];
 +static uint8_t          bl_len[BL_MAXROWS];
@@ -159,22 +162,22 @@ diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 +	int rn = 0;
 +
 +	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
-+	bl_put_str(t, cols, &n, bl_cols, "Bergamota", BL_COL_OURS);
-+	bl_put_str(t, cols, &n, bl_cols, "  verbose boot", BL_COL_DIM);
++	bl_put_str(t, cols, &n, bl_cols, "BERGAMOTA", BL_COL_HDR_INK);
++	bl_put_str(t, cols, &n, bl_cols, "  verbose boot", BL_COL_HDR_DIM);
 +
 +	snprintf(num, sizeof(num), "%llu.%03llu s", ns / 1000000000ull, (ns / 1000000ull) % 1000ull);
-+	bl_put_str(right, rcols, &rn, (int)sizeof(right), num, BL_COL_TEXT);
++	bl_put_str(right, rcols, &rn, (int)sizeof(right), num, BL_COL_HDR_INK);
 +	if (sweet_battery_hud(&pct, &ma)) {
 +		snprintf(num, sizeof(num), "   %d%%", pct);
 +		bl_put_str(right, rcols, &rn, (int)sizeof(right), num,
-+		    pct <= 15 ? BL_COL_ERROR : pct <= 30 ? BL_COL_WARN : BL_COL_OURS);
++		    pct <= 15 ? BL_COL_HDR_RED : pct <= 30 ? BL_COL_HDR_AMBER : BL_COL_HDR_LEAF);
 +		snprintf(num, sizeof(num), " %s%d mA", ma > 0 ? "+" : "", ma);
-+		bl_put_str(right, rcols, &rn, (int)sizeof(right), num, BL_COL_DIM);
++		bl_put_str(right, rcols, &rn, (int)sizeof(right), num, BL_COL_HDR_DIM);
 +	} else {
-+		bl_put_str(right, rcols, &rn, (int)sizeof(right), "   battery --", BL_COL_DIM);
++		bl_put_str(right, rcols, &rn, (int)sizeof(right), "   battery --", BL_COL_HDR_DIM);
 +	}
 +	while (n < bl_cols - rn) {
-+		cols[n] = BL_COL_TEXT;
++		cols[n] = BL_COL_HDR_INK;
 +		t[n++] = ' ';
 +	}
 +	for (int k = 0; k < rn && n < bl_cols; k++) {
@@ -184,7 +187,7 @@ diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 +
 +	int ty = bl_header_y + BL_HEADER_PAD;
 +	bl_draw_text((unsigned int)bl_header_y, (unsigned int)(ty + ISO_CHAR_HEIGHT * bl_scale + BL_HEADER_PAD), ty, t, n, cols,
-+	    BL_COL_TEXT, BL_COL_HEADER, FALSE, 0, 0);
++	    BL_COL_HDR_INK, BL_COL_HEADER, FALSE, 0, 0);
 +}
 +
 +static void
@@ -292,7 +295,7 @@ diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 +	PE_parse_boot_argn("sweetbootlog_scale", &scale, sizeof(scale));
 +	if (scale < 1 || scale > 4) {
 +		scale = 2;
- 	}
++	}
 +	bl_scale = scale;
 +	bl_cols = (int)(vinfo.v_width / (ISO_CHAR_WIDTH * scale)) - 1;
 +	bl_header_y = BL_TOP_MARGIN;
@@ -321,21 +324,20 @@ diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 +	}
 +	bl_started = TRUE;
 +	thread_call_enter(bl_call);
- }
- 
++}
++
 +/* AppleCLCD, on the GUI's first frame: the boot log stops drawing for good */
- void
++void
 +sweet_bootlog_stop(void)
 +{
 +	bl_stopped = 1;
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 +
-+void
+ void
  initialize_screen(PE_Video * boot_vinfo, unsigned int op)
  {
- 	unsigned int newMapSize = 0;
-@@ -3055,6 +3378,9 @@
+@@ -3048,6 +3377,9 @@
  		gc_enable( !graphics_now );
  		gc_acquired = TRUE;
  		gc_desire_text = FALSE;
