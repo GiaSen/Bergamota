@@ -172,7 +172,9 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
         if lp_base < phys_base + mem_size and phys_base < lp_base + lp_size:
             raise SystemExit(f'--lowpool {lp_base:#x}:{lp_size:#x} overlaps the kernel RAM {phys_base:#x}+{mem_size:#x}')
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
-    seed = seed if seed is not None else os.urandom(64)
+    # 256 bytes: xnu-12377 asks the bootloader for 4 * SHA-512 (prng_random.c, panics "Expected 256 seed bytes from
+    # bootloader, but got 64"); older kernels copy only the 64 they ask for (PE_get_random_seed clamps)
+    seed = seed if seed is not None else os.urandom(256)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
 
