@@ -6,7 +6,7 @@
 * iOS 26 has no IO80211Family kext (Wi-Fi = DriverKit dext). wifid matches only IOKit properties, and the IO80211 framework falls back to `SIOCGA80211/SIOCSA80211` ioctls + `KEV_IEEE80211_CLASS` events when the service has no user client, so an in-kernel stand-in is enough for the iOS half. Patch range 1100-1199 is Wi-Fi's.
 * Merged into ios26: **1100** stand-in (`sweet80211=1`, en0 + IOKit + ioctl log), **1101** boot-23 fixes, **1102** `sweet80211=2` synthetic network "Bergamota-test". `tools/adt-wlan.py` -> `enxerto/out/beryllium-n104-2x-wlan.adt`.
 * **2026-10-25 boot 29: Settings › Wi-Fi lists the synthetic network "Bergamota-test" (user-confirmed)** with 1100-1103 + `sweet80211=2`. iOS half done (1103 = HW_SUPPORTED_CHANNELS, which Settings needs before it scans). `sweetwifi scan` also returns it.
-* Next: the chip half (W4+), a real WCN3990 backend: docs/WIFI_BT_PLAN.md P0-P5 forward-ported to xnu-12377 (read-only probes `sweetwlan=1`/`=3` first, then the gated MSS boot with the user present).
+* Chip half started (W4, docs/WIFI_IOS26.md section 5): no new code needed for P0/P1; one boot with `sweetwlan=3 sweetwlandelay=30` (read-only probe + modem/bluetooth partition inventory, reviewed safe) handed to the iOS 26 session. Then P3 (gated MSS/MBA boot) only with the user present.
 
 ### >>> Wi-Fi / Bluetooth on iOS 18 (branch `wifi-bt18`, 2026-10-24): docs/WIFI_BT_IOS18.md <<<
 * **2026-10-24 16:05: BLUETOOTH WORKS on combo9** (GPU session's local kernel = develop + 0238 + 0239 v7, ADT gpufwz-bt, BT boot-args): bluetoothd stays up, PoweredOn, Settings lists nearby devices (user-checked). Fix chain per boot in docs/WIFI_BT_IOS18.md 2.2-2.11. Not merged to develop yet.

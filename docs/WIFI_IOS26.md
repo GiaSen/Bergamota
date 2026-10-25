@@ -194,3 +194,27 @@ through the Bergamota queue, and only with the user's OK.
   in-kernel stand-in, power the radio, scan and show results. What remains is the chip half (W4+): a real WCN3990
   backend behind `s8_get/s8_set` (power, scan results from WMI, then join/WPA2/data). Joining the synthetic
   network fails by design (ASSOCIATE -> ENXIO).
+
+## 5. Chip half (W4+): read-only probes first
+
+Started 2026-10-25 (user: "start the chip half with the read-only sweetwlan probes on xnu-12377").
+`bsd/dev/beryllium_wlan.c` (0104 and the BT patches, forward-ported in patches-12377) already carries P0 and P1 of
+`docs/WIFI_BT_PLAN.md` unchanged:
+
+* `sweetwlan=1`: GCC clock branches (SE and MSS), S6 DFS table, TLMM gpio45-48, SE6 protocol/FIFO (only when its
+  clocks are on), cmd-db addresses of the WCN3990 rails, SMEM table + apps<->modem items, TCSR mutex, apps SMMU
+  SMR/S2CR for stream 0x40 / 0x740. RMB (0x4180000) and QDSP6 (0x4080000) are deliberately not read.
+* `sweetwlan=3`: the stage-1 probe, then a read-only inventory: sizes and first bytes of modemst1/2, fsg, fsc,
+  persist, dsp; FAT16 walk of `modem` (mba.mbn, wlanmdsp.mbn, qdsp6m.qdb, bdwlan.*, bdf_*, modem.mdt segment
+  table vs the MPSS carve-out 0x8e400000..0x95c00000, MBA vs 0x96900000 + 2 MiB) and of `bluetooth`.
+
+Reviewed for iOS 26: no writes, no SCM call, no MSS reset. Stage 3's partition reads take `sweet_ufs_lock` (the
+root's own I/O lock), issue READ(10) only and restore the root LUN afterwards. **One boot with
+`sweetwlan=3 sweetwlandelay=30` covers P0 and P1**; it can keep `sweet80211=2`. Output: `SWEET WLAN:` lines in the
+console log / sweetlog. Stage 2 (Bluetooth power-up) is the only stage that writes registers and is not part of
+this step.
+
+What the output decides: whether MSS clocks/GDSC and the SMMU stream for WLAN (0x40) are left set up by the
+bootloader (they were not on iOS 16: "WLAN sid 0x40 unmapped"), whether SMEM has the modem items, and whether the
+phone's own `modem` partition holds an MBA/MPSS pair that fits the carve-outs. That fixes the inputs of P3
+(MBA load, the first TZ-mediated step, run only with the user present).
