@@ -70,6 +70,8 @@ if [ "${IOS18:-1}" = 1 ]; then
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetmetrics"
 	python3 -I "$pacstrip" --sign "$out18/sweetmetrics"
 	b18 sweetposterset sweetposterset.m posterset.entitlements
+	# a picture as the lock and home wallpaper through PosterBoard's Photos poster (tools/identity/mkwallpaper.sh)
+	b18 sweetwallpaper sweetwallpaper.m posterset.entitlements
 	b18 sweeticonstyle sweeticonstyle.m iconstyle.entitlements -framework UIKit
 	b18 sweetopen sweetopen.m uicache.entitlements
 	# remote testing over SSH: screenshot of the panel (PNG) and synthetic touch/buttons
