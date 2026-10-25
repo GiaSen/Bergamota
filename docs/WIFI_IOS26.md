@@ -337,3 +337,4 @@ reset, 7 SCM assign, 8 QDSP6 boot. Proposed next run: **`sweetmssstep=3`** first
 (only the DDR write), so it isolates the question: a freeze means the normal world cannot write that carve-out from
 xnu at all (mapping attributes / hypervisor stage-2); `MBA copied` means the order was the problem, and the full
 stage can be tried next.
+* 2026-10-25: **paused** by the user (GPU Metal / PosterBoard first). Next when resumed: the copy-only run (`sweetmssstep=3`) with 1108.
