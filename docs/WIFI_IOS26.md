@@ -126,4 +126,6 @@ through the Bergamota queue, and only with the user's OK.
     `SWEET 80211: en0 ... up` and `IOKit interface en0 published`, wifid running, then one
     `SWEET 80211: get/set type N` line per ioctl type wifid uses; `SWEET NET: wifid opened
     IO80211Controller user client: 0x...` shows the IOServiceOpen refusal that selects the ioctl path.
+  * CI run 40191362682 (wlan26 012ed29 = ios26 fb82624 + 1100): success, kernel sha256 `31e6c9c3...`;
+    copies in `research/ios26/wlan1100/` (kernel + `beryllium-n104-2x-wlan.adt`, not in git). Not booted.
   * Side effect of the ADT node alone (without 1100): wifid starts and waits for a device; harmless.
