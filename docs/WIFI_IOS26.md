@@ -153,3 +153,12 @@ through the Bergamota queue, and only with the user's OK.
   bare char[3] (get and set), SIOCGIFDEVMTU (1500), unknown *set* types accepted and ignored (still logged
   once). Unknown gets stay EOPNOTSUPP. Next test: open Settings › Wi-Fi and look for SCAN_REQ (10) or
   SCAN_REQ_MULTIPLE (86), `event 10`, and what the screen shows.
+* 2026-10-25: **1102** (W3, compile-checked, not booted): `sweet80211=2` returns one synthetic open network,
+  "Bergamota-test" (BSSID 02:00:5e:77:e0:aa, channel 6, RSSI -52), per scan. Layout from IO80211
+  `Apple80211Scan` / `_addScanResultToList`: SCAN_REQ is a 5528-byte set; after the SCAN_DONE event the
+  framework gets type 11 into a 2272-byte buffer until the get fails with EIO (or 0xe0820446). One result is
+  the classic `apple80211_scan_result`: version @0, channel {version, number, flags} @4, unk/noise/snr/rssi
+  int16 @16-22, beacon interval @24, capability @26 (bit 0 ESS, 0x10 privacy), BSSID @28, rate count @34,
+  rates u32[15] (Mb/s) @36, SSID length @96, SSID @97, age @132, flags @136, IE length @138, IEs @140
+  (2048), u64 @2256. A privacy bit makes the framework parse WPA/RSN IEs; the fake network is open.
+  Joining it fails (ASSOCIATE -> ENXIO). With `sweet80211=1` nothing changes.
