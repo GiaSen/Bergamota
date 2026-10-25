@@ -11,13 +11,18 @@
 //! - [`hfs`]: the read-only HFS+/HFSX reader (`hfsx.py`)
 //! - [`macho`] and [`pacstrip`]: the arm64e code rewriter (`pacstrip.py`, without `--sign`)
 //! - [`fixups`]: the chained-fixup page-in check (`fixupcheck.py`)
+//! - [`hfsedit`]: the owner/mode pass and owner map (`hfsroot_owners.py`, mkroot-full.py), free runs (`hfs_trim.py`)
+//! - [`hfswrite`]: a new HFSX writer (the Python build uses newfs_hfs + a mount + ditto instead)
 
 pub mod fixups;
 pub mod hfs;
+pub mod hfsedit;
+pub mod hfswrite;
 pub mod io;
 pub mod macho;
 pub mod pacstrip;
 pub mod sparse;
+pub mod tree;
 
 /// Big- and little-endian reads from byte slices (the Mach-O and HFS+ structures are both).
 pub(crate) mod bytes {

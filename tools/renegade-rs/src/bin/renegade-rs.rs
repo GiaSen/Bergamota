@@ -29,6 +29,11 @@ fn main() -> ExitCode {
         Some("hfs") => cmd_hfs(&args[1..]),
         Some("strip") => cmd_strip(&args[1..]),
         Some("fixupcheck") => cmd_fixupcheck(&args[1..]),
+        Some("owners") => cmd_owners(&args[1..]),
+        Some("trim") => cmd_trim(&args[1..]),
+        Some("mkhfs") => cmd_mkhfs(&args[1..]),
+        Some("rebuild") => cmd_rebuild(&args[1..]),
+        Some("root") => cmd_root(&args[1..]),
         _ => {
             eprintln!("{}", USAGE);
             return ExitCode::from(2);
@@ -43,7 +48,252 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "usage: renegade-rs img2simg RAW OUT [--block N] | simg2img IN OUT | hfs SIMG CMD ARGS | strip [opts] IN... | fixupcheck SRC [--prefix P] [--quiet]";
+const USAGE: &str = "usage: renegade-rs img2simg RAW OUT [--block N] | simg2img IN OUT | hfs SIMG CMD ARGS | strip [opts] IN... | fixupcheck SRC [--prefix P] [--quiet] | owners IMAGE [--map MAP] [--default-root] | trim IMAGE";
+
+/// "64m", "20g", "4096".
+fn parse_size(s: &str) -> Res<u64> {
+    let (n, mul) = match s.chars().last() {
+        Some('k' | 'K') => (&s[..s.len() - 1], 1u64 << 10),
+        Some('m' | 'M') => (&s[..s.len() - 1], 1 << 20),
+        Some('g' | 'G') => (&s[..s.len() - 1], 1 << 30),
+        _ => (s, 1),
+    };
+    Ok(n.parse::<u64>()? * mul)
+}
+
+fn cmd_mkhfs(args: &[String]) -> Res<ExitCode> {
+    let (pos, opts, flags) = split(args, &["--size", "--name", "--map", "--date"]);
+    let [src, out] = &pos[..] else { return Err("mkhfs SRC_DIR OUT.img [--size 20g] [--name iOSRoot] [--map owners.tsv] [--default-root] [--date UNIX]".into()) };
+    let (mut entries, paths, skipped) = renegade::tree::scan_dir(Path::new(src))?;
+    for s in &skipped {
+        eprintln!("skipped (not a file, folder or symlink): {s}");
+    }
+    let map = match opts.get("--map") {
+        Some(m) => renegade::hfsedit::parse_map(&fs::read_to_string(m)?)?,
+        None => Default::default(),
+    };
+    let default_root = flags.iter().any(|f| f == "--default-root");
+    if opts.contains_key("--map") || default_root {
+        renegade::tree::apply_map(&mut entries, &map, default_root);
+    }
+    let o = renegade::hfswrite::Options {
+        volume_name: opts.get("--name").cloned().unwrap_or("iOSRoot".into()),
+        block_size: 4096,
+        size: opts.get("--size").map(|s| parse_size(s)).transpose()?,
+        date: opts.get("--date").map(|d| d.parse()).transpose()?.unwrap_or(0),
+    };
+    let f = File::create(out)?;
+    let mut w = renegade::io::FileRw::open(out)?;
+    drop(f);
+    let mut buf = vec![0u8; 1 << 20];
+    let st = renegade::hfswrite::build(&entries, &o, &mut w, &mut |source, sink| {
+        let mut r = File::open(&paths[source])?;
+        loop {
+            let n = io::Read::read(&mut r, &mut buf)?;
+            if n == 0 {
+                return Ok(());
+            }
+            sink(&buf[..n])?;
+        }
+    })?;
+    eprintln!(
+        "{out}: {} folders, {} files ({} hard links to {} iNodes), {} of {} blocks free, {} catalog nodes",
+        st.folders, st.files, st.hard_links, st.inodes, st.free_blocks, st.total_blocks, st.catalog_nodes
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Rebuilds the tree under PREFIX of an existing root image as a new volume with the Rust writer.
+fn cmd_rebuild(args: &[String]) -> Res<ExitCode> {
+    let (pos, opts, _) = split(args, &["--prefix", "--size", "--name", "--date"]);
+    let [src, out] = &pos[..] else { return Err("rebuild SRC.simg OUT.img [--prefix /usr] [--size N] [--name V] [--date UNIX]".into()) };
+    let v = Volume::open(Sparse::open(FileAt::open(src)?)?)?;
+    let entries = renegade::tree::from_volume(&v, opts.get("--prefix").map(String::as_str).unwrap_or("/"))?;
+    // CNID -> catalog record of every file, to read its data
+    let mut rec_of = std::collections::HashMap::new();
+    let mut todo = vec![2u32];
+    while let Some(c) = todo.pop() {
+        for (_, e) in v.children(c) {
+            if e.rt == FOLDER {
+                todo.push(e.cnid);
+            } else if let Some(d) = e.rec {
+                rec_of.insert(e.cnid, d);
+            }
+        }
+    }
+    let o = renegade::hfswrite::Options {
+        volume_name: opts.get("--name").cloned().unwrap_or("iOSRoot".into()),
+        block_size: 4096,
+        size: opts.get("--size").map(|s| parse_size(s)).transpose()?,
+        date: opts.get("--date").map(|d| d.parse()).transpose()?.unwrap_or(0),
+    };
+    File::create(out)?;
+    let mut w = renegade::io::FileRw::open(out)?;
+    let mut buf = vec![0u8; 1 << 20];
+    let st = renegade::hfswrite::build(&entries, &o, &mut w, &mut |cnid, sink| {
+        let d = *rec_of.get(&(cnid as u32)).ok_or_else(|| io::Error::other(format!("no record for CNID {cnid}")))?;
+        let f = v.file_at(cnid as u32, d);
+        let mut off = 0;
+        while off < f.size() {
+            let k = (f.size() - off).min(buf.len() as u64) as usize;
+            f.read_at(off, &mut buf[..k])?;
+            sink(&buf[..k])?;
+            off += k as u64;
+        }
+        Ok(())
+    })?;
+    eprintln!(
+        "{out}: {} folders, {} files ({} hard links to {} iNodes), {} of {} blocks free, {} catalog nodes",
+        st.folders, st.files, st.hard_links, st.inodes, st.free_blocks, st.total_blocks, st.catalog_nodes
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// img2simg that deallocates every 16 MiB of the raw image right after converting it (img2simg.py --consume):
+/// the raw image and the .simg never need the disk twice. The raw image is gone afterwards.
+fn img2simg_consume(raw: &Path, out: &Path) -> Res<renegade::sparse::Img2SimgStats> {
+    struct Consume {
+        f: File,
+        pos: u64,
+        punched: u64,
+    }
+    impl io::Read for Consume {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            // punch everything before the current position once 16 MiB have been read past the last punch
+            if self.pos - self.punched >= renegade::sparse::PIECE as u64 {
+                punch_hole(&self.f, self.punched, self.pos - self.punched)?;
+                self.punched = self.pos;
+            }
+            let n = std::os::unix::fs::FileExt::read_at(&self.f, buf, self.pos)?;
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+    let size = fs::metadata(raw)?.len();
+    let f = fs::OpenOptions::new().read(true).write(true).open(raw)?;
+    let mut src = Consume { f, pos: 0, punched: 0 };
+    let o = BufWriter::with_capacity(1 << 20, File::create(out)?);
+    let st = img2simg(&mut src, size, o, 4096, |d, t| eprint!("\rimg2simg {}%", d * 100 / t))?;
+    eprintln!();
+    Ok(st)
+}
+
+/// The root build from an extracted root folder (the IPSW volumes merged: cryptexes first, OS volume on top):
+/// copy-stage layout fixes, owner map, PAC strip of every Mach-O, HFSX image, sparse image.
+fn cmd_root(args: &[String]) -> Res<ExitCode> {
+    let (pos, opts, flags) = split(args, &["--map", "--size", "--name", "--date", "--raw"]);
+    let [src, out] = &pos[..] else { return Err("root SRC_DIR OUT.simg --unsigned [--map owners.tsv] [--size 20g] [--raw RAW.img] [--keep-raw]".into()) };
+    if !flags.iter().any(|f| f == "--unsigned") {
+        return Err("the Rust root build cannot re-sign the rewritten Mach-Os yet (pacstrip.py --sign does, through codesign/ldid): pass --unsigned to build anyway (the phone refuses unsigned code)".into());
+    }
+    let date: u32 = opts.get("--date").map(|d| d.parse()).transpose()?.unwrap_or(0);
+    let (mut entries, paths, skipped) = renegade::tree::scan_dir(Path::new(src))?;
+    eprintln!("{} entries, {} skipped (not file/folder/symlink)", entries.len(), skipped.len());
+    renegade::tree::layout_fixes(&mut entries, date)?;
+    let map = match opts.get("--map") {
+        Some(m) => renegade::hfsedit::parse_map(&fs::read_to_string(m)?)?,
+        None => Default::default(),
+    };
+    let (mapped, defaulted) = renegade::tree::apply_map(&mut entries, &map, true);
+    eprintln!("owners: {mapped} from the map, {defaulted} root:wheel");
+    let o = renegade::hfswrite::Options {
+        volume_name: opts.get("--name").cloned().unwrap_or("iOSRoot".into()),
+        block_size: 4096,
+        size: opts.get("--size").map(|s| parse_size(s)).transpose()?,
+        date,
+    };
+    let raw = opts.get("--raw").map(Path::new).map(Path::to_path_buf).unwrap_or_else(|| Path::new(out).with_extension("img"));
+    File::create(&raw)?;
+    let mut w = renegade::io::FileRw::open(&raw)?;
+    let dyld = Path::new(src).join(renegade::tree::DYLD_DIR);
+    let mut totals: BTreeMap<String, u64> = BTreeMap::new();
+    let (mut rewritten, mut machos) = (0u64, 0u64);
+    let st = renegade::hfswrite::build(&entries, &o, &mut w, &mut |source, sink| {
+        let p = &paths[source];
+        let mut data = fs::read(p)?;
+        if !p.starts_with(&dyld) && looks_like_macho(&data) {
+            machos += 1;
+            let before = data.clone();
+            let rep = strip(&mut data, &Options { write: true, ..Default::default() }).map_err(io::Error::other)?;
+            if data != before {
+                rewritten += 1;
+            }
+            for (k, v) in rep.counts {
+                *totals.entry(k).or_default() += v;
+            }
+        }
+        sink(&data)
+    })?;
+    eprintln!("{machos} Mach-Os, {rewritten} rewritten: {}", Report { counts: totals, ..Default::default() }.summary());
+    eprintln!("{}: {} folders, {} files ({} hard links), {} of {} blocks free", raw.display(), st.folders, st.files, st.hard_links, st.free_blocks, st.total_blocks);
+    drop(w);
+    let keep = flags.iter().any(|f| f == "--keep-raw");
+    let s = if keep {
+        let o = BufWriter::new(File::create(out)?);
+        img2simg(io::BufReader::new(File::open(&raw)?), fs::metadata(&raw)?.len(), o, 4096, |_, _| {})?
+    } else {
+        let s = img2simg_consume(&raw, Path::new(out))?;
+        fs::remove_file(&raw)?;
+        s
+    };
+    eprintln!("{out}: {} blocks, {} chunks", s.blocks, s.chunks);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_owners(args: &[String]) -> Res<ExitCode> {
+    let (pos, opts, flags) = split(args, &["--map"]);
+    let [img] = &pos[..] else { return Err("owners IMAGE [--map MAPFILE] [--default-root]".into()) };
+    let map = match opts.get("--map") {
+        Some(m) => renegade::hfsedit::parse_map(&fs::read_to_string(m)?)?,
+        None => Default::default(),
+    };
+    let mut f = renegade::io::FileRw::open(img)?;
+    let st = renegade::hfsedit::apply_owners(&mut f, &map, flags.iter().any(|f| f == "--default-root"))?;
+    println!("{}", st.line());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Deallocates a byte range of a file (macOS F_PUNCHHOLE, Linux fallocate PUNCH_HOLE): the range reads as zeros.
+fn punch_hole(f: &File, off: u64, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        struct FPunchhole {
+            fp_flags: u32,
+            reserved: u32,
+            fp_offset: libc::off_t,
+            fp_length: libc::off_t,
+        }
+        let arg = FPunchhole { fp_flags: 0, reserved: 0, fp_offset: off as libc::off_t, fp_length: len as libc::off_t };
+        // SAFETY: F_PUNCHHOLE (99) takes a pointer to struct fpunchhole, which outlives the call
+        if unsafe { libc::fcntl(f.as_raw_fd(), 99, &arg) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: plain syscall on an open descriptor
+        if unsafe { libc::fallocate(f.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE, off as libc::off_t, len as libc::off_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_trim(args: &[String]) -> Res<ExitCode> {
+    let (pos, _, _) = split(args, &[]);
+    let [img] = &pos[..] else { return Err("trim IMAGE".into()) };
+    let f = renegade::io::FileRw::open(img)?;
+    let (total, bsize, runs) = renegade::hfsedit::free_runs(&f)?;
+    let mut freed = 0u64;
+    for &(off, len) in &runs {
+        punch_hole(f.file(), off, len)?;
+        freed += len;
+    }
+    println!("{img}: {total} blocks of {bsize}, punched {} free runs = {} MiB", runs.len(), freed >> 20);
+    Ok(ExitCode::SUCCESS)
+}
 
 /// Positional arguments and `--flag value` options.
 fn split(args: &[String], with_value: &[&str]) -> (Vec<String>, BTreeMap<String, String>, Vec<String>) {

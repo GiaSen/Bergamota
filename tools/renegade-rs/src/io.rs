@@ -95,3 +95,60 @@ impl ReadAt for FileAt {
         }
     }
 }
+
+/// Positioned writes, for in-place edits of an image (the owners pass).
+pub trait WriteAt {
+    fn write_at(&mut self, off: u64, data: &[u8]) -> Result<()>;
+}
+
+impl WriteAt for Vec<u8> {
+    fn write_at(&mut self, off: u64, data: &[u8]) -> Result<()> {
+        let o = off as usize;
+        if self.len() < o + data.len() {
+            self.resize(o + data.len(), 0);
+        }
+        self[o..o + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+}
+
+/// A file opened for reading and writing (native builds).
+#[cfg(not(target_family = "wasm"))]
+pub struct FileRw {
+    file: std::fs::File,
+    size: u64,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl FileRw {
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        let size = file.metadata()?.len();
+        Ok(Self { file, size })
+    }
+    pub fn file(&self) -> &std::fs::File {
+        &self.file
+    }
+}
+
+#[cfg(all(unix, not(target_family = "wasm")))]
+impl ReadAt for FileRw {
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<()> {
+        if off + buf.len() as u64 > self.size {
+            return Err(short(off));
+        }
+        std::os::unix::fs::FileExt::read_exact_at(&self.file, buf, off)
+    }
+}
+
+#[cfg(all(unix, not(target_family = "wasm")))]
+impl WriteAt for FileRw {
+    fn write_at(&mut self, off: u64, data: &[u8]) -> Result<()> {
+        std::os::unix::fs::FileExt::write_all_at(&self.file, data, off)?;
+        self.size = self.size.max(off + data.len() as u64);
+        Ok(())
+    }
+}

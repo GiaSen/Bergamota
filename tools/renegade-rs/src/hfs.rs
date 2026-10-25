@@ -251,6 +251,12 @@ impl<R: ReadAt> Volume<R> {
         self.read_extents(&ext, l)
     }
 
+    /// The data fork of the file with this CNID (as a [`ReadAt`]); `rec` is its catalog record offset.
+    pub fn file_at(&self, cnid: u32, rec: usize) -> VFile<'_, R> {
+        let (l, ext) = self.file_extents(cnid, rec);
+        VFile::new(self, l, &ext)
+    }
+
     /// A regular file (hard links and symlinks resolved) as a [`ReadAt`].
     pub fn open_file(&self, path: &str) -> Result<VFile<'_, R>> {
         let e = self.lookup(path, true)?.filter(|e| e.rt == FILE).ok_or_else(|| bad(format!("{path}: no such file")))?;
