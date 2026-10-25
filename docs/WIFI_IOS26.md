@@ -168,3 +168,4 @@ through the Bergamota queue, and only with the user's OK.
   `tools/sweetnet/build.sh` into `research/sweetnet/ios18/`, arm64e + pacstrip, runs on iOS 26). It calls the
   framework's own Apple80211Open/BindToInterface/Scan over SSH, which tests the scan path (kernel stand-in
   plus IO80211's result parser) without wifid or the UI.
+* 2026-10-25: **paused** by the user (focus on touch). Next step when resumed: `sweetwifi info` / `scan` on a `sweet80211=2` boot.
