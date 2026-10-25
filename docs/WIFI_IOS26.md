@@ -556,3 +556,32 @@ hwlock, size check on reuse and the walk-end check, unwind of valid_entries) are
 Image `shim/out/enxerto-boot-ios26full-boot39-wlan-smp2p.img` (sha256 `c23f2e45...`, kernel `37d1bab0...` = boot 33b's
 kernel + 1108-1112): boot 38's args with `sweetmpsshold=30`. The GPU side needs nothing in the image. Not booted:
 needs the user's OK; afterwards tell the GPU session when iOS is up (backboardd trace).
+
+### 5.11 Boot 39-wlan-smp2p: **MPSS READY** and a clean stop (1112, user present)
+
+**2026-10-25 18:23:20Z** (user OK, given here; also the GPU session's glass test, no image change),
+`enxerto-boot-ios26full-boot39-wlan-smp2p.img`. Steps 1-8 as before (MBA ALIVE). Then:
+
+| Step | Result |
+|------|--------|
+| 9 | SMEM item 428 allocated at +0xb9030 (340 B), free-uncached 0x20 -> 0x188 (the partition's first entry); header + `master-kernel` + `ipa`, doorbell bit 14 twice |
+| 10-11 | modem.mdt as boot 38; metadata **status 3 after 6 ms** |
+| 12-13 | segments as boot 38; MPSS to MSS (status 0); **MBA status 4: `MPSS AUTHENTICATED`** |
+| 14 | modem item **435 at +0xb9198, 2/16 entries** at the first poll; **negotiated (version 1, features 0x1 = SSR ack)**; entries `smp2p` = 0 and **`slave-kernel` = 0x2 after 11 ms: `MPSS READY`**; MBA region back to HLOS (status 0); no further change in 30 s (no handover bit 2, no fatal) |
+| teardown | **stop request: stop-ack after 20 ms (slave-kernel 0xa = ready + stop-ack)**; AXI q6 idle, modem `halt ack 0 idle 0` (as boot 38), nc idle; MPSS left with the modem until reboot; mss.lvl 0, cx/mx kept; QMP `load_state off` consumed; `valid_entries` cleared |
+
+No panic, phone up (SSH fine). Console: `research/ios26/logs-wlan/boot39-wlan-smp2p-usb.txt` (main checkout, not in
+git). **The modem firmware runs on iOS 26 and talks SMP2P with the kernel: the MSS half of W4 is done.**
+
+Notes: the modem did not raise "handover" (bit 2) in 30 s. In Linux that releases the proxy votes after the modem has
+its own; it may come later or depend on services we do not run yet (rmtfs, QRTR). The modem AXI port still does not
+ack the halt after a clean stop; Linux only logs that too.
+
+**Next (W5), in Linux's order, each again gated and one boot per user OK:**
+1. **rmtfs** (`qcom,rmtfs-mem`, 2 MiB shared memory + the rmtfs QMI service that serves modemst1/modemst2/fsg/fsc
+   reads; writes dropped by rule). Without it the modem cannot read its EFS (calibration, NV) and will not bring up
+   WLAN.
+2. **QRTR over GLINK/SMEM** (the IPC router the modem uses for every QMI service; GLINK SMEM transport = SMEM items
+   478/479/480 FIFOs + the same doorbell).
+3. **TFTP/QMI service for `wlanmdsp.mbn`** and the board file, then **WLFW** (QMI service 0x45: capability, BDF
+   download, mode on) to bring up the WCN3990 WLAN core; the copy engine rings and the SMMU stream 0x40 come after.
