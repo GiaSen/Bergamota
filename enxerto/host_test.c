@@ -149,6 +149,8 @@ int main(void)
 		art_text(ART_MONO30, (FB_W - tw) / 2, 360, ID_PAPER, "BOOTLOADER");
 		art_text_centered(ART_MONO22, 440, ID_INK, "fastboot  |  Qualcomm ABL");
 		dump("out/preview/splash-fastboot.ppm");
+		charge_ui_splash();
+		dump("out/preview/splash-charging.ppm");
 	}
 	return 0;
 }

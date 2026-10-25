@@ -13,7 +13,7 @@ Slots in the stock image: 0 power-on logo (MI + mi.com, 161x321), 1 fastboot (10
   mksplash.py build  [--base backup/logo.img] [-o out/logo-bergamota.img] [--size 1080x2246]
   mksplash.py decode <logo.img> <outdir>        # slots -> PNG (+ slots.txt)
   mksplash.py verify <logo.img>                 # structure check
-Only slots 0 (power-on) and 1 (fastboot) are rebranded; every other slot (charging, destroyed/verity
+Slots 0 (power-on), 1 (fastboot) and 2 (off-mode charging) are rebranded; every other slot (destroyed/verity
 warning, Google logos, blanks) is copied byte for byte. Stdlib only. The two screens are Enxerto's own renders
 (enxerto/out/preview/splash-*.ppm, drawn by enxerto/host_test with the tools/identity artwork).
 """
@@ -112,6 +112,11 @@ def compose_poweron(w, h):
     return rendered("splash-poweron", w, h)
 
 
+def compose_charging(w, h):
+    """Slot 2, ABL's off-mode charging picture: Enxerto's charging scene with an empty battery and the bolt."""
+    return rendered("splash-charging", w, h)
+
+
 def compose_fastboot(w, h):
     """Slot 1, ABL's own fastboot: the scene with an ink BOOTLOADER pill (Enxerto's fastboot screen has the leaf
     green FASTBOOT one, so the two are told apart at a glance)."""
@@ -127,14 +132,16 @@ def build(base_path, out_path, size, preview_dir):
     pw, ph = size
     c0 = compose_poweron(pw, ph)
     c1 = compose_fastboot(pw, ph)
+    c2 = compose_charging(pw, ph)
     new = list(bmps)
     new[0] = rgb_to_bmp(c0.w, c0.h, c0.px)
     new[1] = rgb_to_bmp(c1.w, c1.h, c1.px)
+    new[2] = rgb_to_bmp(c2.w, c2.h, c2.px)
     def layout(tight):
         words, cur = [], HDR // BLK + 1
         for i, b in enumerate(new):
             need = (len(b) + BLK - 1) // BLK
-            ln = need if (tight or i < 2) else max(keep_len[i], need)  # stock slots keep their allocation if it fits
+            ln = need if (tight or i < 3) else max(keep_len[i], need)  # stock slots keep their allocation if it fits
             words += [cur, ln]
             cur += ln
         return words, cur

@@ -192,6 +192,15 @@ void charge_ui_init(void)
 	con_window(0, -1);	/* con_* log lines are recorded, not drawn */
 }
 
+/* The static picture of the logo partition's charging slot (ABL shows it before Enxerto runs): the scene and an empty
+ * battery with the bolt, no numbers. */
+void charge_ui_splash(void)
+{
+	charge_ui_init();
+	band(HINT_Y, art_text_h(ART_MONO22));	/* the key hints are Enxerto's, not ABL's */
+	draw_battery(1, 0, 1);
+}
+
 void charge_ui_update(const struct charge_view *v)
 {
 	char pct[8], status[STR_MAX], volt[12], amp[12];
