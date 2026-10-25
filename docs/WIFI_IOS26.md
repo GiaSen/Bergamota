@@ -394,3 +394,39 @@ HLOS); if it panics, the panic text names the fault; if `3d` stops part-way, the
   build + 1109 via `xnu-local-build.sh --remake`, sha256 `2bc47ff2...`, boot 33's ADT and Enxerto blob, boot 35-wlan's
   boot-args minus `sweetfb_noconsole=1`). The GPU session has the phone (boot 33b, backboardd test); boot 36 waits for
   it to free the phone and for the user's OK.
+
+### 5.6 Boot 36-wlan: 1109 probe with panics on screen: the copy works, the unmap panics
+
+GPU session handed the phone over at 16:55Z; user OK; `sweetreboot fastboot` over SSH (the queue's own reboot did not
+reach fastboot), boot sent 17:00:28Z. Image `enxerto-boot-ios26full-boot36-wlan.img` (1109, boot 35-wlan's args
+without `sweetfb_noconsole=1`). Console:
+
+```
+SWEET MSS: step 3: copy MBA into its carve-out (before any MSS power: Linux q6v5_load order)
+SWEET MSS: 3a: MBA carve-out 0x96900000+0x200000 mapped write-combined at 0xfffffec032cbc000; next: read word 0
+SWEET MSS: 3b: word 0 reads 0; next: write word 0
+SWEET MSS: 3c: word 0 written, reads back 0x464c457f (want 0x464c457f); next: copy in 64 KiB pieces
+SWEET MSS: 3d: copy 0+0x10000
+SWEET MSS: 3d: copy 0x10000+0x10000
+SWEET MSS: 3d: copy 0x20000+0x10000
+SWEET MSS: 3d: copy 0x30000+0xa2e0
+```
+
+then the USB console stopped. The screen (user photo, IMG_3982) showed the panic this time:
+`vm_map_delete(...): Attempting to remove permanent VM map entry ... [0xfffffec032cbc000:...] @vm_map.c` (address as
+printed by 3a). **The carve-out is readable and writable and the whole MBA was copied; the panic is the `ml_io_unmap`
+after the copy.** In xnu-12377 `ml_io_map_wcomb()` = `io_map(..., unmappable=false)`, which allocates the kernel VA
+with `KMA_PERMANENT`, and `ml_io_unmap()` = `pmap_remove` + `kmem_free`, which refuses a permanent entry. Boots 34 and
+35 hit the same panic; `sweetfb_noconsole=1` hid it, and panics never reach the USB console, so they looked like
+freezes. The 1106-1108 "copy order" theory was wrong; the copy was never the problem.
+
+**1110** (`1110-beryllium-mss-mba-window-unmappable.patch`): the MBA window comes from
+`ml_io_map_unmappable(MSS_MBA_PA, MSS_MBA_SIZE, VM_WIMG_WCOMB)` (non-permanent, write-combined), the one io mapping
+xnu lets `ml_io_unmap` remove. No other sweet code calls `ml_io_unmap`. The 1109 probe lines stay (about 5 s of pauses).
+Lesson for every stage-4 test: keep panics visible (no `sweetfb_noconsole=1`).
+
+Prepared, not booted (kernel = 1110 remake, sha256 `263851eb...`; boot 33's ADT and Enxerto blob; boot 36-wlan's args):
+`enxerto-boot-ios26full-boot37-wlan-copy.img` (`sweetmssstep=3`: expect `MBA copied`, `stopping before step 4`, an
+empty teardown) and `enxerto-boot-ios26full-boot37-wlan-full.img` (no `sweetmssstep`: the whole stage 4, steps 4-6 as
+on boot 34, then the first SCM hyp-assign (step 7) and the QDSP6 boot (step 8), teardown; a SoC reset in step 7/8 is
+possible and recoverable).
