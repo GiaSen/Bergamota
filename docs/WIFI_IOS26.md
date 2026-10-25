@@ -189,3 +189,8 @@ through the Bergamota queue, and only with the user's OK.
   index table (`gAppleIoucIndexToString`, 587 entries, `convertApple80211IOCTLToString`) has empty slots at 0,
   114 and 353 (CARD_SPECIFIC is -1). Names are right for 1-113 (everything the stand-in implements), one off
   for 114-352 (e.g. 254 = HW_SUPPORTED_CHANNELS, not BTCOEX_PROFILE) and two off from 353 up.
+* 2026-10-25: **MILESTONE, boot 29 (ios26 2ba2989 with 1100-1103, `sweet80211=2`): Settings › Wi-Fi lists
+  "Bergamota-test" (user-confirmed).** The iOS half (W1-W3) is complete: wifid, CoreWiFi and Settings accept the
+  in-kernel stand-in, power the radio, scan and show results. What remains is the chip half (W4+): a real WCN3990
+  backend behind `s8_get/s8_set` (power, scan results from WMI, then join/WPA2/data). Joining the synthetic
+  network fails by design (ASSOCIATE -> ENXIO).
