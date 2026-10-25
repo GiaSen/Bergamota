@@ -1,7 +1,7 @@
 # Migration from xnu-11215 to xnu-12377 (branch `ios26`)
 
 Target: iOS 26.7.1 (23H30) userland, identity iPhone12,1 (N104AP, A13). Why and what was measured: `docs/IOS26_FEASIBILITY.md`.
-Status (2026-10-24): `xnu/patches-12377/` (198 patches, 0001-0235) on `xnu-12377.121.6` (macOS/iOS 26.5, newest published
+Status (2026-10-24): `xnu/patches-12377/` (216 patches: 0001-0250 as in `patches-11215`, plus `1000-` for 12377-only fixes) on `xnu-12377.121.6` (macOS/iOS 26.5, newest published
 xnu-12377 tag) **builds and links** locally: `kernel.development.sweet`, arm64, "Darwin Kernel Version 25.5.0 ... xnu-12377.121.6"
 (`tools/xnu-local-build.sh`, Xcode 27.1 + KDK 26.5). Nothing booted.
 
@@ -48,10 +48,18 @@ Compile and link fixes (CI runs 3-6 and the local build), each in the patch that
 | 0131 | call before definition | prototype |
 | 0148-0151 | `IO_NULL`, `io_otype`, `ip_kotype` gone (kobject types are object types) | shim in 0148, `ip_type` in 0149 |
 | 0190 | `MAX_SCHED_CPUS` gone | `MAX_CPUS` |
-| 0235 (new) | `ml_device_is_prod_fused()` lives in the closed `machine_routines_apple`; Tightbeam startup compiles because the KDK has its headers | SWEET definition (not prod fused, like the ADT); Tightbeam startup off for SWEET |
+| 1000 (new; was 0235 until develop's own 0235 arrived) | `ml_device_is_prod_fused()` lives in the closed `machine_routines_apple`; Tightbeam startup compiles because the KDK has its headers | SWEET definition (not prod fused, like the ADT); Tightbeam startup off for SWEET |
 | 0027 (new, .sh) | CoreEntitlements V2 headers are KDK-only | type stubs when no KDK (`use_kdk=false`); with the KDK it does nothing |
 
 **KDK:** still needed for headers only (`TrustCache/API.h` and friends are closed and not in any SDK). Nothing from the KDK is linked.
+
+**0233-0250 (iOS 18 work merged on develop 2026-10-24: scan-out copy/blit, GPU page-table pool, AKS key wrap, BT HCI
+compat, backlight service, charger, RTC wall clock, Skywalk privileges)** apply unchanged: they only touch our own drivers
+(`SweetFramebuffer`, `SweetSurface`, `SweetAdreno`, `SweetKeyStore`, `SweetPlatformExpert`, `sweet_a630`, `sweet_spmi`,
+`sweet_charger`, `sweet_cpufreq`, `beryllium_bt_hci`, `sweet_amfi`); the `PRIV_SKYWALK_*` numbers are the same in 12377. Only the hunk
+headers differ from the 11215 files. 0009's 11215 change (Tightbeam exports file) has nothing to port: that file is gone.
+Numbering: the two series share numbers for the same change; fixes only 12377 needs start at 1000, so new develop patches
+(0251+) never collide again.
 
 ## 3. Open items
 
