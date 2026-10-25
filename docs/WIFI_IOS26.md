@@ -218,3 +218,26 @@ What the output decides: whether MSS clocks/GDSC and the SMMU stream for WLAN (0
 bootloader (they were not on iOS 16: "WLAN sid 0x40 unmapped"), whether SMEM has the modem items, and whether the
 phone's own `modem` partition holds an MBA/MPSS pair that fits the carve-outs. That fixes the inputs of P3
 (MBA load, the first TZ-mediated step, run only with the user present).
+
+### 5.1 Boot 30: `sweetwlan=3` result (2026-10-25, 74 lines, no crash)
+
+| Area | Observed | Meaning for P3+ |
+|------|----------|-----------------|
+| MSS clocks | `mss cfg_ahb` on, `mss mfab_axis` on, `q6_memnoc_axi` and `snoc_axi` **off**; GPLL0 div vote bit17 set | modem is cold (expected: Linux q6v5-mss turns the AXI branches on itself) |
+| SE6 (BT UART) | clocks gated, registers not read; TLMM gpio45-48 at func 0 | as on iOS 16; only stage 2 configures them |
+| Rails | cmd-db: smpa4 0x40600, ldoa5 0x40f00, ldoa7 0x41300, ldoa17 0x40c00, ldoa23 0x41e00, ldoa25 0x42000 | RPMh addresses for the WCN3990 votes resolve |
+| SMEM | `$TOC` v1, 15 entries; seen: global, 0<->5, 2<->3, 7<->8, 1<->8 | **incomplete: probe bug**, see below |
+| apps SMMU | 76 SMRs / 45 CBs; **sid 0x40 (WLAN) has no SMR**; 0x740 -> SMR6, CB3 | we must map WLAN's stream ourselves (bypass or our own context bank) before the CE rings |
+| EFS | modemst1, modemst2 (LUN 5) and fsg (LUN 4) 8 MiB each, non-zero; fsc, persist, dsp start with zeros | rmtfs can serve the real EFS (reads; writes dropped by rule) |
+| `modem` FAT16 | `image/mba.mbn` 238304 B (fits the 2 MiB carve-out at 0x96900000); `modem.mdt` 30 phdrs, 28 loadable segments spanning **exactly** 0x8e400000..0x95c00000 (120 MiB carve-out), relocatable, hash segment 7400 B; `wlanmdsp.mbn` 3645892 B; `qdsp6m.qdb`; 29 `bdwlan.*`, 5 `bdf_*` | the phone's own MBA/MPSS fit the Linux beryllium carve-outs; WLAN firmware and board data are present (the modem fetches wlanmdsp.mbn through the QRTR TFTP service we host) |
+| `bluetooth` FAT16 | crbtfw21.tlv **222988 B**, crnv21.bin 4591 B (+ the 2.0/1.1 variants) | the phone ships a newer BT rampatch than linux-firmware's 177060 B one we install; worth trying for BT later |
+
+**Probe bug, fixed in 1104** (compile-checked): `wl_dump_smem` stepped the partition table by 32 bytes, but Linux
+`struct smem_ptable_entry` is 48 bytes, so it read only real entries 0, 2, 4, 6 and 8 (printed as 0, 3, 6, 9, 12)
+and skipped every odd one, which is where apps<->modem (hosts 0<->1) normally is. It also read
+`offset_free_uncached` of a partition header at +16 instead of +12. "No apps<->modem partition" is therefore NOT
+a finding yet. Next probe boot (same `sweetwlan=3`) with 1104 lists all 15 entries and the apps<->modem items.
+
+Next after that: write P2/P3 for xnu-12377: the MSS power/clock/reset sequence (q6v5-mss sdm845: AOSS/PDC reset,
+halt registers, the AXI branches above), the MBA load into 0x96900000 and the RMB handshake, as one gated patch
+that stops at "MBA alive" and is run only with the user present (the first TZ-mediated step).
