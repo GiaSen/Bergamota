@@ -2,6 +2,12 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> Web flasher + new identity (branch `web-flasher`, 2026-10-24): apps/web/README.md <<<
+- `apps/web/`: Svelte 5 + Vite site for bergamota.zesmoi.com.br (landing `/`, flasher `/flash/`), Cloudflare Worker static assets (`wrangler.jsonc`, custom domain). **Deployed 2026-10-24 with the user's OK** (account "Moizes.sousa@outlook.com's Account", which owns zesmoi.com.br; version d43ebf3d): https://bergamota.zesmoi.com.br and /flash/.
+- Flasher: WebUSB fastboot (`src/lib/fastboot.ts`, hard allowlist: userdata/boot/logo; getvar/download/flash/reboot only), sparse streaming in <=512 MiB pieces (`src/lib/sparse.ts`), checks product=beryllium, unlocked, partition-size. `npm test`: 11 tests incl. end-to-end flash into a fake phone. Also driven end to end in Chrome against the fake phone (dev hook). **Never run against the real phone.**
+- Default path is "Patch IPSW + flash" (user); the in-browser patcher is phase 3 (Renegade -> Rust/WASM, not started), so the Patch step points to `renegade root` + "Flash an image".
+- Identity approved by the user: Isaac Newton after Kneller 1689 (public domain), black-and-white halftone cutout, lime halftone ground #d7e98a, giant white iOS numerals, leaf green #1a5933. `apps/web/DESIGN.md`. The user asked the main session to move boot images / app icon / README to it (assets in the side-session notes folder, identity/).
+
 ### >>> Wi-Fi / Bluetooth on iOS 18 (branch `wifi-bt18`, 2026-10-24): docs/WIFI_BT_IOS18.md <<<
 * **2026-10-24 16:05: BLUETOOTH WORKS on combo9** (GPU session's local kernel = develop + 0238 + 0239 v7, ADT gpufwz-bt, BT boot-args): bluetoothd stays up, PoweredOn, Settings lists nearby devices (user-checked). Fix chain per boot in docs/WIFI_BT_IOS18.md 2.2-2.11. Not merged to develop yet.
 * Why Control Center showed both Off: bluetoothd exits 0 ("Unable to match bluetooth service in device tree") because the GPU ADT `beryllium-hi-3x-gpufwz.adt` has no `/arm-io/bluetooth`, and no current image sets `sweetwlan=2 sweetbt=1` (the WCN3990 is never powered); wifid never starts (`_LimitLoadToDeviceTree` wlan/marconi-wifi, no such node, and no WLAN driver exists at all).
