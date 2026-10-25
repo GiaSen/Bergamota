@@ -370,7 +370,9 @@ def stage_macho(a, root):
 def stage_cache(a, root):
     need_free('cache stage')
     d = os.path.join(root, 'System/Library/Caches/com.apple.dyld')
-    run([sys.executable, '-I', os.path.join(HERE, 'pacstrip_cache.py'), d, '--jobs', str(a.jobs)])
+    # --stubs: iOS 26 caches keep cross-image stubs in __TEXT_STUBS sub-caches outside every image section, ending
+    # in BRAA x16, x17 (first iOS 26 boot: launchd SIGILL there); iOS 18's islands were plain adrp/add/br
+    run([sys.executable, '-I', os.path.join(HERE, 'pacstrip_cache.py'), d, '--jobs', str(a.jobs), '--stubs'])
     run([sys.executable, '-I', os.path.join(HERE, 'fips_rehmac.py'), d, '--patch'])   # corecrypto FIPS POST integrity HMAC
 
 
