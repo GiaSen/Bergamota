@@ -686,3 +686,12 @@ Image `shim/out/enxerto-boot-ios26full-boot41-wlan-tftp.img` (sha256 `09a90d2c..
 kernel + 1108-1114): boot 40's args plus `sweettftp=1`. Expected: the modem's WLAN PD asks for `wlanmdsp.mbn`
 (3645892 B in the modem partition), then WLFW (QMI service 0x45) appears among the modem's services. Not booted: needs
 the user's OK.
+* 2026-10-25 19:44-19:48Z: **boot 41 did not reach the Wi-Fi stage (twice)**, user OK given here. 1st send (19:44:14) went
+  to Bergamota fastboot; iOS shut down ("Rebooting to device recovery environment") and the phone ended in ABL
+  fastboot without our kernel running. Retry from ABL (19:46:54): our kernel booted, but ~25 s in a shell ran
+  `toybox` + `sweetreboot` (bootloader) and launchd rebooted, before stage 4 (`sweetwlandelay=60`). Not the GPU
+  session's inject (it only writes bgmtl-bb.off); its guess: the Bergamota app's auto-reboot (SSH `sync; sweetreboot`
+  when an item is still waiting and iOS is up). The user then reported an "initproc" panic on the boot that started
+  19:47:44, possibly the GPU session's Apple6 env (BGMTL_FAMILY=6) crash-looping backboardd; the GPU session is
+  recovering with boot 39 and removing the env. **Boot 41 is on hold** until the GPU session reports; rerun it as a
+  Wi-Fi-only test with nothing else queued.
