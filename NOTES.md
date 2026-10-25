@@ -2,7 +2,7 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> Wi-Fi on iOS 26 (branch `wlan26` off `ios26`): docs/WIFI_IOS26.md (PAUSED 2026-10-25, user: focus on touch) <<<
+### >>> Wi-Fi on iOS 26 (branch `wlan26` off `ios26`): docs/WIFI_IOS26.md (resumed 2026-10-25 after touch works on ios26-touch-works) <<<
 * iOS 26 has no IO80211Family kext (Wi-Fi = DriverKit dext). wifid matches only IOKit properties, and the IO80211 framework falls back to `SIOCGA80211/SIOCSA80211` ioctls + `KEV_IEEE80211_CLASS` events when the service has no user client, so an in-kernel stand-in is enough for the iOS half. Patch range 1100-1199 is Wi-Fi's.
 * Merged into ios26: **1100** stand-in (`sweet80211=1`, en0 + IOKit + ioctl log), **1101** boot-23 fixes, **1102** `sweet80211=2` synthetic network "Bergamota-test". `tools/adt-wlan.py` -> `enxerto/out/beryllium-n104-2x-wlan.adt`.
 * Booted (iOS 26 session, boots 23-25): wifid starts, stays up, binds en0 over the ioctl path, powers the radio on. No scan seen yet: touch is broken, so Settings › Wi-Fi can't be opened.
