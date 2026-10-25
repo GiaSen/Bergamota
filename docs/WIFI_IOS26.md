@@ -291,3 +291,21 @@ with `sweetwlandelay` long enough for the persistent log to be up, and read the 
   VMIDs and permissions; QMP offsets, handshake, doorbell and message; the boot order; the alt reset in both
   directions; the QDSP6 sequence; BRANCH_VOTED vs BRANCH_HALT; every physical address including the beryllium
   carve-outs; the teardown order; the ARC cmd-db parsing; the unchanged VRM path.
+
+### 5.3 Boot 32-noinject: first P3 run (2026-10-25, user present)
+
+ios26 + 0251 + 1104-1106, `sweetwlan=4 sweetmss=1 sweetwlandelay=60 sweet80211=2`. The probe ran to the end. With
+1104 the SMEM table is complete: 14 partitions, including **apps<->modem (entry 10, offset 0xb9000, size 0x7c000)**,
+empty (free-uncached 0x20, a cold modem), so boot 30's "no apps<->modem partition" was the probe bug. Then the
+stage-4 banner was the **last line**: no SWEET MSS/RPMH line after it, no panic text, and the USB console went
+silent (11:27 local). Freeze or reboot: being confirmed with the user. Not retried.
+
+Reading: the next line would have followed reading `mba.mbn` (step 2), and no MSS/AOSS/RPMh register is touched
+before that. But the USB console and the persistent log are buffered (the log was last flushed at the banner), so a
+hard freeze can swallow the lines of the following steps: QMP open (first AOSS message-RAM access) and the RPMh
+ARC votes are as likely. No SCM call was reached (each logs and flushes before it runs).
+
+**1107** (compile-checked): every stage-4 step now logs `step N: ...`, flushes the persistent log and waits
+1.5 s for the USB console *before* running, so the last `step N` line names the step that stopped the phone;
+`sweetmssstep=N` stops cleanly before step N+1 (teardown runs) for bisection. Steps: 1 map MMIO, 2 read mba.mbn,
+3 QMP open + load_state, 4 ARC votes, 5 clocks/alt reset, 6 MBA copy, 7 SCM hyp-assign, 8 QDSP6 boot.
