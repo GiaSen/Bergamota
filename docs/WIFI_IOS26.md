@@ -338,3 +338,59 @@ reset, 7 SCM assign, 8 QDSP6 boot. Proposed next run: **`sweetmssstep=3`** first
 xnu at all (mapping attributes / hypervisor stage-2); `MBA copied` means the order was the problem, and the full
 stage can be tried next.
 * 2026-10-25: **paused** by the user (GPU Metal / PosterBoard first). Next when resumed: the copy-only run (`sweetmssstep=3`) with 1108.
+* 2026-10-25: **resumed** (side session of the GPU session, user present for each boot).
+
+### 5.5 Boot 35-wlan: copy-only run (1108, `sweetmssstep=3`): freeze in the copy, modem untouched
+
+**Kernel.** The handoff said 1108 was in `research/ios26/kernel-local/kernel.development.sweet`; it was not (that
+kernel, 11:37, is the 1107 build that boot 33/33b also run: no `MBA copied` string). Built fresh from this branch
+(ios26 22ce835 series = boot 33b's kernel + 1108, the only kernel patch since): `USE_KDK=1
+XNU_LOCAL_DIR=<worktree>/research/xnu-local tools/xnu-local-build.sh 26.5` (~25 min), kernel sha256 `57a4fdb0...`.
+
+**Image** `shim/out/enxerto-boot-ios26full-boot35-wlan.img` (sha256 `99819ceb...`), built without mkboot-full.sh so
+that only the kernel and the stage-4 boot-args differ from boot 33b: boot 33's ADT taken out of its payload
+(`/chosen` etc. unchanged; re-packing the 1107 kernel + that ADT + boot 33's cmdline with `tools/mkpayload.py`
+reproduces boot 33's payload byte for byte), and the boot.img re-packed with boot 33's own Enxerto kernel blob
+(`mkbootimg --header_version 1 ... --cmdline console=null`, which reproduces enxerto-boot-ios26full-boot33.img byte for
+byte). Boot-args = boot 34's (boot 33's with `sweetwlan=4 sweetmss=1` and `sweetwlandelay=60`) plus
+`sweetmssstep=3`; `sweetgpu=8`, the GPU-firmware ADT and everything else as in boot 33b.
+
+**Result (16:14 UTC boot, user present):** probe stages 1/3 as on boot 32 (SMEM 14 partitions, apps<->modem empty,
+sid 0x40 no SMR), then
+
+```
+SWEET MSS: step 1: map MMIO (no access)
+SWEET MSS: step 2: read mba.mbn from the modem partition
+SWEET MSS: mba.mbn 238304 bytes read from the modem partition
+SWEET MSS: step 3: copy MBA into its carve-out (before any MSS power: Linux q6v5_load order)
+```
+
+and ~100 more console lines from other processes (they fit in step 3's 1.5 s pause), the last `exec
+ReportSystemMemory`; then the USB console stopped, ping and SSH timed out, the user confirmed a freeze (no reboot).
+No `MBA copied`, no `stopping before step 4`. Recovered with boot 33b (16:17 UTC, user OK; iOS up 16:18:31).
+Console excerpt: `research/ios26/logs-wlan/boot35-wlan-usb.txt` (main checkout, not in git).
+
+**Reading.** Nothing of the modem was touched before the copy (no QMP, no vote, no clock, no reset, no SCM), so the
+order was not the cause: the normal world stops as soon as xnu touches the MBA carve-out 0x96900000 through
+`ml_io_map_wcomb`. Two things are open, and boot 35 cannot tell them apart:
+1. *Freeze or invisible panic.* All these images carry `sweetfb_noconsole=1`, which keeps panics off the screen
+   (NOTES), and panics never reach the USB console (no `panic(cpu` in the whole live log). A data abort in the copy
+   (e.g. a stage-2 / XPU abort reflected to EL1) would look exactly like this.
+2. *Where it stops:* the mapping, the first read, the first write, or part-way through the 59 pages (part of the
+   2 MiB protected).
+Linux on this phone (Android's pil-q6v55-mss, mainline `q6v5_load`) writes the same region from EL1 after the same
+ABL, so plain HLOS access is allowed in principle; what differs is how xnu maps/accesses it, or a state the Android
+boot path sets up first. Also seen on this boot, not caused by the copy (the copy never ran): `hfs_mark_inconsistent:
+Runtime corruption detected on iOSRoot` (hfs_cnode.c:946, pid 382) several times, most likely left by boot 34's
+hard freeze; fsck is forced on the next mount.
+
+**1109** (`1109-beryllium-mss-mba-copy-probe.patch`, built locally, not run): step 3 probes the carve-out one access
+at a time, each line flushed with a pause first: `3a` mapped (VA printed), `3b` word 0 read, `3c` word 0 written and
+read back, `3d` the copy in 64 KiB pieces. Proposed next run: boot 35-wlan's boot-args **without
+`sweetfb_noconsole=1`** (a panic then shows on screen: photograph it), same `sweetmssstep=3`. If `3b` is the last
+line, the region cannot even be read (stage-2/XPU: look at what Android does before pil, e.g. a hyp-assign back to
+HLOS); if it panics, the panic text names the fault; if `3d` stops part-way, the protected part starts there.
+  Prepared, not booted: `shim/out/enxerto-boot-ios26full-boot36-wlan.img` (sha256 `30b5c30e...`; kernel = the 1108
+  build + 1109 via `xnu-local-build.sh --remake`, sha256 `2bc47ff2...`, boot 33's ADT and Enxerto blob, boot 35-wlan's
+  boot-args minus `sweetfb_noconsole=1`). The GPU session has the phone (boot 33b, backboardd test); boot 36 waits for
+  it to free the phone and for the user's OK.
