@@ -623,3 +623,38 @@ Image `shim/out/enxerto-boot-ios26full-boot40-wlan-rmtfs.img` (sha256 `7e520fd4.
 kernel + 1108-1113): boot 39's args with `sweetrmtfs=1 sweetmpsshold=60`. GPU: the dock-glass change (Chlorophyll
 4a64d87) is userland only and rides along; tell the GPU session once the home screen is up. Not booted: needs the
 user's OK.
+
+### 5.13 Boot 40-wlan-rmtfs: **rmtfs served over QRTR/GLINK, the modem read its EFS and booted fully**
+
+**2026-10-25 18:52Z** (user OK, given here; also the GPU session's dock-glass check, userland only),
+`enxerto-boot-ios26full-boot40-wlan-rmtfs.img` (1113, `sweetrmtfs=1 sweetmpsshold=60`). Steps 1-14 as boot 39 (MPSS
+READY after 11 ms). Step 15 and the 60 s service loop:
+
+* rmtfs buffer 0xf6301000+0x200000 HLOS -> HLOS RW + MSS RW (status 0).
+* **GLINK**: our descriptor +0xb9300, our TX FIFO +0xbd340 (16 KiB), the modem's FIFO (item 480) at +0xb9330 (16 KiB);
+  modem VERSION 1 features 0x7 -> acked with 0x1, our VERSION acked with 0x1. The modem opened `glink_ssr`, `IPCRTR`,
+  `SSM_RTR_MODEM_APPS`, later `apr_voice_svc`, `apr_apps2`, `LOOPBACK_CTL_MPSS`, `DS`, `DATA1`-`DATA4`, `DATA11` (only
+  IPCRTR is served); **IPCRTR open both ways**, 5 x 1 KiB intents; three 52-byte intent requests granted.
+* **QRTR**: HELLO from node 0 -> our HELLO + NEW_SERVER rmtfs (14, instance 1, 1:0x4000). The modem then announced
+  **~40 QMI services** (in order): 0x42, 0x2b, 0xf, 0xe4, 0xffe4, 0x15, 0x18, 0x17, 0x16, 0x24, 0x31, 0x36, 0x11,
+  0x4a, 0x1002, 0x22, 0x29, 0x37, 0x9, 0x32, 0x3, 0xc, 0xa, 0x1, 0x4, 0x1a, 0x7, 0x8, 0x1d, 0x2f, 0xb, 0x2a, 0x2, 0x5,
+  0x30, 0x44, 0x10, 0x21, 0x12, 0x47 (WDS 1, DMS 2, NAS 3, QOS 4, ..., UIM 0xb, LOC 0x10, ...). **No WLFW (0x45)**
+  and no data to an unknown port (the modem never asked for a TFTP server: none was announced).
+* **rmtfs**: open `/boot/modem_fs1` -> modemst1 (caller 0, 8 MiB), `/boot/modem_fs2` -> modemst2 (1), `/boot/modem_fsg`
+  -> fsg (3), `/boot/modem_fsc` -> fsc (2, 256 KiB); `/boot/modem_fsg_oem_1` and `_oem_2` rejected (unknown to upstream
+  rmtfs as well); alloc 2 MiB -> 0xf6301000; **reads**: modemst1 sector 1, modemst2 sector 1, modemst2 4094 sectors
+  from 2 (2 MiB) - all ok. **No writes** in 60 s.
+* SMP2P `slave-kernel` 0x2 (ready, 11 ms) -> **0x6 at 2083 ms: handover** (boot 39, without rmtfs, never got it).
+* Summary line: 61 packets in, 13 out; rmtfs 3 reads (2 MiB), 0 writes. Stop request: **stop-ack after 190 ms**
+  (`slave-kernel` 0xe); rmtfs buffer back to HLOS RW (status 0); MPSS left with the modem until reboot; no panic, phone
+  up, iOS/backboardd/SpringBoard fine throughout.
+
+Console: `research/ios26/logs-wlan/boot40-wlan-rmtfs-usb.txt` (main checkout, not in git).
+
+**Reading:** the IPC stack (GLINK SMEM, QRTR, QMI) works end to end on iOS 26, the modem has its EFS and runs its full
+service set. Two things are missing for Wi-Fi:
+1. **TFTP server** (`tqftpserv`, QRTR service 4096 version 1): the modem's WLAN PD loads `wlanmdsp.mbn` (and reads
+   board data) through it; until one is announced the modem never asks. Serve `/readonly/firmware/image/*` from the
+   phone's `modem` partition (read-only), log every request path.
+2. Then **WLFW** (QMI service 0x45) should appear; next comes the WLFW client (indication register, host capability,
+   BDF download from `bdwlan.*`, WLAN mode on) to bring up the WCN3990 core.
