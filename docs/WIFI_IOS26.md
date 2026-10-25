@@ -241,3 +241,35 @@ a finding yet. Next probe boot (same `sweetwlan=3`) with 1104 lists all 15 entri
 Next after that: write P2/P3 for xnu-12377: the MSS power/clock/reset sequence (q6v5-mss sdm845: AOSS/PDC reset,
 halt registers, the AXI branches above), the MBA load into 0x96900000 and the RMB handshake, as one gated patch
 that stops at "MBA alive" and is run only with the user present (the first TZ-mediated step).
+
+### 5.2 P3: MSS power-up and MBA boot (patches 1105 + 1106, compile-checked, NOT run)
+
+Written 2026-10-25 against Linux v6.6 `qcom_q6v5_mss.c` (`sdm845_mss`: has_alt_reset, need_mem_protection, proxy
+power domains cx/mx/mss, proxy clocks xo/prng, reset clocks iface/snoc_axi, active clocks bus/mem/gpll0_mss/mnoc_axi)
+and `qcom_q6v5.c` (`qcom,qmp` load_state). Stage `sweetwlan=4` runs only when **`sweetmss=1`** is set as well:
+
+1. `mba.mbn` (the phone's own, 238304 bytes) from the `modem` FAT16 partition (read-only).
+2. AOSS QMP (0xc300000; doorbell apss_shared 0x17990000 +12 bit 0): link/channel handshake, then
+   `{class: image, res: load_state, name: modem, val: on}`.
+3. RPMh ARC votes cx.lvl, mx.lvl, mss.lvl at their highest level (1105: `sweet_rpmh_arc_vote`, active set, allow-list
+   of those three; the VRM path for the BT rails is unchanged).
+4. Checks that cfg_ahb, prng, boot_rom and mfab_axis are on (boot 30: they are); enables snoc_axi (BRANCH_HALT, polled).
+5. Alt reset deassert: PDC modem sync reset (0xb2e0100 bit 9) asserted, `RMB_MBA_ALT_RESET`=1, AOSS MSS restart pulse
+   (0xc2b0000 1 -> 0, 300 us each), `RMB_MBA_ALT_RESET`=0, PDC released. Then q6_memnoc_axi (BRANCH_VOTED, not polled).
+6. MBA copied into its carve-out 0x96900000 (write-combined mapping) while the kernel still owns it, then two SCM
+   hyp-assigns, HLOS -> MSS_MSA (RW): MPSS 0x8e400000+0x7800000, MBA 0x96900000+0x200000
+   (SMC 0x42000c16, arginfo 0x1117, args 3..6 in an indirect buffer).
+7. `RMB_MBA_IMAGE` = MBA address; QDSP6SS sleep clock on, `BOOT_CORE_START`=1, `BOOT_CMD`=1, wait `RMB_MBA_MSS_STATUS`
+   bit 0 (10 ms), `RMB_PBL_STATUS` (1 s, 1 = success), `RMB_MBA_STATUS` (5 s, 1/2 = XPU unlocked = **"MBA ALIVE"**).
+8. Teardown (always, unless `sweetmsskeep=1` and alive), in `q6v5_mba_reclaim` order: halt the q6/modem/nc AXI ports
+   (TCSR 0x1f63000/0x1f65000/0x1f64000), alt reset assert, clocks off, hyp-assign both carve-outs back to HLOS (RWX),
+   ARC votes to level 0, QMP load_state off. A carve-out that could not be reclaimed is reported and never touched.
+
+Log lines: `SWEET MSS:` (+ `SWEET RPMH:` for the votes). Expected outcomes, in order of increasing progress: QMP not
+acked; an ARC lookup/vote failure; an SCM hyp-assign error (TZ/hypervisor policy); boot FSM timeout; PBL status
+other than 1; MBA status 0 (MBA did not start); `MBA ALIVE`.
+
+Hazards (WIFI_BT_PLAN.md section 5, P3 = high): the first TZ/hypervisor-mediated action; the QHEE hypervisor may
+treat an unexpected request or an SMMU fault as fatal and reset the SoC. A reset is recoverable (the phone reboots
+to fastboot / Android bootloader as usual); nothing is written to storage. Run it **only with the user present**,
+with `sweetwlandelay` long enough for the persistent log to be up, and read the log before any second attempt.
