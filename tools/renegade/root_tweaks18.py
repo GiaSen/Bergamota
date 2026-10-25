@@ -155,6 +155,10 @@ BT_ENV = {'BT_HCI_TRANSPORT': 'H4BC:POSIX:com.apple.uart.bluetooth,3000000'}
 BT_ENV_REMOVE = ('BT_DEVICE_ADDRESS',)
 BLUETOOL_STUB = None        # default: find_sweetnet('bluetool-stub') at call time (tools/sweetnet/build.sh)
 HCITEST = None              # same for hcitest
+# WCN3990 rampatch + NVM for the kernel BT stage (sweetwlan=2, read from /usr/standalone/firmware/sweet/).
+# Qualcomm firmware, never in git: RENEGADE_BT_FW=DIR with crbtfw21.tlv and crnv21.bin (linux-firmware qca/,
+# the pair that worked on iOS 16 and 18; the phone's own bluetooth partition has an older pair).
+BT_FW_FILES = ('crbtfw21.tlv', 'crnv21.bin')
 
 
 def bluetoothd_env(plist):
@@ -201,6 +205,13 @@ def bluetooth(root):
     if hci and os.path.exists(hci):
         install_file(hci, os.path.join(root, 'usr/local/bin/hcitest'))
         print('bluetooth: /usr/local/bin/hcitest installed')
+    fw = os.environ.get('RENEGADE_BT_FW')
+    if fw:
+        for name in BT_FW_FILES:
+            install_file(os.path.join(fw, name), os.path.join(root, 'usr/standalone/firmware/sweet', name), 0o644)
+        print('bluetooth: WCN3990 firmware from', fw, 'in /usr/standalone/firmware/sweet')
+    else:
+        print('bluetooth: RENEGADE_BT_FW not set: no WCN3990 firmware in the root (the BT stage will not download)')
 
 
 def containers(root):
