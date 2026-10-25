@@ -10,18 +10,22 @@
 //! - [`sparse`]: Android sparse images (`img2simg.py`, `simg2img.py`, the reader in `hfsx.py`)
 //! - [`hfs`]: the read-only HFS+/HFSX reader (`hfsx.py`)
 //! - [`macho`] and [`pacstrip`]: the arm64e code rewriter (`pacstrip.py`, without `--sign`)
+//! - [`codesign`]: ad-hoc signing as `codesign -f -s -` does it (pacstrip.py --sign)
 //! - [`fixups`]: the chained-fixup page-in check (`fixupcheck.py`)
 //! - [`hfsedit`]: the owner/mode pass and owner map (`hfsroot_owners.py`, mkroot-full.py), free runs (`hfs_trim.py`)
 //! - [`plist`]: plistlib's reader and writers (binary and XML, byte-identical)
 //! - [`tweaks`]: the tweaks stage (root_tweaks18.py), the self-contained part
 //! - [`hfswrite`]: a new HFSX writer (the Python build uses newfs_hfs + a mount + ditto instead)
 
+pub mod bundle;
+pub mod codesign;
 pub mod fixups;
 pub mod hfs;
 pub mod hfsedit;
 pub mod hfswrite;
 pub mod io;
 pub mod macho;
+pub mod machostage;
 pub mod pacstrip;
 pub mod plist;
 pub mod sparse;

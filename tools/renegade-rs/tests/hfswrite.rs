@@ -203,12 +203,18 @@ fn root_build_from_a_folder() {
     fs::create_dir_all(src.join("usr/standalone/update")).unwrap();
     fs::write(src.join("usr/standalone/update/ramdisk"), b"ota").unwrap();
     fs::copy(root().join("tests/fixtures/libpac.dylib"), src.join("usr/lib/libpac.dylib")).unwrap();
+    // a bundle: its main executable is re-signed with the bundle sealed (CodeResources written into the image)
+    let app = src.join("Applications/Demo.app");
+    fs::create_dir_all(app.join("en.lproj")).unwrap();
+    fs::write(app.join("Info.plist"), "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\t<key>CFBundleExecutable</key>\n\t<string>Demo</string>\n</dict>\n</plist>\n").unwrap();
+    fs::write(app.join("en.lproj/Localizable.strings"), "x").unwrap();
+    fs::copy(root().join("tests/fixtures/libpac.dylib"), app.join("Demo")).unwrap();
+    let py_app = d.join("py/Demo.app");
+    fs::create_dir_all(py_app.parent().unwrap()).unwrap();
+    run(Command::new("cp").arg("-R").arg(&app).arg(&py_app));
     fs::write(d.join("map.tsv"), "usr/lib/libpac.dylib\t0\t0\t755\nusr\t0\t0\t755\n").unwrap();
-    // refuses without --unsigned (no re-signing yet)
-    let r = Command::new(bin()).arg("root").arg(&src).arg(d.join("x.simg")).output().unwrap();
-    assert!(!r.status.success());
     let simg = d.join("root.simg");
-    run(Command::new(bin()).arg("root").arg(&src).arg(&simg).args(["--unsigned", "--no-tweaks", "--map", "map.tsv", "--date", "1700000000"]).current_dir(&d));
+    run(Command::new(bin()).arg("root").arg(&src).arg(&simg).args(["--no-tweaks", "--map", "map.tsv", "--date", "1700000000"]).current_dir(&d));
     assert!(!d.join("root.img").exists(), "raw image consumed");
     let ls = |p: &str| run(py("hfsx.py").arg(&simg).args(["ls", p]));
     assert!(!ls("/").contains(".fseventsd"));
@@ -216,11 +222,20 @@ fn root_build_from_a_folder() {
     assert!(!ls("/usr").contains("standalone") || !ls("/usr/standalone").contains("update"));
     let cryptex = run(py("hfsx.py").arg(&simg).args(["stat", "/private/preboot/Cryptexes/OS"]));
     assert!(cryptex.contains("mode 120"), "{cryptex}");
-    // the Mach-O in the image is pacstrip.py's rewrite of the original
-    let want = d.join("want.dylib");
-    run(py("pacstrip.py").arg(root().join("tests/fixtures/libpac.dylib")).arg("-o").arg(&want));
-    let got = Command::new("python3").arg("-I").arg(root().join("../renegade/hfsx.py")).arg(&simg).args(["cat", "/usr/lib/libpac.dylib"]).output().unwrap().stdout;
-    assert!(got == fs::read(&want).unwrap(), "stripped Mach-O differs from pacstrip.py's");
+    // the Mach-Os in the image are pacstrip.py --sign's rewrite of the originals (macOS codesign; elsewhere
+    // pacstrip.py signs with ldid, so only the signature's presence is checked)
+    let cat = |p: &str| Command::new("python3").arg("-I").arg(root().join("../renegade/hfsx.py")).arg(&simg).args(["cat", p]).output().unwrap().stdout;
+    if cfg!(target_os = "macos") && have("codesign") {
+        let want = d.join("want.dylib");
+        run(py("pacstrip.py").arg("--sign").arg(root().join("tests/fixtures/libpac.dylib")).arg("-o").arg(&want));
+        assert!(cat("/usr/lib/libpac.dylib") == fs::read(&want).unwrap(), "re-signed Mach-O differs from pacstrip.py --sign's");
+        run(py("pacstrip.py").arg("--sign").arg(py_app.join("Demo")));
+        assert!(cat("/Applications/Demo.app/Demo") == fs::read(py_app.join("Demo")).unwrap(), "bundle executable differs");
+        let cr = cat("/Applications/Demo.app/_CodeSignature/CodeResources");
+        assert!(cr == fs::read(py_app.join("_CodeSignature/CodeResources")).unwrap(), "CodeResources differs");
+    } else {
+        assert!(renegade::codesign::identity(&cat("/usr/lib/libpac.dylib")).is_some());
+    }
     let st = run(py("hfsx.py").arg(&simg).args(["stat", "/usr/lib/libpac.dylib"]));
     assert!(st.contains("uid,gid (0, 0) mode 100755"), "{st}");
     let st = run(py("hfsx.py").arg(&simg).args(["stat", "/usr/lib/hello.txt"]));
@@ -250,7 +265,7 @@ fn root_build_with_tweaks_matches_root_tweaks18() {
     }
     run(Command::new("python3").arg("-I").arg(&script).arg("run").arg(&py_root).arg(&tools));
     let simg = d.join("root.simg");
-    run(Command::new(bin()).arg("root").arg(&src).arg(&simg).args(["--unsigned", "--build", "22H352", "--version", "18.7.8", "--board", "N841", "--adt-target", "D22"])
+    run(Command::new(bin()).arg("root").arg(&src).arg(&simg).args(["--build", "22H352", "--version", "18.7.8", "--board", "N841", "--adt-target", "D22"])
         .arg("--netcfg").arg(tools.join("sweetnetcfg")).arg("--sweetreboot").arg(tools.join("sweetreboot")));
     let cat = |p: &str| Command::new("python3").arg("-I").arg(root().join("../renegade/hfsx.py")).arg(&simg).args(["cat", p]).output().unwrap().stdout;
     for p in [

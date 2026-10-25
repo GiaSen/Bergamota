@@ -24,15 +24,38 @@ the web flasher (`apps/web`, phase 3).
 | `newfs_hfs -s` + mount + `ditto` + `hfsroot_owners.py` (no Python writer) | `hfswrite::build`, `renegade-rs mkhfs DIR IMG`, `rebuild SIMG IMG --prefix P` | fsck_hfs clean, mounts, same tree, same owners as the Python way |
 | `plistlib.load` / `dump(FMT_BINARY / FMT_XML)` | `plist::parse`, `to_binary`, `to_xml`, `renegade-rs plist IN OUT [--fmt xml]` | byte-identical on 426 plists of the iOS 26 root (852 dumps, incl. launchd.plist's shared containers) and 300 random ones |
 | `root_tweaks18.py`: launchd, quiet, containers, launchservices, event_timing, usbnet, netcfg, sweetreboot, sweetmetrics, audio, activation, prefs, iosroot_dirs, staged apps, the bluetoothd environment, add_job | `tweaks::run` on a folder (`DirFs`, `renegade-rs tweaks DIR`) or on the root build's tree (`TreeFs`) | same files, modes, recorded owners and printed lines as root_tweaks18.py |
-| copy-stage layout fixes, tweaks, owner map (+ the tweaks' owners as OWNER_EXTRA), macho stage (strip), seal, img2simg --consume | `renegade-rs root DIR OUT.simg --unsigned --build B --version V` | tweaked files identical to root_tweaks18.py's, stripped Mach-Os identical to pacstrip.py, fsck_hfs clean; no re-signing yet |
+| `pacstrip.py --sign` (`codesign -f -s - -i ID -o OPTS --entitlements E` on macOS; the bundle sealed when the file is its main executable) | `codesign::resign` / `sign`, `bundle::code_resources`, `renegade-rs strip --sign`, `sign FILE [--info] [--resources]` | byte-identical to codesign: all 3,222 Mach-Os pacstrip.py re-signed in the iOS 26 root (`renegade-rs resign-check`), 2,368 bundle seals; thin, fat, kext, hardened-runtime, entitlements, bundles in the tests |
+| copy-stage layout fixes, tweaks, owner map (+ the tweaks' owners as OWNER_EXTRA), macho stage (strip + re-sign, bundles sealed), seal, img2simg --consume | `renegade-rs root DIR OUT.simg --build B --version V [--no-macho]` | tweaked files identical to root_tweaks18.py's, Mach-Os and CodeResources identical to pacstrip.py --sign's, fsck_hfs clean |
 
-Not ported yet: `pacstrip.py --sign` (ad-hoc re-signing goes through codesign/ldid; the Rust CLI refuses
-`--sign`, and `renegade-rs root` needs `--unsigned` until it can sign), the tweaks that install prebuilt tools
+Not ported yet: ldid signing (pacstrip.py `--sign` on Linux), the tweaks that install prebuilt tools
 with host steps (ssh: dropbear + host-generated keys; the BlueTool stub, hcitest and firmware; PosterBoard +
 sweetfp via addlc.py; bgmtl; bglrender; the first-boot job; sweetprefs), the console bring-up job, the
 jailbreak stage, IPSW/AEA extraction and the APFS volumes (the root build starts from an extracted folder),
 the shared-cache stage (`pacstrip_cache.py`, still changing on the `ios26` branch: `--stubs`),
 `simg_putfile.py`, and the boot images (`mkboot-full.sh`). Reference for the port: branch `ios26` at `6a66010`.
+
+### Ad-hoc signing
+
+`codesign` reproduced without codesign, so the root builds on Linux and in the browser with the bytes the macOS
+build gets: one SHA-256 CodeDirectory (0x20400; 0x20500 with the hardened runtime, carrying the SDK version;
+0x20100 for kexts), 16 KiB pages, the exec segment from `__TEXT`, special slots for Info.plist (the bundle's or
+the embedded `__info_plist` section), the empty requirement set, CodeResources and both entitlement forms (XML,
+and CoreEntitlements DER), an empty CMS wrapper. Details that took matching against codesign:
+
+- The space reserved is codesign's estimate rounded: `roundup16(length + 88 − header + 8)`, the estimate counting
+  a 0x20400 header whatever the version; the padding keeps the bytes the file had there.
+- pacstrip.py reads the old entitlements back through `codesign -d --entitlements - --xml`, which prints the
+  CoreEntitlements view as compact XML (keys sorted, `<dict></dict>`, `&quot;`/`&apos;`); that text is what the
+  new signature holds (`codesign::codesign_xml`).
+- A bundle's main executable is CFBundleExecutable, or without that key the file named after the folder minus
+  its extension. Its CodeResources follows the iOS rules (SHA-1 `files`, SHA-256 `files2`, `.lproj` optional,
+  locversion and `.DS_Store` omitted, nested bundles hashed as plain files) in CoreFoundation's XML layout.
+- Apple's own untouched ad-hoc signatures (4 KiB pages) are left alone, as the Python build leaves every file
+  pacstrip does not change.
+
+The root build seals bundles deepest first. The Python stage signs in a process pool, so a bundle can be sealed
+before its nested code is re-signed: 68 bundles of the iOS 26 root carry stale hashes of their app extensions,
+which the Rust build does not reproduce.
 
 ### The HFSX writer
 
@@ -72,5 +95,10 @@ The tests compare, on generated images and on the fixtures (small HFS+ and HFSX 
 compiled from `tests/fixtures/pac.s`, `fix.c`, `exe.c`, a hand-built Mach-O with a data-in-code entry):
 img2simg bytes, simg2img images and random reads, every `hfs` command on both volumes (including hard links,
 relative and absolute symlinks, NFC/NFD names), pacstrip scan and rewrite bytes and verbose lines,
-`--dylinker`, 200,000 random instruction words classified by `pacstrip.rewrite_word`, and fixupcheck on a
-directory (with a deliberately broken chain) and on the image. No Apple file is committed.
+`--dylinker`, 200,000 random instruction words classified by `pacstrip.rewrite_word`, fixupcheck on a
+directory (with a deliberately broken chain) and on the image, and (macOS) `strip --sign` against
+`pacstrip.py --sign` on linker-signed, codesign-signed (entitlements, hardened runtime, long identifier) and fat
+binaries and on bundles with and without CFBundleExecutable. No Apple file is committed.
+
+`renegade-rs resign-check ROOT.simg` re-signs every codesign-signed Mach-O of a Python-built root and reports
+the ones that do not come out identical.

@@ -765,6 +765,15 @@ impl<'a> TreeFs<'a> {
         Ok(&mut self.entries[i])
     }
 
+    /// The kind of the entry at a path (symlinks in the path followed, the last one not).
+    pub fn kind_of(&self, p: &str) -> Option<crate::hfswrite::Kind> {
+        let p = Self::norm(p);
+        let (dir, name) = p.rsplit_once('/').unwrap_or(("", p.as_str()));
+        let dir = self.resolve(dir)?;
+        let full = if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") };
+        self.index.get(&full).map(|&i| self.entries[i].kind.clone())
+    }
+
     /// The content of a file entry.
     pub fn data(&self, source: usize) -> Result<Vec<u8>> {
         if source >= self.base { Ok(self.overlay[source - self.base].clone()) } else { (self.read_source)(source) }

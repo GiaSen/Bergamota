@@ -36,6 +36,8 @@ fn main() -> ExitCode {
         Some("root") => cmd_root(&args[1..]),
         Some("plist") => cmd_plist(&args[1..]),
         Some("tweaks") => cmd_tweaks(&args[1..]),
+        Some("sign") => cmd_sign(&args[1..]),
+        Some("resign-check") => cmd_resign_check(&args[1..]),
         _ => {
             eprintln!("{}", USAGE);
             return ExitCode::from(2);
@@ -185,11 +187,8 @@ fn img2simg_consume(raw: &Path, out: &Path) -> Res<renegade::sparse::Img2SimgSta
 fn cmd_root(args: &[String]) -> Res<ExitCode> {
     let (pos, opts, flags) = split(args, &["--map", "--size", "--name", "--date", "--raw", "--build", "--version", "--board", "--adt-target", "--netcfg", "--sweetreboot"]);
     let [src, out] = &pos[..] else {
-        return Err("root SRC_DIR OUT.simg --unsigned --build B --version V [--board N104 --adt-target N104] [--map owners.tsv] [--size 20g] [--raw RAW.img] [--keep-raw] [--no-tweaks] [--quiet] [--netcfg FILE] [--sweetreboot FILE]".into());
+        return Err("root SRC_DIR OUT.simg --build B --version V [--board N104 --adt-target N104] [--map owners.tsv] [--size 20g] [--raw RAW.img] [--keep-raw] [--no-tweaks] [--no-macho] [--quiet] [--netcfg FILE] [--sweetreboot FILE]".into());
     };
-    if !flags.iter().any(|f| f == "--unsigned") {
-        return Err("the Rust root build cannot re-sign the rewritten Mach-Os yet (pacstrip.py --sign does, through codesign/ldid): pass --unsigned to build anyway (the phone refuses unsigned code)".into());
-    }
     let date: u32 = opts.get("--date").map(|d| d.parse()).transpose()?.unwrap_or(0);
     let (mut entries, paths, skipped) = renegade::tree::scan_dir(Path::new(src))?;
     eprintln!("{} entries, {} skipped (not file/folder/symlink)", entries.len(), skipped.len());
@@ -228,7 +227,23 @@ fn cmd_root(args: &[String]) -> Res<ExitCode> {
             map.insert(p.nfd().collect(), (u, g, perm));
         }
     }
+    // macho stage: strip, re-sign what changed (bundles sealed deepest first); CodeResources go into the tree
+    let plan = if flags.iter().any(|f| f == "--no-macho") {
+        renegade::machostage::Plan::default()
+    } else {
+        let p = renegade::machostage::plan(&mut tfs, renegade::tree::DYLD_DIR)?;
+        eprintln!(
+            "macho: {} Mach-Os, {} rewritten and re-signed ({} bundles sealed), {} unchanged: {}",
+            p.machos,
+            p.signed.len(),
+            p.bundles_sealed,
+            p.clean,
+            Report { counts: p.counts.clone(), ..Default::default() }.summary()
+        );
+        p
+    };
     let renegade::tweaks::TreeFs { mut entries, overlay, .. } = tfs;
+    renegade::machostage::apply_sizes(&plan, &mut entries);
     let (mapped, defaulted) = renegade::tree::apply_map(&mut entries, &map, true);
     eprintln!("owners: {mapped} from the map, {defaulted} root:wheel");
     let o = renegade::hfswrite::Options {
@@ -240,29 +255,13 @@ fn cmd_root(args: &[String]) -> Res<ExitCode> {
     let raw = opts.get("--raw").map(Path::new).map(Path::to_path_buf).unwrap_or_else(|| Path::new(out).with_extension("img"));
     File::create(&raw)?;
     let mut w = renegade::io::FileRw::open(&raw)?;
-    let dyld = Path::new(src).join(renegade::tree::DYLD_DIR);
-    let mut totals: BTreeMap<String, u64> = BTreeMap::new();
-    let (mut rewritten, mut machos) = (0u64, 0u64);
     let st = renegade::hfswrite::build(&entries, &o, &mut w, &mut |source, sink| {
         if source >= base {
             return sink(&overlay[source - base]);
         }
-        let p = &paths[source];
-        let mut data = fs::read(p)?;
-        if !p.starts_with(&dyld) && looks_like_macho(&data) {
-            machos += 1;
-            let before = data.clone();
-            let rep = strip(&mut data, &Options { write: true, ..Default::default() }).map_err(io::Error::other)?;
-            if data != before {
-                rewritten += 1;
-            }
-            for (k, v) in rep.counts {
-                *totals.entry(k).or_default() += v;
-            }
-        }
+        let data = renegade::machostage::final_bytes(&plan, source, fs::read(&paths[source])?)?;
         sink(&data)
     })?;
-    eprintln!("{machos} Mach-Os, {rewritten} rewritten: {}", Report { counts: totals, ..Default::default() }.summary());
     eprintln!("{}: {} folders, {} files ({} hard links), {} of {} blocks free", raw.display(), st.folders, st.files, st.hard_links, st.free_blocks, st.total_blocks);
     drop(w);
     let keep = flags.iter().any(|f| f == "--keep-raw");
@@ -318,6 +317,197 @@ fn cmd_tweaks(args: &[String]) -> Res<ExitCode> {
         println!("OWNER {p} {u} {g}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// A bundle executable's signing context: its bundle's Info.plist and CodeResources.
+type BundleContext = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// When `exe` is the main executable of the bundle around it (Info.plist's CFBundleExecutable, else the folder's name), writes the
+/// bundle's _CodeSignature/CodeResources as codesign does and returns (Info.plist, CodeResources).
+fn seal_bundle_on_disk(exe: &Path) -> Res<BundleContext> {
+    let dir = exe.parent().unwrap_or(Path::new("."));
+    let name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let info = fs::read(dir.join("Info.plist")).ok();
+    let dir_name = dir.canonicalize().ok().and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default();
+    if !renegade::bundle::is_main_executable(info.as_deref(), &dir_name, &name) {
+        return Ok((None, None));
+    }
+    let mut items = Vec::new();
+    let mut todo = vec![(dir.to_path_buf(), String::new())];
+    while let Some((d, rel)) = todo.pop() {
+        for e in fs::read_dir(&d)? {
+            let e = e?;
+            let nm = e.file_name().to_string_lossy().into_owned();
+            let r = if rel.is_empty() { nm.clone() } else { format!("{rel}/{nm}") };
+            if rel.is_empty() && (nm == "_CodeSignature" || nm == name) {
+                continue;
+            }
+            let ft = e.file_type()?;
+            if ft.is_dir() {
+                todo.push((e.path(), r));
+            } else if ft.is_symlink() {
+                items.push((r, renegade::bundle::Item::Symlink(fs::read_link(e.path())?.to_string_lossy().into_owned())));
+            } else {
+                items.push((r, renegade::bundle::Item::file(&fs::read(e.path())?)));
+            }
+        }
+    }
+    let cr = renegade::bundle::code_resources(&items);
+    fs::create_dir_all(dir.join("_CodeSignature"))?;
+    fs::write(dir.join("_CodeSignature/CodeResources"), &cr)?;
+    Ok((info, Some(cr)))
+}
+
+/// Re-signs ad hoc keeping identifier, options and entitlements (pacstrip.py's sign()). For a bundle's main
+/// executable pass its Info.plist and _CodeSignature/CodeResources.
+fn cmd_sign(args: &[String]) -> Res<ExitCode> {
+    let (pos, opts, _) = split(args, &["-o", "--info", "--resources"]);
+    let [src] = &pos[..] else { return Err("sign FILE [-o OUT] [--info Info.plist] [--resources CodeResources]".into()) };
+    let data = fs::read(src)?;
+    let (info, res) = if opts.contains_key("--info") || opts.contains_key("--resources") {
+        (opts.get("--info").map(fs::read).transpose()?, opts.get("--resources").map(fs::read).transpose()?)
+    } else {
+        seal_bundle_on_disk(Path::new(opts.get("-o").unwrap_or(src)))?
+    };
+    let out = renegade::codesign::resign(&data, info, res)?;
+    fs::write(opts.get("-o").unwrap_or(src), out)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Re-signs every Mach-O of a root image in memory (identifier, options and entitlements from its own signature;
+/// bundle executables with a freshly generated CodeResources) and compares with the image: what codesign wrote
+/// must come out byte for byte.
+fn cmd_resign_check(args: &[String]) -> Res<ExitCode> {
+    let (pos, opts, _) = split(args, &["--prefix", "--show"]);
+    let [img] = &pos[..] else { return Err("resign-check IMAGE.simg [--prefix /usr] [--show 10]".into()) };
+    let show: usize = opts.get("--show").map(|s| s.parse()).transpose()?.unwrap_or(10);
+    let v = Volume::open(Sparse::open(FileAt::open(img)?)?)?;
+    let prefix = opts.get("--prefix").cloned().unwrap_or("/".into());
+    let top = v.lookup(&prefix, true)?.filter(|e| e.rt == FOLDER).ok_or("prefix is not a folder")?;
+    let read = |e: Entry| -> io::Result<Vec<u8>> { v.read_file(v.resolve_link(e).ok_or_else(|| io::Error::other("hard link without iNode"))?) };
+    let mode = |e: Entry| v.resolve_link(e).and_then(|t| t.rec).map(|d| v.mode(d)).unwrap_or(0);
+    // every file and symlink under a folder, paths relative to it (skip: the top _CodeSignature and `exe`)
+    let bundle_items = |dir: u32, exe: &str| -> io::Result<Vec<(String, renegade::bundle::Item)>> {
+        let mut out = Vec::new();
+        let mut todo = vec![(dir, String::new())];
+        while let Some((c, rel)) = todo.pop() {
+            for (nm, e) in v.children(c) {
+                let p = if rel.is_empty() { nm.clone() } else { format!("{rel}/{nm}") };
+                if rel.is_empty() && (nm == "_CodeSignature" || nm == exe) {
+                    continue;
+                }
+                if e.rt == FOLDER {
+                    todo.push((e.cnid, p));
+                } else if mode(*e) & 0o170000 == 0o120000 {
+                    out.push((p, renegade::bundle::Item::Symlink(String::from_utf8_lossy(&read(*e)?).into_owned())));
+                } else {
+                    out.push((p, renegade::bundle::Item::file(&read(*e)?)));
+                }
+            }
+        }
+        Ok(out)
+    };
+    let (mut n, mut same, mut bundles, mut cr_same, mut cr_stale, mut apple, mut cr_sealed_ok) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut own = 0u64;
+    let mut bad: Vec<String> = Vec::new();
+    let note = |bad: &mut Vec<String>, s: String| {
+        if bad.len() < show {
+            bad.push(s);
+        }
+    };
+    let mut todo = vec![(top.cnid, prefix.trim_end_matches('/').to_string())];
+    while let Some((cnid, p)) = todo.pop() {
+        for (nm, e) in v.children(cnid) {
+            let q = format!("{p}/{nm}");
+            if e.rt == FOLDER {
+                if !nm.starts_with("\0\0\0\0HFS+") {
+                    todo.push((e.cnid, q));
+                }
+                continue;
+            }
+            if mode(*e) & 0o170000 != 0o100000 || q.starts_with("/System/Library/Caches/com.apple.dyld/") {
+                continue;
+            }
+            let data = read(*e)?;
+            if !looks_like_macho(&data) || renegade::codesign::identity(&data).is_none() {
+                continue;
+            }
+            // a signature codesign did not write (Apple's own ad-hoc ones use 4 KiB pages): the Python build left
+            // the file alone (pacstrip found nothing to rewrite)
+            if renegade::codesign::page_shift(&data) != Some(14) {
+                apple += 1;
+                continue;
+            }
+            // entitlements not in `codesign -d --xml` form: signed by the build's own tools (codesign with the XML
+            // as written), never re-signed by pacstrip.py, so not something resign reproduces
+            if let Some(ents) = renegade::codesign::identity(&data).and_then(|i| i.entitlements)
+                && renegade::codesign::codesign_xml(&ents).ok().as_deref() != Some(&ents[..])
+            {
+                own += 1;
+                continue;
+            }
+            n += 1;
+            let info = v.child(cnid, "Info.plist").map(read).transpose()?;
+            let dir_name = p.rsplit('/').next().unwrap_or("");
+            if renegade::bundle::is_main_executable(info.as_deref(), dir_name, nm) {
+                bundles += 1;
+                let items = bundle_items(cnid, nm)?;
+                let cr = renegade::bundle::code_resources(&items);
+                let old = v.child(cnid, "_CodeSignature").and_then(|c| v.child(c.cnid, "CodeResources")).map(read).transpose()?;
+                // the binary's resource slot is the hash of the CodeResources codesign generated when it signed:
+                // re-signed with ours, the binary must come out identical
+                match renegade::codesign::resign(&data, info.clone(), Some(cr.clone())) {
+                    Ok(out) if out == data => {
+                        same += 1;
+                        if old.as_deref() == Some(&cr[..]) {
+                            cr_same += 1;
+                        } else {
+                            cr_sealed_ok += 1; // the CodeResources file in the image is not the one that was sealed
+                        }
+                    }
+                    _ => match renegade::codesign::resign(&data, info, old.clone()) {
+                        Ok(out) if out == data => {
+                            same += 1;
+                            let stale = old.as_deref().and_then(|o| renegade::bundle::stale_entries(o, &items)).unwrap_or_default();
+                            if !stale.is_empty() {
+                                cr_stale += 1;
+                                note(&mut bad, format!("{q}: sealed with stale hashes (bundle signed before its nested code): {}", stale.join(", ")));
+                            } else {
+                                note(&mut bad, format!("{q}: sealed CodeResources differs from ours ({} vs {} bytes)", cr.len(), old.map(|o| o.len()).unwrap_or(0)));
+                            }
+                        }
+                        Ok(out) => {
+                            let at = out.iter().zip(&data).position(|(a, b)| a != b).unwrap_or(out.len().min(data.len()));
+                            note(&mut bad, format!("{q}: bundle executable differs at byte {at} of {} (re-signed {} bytes)", data.len(), out.len()));
+                        }
+                        Err(err) => note(&mut bad, format!("{q}: {err}")),
+                    },
+                }
+            } else {
+                match renegade::codesign::resign(&data, None, None) {
+                    Ok(out) if out == data => same += 1,
+                    Ok(out) => {
+                        let at = out.iter().zip(&data).position(|(a, b)| a != b).unwrap_or(out.len().min(data.len()));
+                        note(&mut bad, format!("{q}: differs at byte {at} of {} (re-signed {} bytes)", data.len(), out.len()));
+                    }
+                    Err(err) => note(&mut bad, format!("{q}: {err}")),
+                }
+            }
+            if n % 1000 == 0 {
+                eprintln!("... {n} checked, {same} identical");
+            }
+        }
+    }
+    for b in &bad {
+        println!("NOTE {b}");
+    }
+    println!(
+        "{n} codesign-signed Mach-Os re-signed: {same} byte-identical ({apple} with Apple's untouched signature and {own} signed outside pacstrip skipped); \
+         {bundles} bundle executables: our CodeResources is the sealed one for {}, ({cr_same} also equal to the file in the image, \
+         {cr_sealed_ok} where the image holds another CodeResources than the sealed one), {cr_stale} sealed with stale hashes by the Python build",
+        cr_same + cr_sealed_ok
+    );
+    Ok(if same == n { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
 fn cmd_owners(args: &[String]) -> Res<ExitCode> {
@@ -542,9 +732,7 @@ fn cmd_strip(args: &[String]) -> Res<ExitCode> {
     let (inputs, opts, flags) = split(args, &["-o", "--output", "--dylinker", "--subtype"]);
     let verbose = flags.iter().any(|f| f == "-v" || f == "--verbose");
     let scan = flags.iter().any(|f| f == "--scan");
-    if flags.iter().any(|f| f == "--sign") {
-        return Err("--sign is not ported yet: sign with tools/renegade/pacstrip.py --sign (codesign / ldid)".into());
-    }
+    let do_sign = flags.iter().any(|f| f == "--sign");
     let output = opts.get("-o").or(opts.get("--output"));
     if output.is_some() && inputs.len() != 1 {
         return Err("-o needs exactly one input".into());
@@ -568,7 +756,13 @@ fn cmd_strip(args: &[String]) -> Res<ExitCode> {
             *total.entry(k.clone()).or_default() += v;
         }
         if !scan {
-            fs::write(output.unwrap_or(path), &buf)?;
+            let dst = output.unwrap_or(path);
+            if do_sign {
+                // pacstrip.py writes, then sign(out): codesign seals the bundle when `out` is its main executable
+                let (info, cr) = seal_bundle_on_disk(Path::new(dst))?;
+                buf = renegade::codesign::resign(&buf, info, cr)?;
+            }
+            fs::write(dst, &buf)?;
         }
     }
     if inputs.len() > 1 {
