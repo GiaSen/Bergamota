@@ -13,7 +13,7 @@ at image build time into the (git-ignored) header and never committed.  Without 
 keeps the Bergamota screen.
 
 The source is ProgressUI's CgBI PNG (Apple "optimised": BGRA, premultiplied, raw deflate).  The logo is
-a single-colour shape, so only its coverage is kept: 256 grey levels on black, same RLE as bootlogo.h.
+a single-colour shape, so only its coverage is kept: 256 grey levels on black, the palette RLE enxerto/bootui.c draws.
 """
 import argparse
 import os
@@ -140,7 +140,7 @@ def main():
         f.write("/* a8r8g8b8 grey ramp, index = coverage, 0 = black background */\nstatic const unsigned int applelogo_pal[256] = {")
         for i in range(256):
             f.write("%s0xff%02x%02x%02x," % ("\n\t" if i % 8 == 0 else " ", i, i, i))
-        f.write("\n};\n/* per-row RLE, see tools/mkbootlogo.py */\n")
+        f.write("\n};\n/* per-row RLE: c & 0x80 ? (c & 0x7f) + 1 literal indices : c + 1 copies of the next index */\n")
         f.write("static const unsigned char applelogo_rle[%d] = {" % len(rle))
         for i, v in enumerate(rle):
             f.write("%s0x%02x," % ("\n\t" if i % 16 == 0 else "", v))

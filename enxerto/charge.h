@@ -25,6 +25,8 @@ struct charge_view {
 
 /* Full redraw of the static parts; forgets everything cached. */
 void charge_ui_init(void);
+/* The static charging picture for the logo partition (tools/mksplash.py, slot 2). */
+void charge_ui_splash(void);
 /* Redraw whatever differs from the last call. */
 void charge_ui_update(const struct charge_view *v);
 /* One-line notice above the footer in colour fg (0 or "" clears it). */

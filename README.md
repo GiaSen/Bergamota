@@ -11,10 +11,12 @@
 
 <p align="center">
   <img alt="iOS 18.7.8" src="https://img.shields.io/badge/iOS-18.7.8-1a5933?style=flat-square">
-  <img alt="SpringBoard" src="https://img.shields.io/badge/SpringBoard-booting-8fd14f?style=flat-square">
-  <img alt="Kernel" src="https://img.shields.io/badge/kernel-Heartwood-e6e86a?style=flat-square">
+  <img alt="SpringBoard" src="https://img.shields.io/badge/SpringBoard-booting-d7e98a?style=flat-square">
+  <img alt="Kernel" src="https://img.shields.io/badge/kernel-Heartwood-161616?style=flat-square">
   <img alt="Host" src="https://img.shields.io/badge/host-macOS-555?style=flat-square">
 </p>
+
+<p align="center"><sub>The face of the project is Isaac Newton, after Godfrey Kneller's 1689 portrait (public domain), printed as a halftone. Identity: <a href="tools/identity/IDENTITY.md"><code>tools/identity/IDENTITY.md</code></a>.</sub></p>
 
 ---
 
@@ -234,7 +236,8 @@ It does this for every Mach-O in the root and for all of the dyld shared cache. 
 | `tools/extract-dtb.py` | Extracts the stock DTBs from a boot.img (also the Poco F1's appended Image.gz-dtb) and picks yours |
 | `tools/mkadt.py`, `mkpayload.py` | Apple Device Tree generator; kernel + ADT + boot-args payload packer |
 | `tools/sweetnet/` | Small on-device tools (`sweetps`, `sweetprefs`, `sweetuicache`, …) |
-| `tools/assets/`, `mk*art.py`, `mkbootlogo.py`, `mksplash.py` | Bergamota artwork for Enxerto and the ABL splash (`logo` partition) |
+| `tools/identity/` | The Bergamota identity (Newton halftone, lime ground, Archivo + JetBrains Mono): `mkidentity.py` generates Enxerto's `art.h` and the kernel console's portrait, `mkicon.sh` the app icon |
+| `tools/mksplash.py` | The ABL screens of the `logo` partition, from Enxerto's own renders |
 | `docs/` | Design notes: iOS 18 port, Bergamota fastboot and charging, GPU research, … |
 | `NOTES.md` | The engineering log: every boot, crash and decision |
 
