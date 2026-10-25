@@ -183,6 +183,9 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
         ('dram-base', u64(phys_base)),
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
+        # xnu-12377 asserts iBoot wrote this (ml_unsafe_kernel_text, machine_routines.c). 1 = kernel text treated as
+        # read-only, which is xnu-11215's default (pmap_ppl_disable FALSE without -unsafe_kernel_text); older kernels ignore it
+        ('kernel-ctrr-to-be-enabled', u32(1)),
         ('debug-enabled', u32(1)),
         ('firmware-version', cstr('enxerto')),
         ('system-firmware-version', cstr('enxerto')),
