@@ -2,6 +2,11 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> Wi-Fi on iOS 26 (branch `wlan26` off `ios26`, 2026-10-25): docs/WIFI_IOS26.md <<<
+* iOS 26 has no IO80211Family kext (Wi-Fi = DriverKit dext). wifid matches only IOKit properties (`WiFiHardwareHealthy`, `IO80211InterfaceRole=Infrastructure` + `IOInterfaceName`, name `AppleWLANDriver`), and the IO80211 framework falls back to `SIOCGA80211/SIOCSA80211` ioctls + `KEV_IEEE80211_CLASS` events when the service has no user client. All of that is doable inside xnu: the iOS half shrank from a 4-8 week family to a stand-in.
+* Done (not booted): xnu **1100** `sweet80211=1` null-backend stand-in (en0 + IOKit + ioctl log), `tools/adt-wlan.py` (/arm-io/wlan, launchd gate for wifid). Patch range 1100-1199 is Wi-Fi's (iOS 26 port: 1000-1099).
+* Next: a boot with 1100 + adt-wlan ADT + `sweet80211=1` (the iOS 26 session owns the phone and flashes), read the `SWEET 80211:` lines, answer the ioctls wifid needs (W2), then a synthetic scan result (W3). Chip half (WCN3990 MSS/WLFW) unchanged: docs/WIFI_BT_PLAN.md P0-P5.
+
 ### >>> Wi-Fi / Bluetooth on iOS 18 (branch `wifi-bt18`, 2026-10-24): docs/WIFI_BT_IOS18.md <<<
 * **2026-10-24 16:05: BLUETOOTH WORKS on combo9** (GPU session's local kernel = develop + 0238 + 0239 v7, ADT gpufwz-bt, BT boot-args): bluetoothd stays up, PoweredOn, Settings lists nearby devices (user-checked). Fix chain per boot in docs/WIFI_BT_IOS18.md 2.2-2.11. Not merged to develop yet.
 * Why Control Center showed both Off: bluetoothd exits 0 ("Unable to match bluetooth service in device tree") because the GPU ADT `beryllium-hi-3x-gpufwz.adt` has no `/arm-io/bluetooth`, and no current image sets `sweetwlan=2 sweetbt=1` (the WCN3990 is never powered); wifid never starts (`_LimitLoadToDeviceTree` wlan/marconi-wifi, no such node, and no WLAN driver exists at all).

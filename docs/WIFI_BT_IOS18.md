@@ -80,6 +80,9 @@ kernel control registered, `hcitest` got HCI Reset / Read Local Version (Qualcom
 
 ## 3. Wi-Fi: blocker
 
+> iOS 26 re-scope (2026-10-25): docs/WIFI_IOS26.md. On iOS 26 the iOS half no longer needs an IO80211Family
+> stand-in; an in-kernel interface with the right IOKit properties and the Apple80211 ioctls is enough.
+
 There is no Wi-Fi driver of any kind yet, at either end:
 
 1. **Chip side.** On SDM845 the WCN3990 WLAN firmware (`wlanmdsp.mbn`) runs inside the modem DSP (MSS). Nothing
