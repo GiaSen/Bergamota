@@ -177,3 +177,15 @@ through the Bergamota queue, and only with the user's OK.
   -52, NOISE -92, SNR 40, RATES 1..54, CAPABILITIES 1, AP_MODE 2, IE (29 bytes). Kernel log: set type 10 (len
   5528), event 10, get type 11 (len 2272) -> result then EIO; a second event 10 shows that another client
   (wifid) also scanned. New set type 571 (len 8) accepted. Still open: what Settings › Wi-Fi shows (asked).
+* 2026-10-25: **Settings › Wi-Fi showed "No networks" (boot 28, user)**. The iOS 26 session's log stream of wifid and
+  Preferences shows why: on opening the page, Settings asks wifid for the hardware channel list (CoreWiFi
+  "GET HW SUPP CHANNELS", `queryHardwareSupportedChannelsWithRequestParams`). wifid sends ioctl type **254**, named
+  `APPLE80211_IOC_HW_SUPPORTED_CHANNELS` by IO80211 itself (len 4824). 1100 refused it, so Settings logged "device
+  scan channels are nil" and "scanning did finish ... results=0" without ever requesting a scan.
+  **1103** (compile-checked, not booted) answers 254 with the SUPPORTED_CHANNELS list. The IO80211 parser
+  (CopyValue, 0x25d42b428) reads `{u32 version; u32 count @4; {version, channel @12, flags @16} x count}`,
+  12-byte stride, into SUP_CHANNEL / SUP_CHANNEL_FLAGS.
+  **Correction: type numbers.** The names in the boot 23 table came from string order. The framework's real
+  index table (`gAppleIoucIndexToString`, 587 entries, `convertApple80211IOCTLToString`) has empty slots at 0,
+  114 and 353 (CARD_SPECIFIC is -1). Names are right for 1-113 (everything the stand-in implements), one off
+  for 114-352 (e.g. 254 = HW_SUPPORTED_CHANNELS, not BTCOEX_PROFILE) and two off from 353 up.
