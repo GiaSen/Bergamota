@@ -79,6 +79,11 @@ if [ "${IOS18:-1}" = 1 ]; then
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetsample.c" -o "$out18/sweetsample"
 	codesign -s - -f --entitlements "$here/sample.entitlements" "$out18/sweetsample"
 	python3 -I "$pacstrip" --sign "$out18/sweetsample"
+	# Wi-Fi over SSH (iOS 26 stand-in, docs/WIFI_IOS26.md): Apple80211 info/power/scan without wifid or the UI
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework CoreFoundation \
+		"$here/sweetwifi.c" -o "$out18/sweetwifi"
+	codesign -s - -f --entitlements "$here/wifi.entitlements" "$out18/sweetwifi"
+	python3 -I "$pacstrip" --sign "$out18/sweetwifi"
 	# the unified log over SSH (no `log` tool on iOS)
 	b18 sweetlog sweetlog.m log.entitlements -framework OSLog
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework CoreFoundation -framework IOKit \

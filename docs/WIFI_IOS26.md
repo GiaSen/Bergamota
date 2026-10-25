@@ -162,3 +162,9 @@ through the Bergamota queue, and only with the user's OK.
   rates u32[15] (Mb/s) @36, SSID length @96, SSID @97, age @132, flags @136, IE length @138, IEs @140
   (2048), u64 @2256. A privacy bit makes the framework parse WPA/RSN IEs; the fake network is open.
   Joining it fails (ASSOCIATE -> ENXIO). With `sweet80211=1` nothing changes.
+* 2026-10-25: boot 24/25 (`sweet80211=2`, 1101 + 1102): wifid up, optional sets now accepted (new: 470, 482,
+  560), COUNTRY_CODE fine. Still no SCAN_REQ: touch does not work yet, so nobody can open Settings ›
+  Wi-Fi. Added `tools/sweetnet/sweetwifi.c` (`sweetwifi info | power on|off | scan`; built by
+  `tools/sweetnet/build.sh` into `research/sweetnet/ios18/`, arm64e + pacstrip, runs on iOS 26). It calls the
+  framework's own Apple80211Open/BindToInterface/Scan over SSH, which tests the scan path (kernel stand-in
+  plus IO80211's result parser) without wifid or the UI.
