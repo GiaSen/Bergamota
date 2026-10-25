@@ -2,6 +2,11 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> Renegade in Rust, phase 2 started (branch `renegade-rs`, 2026-10-24): tools/renegade-rs/README.md <<<
+- Crate `tools/renegade-rs` (lib + `renegade-rs` CLI, lib also builds for wasm32-unknown-unknown). Ported the stages the iOS 26 port marked stable (reference: branch ios26 @ 6a66010): img2simg/simg2img (byte-identical), hfsx.py reader, pacstrip.py (without --sign), fixupcheck.py.
+- `cargo test --release`: 8 comparison tests against the Python on generated data and committed fixtures (our own HFS+/HFSX volumes and arm64e binaries). Checked by hand on research/ios26/ios26-root-full.simg (main checkout): ls/stat/get/strip --scan identical; fixupcheck of the whole root identical (3793 Mach-Os, 0 bad) in 11 s vs 57 s.
+- Found: `pacstrip.py --subtype arm64` raises struct.error on arm64e (signed cpusubtype). Next: shared-cache stage once pacstrip_cache --stubs settles, HFS+ writer/root build, IPSW/AEA extraction, signing, boot images; then wire the wasm build into apps/web (phase 3).
+
 ### >>> Wi-Fi / Bluetooth on iOS 18 (branch `wifi-bt18`, 2026-10-24): docs/WIFI_BT_IOS18.md <<<
 * **2026-10-24 16:05: BLUETOOTH WORKS on combo9** (GPU session's local kernel = develop + 0238 + 0239 v7, ADT gpufwz-bt, BT boot-args): bluetoothd stays up, PoweredOn, Settings lists nearby devices (user-checked). Fix chain per boot in docs/WIFI_BT_IOS18.md 2.2-2.11. Not merged to develop yet.
 * Why Control Center showed both Off: bluetoothd exits 0 ("Unable to match bluetooth service in device tree") because the GPU ADT `beryllium-hi-3x-gpufwz.adt` has no `/arm-io/bluetooth`, and no current image sets `sweetwlan=2 sweetbt=1` (the WCN3990 is never powered); wifid never starts (`_LimitLoadToDeviceTree` wlan/marconi-wifi, no such node, and no WLAN driver exists at all).
