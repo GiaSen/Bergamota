@@ -41,6 +41,7 @@ SWEETNET = [
     ('ios18/sweetprefs', 'macho'), ('ios18/sweetuicache', 'macho'), ('ios18/sweetfp.dylib', 'macho'),
     ('ios18/sweetmetrics', 'macho'), ('ios18/sweetposterset', 'macho'), ('ios18/sweeticonstyle', 'macho'),
     ('ios18/sweetopen', 'macho'), ('ios18/sweetshot', 'macho'), ('ios18/sweettouch', 'macho'),
+    ('ios18/sweetsample', 'macho'), ('ios18/sweetlog', 'macho'),
     ('ios18/SweetRun.app/SweetRun', 'macho'), ('ios18/SweetRun.app/Info.plist', 'data'),
     ('ios18/SweetRun.app/_CodeSignature/CodeResources', 'data'),
 ]
