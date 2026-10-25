@@ -273,3 +273,21 @@ Hazards (WIFI_BT_PLAN.md section 5, P3 = high): the first TZ/hypervisor-mediated
 treat an unexpected request or an SMMU fault as fatal and reset the SoC. A reset is recoverable (the phone reboots
 to fastboot / Android bootloader as usual); nothing is written to storage. Run it **only with the user present**,
 with `sweetwlandelay` long enough for the persistent log to be up, and read the log before any second attempt.
+
+**Independent review (2026-10-25, against the Linux v6.6 sources) and fixes now in 1105/1106:**
+* *Could reset the SoC:* the teardown voted cx.lvl/mx.lvl to level 0. An apps-DRV vote replaces ABL's vote, and
+  Linux clamps rpmhpd to the top level before sync_state (`rpmhpd_aggregate_corner`). Fixed: `sweet_rpmh_arc_vote`
+  refuses an off vote for cx/mx; only mss.lvl goes back to 0.
+* *Could reset the SoC:* the write-combined MBA window stayed mapped after the carve-out went to the modem (Linux
+  `memunmap`s before the assign). Fixed: `ml_io_unmap` right after the copy.
+* *Wrong result:* the active clock gpll0_mss (GCC vote 0x52004 bit 17, clear on boot 30) and the proxy prng vote
+  (bit 13, also clear) were not voted, and mnoc_axi's enable was not set. Fixed: set if clear, cleared in teardown.
+* *Wrong result, rare:* an interrupted SMC was re-issued with the returned registers. Linux re-issues with x0 = 1,
+  the original x1..x5, x6 = returned token, x7 = 0. Fixed in `ms_scm_call` (the GPU loader `sweet_a630_pas.c`
+  has the same pattern; reported to its owner, not changed here).
+* Minor: `out` initialised before printing, snoc enable cleared on failure too, QMP link-timeout path closes only
+  the link.
+* Checked and correct per the review: SCM function ID / arginfo / register vs indirect arguments / buffer layout /
+  VMIDs and permissions; QMP offsets, handshake, doorbell and message; the boot order; the alt reset in both
+  directions; the QDSP6 sequence; BRANCH_VOTED vs BRANCH_HALT; every physical address including the beryllium
+  carve-outs; the teardown order; the ARC cmd-db parsing; the unchanged VRM path.

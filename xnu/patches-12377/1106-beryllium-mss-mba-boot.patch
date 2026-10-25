@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
-index 2ee8e565c4bfc011d374156cc0bd4ce436cdfc19..b0fc35d789cbe86bcf198db9978bff240f9e91ad 100644
+index 2ee8e565c4bfc011d374156cc0bd4ce436cdfc19..c03ee4c5c2fba56397b740727eaf8ff3e05a52e3 100644
 --- a/bsd/dev/beryllium_wlan.c
 +++ b/bsd/dev/beryllium_wlan.c
 @@ -17,6 +17,10 @@
@@ -24,7 +24,7 @@ index 2ee8e565c4bfc011d374156cc0bd4ce436cdfc19..b0fc35d789cbe86bcf198db9978bff24
  #include "sweet_board.h"
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-@@ -919,6 +927,523 @@ wl_inventory(void)
+@@ -919,6 +927,557 @@ wl_inventory(void)
  	printf("SWEET WLAN: inventory done\n");
  }
  
@@ -68,6 +68,7 @@ index 2ee8e565c4bfc011d374156cc0bd4ce436cdfc19..b0fc35d789cbe86bcf198db9978bff24
 +
 +extern int sweet_rpmh_arc_vote(const char *res, bool max);
 +extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 +extern void sweet_log_sync(void);
 +extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
 +extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
@@ -76,6 +77,8 @@ index 2ee8e565c4bfc011d374156cc0bd4ce436cdfc19..b0fc35d789cbe86bcf198db9978bff24
 +	vm_offset_t q6, rmb, aoss, pdc, qmp, ipc, halt;
 +	uint32_t qmp_off, qmp_size;
 +	bool qmp_open, arc[3], snoc, memnoc, reset_out, mba_assigned, mpss_assigned;
++	uint32_t vote_set;              /* GCC 0x52004 bits we set (gpll0_mss 17, prng 13) */
++	bool mnoc_set;                  /* we set mfab_axis CBCR enable */
 +	bool scm_dead;                  /* an SCM call did not complete: no further calls */
 +} ms;
 +
@@ -96,22 +99,28 @@ index 2ee8e565c4bfc011d374156cc0bd4ce436cdfc19..b0fc35d789cbe86bcf198db9978bff24
 +	register uint64_t x4 __asm__("x4") = r->a[4];
 +	register uint64_t x5 __asm__("x5") = r->a[5];
 +	register uint64_t x6 __asm__("x6") = r->a[6];
++	register uint64_t x7 __asm__("x7") = 0;
 +	__asm__ volatile ("smc #0"
-+	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6)
-+	    : : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++	    : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
 +	*r = (struct ms_scm) { { x0, x1, x2, x3, x4, x5, x6 } };
 +}
 +
-+/* x0 status: 0 ok, 1 interrupted (reissue with x6), -12 busy (retry) */
++/*
++ * x0 status: 0 ok, 1 interrupted, -12 busy. An interrupted call is re-issued like Linux
++ * __scm_smc_do_quirk: x0 = 1, the ORIGINAL x1..x5, x6 = the token TZ returned, x7 = 0.
++ */
 +static bool
 +ms_scm_call(const struct ms_scm *in, struct ms_scm *out)
 +{
++	*out = (struct ms_scm) { { (uint64_t)-1, 0, 0, 0, 0, 0, 0 } };
 +	if (ms.scm_dead) {
 +		return false;
 +	}
 +	for (unsigned busy = 0; busy <= 3; busy++) {
-+		*out = *in;
++		struct ms_scm call = *in;
 +		for (unsigned resume = 0;; resume++) {
++			*out = call;
 +			ms_smc(out);
 +			if ((int32_t)out->a[0] != 1) {
 +				break;
@@ -120,6 +129,9 @@ index 2ee8e565c4bfc011d374156cc0bd4ce436cdfc19..b0fc35d789cbe86bcf198db9978bff24
 +				ms.scm_dead = true;
 +				return false;
 +			}
++			call = *in;
++			call.a[0] = 1;
++			call.a[6] = out->a[6];
 +		}
 +		if ((int32_t)out->a[0] != -12) {
 +			return true;
@@ -232,7 +244,7 @@ index 2ee8e565c4bfc011d374156cc0bd4ce436cdfc19..b0fc35d789cbe86bcf198db9978bff24
 +	ms_qmp_kick();
 +	if (!ms_qmp_wait(0x28, 0xffffu, 1000)) {        /* ucore acks our link */
 +		printf("SWEET MSS: QMP link not acked\n");
-+		goto close;
++		goto close_link;
 +	}
 +	wl_wr(ms.qmp, 0x2c, 0xffffu);                   /* mcore channel up */
 +	ms_qmp_kick();
@@ -250,6 +262,7 @@ index 2ee8e565c4bfc011d374156cc0bd4ce436cdfc19..b0fc35d789cbe86bcf198db9978bff24
 +	return true;
 +close:
 +	wl_wr(ms.qmp, 0x2c, 0xffff0000u);
++close_link:
 +	wl_wr(ms.qmp, 0x24, 0xffff0000u);
 +	ms_qmp_kick();
 +	return false;
@@ -399,6 +412,12 @@ index 2ee8e565c4bfc011d374156cc0bd4ce436cdfc19..b0fc35d789cbe86bcf198db9978bff24
 +	if (ms.snoc) {
 +		ms_branch(0x8a150, false, false);
 +	}
++	if (ms.mnoc_set) {
++		ms_branch(0x8a004, false, true);
++	}
++	if (ms.vote_set) {
++		wl_wr(wl.gcc, 0x52004, wl_rd(wl.gcc, 0x52004) & ~ms.vote_set);
++	}
 +	if (ms.mba_assigned &&
 +	    ms_assign("mba back", MSS_MBA_PA, MSS_MBA_SIZE, SCM_VMID_MSS_MSA, SCM_VMID_HLOS, SCM_PERM_RWX)) {
 +		ms.mba_assigned = false;
@@ -472,14 +491,27 @@ index 2ee8e565c4bfc011d374156cc0bd4ce436cdfc19..b0fc35d789cbe86bcf198db9978bff24
 +		    wl_rd(wl.gcc, 0x8a000), wl_rd(wl.gcc, 0x34004), wl_rd(wl.gcc, 0x38004), wl_rd(wl.gcc, 0x8a004));
 +		goto out;
 +	}
++	ms.snoc = true;                         /* set even if it fails: teardown clears the enable */
 +	if (!ms_branch(0x8a150, true, false)) {
 +		goto out;
 +	}
-+	ms.snoc = true;
 +	ms_reset_deassert();
 +	ms.reset_out = true;
 +	ms_branch(0x8a154, true, true);         /* active clock "bus" (q6_memnoc_axi) */
 +	ms.memnoc = true;
++	/* active clocks "gpll0_mss" (vote bit 17) and "mnoc_axi" (mfab CBCR enable), proxy "prng" (vote
++	 * bit 13): boot 30 read 0x52004 = 0x1619d7b, bits 17 and 13 clear (other masters keep prng on) */
++	uint32_t vote = wl_rd(wl.gcc, 0x52004);
++	ms.vote_set = ~vote & ((1u << 17) | (1u << 13));
++	if (ms.vote_set) {
++		wl_wr(wl.gcc, 0x52004, vote | ms.vote_set);
++	}
++	if (!(wl_rd(wl.gcc, 0x8a004) & 1u)) {
++		ms_branch(0x8a004, true, true);
++		ms.mnoc_set = true;
++	}
++	printf("SWEET MSS: GCC vote %#x -> %#x, mfab_axis CBCR %#x\n", vote, wl_rd(wl.gcc, 0x52004),
++	    wl_rd(wl.gcc, 0x8a004));
 +
 +	/* the MBA image goes in while the kernel still owns the carve-out, then both regions go to the Q6 */
 +	vm_offset_t mba_va = ml_io_map_wcomb(MSS_MBA_PA, MSS_MBA_SIZE);
@@ -489,6 +521,8 @@ index 2ee8e565c4bfc011d374156cc0bd4ce436cdfc19..b0fc35d789cbe86bcf198db9978bff24
 +	}
 +	memcpy((void *)mba_va, mba, mba_len);
 +	__asm__ volatile ("dsb sy" ::: "memory");
++	ml_io_unmap(mba_va, MSS_MBA_SIZE);      /* no kernel mapping may exist once the Q6 owns it */
++	mba_va = 0;
 +	if (!ms_assign("mpss", MSS_MPSS_PA, MSS_MPSS_SIZE, SCM_VMID_HLOS, SCM_VMID_MSS_MSA, SCM_PERM_RW)) {
 +		goto out;
 +	}
@@ -548,7 +582,7 @@ index 2ee8e565c4bfc011d374156cc0bd4ce436cdfc19..b0fc35d789cbe86bcf198db9978bff24
  /* ---------------------------------------------------------------- stage 2: Bluetooth */
  
  static void wl_rx_stop(void);
-@@ -2801,6 +3326,8 @@ wl_thread(void *arg, wait_result_t wr)
+@@ -2801,6 +3360,8 @@ wl_thread(void *arg, wait_result_t wr)
  		wl_bt();
  	} else if (wl.stage == 3) {
  		wl_inventory();

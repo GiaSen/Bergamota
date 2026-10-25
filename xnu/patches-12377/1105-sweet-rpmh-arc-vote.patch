@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
-index 2d88a344fd3a07f81f5afda97e4930a6b99deb96..a087e1af2985aa77752abef40787521c8714bf13 100644
+index 2d88a344fd3a07f81f5afda97e4930a6b99deb96..6ae963652c311fdf264f91c6f294e4496734dad2 100644
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
 @@ -14,6 +14,7 @@
@@ -125,7 +125,7 @@ index 2d88a344fd3a07f81f5afda97e4930a6b99deb96..a087e1af2985aa77752abef40787521c
  /*
   * Poco F1 WCN3990 rails (mainline sdm845-xiaomi-beryllium-common.dtsi):
   * l5a 0.8 V (cx/mx), l7a 1.8 V (xo), l17a 1.304 V (rfa), l23a 3.3 V (ch1),
-@@ -444,4 +471,69 @@ out:
+@@ -444,4 +471,80 @@ out:
  	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
  	return error;
  }
@@ -181,6 +181,17 @@ index 2d88a344fd3a07f81f5afda97e4930a6b99deb96..a087e1af2985aa77752abef40787521c
 +				count = k;
 +				break;
 +			}
++		}
++		/*
++		 * Never an off vote for cx/mx: an apps-DRV vote replaces ABL's vote through this DRV, and
++		 * CX/MX feed the display, UFS and memory (Linux clamps to the top level before sync_state;
++		 * an ldoa7 off vote panicked boot 0116hw). Only mss.lvl, which nothing else on the AP uses,
++		 * is voted back to 0.
++		 */
++		if (!max && strcmp(res, "mss.lvl")) {
++			printf("SWEET RPMH: %s off vote refused (kept at the top level)\n", res);
++			error = 0;
++			goto out;
 +		}
 +		uint32_t hlvl = max ? count - 1 : 0;
 +		printf("SWEET RPMH: %s ARC %#x: %u levels, vote hlvl %u (vlvl %u)\n", res, address, count, hlvl,
