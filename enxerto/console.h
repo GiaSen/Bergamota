@@ -3,11 +3,12 @@
 
 #include "board.h"
 
-/* Bergamota palette (apps/Bergamota icon): bergamot leaf, rind, pulp. */
-#define BG_BOOT	0xff1a5933U	/* dark bergamot green: normal boot screens */
-#define BG_PANIC 0xff7a1414U	/* deep red: shim exceptions */
-#define LABEL	0xffccec59U	/* lime rind */
-#define TEXT	0xfffff78cU	/* pale bergamot yellow */
+/* Text-console palette (tools/identity/IDENTITY.md): ink on paper, labels in leaf green. The branded screens draw
+ * their own ground (artdraw.c). */
+#define BG_BOOT	0xfff4f3ecU	/* paper: text screens and log panels */
+#define BG_PANIC 0xffb3261eU	/* alert red: shim exceptions */
+#define LABEL	0xff1a5933U	/* leaf green */
+#define TEXT	0xff161616U	/* ink */
 #define WHITE	0xffffffffU
 #define GREEN	0xff00ff00U
 
@@ -17,6 +18,8 @@
 extern volatile uint32_t *con_fb;
 
 void con_clear(uint32_t bg);
+/* The background text rows and log windows are drawn on, without clearing (screens that paint their own ground). */
+void con_set_bg(uint32_t bg);
 void con_skip(void);
 /* Re-print the recorded console lines (kept even while the boot-screen log is muted). */
 void con_replay(void);

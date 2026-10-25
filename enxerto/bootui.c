@@ -5,7 +5,6 @@
  */
 #include "bootui.h"
 #include "console.h"
-#include "bootlogo.h"
 /* Apple logo for the hand-off screen: generated from the iOS root by tools/mkapplelogo.py (git-ignored). */
 #if defined(__has_include)
 #if __has_include("applelogo.h")
@@ -14,45 +13,39 @@
 #endif
 #endif
 
+#include "artdraw.h"
+
 #ifndef BOOTUI_LOG
 #define BOOTUI_LOG	0	/* logo only; the log is recorded and shown if the boot fails */
 #endif
 
-#define NOTCH_PX	128			/* status bar / notch area, nothing is drawn above */
 #define LOG_SCALE	2
 #define LOG_ROWS	24
 #define LOG_Y		(FB_H - 24 - LOG_ROWS * 16 * LOG_SCALE)
 
-#define TITLE_SCALE	5
-#define TITLE_SPACE	10
-#define SUB_SCALE	2
-#define SUB_SPACE	14
+/* tools/identity/IDENTITY.md: wordmark, subtitle, progress and status at the top; the iOS generation's giant white
+ * numerals behind the Newton portrait, which stands on the bottom edge. */
+#define WORD_Y		205
+#define SUB_Y		350
 #define BAR_W		640
 #define BAR_H		16
-#define STATUS_SCALE	2
-
-#define GAP_LOGO	56
-#define GAP_SUB		16
-#define GAP_BAR		96
-#define GAP_STATUS	28
-
-#define BLOCK_H		(BOOTLOGO_H + GAP_LOGO + 16 * TITLE_SCALE + GAP_SUB + 16 * SUB_SCALE + GAP_BAR + \
-			 BAR_H + GAP_STATUS + 16 * STATUS_SCALE)
-#define BLOCK_TOP	(((NOTCH_PX + (BOOTUI_LOG ? LOG_Y : FB_H - 24)) - BLOCK_H) / 2)
-#define LOGO_Y		BLOCK_TOP
-#define TITLE_Y		(LOGO_Y + BOOTLOGO_H + GAP_LOGO)
-#define SUB_Y		(TITLE_Y + 16 * TITLE_SCALE + GAP_SUB)
-#define BAR_Y		(SUB_Y + 16 * SUB_SCALE + GAP_BAR)
 #define BAR_X		((FB_W - BAR_W) / 2)
-#define STATUS_Y	(BAR_Y + BAR_H + GAP_STATUS)
+#define BAR_Y		450
+#define STATUS_Y	492
+#define PORTRAIT_W	1000
+#define PORTRAIT_X	((FB_W - PORTRAIT_W) / 2)
+#define BAR_TRACK	0xffbccb7aU	/* ink at 14 % over the lime */
 
-#define BAR_TRACK	0xff0f3d22U	/* darker green */
-#define FAIL		0xffff8a6aU
+#ifdef BOARD_BERYLLIUM
+#define DEVICE_NAME	"POCO F1"
+#else
+#define DEVICE_NAME	"REDMI NOTE 10 PRO"
+#endif
 
 static int active;
 static unsigned bar_px;		/* filled width so far */
 
-/* Row-wise RLE (tools/mkbootlogo.py) straight into the framebuffer; also used by fbui.c. */
+/* Row-wise palette RLE (tools/mkapplelogo.py) straight into the framebuffer: the Apple logo of the hand-off screen. */
 void bootui_draw_rle(const unsigned int *pal, const unsigned char *p, int w, int h, int x0, int y0)
 {
 	for (int y = 0; y < h; y++) {
@@ -72,31 +65,31 @@ void bootui_draw_rle(const unsigned int *pal, const unsigned char *p, int w, int
 	}
 }
 
-static void draw_logo(int x0, int y0)
+/* The ground with the giant numerals and the portrait, as every identity screen starts. */
+void bootui_scene(int portrait_x, int portrait_w, int numerals_x, int numerals_lift, enum art_image numerals)
 {
-	bootui_draw_rle(bootlogo_pal, bootlogo_rle, BOOTLOGO_W, BOOTLOGO_H, x0, y0);
-}
-
-static void centered(int y, int scale, int spacing, uint32_t fg, const char *s)
-{
-	con_text((FB_W - con_text_w(s, scale, spacing)) / 2, y, scale, spacing, fg, s);
+	int ph = art_portrait_h(portrait_w), py = FB_H - ph;
+	art_ground(0, 0, FB_W, FB_H);
+	art_image(numerals, numerals_x, py - numerals_lift, ID_WHITE);
+	art_portrait(portrait_x, py, portrait_w);
+	art_image(ART_WORDMARK, (FB_W - art_image_w(ART_WORDMARK)) / 2, WORD_Y, ID_INK);
 }
 
 static void status(uint32_t fg, const char *s)
 {
-	con_rect(0, STATUS_Y, FB_W, 16 * STATUS_SCALE, BG_BOOT);
-	centered(STATUS_Y, STATUS_SCALE, 0, fg, s);
+	art_ground(0, STATUS_Y, FB_W, art_text_h(ART_MONO30));
+	art_text_centered(ART_MONO30, STATUS_Y, fg, s);
 }
 
 void bootui_init(void)
 {
-	con_clear(BG_BOOT);
-	draw_logo((FB_W - BOOTLOGO_W) / 2, LOGO_Y);
-	centered(TITLE_Y, TITLE_SCALE, TITLE_SPACE, TEXT, "BERGAMOTA");
-	centered(SUB_Y, SUB_SCALE, SUB_SPACE, LABEL, "PROJECT");
-	con_rect(BAR_X, BAR_Y, BAR_W, BAR_H, BAR_TRACK);
+	enum art_image num = art_ios_numerals();
+	bootui_scene(PORTRAIT_X, PORTRAIT_W, (FB_W - art_image_w(num)) / 2, 150, num);
+	art_text_centered(ART_MONO30, SUB_Y, ID_INK, num == ART_NUM_18 ? "iOS 18 / " DEVICE_NAME : "iOS 26 / " DEVICE_NAME);
+	art_rrect(BAR_X, BAR_Y, BAR_W, BAR_H, BAR_H / 2, BAR_TRACK);
 	bar_px = 0;
-	status(LABEL, "STARTING");
+	status(ID_INK, "STARTING");
+	con_set_bg(BG_BOOT);
 	con_set_scale(LOG_SCALE);
 	con_window(BOOTUI_LOG ? LOG_Y : 0, BOOTUI_LOG ? LOG_ROWS : -1);
 	if (BOOTUI_LOG)
@@ -122,8 +115,8 @@ static void bar_to(unsigned permille)
 	if (permille > 1000)
 		permille = 1000;
 	unsigned px = (unsigned)((uint64_t)BAR_W * permille / 1000);
-	if (px > bar_px) {
-		con_rect(BAR_X + bar_px, BAR_Y, px - bar_px, BAR_H, LABEL);
+	if (px > bar_px && px >= BAR_H) {
+		art_rrect(BAR_X, BAR_Y, (int)px, BAR_H, BAR_H / 2, ID_INK);	/* redrawn whole: the round end moves */
 		bar_px = px;
 	}
 }
@@ -131,7 +124,7 @@ static void bar_to(unsigned permille)
 void bootui_progress(unsigned permille, const char *s)
 {
 	bar_to(permille);
-	status(TEXT, s);
+	status(ID_INK, s);
 }
 
 static char *put_u(char *d, uint64_t v)
@@ -160,12 +153,12 @@ void bootui_mib(const char *label, uint64_t done, uint64_t total, unsigned from,
 		*d++ = *u++;
 	*d = 0;
 	bar_to(total ? from + (unsigned)((uint64_t)(to - from) * (done > total ? total : done) / total) : from);
-	status(TEXT, buf);
+	status(ID_INK, buf);
 }
 
 void bootui_fail(const char *msg)
 {
-	status(FAIL, msg);
+	status(ID_ALERT, msg);
 }
 
 int bootui_active(void)

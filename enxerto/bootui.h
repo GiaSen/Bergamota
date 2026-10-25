@@ -17,5 +17,9 @@ void bootui_fail(const char *msg);
 int bootui_active(void);
 /* Last act before xnu: swap the branded screen for the Apple logo (no-op if applelogo.h was not generated). */
 void bootui_handoff(void);
-/* Draw a palette+RLE picture (tools/mkbootlogo.py format) at x0,y0. */
+/* Draw a palette+RLE picture (tools/mkapplelogo.py format) at x0,y0. */
+/* The identity's background: ground, giant numerals, the portrait (width portrait_w at portrait_x, standing on the
+ * bottom edge) and the wordmark. numerals_lift: how far the numerals start above the portrait's top. */
+#include "artdraw.h"
+void bootui_scene(int portrait_x, int portrait_w, int numerals_x, int numerals_lift, enum art_image numerals);
 void bootui_draw_rle(const unsigned int *pal, const unsigned char *rle, int w, int h, int x0, int y0);

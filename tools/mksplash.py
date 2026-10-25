@@ -14,7 +14,8 @@ Slots in the stock image: 0 power-on logo (MI + mi.com, 161x321), 1 fastboot (10
   mksplash.py decode <logo.img> <outdir>        # slots -> PNG (+ slots.txt)
   mksplash.py verify <logo.img>                 # structure check
 Only slots 0 (power-on) and 1 (fastboot) are rebranded; every other slot (charging, destroyed/verity
-warning, Google logos, blanks) is copied byte for byte. Stdlib only. Assets: tools/assets (make-boot-assets.swift).
+warning, Google logos, blanks) is copied byte for byte. Stdlib only. The two screens are Enxerto's own renders
+(enxerto/out/preview/splash-*.ppm, drawn by enxerto/host_test with the tools/identity artwork).
 """
 import argparse
 import os
@@ -22,10 +23,9 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bergamota_img import BG, Canvas, crop_alpha, read_png, resize_rgba, write_png
+from bergamota_img import Canvas, write_png
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ASSETS = os.path.join(HERE, "assets")
 SIZE = 32 * 1024 * 1024
 HDR = 0x4000
 BLK = 4096
@@ -87,68 +87,35 @@ def rgb_to_bmp(w, h, rgb, template=None):
     return hdr + bytes(body)
 
 
-def fit(img, max_w, max_h=None):
-    w, h, _ = img
-    s = min(max_w / w, (max_h or 10**9) / h)
-    return resize_rgba(img, max(1, round(w * s)), max(1, round(h * s)))
+def read_ppm(path):
+    d = open(path, "rb").read()
+    parts = d.split(None, 4)
+    assert parts[0] == b"P6" and parts[3] == b"255", path + ": binary PPM expected"
+    w, h = int(parts[1]), int(parts[2])
+    return w, h, bytearray(parts[4][:w * h * 3])
+
+
+def rendered(name, w, h):
+    """The screen as Enxerto draws it (tools/identity: enxerto/host_test renders it to out/preview/NAME.ppm)."""
+    path = os.path.join(HERE, "..", "enxerto", "out", "preview", name + ".ppm")
+    if not os.path.exists(path):
+        raise SystemExit("%s missing: build Enxerto first (enxerto/build.sh renders the previews)" % path)
+    pw, ph, px = read_ppm(path)
+    assert (pw, ph) == (w, h), "%s is %dx%d, the logo slot is %dx%d" % (path, pw, ph, w, h)
+    c = Canvas(w, h, (0, 0, 0))
+    c.px[:] = px
+    return c
 
 
 def compose_poweron(w, h):
-    c = Canvas(w, h, BG)
-    logo = fit(crop_alpha(read_png(os.path.join(ASSETS, "bergamota-logo.png")), 8), min(w * 0.46, 520), 520)
-    word = fit(crop_alpha(read_png(os.path.join(ASSETS, "bergamota-wordmark.png")), 2), min(w * 0.60, 660))
-    gap = 56
-    total = logo[1] + gap + word[1]
-    y = int(h * 0.46 - total / 2) if h > 1500 else (h - total) // 2
-    c.blit(logo, (w - logo[0]) // 2, y)
-    c.blit(word, (w - word[0]) // 2, y + logo[1] + gap)
-    return c
-
-
-def gradient_glow(w, h, glow_y=0.40):
-    """Colourful fastboot background (the panel is an LCD, black buys nothing): a diagonal
-    emerald -> teal -> deep bergamot green gradient with a soft pale-yellow glow behind the logo."""
-    c = Canvas(w, h, BG)
-    stops = [(0.0, (0x12, 0xb0, 0x6a)), (0.5, (0x0b, 0x7a, 0x75)), (1.0, (0x1a, 0x59, 0x33))]
-    gx, gy, gr = w / 2, h * glow_y, min(w, h) * 0.42
-    px = c.px
-    for y in range(h):
-        for x in range(w):
-            t = (x / w * 0.45 + y / h * 0.55)
-            for i in range(len(stops) - 1):
-                if t <= stops[i + 1][0]:
-                    (t0, c0), (t1, c1) = stops[i], stops[i + 1]
-                    f = (t - t0) / (t1 - t0)
-                    break
-            r, g, b_ = (c0[k] + (c1[k] - c0[k]) * f for k in range(3))
-            d2 = ((x - gx) ** 2 + (y - gy) ** 2) / (gr * gr)
-            if d2 < 1:
-                a = (1 - d2) ** 2 * 0.55          # glow strength
-                r, g, b_ = r + (0xff - r) * a, g + (0xf7 - g) * a, b_ + (0x8c - b_) * a
-            o = (y * w + x) * 3
-            px[o], px[o + 1], px[o + 2] = int(r), int(g), int(b_)
-    return c
+    """Slot 0, ABL's power-on screen: the identity's boot scene without text (tools/identity/IDENTITY.md)."""
+    return rendered("splash-poweron", w, h)
 
 
 def compose_fastboot(w, h):
-    """ABL fastboot (slot 1), full screen like slot 0: small logo + BERGAMOTA at the top (below the notch),
-    the flash scene (computer -- cable --> memory chip, write arrow) in the middle, no text below. Enxerto's own Bergamota fastboot screen (enxerto/fbui.c) is the dark
-    green one with a computer + power symbol, so the two are told apart at a glance."""
-    def load(name, pad=2):
-        return crop_alpha(read_png(os.path.join(ASSETS, name)), pad)
-    logo = fit(load("bergamota-logo.png", 8), 170, 170)
-    title = fit(load("bergamota-title.png"), 520)
-    scene = fit(load("bergamota-flash-scene.png", 8), 980, 760)
-    y_logo = 230
-    y_title = y_logo + logo[1] + 24
-    # no FASTBOOT / 'Qualcomm bootloader' text (user: the picture says it): the scene sits centred in the
-    # space below the title
-    top = y_title + title[1]
-    y_scene = top + (h - top - scene[1]) // 2 - 60
-    c = gradient_glow(w, h, (y_scene + scene[1] / 2) / h)
-    for img, y in ((logo, y_logo), (title, y_title), (scene, y_scene)):
-        c.blit(img, (w - img[0]) // 2, y)
-    return c
+    """Slot 1, ABL's own fastboot: the scene with an ink BOOTLOADER pill (Enxerto's fastboot screen has the leaf
+    green FASTBOOT one, so the two are told apart at a glance)."""
+    return rendered("splash-fastboot", w, h)
 
 
 def build(base_path, out_path, size, preview_dir):

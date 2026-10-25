@@ -7,6 +7,7 @@
 #include "console.h"
 #include "fbui.h"
 #include "charge.h"
+#include "artdraw.h"
 
 static uint32_t host_fb[FB_H * FB_STRIDE / 4];
 
@@ -134,6 +135,20 @@ int main(void)
 		charge_ui_update(&v);
 		charge_ui_notice("fastboot stopped: USB clocks off", 0xffff6a5aU);
 		dump("out/preview/charge-63-notice.ppm");
+	}
+
+	/* The logo partition's ABL screens (tools/mksplash.py packs these): power-on, the boot scene without text; ABL's
+	 * own fastboot, the scene with an ink BOOTLOADER pill (Enxerto's fastboot screen has the leaf green FASTBOOT one). */
+	{
+		enum art_image num = art_ios_numerals();
+		bootui_scene((FB_W - 1000) / 2, 1000, (FB_W - art_image_w(num)) / 2, 150, num);
+		dump("out/preview/splash-poweron.ppm");
+		bootui_scene(-90, 800, FB_W - art_image_w(num) + 40, 110, num);
+		int tw = art_text_w(ART_MONO30, "BOOTLOADER"), pw = tw + 56, ph = art_text_h(ART_MONO30) + 20;
+		art_rrect((FB_W - pw) / 2, 350, pw, ph, ph / 2, ID_INK);
+		art_text(ART_MONO30, (FB_W - tw) / 2, 360, ID_PAPER, "BOOTLOADER");
+		art_text_centered(ART_MONO22, 440, ID_INK, "fastboot  |  Qualcomm ABL");
+		dump("out/preview/splash-fastboot.ppm");
 	}
 	return 0;
 }

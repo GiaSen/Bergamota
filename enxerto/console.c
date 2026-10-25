@@ -47,6 +47,11 @@ static void hist_newline(void)
 		hist_ch[l][i] = 0;
 }
 
+void con_set_bg(uint32_t bg)
+{
+	con_bg = bg;
+}
+
 void con_clear(uint32_t bg)
 {
 	for (int y = 0; y < FB_H; y++) {
@@ -140,6 +145,8 @@ static void put_char(int col, char ch, uint32_t fg)
 	const unsigned char *g = font8x16[ch - 0x20];
 	int x0 = MARGIN + col * CH_W, y0 = base_y + row * CH_H;
 	hist_put(col, ch, fg);
+	if (con_bg == BG_PANIC)		/* ink on the alert red does not read: paper text, pale labels */
+		fg = fg == LABEL ? 0xffffcfc4U : 0xfff4f3ecU;
 	if (win_rows < 0)
 		return;
 	if (x0 + CH_W > FB_W || y0 + CH_H > FB_H)

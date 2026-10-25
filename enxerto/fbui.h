@@ -2,16 +2,16 @@
 #include <stdint.h>
 
 /*
- * Bergamota fastboot screen (the "connect to a computer" picture): logo, title, laptop + USB
- * cable illustration (fbart.h, tools/mkfbart.py), a big status line with progress bar, a footer
- * hint, and optional muted diagnostics. Only the status strip / bar / diagnostics are redrawn
- * after fbui_init; all stores are aligned 32-bit (MMU off safe). con_* log lines are muted
- * (but recorded) while it is up and shown small under the status on fbui_error.
+ * Bergamota fastboot screen (tools/identity/IDENTITY.md): wordmark, a leaf green FASTBOOT pill, a paper plate with the
+ * status line, detail, progress bar, charge line and muted diagnostics, hints on the ground, and the Newton portrait
+ * in front of the giant iOS numerals. Only the plate's lines are redrawn after fbui_init; all stores are aligned
+ * 32-bit (MMU off safe). con_* log lines are muted (but recorded) while it is up and shown on a paper band on
+ * fbui_error.
  */
 #define FBUI_NOBAR	(-1)
 
-#define FBUI_OK_COLOR	0xffccec59U	/* lime */
-#define FBUI_ERR_COLOR	0xffff6a5aU	/* red */
+#define FBUI_OK_COLOR	0xff161616U	/* ink (ID_INK) */
+#define FBUI_ERR_COLOR	0xffb3261eU	/* ID_ALERT */
 
 /* Full redraw. `entry` = why fastboot was entered (shown small in the footer), may be 0. */
 void fbui_init(const char *entry);

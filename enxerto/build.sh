@@ -17,7 +17,9 @@ NM=${CROSS}nm
 # BOOTLOG=1 shows the log window at the bottom of the branded boot screen (default: logo only; the
 # log is recorded and printed on the text screen when the boot fails).
 # -fno-tree-loop-distribute-patterns: no libc, so gcc must not turn loops into memcpy/memset calls (the link would fail).
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-tree-loop-distribute-patterns -Wall -Wextra"
+# -fno-tree-switch-conversion -fno-jump-tables: gcc turns switches (and if/else chains) that pick between pointers into
+# tables of pointers, which need ABS64 relocations (refused below).
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-tree-loop-distribute-patterns -fno-tree-switch-conversion -fno-jump-tables -Wall -Wextra"
 [ "${BOOTLOG:-0}" = 0 ] || CFLAGS="$CFLAGS -DBOOTUI_LOG=1"
 # CHARGER=0 compiles the early fast charging out (charger.c, README); default on. Runtime: boot.img cmdline
 # bergamota.charger=0 (off) / =keep (leave the programmed ICL/FCC in place at the kernel hand-off).
@@ -39,7 +41,7 @@ case ${BERGAMOTA:-} in
 1) CMDLINE="$CMDLINE bergamota.fastboot=1" ;;
 0) CMDLINE="$CMDLINE bergamota.fastboot=0" ;;
 esac
-SRCS="start.S enxerto.c console.c bootui.c fbui.c mmu.c fdt.c loader.c ufs.c inflate.c usb_dwc3.c usb_power.c fastboot.c sparse.c storage.c blake2b.c bergamota.c pmic.c charge.c charge_mode.c charger.c"
+SRCS="start.S enxerto.c console.c artdraw.c bootui.c fbui.c mmu.c fdt.c loader.c ufs.c inflate.c usb_dwc3.c usb_power.c fastboot.c sparse.c storage.c blake2b.c bergamota.c pmic.c charge.c charge_mode.c charger.c"
 OBJS=""
 for f in $SRCS; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
@@ -88,7 +90,7 @@ if [ "$BOARD" = beryllium ]; then
 fi
 # Host render of the console layout and the boot screen (out/host.ppm, out/preview/*.ppm).
 mkdir -p out/preview
-cc -O1 -Wall $([ "$BOARD" = beryllium ] && echo -DBOARD_BERYLLIUM) $([ "${BOOTLOG:-0}" = 0 ] || echo -DBOOTUI_LOG=1) -o out/host_test console.c bootui.c fbui.c charge.c host_test.c && ./out/host_test
+cc -O1 -Wall $([ "$BOARD" = beryllium ] && echo -DBOARD_BERYLLIUM) $([ "${BOOTLOG:-0}" = 0 ] || echo -DBOOTUI_LOG=1) -o out/host_test console.c artdraw.c bootui.c fbui.c charge.c host_test.c && ./out/host_test
 # Host tests of the fastboot protocol, the sparse parser, GPT/allowlist storage and BLAKE2b (fake storage).
 cc -O1 -Wall -Wextra -o out/fastboot_test fastboot.c sparse.c storage.c blake2b.c fastboot_test.c && ./out/fastboot_test
 # The image Bergamota (the Mac app) boots from ABL with `fastboot boot`: fastboot forced on, empty ramdisk.

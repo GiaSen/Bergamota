@@ -2,49 +2,36 @@
  * Off-mode charging screen, see charge.h. Palette/logo/text helpers are the Bergamota fastboot
  * screen's (fbui.c); everything below the 128 px notch area of the 1080-wide a8r8g8b8 FB.
  */
+#include "artdraw.h"
 #include "bootui.h"
 #include "charge.h"
 #include "console.h"
-#include "fbart.h"
 #include "fbui.h"
 
-#define LOGO_Y		144
-#define TITLE_SCALE	4
-#define TITLE_Y		(LOGO_Y + FBART_LOGO_H + 20)
-#define SUB_Y		(TITLE_Y + 16 * TITLE_SCALE + 14)
+/* tools/identity/IDENTITY.md: wordmark, CHARGING, a battery in front of a giant white %, the percentage and the state
+ * in mono, the portrait centred on the bottom edge. */
+#define SUB_Y		350
+#define NUM_Y		470
+#define BATT_W		400
+#define BATT_H		180
+#define BATT_X		((FB_W - BATT_W) / 2 - 12)
+#define BATT_Y		560
+#define BORDER		10
+#define RADIUS		34
+#define NUB_W		20
+#define NUB_H		56
+#define IN_X		(BATT_X + BORDER + 8)
+#define IN_Y		(BATT_Y + BORDER + 8)
+#define IN_W		(BATT_W - 2 * (BORDER + 8))
+#define IN_H		(BATT_H - 2 * (BORDER + 8))
+#define PCT_Y		790
+#define STATUS_Y	1010
+#define NOTICE_Y	1066
+#define HINT_Y		1112
+#define DIAG_Y		1156
+#define PORTRAIT_W	700
 
-/* battery icon: nub on top of a rounded body, fill grows from the bottom */
-#define BODY_W		360
-#define BODY_H		600
-#define BODY_X		((FB_W - BODY_W) / 2)
-#define NUB_W		120
-#define NUB_H		32
-#define NUB_Y		(SUB_Y + 32 + 56)
-#define BODY_Y		(NUB_Y + NUB_H)
-#define BORDER		16
-#define RADIUS		40
-#define IN_X		(BODY_X + BORDER)
-#define IN_Y		(BODY_Y + BORDER)
-#define IN_W		(BODY_W - 2 * BORDER)
-#define IN_H		(BODY_H - 2 * BORDER)
-
-#define PCT_SCALE	12
-#define PCT_H		(16 * PCT_SCALE)
-#define PCT_Y		(BODY_Y + BODY_H + 48)
-#define STATUS_SCALE	3
-#define STATUS_H	(16 * STATUS_SCALE)
-#define STATUS_Y	(PCT_Y + PCT_H + 36)
-#define BAR_Y		(STATUS_Y + STATUS_H + 44)
-#define BAR_W		640
-#define BAR_H		16
-#define BAR_X		((FB_W - BAR_W) / 2)
-#define NOTICE_Y	(BAR_Y + BAR_H + 56)
-#define DIAG_Y		(FB_H - 136)
-#define HINT_Y		(FB_H - 76)
-
-#define BAR_TRACK	0xff0f3d22U
-#define MUTED		0xff74a283U
-#define AMBER		0xffffc04dU
+#define MUTED		0xff5d6638U	/* ink at 55 % over the lime */
 
 #define STR_MAX		96
 
@@ -54,7 +41,6 @@ static enum charge_state cur_state;
 static int cur_charging, cur_avail;
 static char cur_pct[8], cur_status[STR_MAX], cur_notice[STR_MAX], cur_diag[2][STR_MAX];
 static uint32_t cur_notice_fg;
-static int bar_px = -1;
 
 static void copy(char *d, const char *s)
 {
@@ -71,30 +57,6 @@ static int same(const char *a, const char *b)
 	while (*a && *a == *b)
 		a++, b++;
 	return *a == *b;
-}
-
-static void centered(int y, int scale, int spacing, uint32_t fg, const char *s)
-{
-	con_text((FB_W - con_text_w(s, scale, spacing)) / 2, y, scale, spacing, fg, s);
-}
-
-/* Parts separated by a small square dot (the 8x16 font has no middle dot). */
-static void parts_line(int y, int scale, uint32_t fg, const char *const *p, int n)
-{
-	int dot = scale * 2, gap = scale * 6, w = 0;
-
-	for (int i = 0; i < n; i++)
-		w += con_text_w(p[i], scale, 0) + (i ? 2 * gap + dot : 0);
-	int x = (FB_W - w) / 2;
-	for (int i = 0; i < n; i++) {
-		if (i) {
-			x += gap;
-			con_rect(x, y + 8 * scale - dot / 2, dot, dot, fg);
-			x += dot + gap;
-		}
-		con_text(x, y, scale, 0, fg, p[i]);
-		x += con_text_w(p[i], scale, 0);
-	}
 }
 
 /* ---- tiny string builder ---- */
@@ -123,30 +85,37 @@ static void sb_u(struct sb *b, unsigned v)
 	b->d[b->n] = 0;
 }
 
-/* ---- battery icon ---- */
-
-static void body_corners(int x, int y, int w, int h, int r, uint32_t bg)
+/* Repaint a band of the ground, with the part of the giant % that falls in it. */
+static void band(int y, int h)
 {
-	for (int i = 0; i < r; i++) {
-		int dy = r - i, cut = 0;
-		while ((r - cut) * (r - cut) + dy * dy > r * r)
-			cut++;
-		if (!cut)
-			continue;
-		con_rect(x, y + i, cut, 1, bg);
-		con_rect(x + w - cut, y + i, cut, 1, bg);
-		con_rect(x, y + h - 1 - i, cut, 1, bg);
-		con_rect(x + w - cut, y + h - 1 - i, cut, 1, bg);
-	}
+	art_ground(0, y, FB_W, h);
+	art_image_rows(ART_NUM_PCT, (FB_W - art_image_w(ART_NUM_PCT)) / 2, NUM_Y, ID_WHITE, y, y + h);
 }
 
+/* "a | b | c" centred, in one mono size. */
+static void parts_line(int y, enum art_font f, uint32_t fg, const char *const *p, int n)
+{
+	char buf[STR_MAX];
+	struct sb b = { buf, 0, sizeof buf };
+	buf[0] = 0;
+	for (int i = 0; i < n; i++) {
+		if (i)
+			sb_str(&b, "  |  ");
+		sb_str(&b, p[i]);
+	}
+	art_text_centered(f, y, fg, buf);
+}
+
+/* ---- battery: ink outline, paper inside, a fill growing left to right, a bolt while charging ---- */
+
 /* Lightning bolt, polygon in a 20 x 32 grid scaled by BOLT_S, scan-converted with integers. */
-#define BOLT_S		11
+#define BOLT_S		4
 #define BOLT_N		7
 static const int8_t bolt_x[BOLT_N] = { 11, 2, 9, 6, 18, 10, 14 };
 static const int8_t bolt_y[BOLT_N] = { 0, 18, 18, 32, 11, 11, 0 };
 
-static void bolt_row(int py, int x0, int y0, int fill_top, uint32_t over_fill, uint32_t over_empty)
+/* One scanline of the bolt; the part left of fill_x (over the fill) in over_fill, the rest in over_empty. */
+static void bolt_row(int py, int x0, int y0, int fill_x, uint32_t over_fill, uint32_t over_empty)
 {
 	int xs[BOLT_N], n = 0;
 
@@ -166,66 +135,38 @@ static void bolt_row(int py, int x0, int y0, int fill_top, uint32_t over_fill, u
 		for (int j = i; j > 0 && xs[j - 1] > xs[j]; j--) {
 			int t = xs[j]; xs[j] = xs[j - 1]; xs[j - 1] = t;
 		}
-	int ay = y0 + py;
-	for (int i = 0; i + 1 < n; i += 2)
-		con_rect(x0 + xs[i], ay, xs[i + 1] - xs[i], 1, ay >= fill_top ? over_fill : over_empty);
+	for (int i = 0; i + 1 < n; i += 2) {
+		int a = x0 + xs[i], b = x0 + xs[i + 1];
+		if (a < fill_x)
+			con_rect(a, y0 + py, (b < fill_x ? b : fill_x) - a, 1, over_fill);
+		if (b > fill_x)
+			con_rect(a > fill_x ? a : fill_x, y0 + py, b - (a > fill_x ? a : fill_x), 1, over_empty);
+	}
 }
 
-static void draw_icon(int avail, unsigned soc, int charging)
+static void draw_battery(int avail, unsigned soc, int charging)
 {
-	uint32_t fill = LABEL;
+	uint32_t fill = soc <= 15 && !charging ? ID_ALERT : ID_LEAF;
 
-	if (soc <= 15)
-		fill = charging ? AMBER : FBUI_ERR_COLOR;
-	con_rect(IN_X, IN_Y, IN_W, IN_H, BG_BOOT);
-	int fh = 0;
+	art_rrect(BATT_X + BATT_W - 2, BATT_Y + (BATT_H - NUB_H) / 2, NUB_W + 2, NUB_H, 8, ID_INK);
+	art_rrect(BATT_X, BATT_Y, BATT_W, BATT_H, RADIUS, ID_INK);
+	art_rrect(BATT_X + BORDER, BATT_Y + BORDER, BATT_W - 2 * BORDER, BATT_H - 2 * BORDER, RADIUS - BORDER, ID_PAPER);
+	int fw = 0;
 	if (avail) {
-		fh = IN_H * (int)soc / 100;
-		if (soc && fh < 6)
-			fh = 6;
-		con_rect(IN_X, IN_Y + IN_H - fh, IN_W, fh, fill);
+		fw = IN_W * (int)soc / 100;
+		if (soc && fw < 2 * 12)
+			fw = 2 * 12;
+		if (fw)
+			art_rrect(IN_X, IN_Y, fw, IN_H, 12, fill);
 	}
 	if (!avail) {
-		const char *q = "?";
-		con_text((FB_W - 8 * 24) / 2, IN_Y + (IN_H - 16 * 24) / 2, 24, 0, MUTED, q);
+		art_text(ART_MONO150, IN_X + (IN_W - art_text_w(ART_MONO150, "%")) / 2, IN_Y + (IN_H - art_text_h(ART_MONO150)) / 2, MUTED, "%");
 	} else if (charging) {
 		int bw = 20 * BOLT_S, bh = 32 * BOLT_S;
 		int bx = IN_X + (IN_W - bw) / 2, by = IN_Y + (IN_H - bh) / 2;
 		for (int py = 0; py < bh; py++)
-			bolt_row(py, bx, by, IN_Y + IN_H - fh, BG_BOOT, TEXT);
+			bolt_row(py, bx, by, IN_X + fw, ID_PAPER, ID_INK);
 	}
-}
-
-static void draw_icon_frame(void)
-{
-	con_rect(BODY_X + (BODY_W - NUB_W) / 2, NUB_Y, NUB_W, NUB_H, LABEL);
-	con_rect(BODY_X, BODY_Y, BODY_W, BODY_H, LABEL);
-	body_corners(BODY_X, BODY_Y, BODY_W, BODY_H, RADIUS, BG_BOOT);
-	con_rect(IN_X, IN_Y, IN_W, IN_H, BG_BOOT);
-}
-
-/* ---- bar ---- */
-
-static void draw_bar(int permille)
-{
-	if (permille < 0) {
-		if (bar_px >= 0)
-			con_rect(BAR_X, BAR_Y, BAR_W, BAR_H, BG_BOOT);
-		bar_px = -1;
-		return;
-	}
-	if (permille > 1000)
-		permille = 1000;
-	int px = BAR_W * permille / 1000;
-	if (bar_px < 0) {
-		con_rect(BAR_X, BAR_Y, BAR_W, BAR_H, BAR_TRACK);
-		bar_px = 0;
-	}
-	if (px > bar_px)
-		con_rect(BAR_X + bar_px, BAR_Y, px - bar_px, BAR_H, LABEL);
-	else if (px < bar_px)
-		con_rect(BAR_X + px, BAR_Y, bar_px - px, BAR_H, BAR_TRACK);
-	bar_px = px;
 }
 
 /* ---- public ---- */
@@ -233,19 +174,20 @@ static void draw_bar(int permille)
 void charge_ui_init(void)
 {
 	const char *foot[2];	/* filled at run time: a static pointer table would need ABS64 relocations */
+	int pw = PORTRAIT_W;
 
-	foot[0] = "Vol - fastboot";
-	foot[1] = "Power hold: start iOS";
-	con_clear(BG_BOOT);
-	bootui_draw_rle(fbart_logo_pal, fbart_logo_rle, FBART_LOGO_W, FBART_LOGO_H, (FB_W - FBART_LOGO_W) / 2, LOGO_Y);
-	centered(TITLE_Y, TITLE_SCALE, 10, TEXT, "BERGAMOTA");
-	centered(SUB_Y, 2, 14, LABEL, "CHARGING");
-	draw_icon_frame();
-	parts_line(HINT_Y, 2, MUTED, foot, 2);
+	foot[0] = "Vol - : fastboot";
+	foot[1] = "hold Power : start iOS";
+	art_ground(0, 0, FB_W, FB_H);
+	art_image(ART_NUM_PCT, (FB_W - art_image_w(ART_NUM_PCT)) / 2, NUM_Y, ID_WHITE);
+	art_portrait((FB_W - pw) / 2, FB_H - art_portrait_h(pw), pw);
+	art_image(ART_WORDMARK, (FB_W - art_image_w(ART_WORDMARK)) / 2, 205, ID_INK);
+	art_text_centered(ART_MONO30, SUB_Y, ID_INK, "CHARGING");
+	parts_line(HINT_Y, ART_MONO22, ID_INK, foot, 2);
 	cur_valid = 0;
 	cur_pct[0] = cur_status[0] = cur_notice[0] = 0;
 	cur_diag[0][0] = cur_diag[1][0] = 0;
-	bar_px = -1;
+	con_set_bg(BG_BOOT);
 	con_set_scale(2);
 	con_window(0, -1);	/* con_* log lines are recorded, not drawn */
 }
@@ -259,7 +201,7 @@ void charge_ui_update(const struct charge_view *v)
 	int np = 0, avail = v->state != CHARGE_UNAVAILABLE;
 	unsigned soc = v->soc > 100 ? 100 : v->soc;
 	int charging = v->state == CHARGE_CHARGING;
-	uint32_t pcol = TEXT;
+	uint32_t pcol = ID_INK;
 
 	pct[0] = status[0] = volt[0] = amp[0] = 0;
 	if (avail) {
@@ -282,9 +224,9 @@ void charge_ui_update(const struct charge_view *v)
 		if (v->ma_valid && charging)
 			parts[np++] = amp;
 		if (soc <= 15 && !charging)
-			pcol = FBUI_ERR_COLOR;
+			pcol = ID_ALERT;
 	} else {
-		sb_str(&bp, "--%");
+		sb_str(&bp, "%");
 		parts[np++] = "Battery info unavailable";
 		pcol = MUTED;
 	}
@@ -295,18 +237,17 @@ void charge_ui_update(const struct charge_view *v)
 	}
 
 	if (!cur_valid || soc != cur_soc || charging != cur_charging || avail != cur_avail)
-		draw_icon(avail, soc, charging);
+		draw_battery(avail, soc, charging);
 	if (!cur_valid || !same(pct, cur_pct) || v->state != cur_state) {
-		con_rect(0, PCT_Y, FB_W, PCT_H, BG_BOOT);
-		centered(PCT_Y, PCT_SCALE, 0, pcol, pct);
+		band(PCT_Y, art_text_h(ART_MONO150));
+		art_text_centered(ART_MONO150, PCT_Y, pcol, avail ? pct : "");
 		copy(cur_pct, pct);
 	}
 	if (!cur_valid || !same(status, cur_status)) {
-		con_rect(0, STATUS_Y, FB_W, STATUS_H, BG_BOOT);
-		parts_line(STATUS_Y, STATUS_SCALE, LABEL, parts, np);
+		band(STATUS_Y, art_text_h(ART_MONO30));
+		parts_line(STATUS_Y, ART_MONO30, ID_INK, parts, np);
 		copy(cur_status, status);
 	}
-	draw_bar(avail ? (int)soc * 10 : FBUI_NOBAR);
 	cur_soc = soc;
 	cur_state = v->state;
 	cur_charging = charging;
@@ -321,9 +262,9 @@ void charge_ui_notice(const char *s, uint32_t fg)
 	if (same(cur_notice, s) && fg == cur_notice_fg)
 		return;
 	cur_notice_fg = fg;
-	con_rect(0, NOTICE_Y, FB_W, 32, BG_BOOT);
+	band(NOTICE_Y, art_text_h(ART_MONO22));
 	if (*s)
-		centered(NOTICE_Y, 2, 0, fg, s);
+		art_text_centered(ART_MONO22, NOTICE_Y, fg == FBUI_OK_COLOR ? ID_LEAF : fg, s);
 	copy(cur_notice, s);
 }
 
@@ -335,8 +276,8 @@ void charge_ui_diag(const char *l0, const char *l1)
 		const char *s = l[i] ? l[i] : "";
 		if (same(cur_diag[i], s))
 			continue;
-		con_rect(0, DIAG_Y + i * 16, FB_W, 16, BG_BOOT);
-		centered(DIAG_Y + i * 16, 1, 0, MUTED, s);
+		band(DIAG_Y + i * 18, 16);
+		con_text((FB_W - con_text_w(s, 1, 0)) / 2, DIAG_Y + i * 18, 1, 0, MUTED, s);
 		copy(cur_diag[i], s);
 	}
 }
