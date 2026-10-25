@@ -3,6 +3,8 @@
   // Nothing from Apple or Qualcomm is ever part of dist/: users bring their own files and everything runs locally.
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "bergamota-web",
+  // the account that owns the zesmoi.com.br zone
+  "account_id": "8e07b3d20205c2672fcb3334f7797ac8",
   "compatibility_date": "2026-10-01",
   "assets": {
     "directory": "./dist",
