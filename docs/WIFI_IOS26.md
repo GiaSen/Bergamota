@@ -127,5 +127,7 @@ through the Bergamota queue, and only with the user's OK.
     `SWEET 80211: get/set type N` line per ioctl type wifid uses; `SWEET NET: wifid opened
     IO80211Controller user client: 0x...` shows the IOServiceOpen refusal that selects the ioctl path.
   * CI run 40191362682 (wlan26 012ed29 = ios26 fb82624 + 1100): success, kernel sha256 `31e6c9c3...`;
-    copies in `research/ios26/wlan1100/` (kernel + `beryllium-n104-2x-wlan.adt`, not in git). Not booted.
+    **superseded, do not boot**: it carries the old 1013 (touch events in a layout iOS 26 doesn't read).
+    wlan26 is merged into ios26 (bd41a75); the iOS 26 session builds boot 23 from the ios26 tip with 1100,
+    `enxerto/out/beryllium-n104-2x-wlan.adt` and `sweet80211=1`.
   * Side effect of the ADT node alone (without 1100): wifid starts and waits for a device; harmless.
