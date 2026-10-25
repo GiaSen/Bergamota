@@ -76,6 +76,8 @@ Neither is done yet; the user picks one before the flash is queued.
 
      So the wire format we send is still the accepted one; the 160-byte record is userland's in-memory form. Not verified on iOS 26
      itself: watch backboardd for a fault in the digitizer getters on the first boot.
+     **Superseded by section 4:** that holds for `IOHIDEventCreateData`, but events queued by a kernel service are read in the
+     160-byte layout with one queue element per event.
    * **Identity.** iPhone12,1 is a real product (no iPod-class fallback like their unknown model). `research/ios26/n104ap.adt` comes
      from a real N104 and keeps its buttons node; `/buttons/home-button-type` is not checked yet.
    * **Still to check against theirs:**
@@ -86,3 +88,49 @@ Neither is done yet; the user picks one before the flash is queued.
 3. Expected first problems (iOS 18 -> 26 userland drift): IOSurface / IOMobileFramebuffer user-client layouts (0157/0159 style),
    MobileGestalt answers for iPhone12,1, new launchd boot tasks, AKS selectors. Logs: `tools/sweet-log-pull.sh`, SSH once USB
    networking is up.
+
+## 4. Milestone: touch works on iOS 26 (2026-10-25, boot 27)
+
+Boot 27 (ios26 at 9fdfb1c): the lock screen takes taps and swipe-up. Before it, iOS 26 booted to SpringBoard and the lock screen,
+the kernel read NT36672A frames and backboardd's event system took our events, but nothing ever reached a window.
+
+**Root cause: the kernel-to-user event format changed.** iOS 26 has two IOHIDEvent serializations:
+
+| path | iOS 26 format |
+|---|---|
+| `IOHIDEventCreateData` / `CreateWithData` (user space) | legacy: one `IOHIDSystemQueueElement`, then 104-byte `IOFixed` records packed |
+| kernel service queue (`IOHIDEventServiceQueue` -> `getLength`/`readBytes`) | 160-byte records (position, pressure, twist, orientation as doubles; generation/will/did at 0x90), **one queue element per event**: parent, then each child with `depth` = 1, parent `eventCount` = total (IOHIDFamily 2238 `withBytes`/`readBytes`) |
+
+Our xnu-12377 `IOHIDEvent` wrote the older queue format: one element, legacy records, children packed.
+
+**Patches** (xnu/patches-12377):
+
+| patch | what |
+|---|---|
+| 1010 | NT36672A reset pulse before reading params (`sweettouchnvtrst=1`); fixed controller frames and IRQs |
+| 1013 | `sweethidlog=1` dumps the first touch events' `createBytes` |
+| 1014 | collection `childEventMask` = OR of the fingers' masks (as `IOHIDEventAppendEvent`); harmless, backboardd doesn't read it |
+| 1015 | touch events carry `IsBuiltIn` (backboardd forwards it to SpringBoard) |
+| 1016 | `sweetdenypath=SUFFIX` makes matching path lookups fail (recovery switch for a crash-looping debug dylib) |
+| **1017** | queued digitizer records in the 160-byte double layout; `createBytes` stays legacy |
+| **1018** | one `IOHIDSystemQueueElement` per child (depth 1, total in the parent's `eventCount`) |
+
+1017 + 1018 are the fix. 1011/1012 (test: `IsDisplayIntegrated` on events, `Authenticated` service property) are still in; whether
+they are needed is not tested.
+
+**How it was found (tools kept in the scratchpad, on the phone in `/var/root`):**
+* `logstream`: live unified log on the phone through LoggingSupport's `OSLogEventLiveStream` (iOS has no `log`): formatted
+  messages in milliseconds instead of copying `/var/db/diagnostics` to the Mac. `logstream PROC[,PROC] [FILTER]`, `-` = all.
+* `hidwire2`/`hidwire3`/`hidparse`/`hidupd`: user-space IOHIDEvent serialization and `BKSHIDEventContainsUpdates` probes. They
+  showed the `CreateData` format, which misled the first revert of 1013 (it is not the queue format).
+* `bbhook2.dylib`: ObjC tracer weakly linked into a re-signed copy of backboardd (`LC_LOAD_WEAK_DYLIB`, original entitlements),
+  forwarding every method of the touch classes through `forwardInvocation:` and logging to `/private/var/mobile/tmp/bbhook.log`
+  (the sandbox's writable temp dir). It showed `processEvent` -> `_handleDirectTouchEvent` running, the event backboardd actually
+  got (fields shifted, then a hand with no `ChildEvents`), and then the full fix. Lessons:
+  * restarting backboardd breaks touch delivery until reboot, and 3-4 restarts in a few minutes make launchd shut the system down
+    (on our kernel that ends in the "initproc exited" panic), so the hook is armed from boot (`/usr/libexec/bbhook2.arm`);
+  * never hook a selector in both a class and its subclass (an override calling super recursed: stack overflow at boot);
+  * recovery: boot with `sweetdenypath=/var/root/bbhook2.dylib` (weak load -> backboardd starts clean), then restore over SSH.
+  After boot 27 the arm file is removed and the original backboardd is back on disk (`/usr/libexec/backboardd.orig` kept).
+
+**Next:** drop 1011/1012 if not needed and make `sweettouchnvtrst=1` the default; Wi-Fi (sweet80211, paused); Metal/Chlorophyll.
