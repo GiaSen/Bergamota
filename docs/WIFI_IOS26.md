@@ -430,3 +430,39 @@ Prepared, not booted (kernel = 1110 remake, sha256 `263851eb...`; boot 33's ADT 
 empty teardown) and `enxerto-boot-ios26full-boot37-wlan-full.img` (no `sweetmssstep`: the whole stage 4, steps 4-6 as
 on boot 34, then the first SCM hyp-assign (step 7) and the QDSP6 boot (step 8), teardown; a SoC reset in step 7/8 is
 possible and recoverable).
+
+### 5.7 Boot 37-wlan-full: **MBA ALIVE** (1110, whole stage 4, user present)
+
+**2026-10-25 17:09:44Z, `enxerto-boot-ios26full-boot37-wlan-full.img`** (1110 kernel; boot 36-wlan's args without
+`sweetmssstep`). Every step completed, the phone stayed up (iOS and SSH fine afterwards):
+
+| Step | Result |
+|------|--------|
+| 2 mba.mbn | 238304 B |
+| 3 copy | 3a mapped (non-permanent VA 0xfffffecf5c100000), word 0 read 0 / write ok, 4 pieces, **`MBA copied to 0x96900000`**: 1110 fixed the unmap |
+| 4 QMP | magic `LIAM` v1, mailbox 0x128+0x2d8, `load_state on` consumed |
+| 5 ARC | cx.lvl hlvl 7, mx.lvl hlvl 4, mss.lvl hlvl 7: each TCS0 done, cmd-status 0x10101 |
+| 6 clocks/reset | GCC vote 0x1619d7b -> 0x163bd7b, mfab_axis CBCR 0x1 |
+| 7 SCM | hyp-assign MPSS 0x8e400000+0x7800000 and MBA 0x96900000+0x200000 HLOS(3) -> MSS_MSA(15) RW: `completed=1 status=0 result=0` both: **the first TrustZone/hypervisor calls work** |
+| 8 QDSP6 | **PBL status 0x1 after 65 ms, MBA status 0x1 after 0 ms (XPU unlocked): `MBA ALIVE`** |
+| teardown | AXI q6/modem/nc already idle, alt reset asserted, clocks off; hyp-assign MBA and MPSS back to HLOS RWX `status=0` both; mss.lvl -> 0, cx/mx off votes refused by design (kept at top); QMP `load_state off` consumed |
+
+Console: `research/ios26/logs-wlan/boot37-wlan-full-usb.txt` (main checkout, not in git).
+
+**Next (P4, not written): MPSS load and boot**, Linux `q6v5_mpss_load()` order, from the state "MBA alive" (so
+`sweetmsskeep=1` semantics, i.e. no teardown in between):
+1. `modem.mdt` from the `modem` FAT16 partition: ELF header + program headers + hash segment (7400 B). Copy the
+   metadata into a physically contiguous, DMA-able buffer the modem may read (Linux: `dma_alloc_attrs` +
+   hyp-assign of that buffer to MSS for the auth call), write its address to `RMB_PMI_META_DATA_REG`, then
+   `RMB_MBA_COMMAND_REG = RMB_CMD_META_DATA_READY` and wait for `RMB_MBA_STATUS_REG == RMB_MBA_META_DATA_AUTH_SUCCESS`
+   (3). The metadata buffer must sit below 4 GiB and outside xnu's RAM (xnu RAM starts at 0x1_00000000), e.g. a free
+   slice of the low bank.
+2. Each loadable segment `modem.bNN` (28 of them) copied into the MPSS carve-out at its relocated address: the carve-out
+   currently belongs to MSS after step 7, so Linux hyp-assigns it back to HLOS (`q6v5_xfer_mem_ownership(...,
+   false, ...)`) for the copy, then to MSS again; after each segment (or once) write `RMB_PMI_CODE_START_REG` /
+   `RMB_PMI_CODE_LENGTH_REG` (running length) and `RMB_MBA_COMMAND_REG = RMB_CMD_LOAD_READY`, then wait
+   `RMB_MBA_STATUS_REG == RMB_MBA_AUTH_COMPLETE` (5) (10 s).
+3. Then the modem runs: wait for the `ready` SMP2P bit (inbound smp2p from the modem, item 435 in SMEM), handover
+   (proxy votes released), then rmtfs (EFS reads), QRTR over GLINK/SMEM, TFTP for `wlanmdsp.mbn`, then WLFW (QMI) to
+   bring up the WCN3990.
+Each step again one boot per user OK, panics visible, same 1.5 s step trace.
