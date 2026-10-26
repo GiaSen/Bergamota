@@ -23,6 +23,7 @@ export interface LogLine {
 export const PATCH_STAGES: [string, string][] = [
   ["open", "Open the IPSW and decrypt its disk images"],
   ["copy", "Merge the root and the cryptexes"],
+  ["scan", "Find the programs among 235,000 files"],
   ["tweaks", "Apply Bergamota's first-boot changes"],
   ["macho", "Rewrite and re-sign every program"],
   ["cache", "Rewrite the shared cache"],
