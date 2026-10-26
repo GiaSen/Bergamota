@@ -808,3 +808,40 @@ WLFW was lost. **The chip half is done up to WLFW.** Next (1117): the WLFW clien
 IND_REGISTER, CAP (chip/board/soc ids, firmware version), MSA info/ready if needed, BDF download (`bdwlan.*` for
 the board id, from the modem partition, read-only), WLAN config (CE/service tables of `ath10k/snoc`), mode ON; then
 the copy engine/SNOC data path.
+
+### 5.19 1117: WLFW client up to FW READY (`sweetwlfw=1`): built, NOT run
+
+`1117-beryllium-wlfw-client.patch`, gate **`sweetwlfw=1`** (on top of rmtfs/TFTP/pd-mapper), the host side of WLFW
+in mainline ath10k `qmi.c` order (beryllium sets `qcom,snoc-host-cap-skip-quirk`, so no HOST_CAP):
+1. At step 15: the WCN3990 rails of the beryllium `&wifi` node voted on in ath10k's vreg order (ldoa5 0.8 V, ldoa7
+   1.8 V, ldoa17 1.304 V, ldoa25 3.3 V, ldoa23 3.3 V; never voted off, as in the Bluetooth stage); a failed vote
+   disables the client. No RF_CLK2 vote (Bluetooth works without one; to revisit if the chip does not come up).
+2. NEW_SERVER 0x45 -> **IND_REGISTER** (fw_ready, msa_ready, client id 0x4b4e454c) from our port 1:0x4003; a
+   FW_READY bit in fw_status ends the sequence (firmware already up).
+3. **MSA_INFO** (0x8e300000, 1 MiB, the beryllium `wlan_msa_mem`); each returned region (at most 2, checked inside
+   the carve-out without overflow) is hyp-assigned after ath10k's 20 ms pause: HLOS -> MSS_MSA + WLAN (0x18) +
+   WLAN_CE (0x19) RW (no WLAN_CE when secure). `ms_assign_list` now takes up to 3 VMIDs.
+4. **MSA_READY**, **CAP** (chip id/family, board id, soc id, firmware version + timestamp, build id, all logged).
+5. On the MSA_READY indication: board data from the modem partition, read-only, by the cnss names present there
+   (`bdwlan.bNN` for board id < 0xff, `bdwlan.NNN`, else/fallback `bdwlan.bin`), sent as **BDF_DOWNLOAD** segments
+   of 6144 bytes (file_id 0, total size, seg id, end on the last; a failure on the end segment is tolerated as ath10k
+   does for the BDF CRC check), then **CAL_REPORT** (no calibration ids).
+6. Wait for the **FW_READY** indication: `wlfw: FW READY indication: the WLAN firmware runs`. **Stops there**:
+   WLAN_CFG (CE tables) and mode ON come with the copy engines (next step).
+* 30 s per response/indication (ATH10K_QMI_TIMEOUT), then the client stops. Only the WLFW server's node/port is
+  accepted on 0x4003. A DEL_SERVER resets the client (MSA back to HLOS, board data freed), as ath10k's server exit.
+* Teardown (after the modem stop): MSA regions back to HLOS (MSS_MSA + WLAN + WLAN_CE -> HLOS RW).
+* The summary adds `wlfw client: <state>; chip .. board .. soc .. fw .., <bdf> N bytes in M segments`; the event
+  record (now 3 KiB) has every step.
+
+Checked: a userspace harness ran the client through a scripted exchange (wire bytes of every request, region
+parse, assign arguments, 4 BDF segments for a 19152-byte file, end-segment tolerance, FW READY, server
+leave/re-arrive, a foreign sender). Sixth independent review against ath10k `qmi.c`, `qmi_wlfw_v01.c`,
+`qmi_encdec.c` and `qcom_scm_assign_mem`: wire formats and assign layout correct; applied its fixes (wrap-safe MSA
+range check, reset on server exit, sender check, late FW_READY no longer drops a pending response, rail failure
+stops the client, 30 s timeouts).
+
+Image `shim/out/enxerto-boot-ios26full-boot44-wlan-wlfw.img` (sha256 `98d496e7...`, kernel `2c70cd94...` = boot 33b's
+kernel + 1108-1117): boot 43's args plus `sweetwlfw=1`, hold 120 s (was 90). Expected: CAP values (board id ->
+which `bdwlan.*`), BDF accepted, **FW READY**. Not booted: needs the user's OK; one queue item, or combined with a
+GPU boot through the GPU session.
