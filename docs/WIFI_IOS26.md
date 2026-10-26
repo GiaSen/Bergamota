@@ -1376,3 +1376,11 @@ completion before the link is up (status ok/discard/no-ack/postpone); the teardo
 Built. Image `shim/out/enxerto-boot-ios26full-boot53-wlan-wpa2-tid.img` (kernel 1128, same args). Not booted: needs the
 user's OK. If message 2 still does not get through, the TX-completion lines tell whether the firmware sent it (status
 ok = the AP got it and rejected the MIC, i.e. a key derivation problem) or not.
+
+**Boot 53-wlan-wpa2-tid (2026-10-26 ~22:33Z, user OK, user present), so far:** first join attempt went to the user's
+5 GHz network (5180 MHz, -79 dBm): three authentication frames sent by WMI reference, all completed "no ACK" (status 3),
+result 26 to wifid, and the new teardown went down cleanly in 5 ms (no firmware assert; the service and scans kept
+working, ECHOs answered). Second attempt (2.4 GHz network): "no BSS" because the passive scan just before had not heard
+that AP and each scan replaced the whole cache. **1129** (`1129-beryllium-wlan-bss-cache-aging.patch`): the BSS cache
+keeps a network until three scans in a row miss it; image `shim/out/enxerto-boot-ios26full-boot54-wlan-wpa2-cache.img`
+(kernel 1129), built, not booted.
