@@ -1058,3 +1058,32 @@ Image `shim/out/enxerto-boot-ios26full-boot47-wlan-scan.img` (sha256 `471a50c2..
 kernel + 1108-1120): boot 46's args plus `sweetscan=1` (**604 bytes of 607**: little room left in the boot-args
 field). Expected: HTT version, the seven commands, scan STARTED, channel visits, beacons from nearby networks,
 COMPLETED, summary, mode off. Not booted: needs the user's OK.
+
+### 5.26 Boot 47-wlan-scan (1120, user present): **the scan runs, but no beacons arrive**
+
+**2026-10-26 19:14:39Z** (user OK "combine it with the GPU session's next boot"; the phone was in Bergamota
+fastboot with an empty queue, so this session queued it as the only item; iOS up ~19:15Z). Up to WMI READY as
+boot 46, then:
+
+```
+scan: HTT version request sent / HTT version 3.73
+scan: pdev tx chain mask 3, rx chain mask 3, channel list (26, all passive, 744 B), regdomain 0x52,
+      vdev 0 create (station), vdev tx encap native wifi, start scan (passive) (236 B)   (one credit each)
+scan: STARTED (scan id 0xa000)
+scan: COMPLETED reason 0 after 26 channel visits: 0 beacons/probe responses, 0 BSS
+scan summary: htt 3.73, completed, 78 events, 26 channel visits, 0 beacons/probe responses, 0 BSS
+wce: mode off confirmed
+```
+
+Every command was accepted (credit returned each time), the firmware ran the whole passive scan (26 foreign
+channel visits, CHAN_INFO 0x4002 events during it), and reported COMPLETED reason 0, but **no MGMT_RX event** came.
+Clean stop, no panic. Console: `research/ios26/logs-wlan/boot47-wlan-scan-usb.txt` (main checkout, not in git).
+
+**Open question: is the radio receiving at all, or does the firmware keep the frames?** Next (1121), in order of
+cheapness:
+1. Parse **CHAN_INFO** (tag 38, 13 u32: noise floor, rx_clear_count, cycle_count, rx_frame_count, ...): non-zero
+   `rx_frame_count` / a sane noise floor = the RF works and frames are filtered before the host.
+2. Do the rest of **ath10k_htt_setup** (frag-desc bank, HTT RX ring with buffers, aggr config): ath10k never scans
+   without it, and the firmware may not deliver management frames to a host whose HTT RX path is unconfigured.
+3. The **RF_CLK2** reference-clock vote (`cxo_ref_clk_pin`, RPMh "rfclka2") that ath10k makes at probe and this
+   driver skips: Bluetooth works without it, but the WLAN RF may not.
