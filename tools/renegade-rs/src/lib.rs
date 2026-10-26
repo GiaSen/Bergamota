@@ -19,13 +19,17 @@
 //! - [`hfswrite`]: a new HFSX writer (the Python build uses newfs_hfs + a mount + ditto instead)
 
 pub mod apfs;
+pub mod aea;
 pub mod bundle;
 pub mod codesign;
 pub mod fixups;
 pub mod hfs;
 pub mod hfsedit;
 pub mod hfswrite;
+#[cfg(not(target_family = "wasm"))]
+pub mod http;
 pub mod io;
+pub mod ipsw;
 pub mod macho;
 pub mod machostage;
 pub mod pacstrip;
@@ -33,6 +37,7 @@ pub mod plist;
 pub mod sparse;
 pub mod tree;
 pub mod tweaks;
+pub mod zip;
 
 /// Big- and little-endian reads from byte slices (the Mach-O and HFS+ structures are both).
 pub(crate) mod bytes {

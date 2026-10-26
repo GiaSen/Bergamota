@@ -36,6 +36,7 @@ fn main() -> ExitCode {
         Some("root") => cmd_root(&args[1..]),
         Some("plist") => cmd_plist(&args[1..]),
         Some("tweaks") => cmd_tweaks(&args[1..]),
+        Some("ipsw") => cmd_ipsw(&args[1..]),
         Some("sign") => cmd_sign(&args[1..]),
         Some("resign-check") => cmd_resign_check(&args[1..]),
         _ => {
@@ -846,4 +847,52 @@ fn cmd_fixupcheck(args: &[String]) -> Res<ExitCode> {
     }
     println!("{n} Mach-O files checked, {bad} with fixup chains that would fail at page-in");
     Ok(if bad > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS })
+}
+
+/// A local file or an http(s) URL as a shared random-access source.
+fn open_src(s: &str) -> Res<renegade::io::Src> {
+    if s.starts_with("http://") || s.starts_with("https://") {
+        Ok(std::rc::Rc::new(renegade::http::HttpAt::open(s)?))
+    } else {
+        Ok(std::rc::Rc::new(FileAt::open(s)?))
+    }
+}
+
+fn http_get(url: &str) -> Res<String> {
+    Ok(ureq::get(url).call()?.into_string()?)
+}
+
+/// ipsw SRC [--dump IMAGE OUT.img [--len N]] [--verify]: manifest, images, AEA keys (fetched from the key URL).
+fn cmd_ipsw(args: &[String]) -> Res<ExitCode> {
+    let (pos, opts, flags) = split(args, &["--dump", "--len", "--pem"]);
+    let Some(src) = pos.first() else { return Err("ipsw SRC(file or URL) [--dump os|sysos|appos OUT --len N] [--verify] [--pem FILE]".into()) };
+    let ipsw = renegade::ipsw::Ipsw::open(open_src(src)?)?;
+    let m = &ipsw.manifest;
+    println!("{} {} ({}) members {}", m.device, m.version, m.build, ipsw.zip.entries.len());
+    for (im, p) in &m.paths {
+        let e = ipsw.zip.find(p).map(|e| e.size).unwrap_or(0);
+        println!("  {:<8} {p} ({e} bytes, key url {:?})", im.name(), ipsw.key_url(*im)?);
+    }
+    if let Some(name) = opts.get("--dump") {
+        let im = renegade::ipsw::Image::ALL.into_iter().find(|i| i.name() == name).ok_or("image must be os, sysos or appos")?;
+        let out = pos.get(1).ok_or("--dump needs OUT as a second argument")?;
+        let pem = match (opts.get("--pem"), ipsw.key_url(im)?) {
+            (Some(f), _) => Some(fs::read_to_string(f)?),
+            (None, Some(u)) => Some(http_get(&u)?),
+            _ => None,
+        };
+        let img = ipsw.open_image(im, pem.as_deref(), flags.iter().any(|f| f == "--verify"))?;
+        let total = opts.get("--len").map(|l| parse_size(l)).transpose()?.unwrap_or(img.size()).min(img.size());
+        println!("{}: {} bytes", im.name(), img.size());
+        let mut o = BufWriter::new(File::create(out)?);
+        let mut off = 0;
+        let mut buf = vec![0u8; 4 << 20];
+        while off < total {
+            let n = buf.len().min((total - off) as usize);
+            img.read_at(off, &mut buf[..n])?;
+            o.write_all(&buf[..n])?;
+            off += n as u64;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }

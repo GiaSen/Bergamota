@@ -35,6 +35,46 @@ impl ReadAt for Vec<u8> {
     }
 }
 
+impl<T: ReadAt + ?Sized> ReadAt for std::rc::Rc<T> {
+    fn size(&self) -> u64 {
+        (**self).size()
+    }
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<()> {
+        (**self).read_at(off, buf)
+    }
+}
+
+/// A shared, type-erased source: what the IPSW readers hand around.
+pub type Src = std::rc::Rc<dyn ReadAt>;
+
+/// A window `[start, start + len)` of another source.
+pub struct SubRange<R> {
+    pub inner: R,
+    pub start: u64,
+    pub len: u64,
+}
+
+impl<R: ReadAt> SubRange<R> {
+    pub fn new(inner: R, start: u64, len: u64) -> Result<Self> {
+        if start.checked_add(len).is_none_or(|e| e > inner.size()) {
+            return Err(bad("window runs past the end of its source"));
+        }
+        Ok(Self { inner, start, len })
+    }
+}
+
+impl<R: ReadAt> ReadAt for SubRange<R> {
+    fn size(&self) -> u64 {
+        self.len
+    }
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<()> {
+        if off.checked_add(buf.len() as u64).is_none_or(|e| e > self.len) {
+            return Err(short(off));
+        }
+        self.inner.read_at(self.start + off, buf)
+    }
+}
+
 impl<T: ReadAt + ?Sized> ReadAt for &T {
     fn size(&self) -> u64 {
         (**self).size()

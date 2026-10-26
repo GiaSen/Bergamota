@@ -27,8 +27,8 @@
 mod btree;
 mod file;
 mod fs;
-mod lzbitmap;
-mod lzvn;
+pub(crate) mod lzbitmap;
+pub(crate) mod lzvn;
 mod obj;
 
 pub use file::File;
