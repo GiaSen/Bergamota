@@ -959,6 +959,39 @@ fn cmd_apfs(args: &[String]) -> Res<ExitCode> {
             let inv = hints.windows(2).filter(|w| w[1].1 < w[0].1).count();
             println!("{} files with extents of {}; {} inversions by inode order; physical span {} MiB", hints.len(), files.len(), inv, hints.iter().map(|h| h.1).max().unwrap_or(0) >> 20);
         }
+        Some("readall") => {
+            let v = c.volume(vi)?;
+            let mut files = Vec::new();
+            v.walk(&mut |n| {
+                if matches!(n.kind, renegade::apfs::Kind::File) {
+                    files.push((n.ino, n.path.to_string(), n.size));
+                }
+                Ok(())
+            })?;
+            files.sort();
+            let (mut bad, mut bytes) = (0, 0u64);
+            for (ino, path, size) in &files {
+                let r = (|| -> io::Result<()> {
+                    let f = v.open_file(*ino)?;
+                    let mut buf = vec![0u8; 1 << 20];
+                    let mut off = 0;
+                    while off < *size {
+                        let n = buf.len().min((*size - off) as usize);
+                        f.read_at(off, &mut buf[..n])?;
+                        off += n as u64;
+                    }
+                    Ok(())
+                })();
+                match r {
+                    Ok(()) => bytes += size,
+                    Err(e) => {
+                        bad += 1;
+                        println!("FAIL {path} ({size} bytes, inode {ino}): {e}");
+                    }
+                }
+            }
+            println!("{} files, {} failed, {} MiB read", files.len(), bad, bytes >> 20);
+        }
         Some("find") => {
             let needle = rest.get(1).ok_or("find SUBSTR")?;
             let v = c.volume(vi)?;

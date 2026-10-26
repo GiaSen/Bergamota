@@ -341,7 +341,14 @@ fn decode_block(lz: &LzCell, ty: u32, raw: &[u8], expect: usize) -> Result<Vec<u
                 }
             }
         }
-        13 | 14 => super::lzbitmap::decode(raw, expect)?,
+        13 | 14 => {
+            // an incompressible block is stored as 0xFF + the data (as for LZFSE), seen in the real iOS 26 cryptex
+            if first == 0xff && raw.len() == expect + 1 {
+                raw[1..].to_vec()
+            } else {
+                super::lzbitmap::decode(raw, expect)?
+            }
+        }
         9 | 10 => {
             if raw.len() == expect {
                 raw.to_vec()

@@ -147,7 +147,7 @@ fn chunk(c: &[u8], dec: usize, out: &mut Vec<u8>) -> Result<()> {
 /// Decodes a whole "ZBM\x09" stream; the result must have exactly `out_len` bytes.
 pub(crate) fn decode(src: &[u8], out_len: usize) -> Result<Vec<u8>> {
     if src.get(..4) != Some(&MAGIC[..]) {
-        return Err(bad("LZBITMAP: bad magic"));
+        return Err(bad(format!("LZBITMAP: bad magic (first bytes {:02x?}, {} bytes, wanted {out_len})", &src[..src.len().min(12)], src.len())));
     }
     let mut out: Vec<u8> = Vec::with_capacity(out_len);
     let mut pos = 4;
