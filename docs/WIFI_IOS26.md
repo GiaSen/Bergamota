@@ -922,3 +922,37 @@ kernel + 1108-1118), built from the boot-args that ran boot 44 (the GPU session'
 the Bluetooth stage; needed to stay within the 607 usable bytes of the 608-byte boot-args field, which
 `mkpayload.py` truncates silently). Expected: SMMU map 0/0, wlan-cfg 0/0, mode mission 0/0, CE rings, **HTC READY**,
 mode off confirmed. Not booted: needs the user's OK; run it with the user present (first CE access).
+
+### 5.22 Boot 45-wlan-ce (1118, combined with a GPU boot, user present): **HTC READY: the WCN3990 talks to the host**
+
+**2026-10-26, sent 15:34:01Z, iOS up 15:35:25Z** (the app's auto-reboot failed on a host key, the GPU session
+sent the phone to fastboot over SSH; user OK "combine it with the GPU session's next boot ... I'll be by the phone"; queued by the
+GPU session as the only item). Everything up to FW READY as boot 44, then:
+
+```
+SWEET SMMU: sid 0x40 -> smr 7 s2cr 0x3 (translate)          (the shared identity bank, context bank 3, as USB)
+SWEET SMMU: sid 0x41 -> smr 8 s2cr 0x3 (translate)
+wce: wlan-cfg result 0 error 0
+wce: wlan-mode mission result 0 error 0
+wce: mode on: first access to the CE registers at 0x18a40000          (no freeze)
+wce: CE0 source ring 16 entries at 0xe0101000: sw 0 wr 0, ctrl1 0x80800
+wce: CE3 source ring 32 entries at 0xe0102000: sw 0 wr 0, ctrl1 0x80800
+wce: CE1 destination ring 32 entries at 0xe0103000: sw 0 wr 31, ctrl1 0x80800
+wce: CE2 destination ring 64 entries at 0xe0104000: sw 0 wr 63, ctrl1 0x80800
+wce: CE2 message 20 bytes: 00 00 0c 00 00 00 00 00 01 00 02 00 88 08 16 00 01 00 00 00
+wce: HTC READY: 2 credits of 2184 bytes, 22 endpoints, HTC version 1
+wce: wlan-mode off result 0 error 0 / mode off confirmed
+```
+
+The chip DMA'd its first HTC message through the SMMU into our CE2 ring (endpoint 0, READY extended: 2 credits of
+2184 bytes, max 22 endpoints, HTC 2.1). No SMMU fault, no freeze. The destination rings read back CTRL1 0x80800
+too (the reset value carries dmax 0x800). The modem wrote modemst1 once during this boot (`rmtfs write caller 0:
+4096 sectors`, 2 MiB): kept in the RAM copy, storage untouched. Clean stop (stop-ack 190 ms), MSA regions and the
+rmtfs buffer back to HLOS (status 0), no panic. Console: `research/ios26/logs-wlan/boot45-wlan-ce-usb.txt` (main
+checkout, not in git).
+
+**The data path works.** Next (1119): HTC and WMI, ath10k `htc.c` / `wmi-tlv.c`: HTC connect RSVD_CTRL is implicit;
+send CONNECT_SERVICE for WMI_CONTROL (0x100) on CE0, read the response (endpoint, max message size), SETUP_COMPLETE_EX;
+then the target's WMI SERVICE_READY event on CE2 (the firmware's capabilities: PHY, bands, MAC address, services)
+and WMI INIT -> READY event. The source ring write index goes through the shadow register (0x32000 for CE0, 0x3200c
+for CE3) as ath10k does for WCN3990.
