@@ -7,6 +7,7 @@ What goes in (standard library only, plus Google Chrome to rasterise the two typ
     resolution. art.c redraws round dots from it at any size (a 16x16 Euclidean-spot threshold matrix), so the portrait
     costs ~50 KB instead of a run-length image of dots;
   - Archivo (wordmark, the giant numerals) as 4-bit alpha images, run-length coded per row;
+  - Archivo digits, one image each on a common baseline, for the charging screen's giant percentage;
   - JetBrains Mono glyph atlases (4-bit coverage) for the text the screens draw at run time.
 Text is rendered white on black by tools/identity/render.html, so a pixel's brightness is its coverage.
 """
@@ -35,13 +36,17 @@ IMAGES = [
     ('wordmark', 'archivo', 108, 900, 118, 0.02, 'BERGAMOTA'),
     ('num_26', 'archivo', 820, 900, 112, -0.04, '26'),
     ('num_18', 'archivo', 820, 900, 112, -0.04, '18'),
-    ('num_pct', 'archivo', 1000, 900, 112, 0, '%'),
+    ('pct', 'archivo', 236, 900, 112, 0, '%'),
+]
+# (name, size, weight, stretch, chars)  -- Archivo glyphs cut one by one to their ink, all rows of the set kept
+# (common baseline), so the screen can set any string of them with its own spacing
+GLYPHS = [
+    ('digits', 520, 900, 112, '0123456789-'),
 ]
 # (name, size, weight, chars)  -- JetBrains Mono atlases (advance 0.6 em)
 FONTS = [
     ('mono30', 30, 600, ASCII),
     ('mono22', 22, 500, ASCII),
-    ('mono150', 150, 800, '0123456789%'),
 ]
 
 
@@ -210,6 +215,33 @@ def main():
         parts += ['#define ART_%s_W %d' % (up, w), '#define ART_%s_H %d' % (up, h),
                   carray('art_%s' % name, data), '']
         print('%-10s %4dx%-4d %6d bytes' % (name, w, h, len(data)))
+
+    for name, size, weight, stretch, chars in GLYPHS:
+        shots = []
+        for k, ch in enumerate(chars):
+            png = os.path.join(tmp, '%s-%d.png' % (name, k))
+            chrome_shot(a.chrome, {'font': 'archivo', 'size': size, 'weight': weight, 'stretch': stretch, 'text': ch},
+                        int(size * 1.2) + 2 * PAD, int(size * 1.4) + 2 * PAD, png, prof)
+            shots.append(coverage(png))
+        ys = [i // w for w, h, cov in shots for i in range(w * h) if cov[i] > 8]
+        y0, y1 = min(ys), max(ys) + 1
+        data, offs, widths = bytearray(), [], []
+        for w, h, cov in shots:
+            xs = [i % w for i in range(w * h) if cov[i] > 8]
+            x0, x1 = min(xs), max(xs) + 1
+            sub = bytearray()
+            for y in range(y0, y1):
+                sub += cov[y * w + x0:y * w + x1]
+            offs.append(len(data))
+            widths.append(x1 - x0)
+            data += rle4(x1 - x0, y1 - y0, sub)
+        up = name.upper()
+        parts += ['#define ART_%s_H %d' % (up, y1 - y0),
+                  'static const char art_%s_chars[] = "%s";' % (name, chars),
+                  carray('art_%s_widths' % name, widths, 'unsigned short'),
+                  carray('art_%s_offs' % name, offs, 'unsigned int'),
+                  carray('art_%s' % name, data), '']
+        print('%-10s %d glyphs, %d high, widths %s  %6d bytes' % (name, len(chars), y1 - y0, widths, len(data)))
 
     for name, size, weight, chars in FONTS:
         cw, chh = int(math.ceil(size * 0.6)), int(math.ceil(size * 1.32))

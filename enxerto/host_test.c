@@ -138,17 +138,23 @@ int main(void)
 	}
 
 	/* The logo partition's ABL screens (tools/mksplash.py packs these): power-on, the boot scene without text; ABL's
-	 * own fastboot, the scene with an ink BOOTLOADER pill (Enxerto's fastboot screen has the leaf green FASTBOOT one). */
+	 * own fastboot, the stage of the Bergamota fastboot screen with an ink BOOTLOADER pill (Enxerto's has the leaf
+	 * green FASTBOOT one) and fixed text on the panel, since ABL draws no state of its own. */
 	{
 		enum art_image num = art_ios_numerals();
 		bootui_scene((FB_W - 1000) / 2, 1000, (FB_W - art_image_w(num)) / 2, 150, num);
 		dump("out/preview/splash-poweron.ppm");
-		bootui_scene(-90, 800, FB_W - art_image_w(num) + 40, 110, num);
-		int tw = art_text_w(ART_MONO30, "BOOTLOADER"), pw = tw + 56, ph = art_text_h(ART_MONO30) + 20;
-		art_rrect((FB_W - pw) / 2, 350, pw, ph, ph / 2, ID_INK);
-		art_text(ART_MONO30, (FB_W - tw) / 2, 360, ID_PAPER, "BOOTLOADER");
-		art_text_centered(ART_MONO22, 440, ID_INK, "fastboot  |  Qualcomm ABL");
+		art_ground(0, 0, FB_W, FB_H);
+		art_image(num, (FB_W - art_image_w(num)) / 2, STAGE_NUM_Y, ID_WHITE);
+		art_stage_front(STAGE_PORTRAIT_W, 0, FB_H);
+		art_pill(FB_W / 2, STAGE_PILL_Y, ID_INK, ID_PAPER, "BOOTLOADER");
+		art_text(ART_MONO30, 96, STAGE_PANEL_Y + 40, ID_PAPER, "QUALCOMM ABL FASTBOOT");
+		art_text(ART_MONO22, 96, STAGE_PANEL_Y + 94, ID_LIME, "stock bootloader: Bergamota boots Enxerto from here");
+		art_text(ART_MONO22, 96, STAGE_PANEL_Y + 130, STAGE_MUTED, "fastboot boot bergamota-fastboot.img");
+		art_text_centered(ART_MONO22, FB_H - 118, ID_PAPER, "Hold Power 10 s to restart");
 		dump("out/preview/splash-fastboot.ppm");
+		charge_ui_splash();
+		dump("out/preview/splash-charging.ppm");
 	}
 	return 0;
 }

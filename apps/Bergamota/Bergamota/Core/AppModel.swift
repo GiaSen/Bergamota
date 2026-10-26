@@ -38,6 +38,7 @@ final class AppModel {
         hooks.rebootToFastboot = { [unowned self] in await self.tools.rebootIOS(to: "fastboot").1 }
         hooks.rebootToBergamota = { [unowned self] in await self.tools.rebootIOS(to: "bergamota").1 }
         build.rescan()
+        if DesignPreview.active { DesignPreview.apply(self); return }   // sample states only: no polling, listener or inbox
         monitor.start()
         logs.start()
         remote.start()

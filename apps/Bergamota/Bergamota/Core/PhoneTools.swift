@@ -50,13 +50,14 @@ final class PhoneTools {
 
     private var host: String { "root@\(settings.phoneIP)" }
 
-    /// ssh/scp wrappers adding BatchMode and ConnectTimeout, put first on PATH for the repo scripts.
+    /// ssh/scp wrappers adding Shell.sshOptions, put first on PATH for the repo scripts.
     private func environment() -> [String: String] {
         let dir = RemoteControl.baseURL.appendingPathComponent("bin")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         for (n, real) in [("ssh", "/usr/bin/ssh"), ("scp", "/usr/bin/scp")] {
             let p = dir.appendingPathComponent(n)
-            let body = "#!/bin/sh\nexec \(real) -o BatchMode=yes -o ConnectTimeout=3 \"$@\"\n"
+            let opts = Shell.sshOptions.map { "'\($0)'" }.joined(separator: " ")
+            let body = "#!/bin/sh\nexec \(real) \(opts) \"$@\"\n"
             if (try? String(contentsOf: p, encoding: .utf8)) != body {
                 try? body.write(to: p, atomically: true, encoding: .utf8)
                 try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: p.path)
@@ -65,7 +66,7 @@ final class PhoneTools {
         return ["PATH": dir.path + ":" + Shell.childPath, "SWEET_HOST": host]
     }
 
-    private func sshArgs(_ remote: String) -> [String] { ["-o", "BatchMode=yes", "-o", "ConnectTimeout=3", host, remote] }
+    private func sshArgs(_ remote: String) -> [String] { Shell.sshOptions + [host, remote] }
 
     private func log(_ s: String) { output += s }
 
@@ -157,7 +158,7 @@ final class PhoneTools {
     }
 
     func refreshInstalled() async {
-        guard !listing else { return }
+        guard !listing, !DesignPreview.active else { return }
         guard iosUp, let ssh = settings.ssh else { listError = disabledReason ?? "ssh not found"; return }
         listing = true
         defer { listing = false }
@@ -261,7 +262,7 @@ final class PhoneTools {
         func send(_ f: String, to folder: String, as name: String, label: String) async {
             let mk = await Shell.run(ssh, sshArgs("mkdir -p \(folder)"), timeout: 15)
             guard mk.ok else { let e = mk.stderr.trimmingCharacters(in: .whitespacesAndNewlines); record(name, label, false, e); lastError = e; return }
-            let r = await Shell.run(scp, ["-O", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", f, "\(host):\(folder)/\(name)"], timeout: 1800)
+            let r = await Shell.run(scp, ["-O"] + Shell.sshOptions + [f, "\(host):\(folder)/\(name)"], timeout: 1800)
             uploadOutput += "\(f) -> \(folder)/\(name)\n" + r.combined
             if r.ok {
                 _ = await Shell.run(ssh, sshArgs("chown 501:501 \(folder)/\(name)"), timeout: 15)

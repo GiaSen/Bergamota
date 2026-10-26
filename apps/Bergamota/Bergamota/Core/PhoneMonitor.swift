@@ -333,7 +333,7 @@ final class PhoneMonitor {
         defer { infoInFlight = false }
         let ip = settings.phoneIP
         let remote = "uname -a; echo '@@BOOT'; sysctl -n kern.boottime 2>/dev/null; echo '@@ETIME'; ps -o etime= -p 1 2>/dev/null; echo '@@NOW'; date +%s; echo '@@PS'; /usr/local/bin/sweetps; echo '@@SRB'; /usr/local/bin/sweetreboot 2>&1 </dev/null"
-        let r = await Shell.run(ssh, ["-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "root@\(ip)", remote], timeout: 10)
+        let r = await Shell.run(ssh, Shell.sshOptions + ["root@\(ip)", remote], timeout: 10)
         if r.launchError != nil || r.timedOut || (r.status != 0 && r.stdout.isEmpty) {
             infoError = r.timedOut ? "ssh timed out" : (r.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "ssh failed (exit \(r.status))" : r.stderr.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -353,7 +353,7 @@ final class PhoneMonitor {
         defer { metricsInFlight = false }
         let ip = settings.phoneIP
         let remote = "/usr/local/bin/sweetmetrics" + (settings.metricsGPUInfo ? " --gpu-info" : "")
-        let r = await Shell.run(ssh, ["-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "root@\(ip)", remote], timeout: 6)
+        let r = await Shell.run(ssh, Shell.sshOptions + ["root@\(ip)", remote], timeout: 6)
         guard state == .ios else { return }      // the phone went away while we waited
         if r.launchError != nil || r.timedOut || (r.status != 0 && PhoneMetrics.extractJSON(r.stdout) == nil) {
             let err = r.stderr.trimmingCharacters(in: .whitespacesAndNewlines)

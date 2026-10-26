@@ -99,6 +99,7 @@ final class BootQueue {
     private struct Saved: Codable { var items: [QueueItem]; var armed: Bool }
     @ObservationIgnored private var loading = false
     private static var storeURL: URL {
+        if DesignPreview.active { return DesignPreview.queueURL }
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Bergamota")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("queue.json")

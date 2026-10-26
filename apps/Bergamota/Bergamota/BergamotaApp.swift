@@ -8,7 +8,7 @@ struct BergamotaApp: App {
         WindowGroup("Bergamota") {
             ContentView()
                 .environment(model)
-                .frame(minWidth: 960, minHeight: 620)
+                .frame(minWidth: 1100, minHeight: 640)
                 .task { model.start() }
         }
         .defaultSize(width: 1180, height: 760)

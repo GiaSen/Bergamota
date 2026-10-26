@@ -29,7 +29,7 @@ struct Sparkline: View {
                     var z = Path()
                     let y = size.height * (1 - (0 - lo) / (hi - lo))
                     z.move(to: CGPoint(x: 0, y: y)); z.addLine(to: CGPoint(x: size.width, y: y))
-                    g.stroke(z, with: .color(.secondary.opacity(0.35)), style: StrokeStyle(lineWidth: 0.5, dash: [2, 2]))
+                    g.stroke(z, with: .color(color.opacity(0.4)), style: StrokeStyle(lineWidth: 0.5, dash: [2, 2]))
                 }
                 var line = Path()
                 var prev: Date?
@@ -38,10 +38,10 @@ struct Sparkline: View {
                     else if prev == nil { line.move(to: xy(p)) } else { line.addLine(to: xy(p)) }
                     prev = p.0
                 }
-                g.stroke(line, with: .color(color), style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+                g.stroke(line, with: .color(color), style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
             }
         }
-        .background(color.opacity(0.07), in: RoundedRectangle(cornerRadius: 4))
+        .background(alignment: .bottom) { Rectangle().fill(color.opacity(0.25)).frame(height: 1) }
         .accessibilityHidden(true)
     }
 }
@@ -54,9 +54,9 @@ struct FreqBar: View {
     var body: some View {
         GeometryReader { g in
             ZStack(alignment: .leading) {
-                Capsule().fill(color.opacity(0.18))
+                Capsule().fill(color.opacity(0.16))
                 if let f = fraction {
-                    Capsule().fill(color.gradient).frame(width: max(height, g.size.width * min(max(f, 0), 1)))
+                    Capsule().fill(color).frame(width: max(height, g.size.width * min(max(f, 0), 1)))
                         .animation(.easeOut(duration: 0.4), value: f)
                 }
             }
@@ -67,124 +67,109 @@ struct FreqBar: View {
 
 struct RendererBadge: View {
     var r: RendererMetrics
-    var size: CGFloat = 13
-    static func color(_ mode: String) -> Color { mode == "fd630" ? .lime : (mode == "softpipe" ? .orange : .gray) }
-    var body: some View {
-        Text(r.label)
-            .font(.system(size: size, weight: .heavy)).lineLimit(1).minimumScaleFactor(0.6)
-            .padding(.horizontal, size * 0.6).padding(.vertical, size * 0.2)
-            .background(Self.color(r.mode), in: Capsule())
-            .foregroundStyle(r.mode == "cpu" ? Color.white : Color.black)
-    }
+    var size: CGFloat = 10.5
+    static func tone(_ mode: String) -> Tone { mode == "fd630" ? .lime : (mode == "softpipe" ? .amber : .quiet) }
+    var body: some View { Pill(text: r.label, tone: Self.tone(r.mode), size: size) }
 }
 
-func gpuStateColor(_ s: String) -> Color {
+func gpuStateTone(_ s: String) -> Tone {
     switch s {
-    case "on": .green
-    case "slumber": .cyan
-    case "off": .gray
-    case "lost": .red
-    default: .secondary
+    case "on": .leaf
+    case "slumber": .ink
+    case "lost": .alert
+    default: .quiet
     }
 }
 
-// MARK: Dashboard
+// MARK: Performance page
 
-struct PerformanceCard: View {
+struct PerformanceView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
         let mon = model.monitor
-        Card(title: "Performance", symbol: "gauge.with.dots.needle.67percent") {
-            if mon.state != .ios {
-                Text("Available when iOS is up.").foregroundStyle(.secondary)
-            } else if let m = mon.metrics {
-                content(m, mon.metricsHistory)
-            } else if let e = mon.metricsError {
-                Label(e, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled)
-            } else {
-                HStack { ProgressView().controlSize(.small); Text("Waiting for the first sweetmetrics sample...") }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                PageHeader(title: "Performance", subtitle: "sweetmetrics over SSH every ~2 s while iOS is up; the plots hold the last 2 minutes.") {
+                    if let m = mon.metrics { RendererBadge(r: m.renderer, size: 11) }
+                }
+                if mon.state != .ios {
+                    EmptyStage(title: "Available when iOS is up", text: "The phone is \(mon.state.title.lowercased()). Metrics start with the first sweetmetrics answer over SSH after iOS comes up.", symbol: "gauge.with.dots.needle.0percent")
+                } else if let m = mon.metrics {
+                    content(m, mon.metricsHistory)
+                } else if let e = mon.metricsError {
+                    Notice(text: e)
+                } else {
+                    HStack { ProgressView().controlSize(.small); Text("Waiting for the first sweetmetrics sample...").foregroundStyle(Color.muted) }
+                }
             }
+            .padding(28)
+            .frame(maxWidth: 1080, alignment: .leading)
         }
+        .page("Performance")
+    }
+
+    /// One measured line: name, bar against its peak, the value, its load, and its last two minutes.
+    private func meter(_ name: String, _ sub: String, fraction: Double?, value: String, load: String?, color: Color,
+                       points: [(Date, Double)], range: ClosedRange<Double>?, zeroLine: Bool = false, note: String = "") -> some View {
+        HStack(alignment: .center, spacing: 16) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(name).font(BFont.display(17)).foregroundStyle(Color.text)
+                Text(sub).font(BFont.mono(10.5)).foregroundStyle(Color.muted)
+            }
+            .frame(width: 92, alignment: .leading)
+            Text(note).font(.caption).foregroundStyle(Color.muted).lineLimit(1).frame(width: 170, alignment: .leading)
+            Text(value).font(BFont.mono(15, 600)).monospacedDigit().foregroundStyle(Color.text).frame(width: 104, alignment: .trailing)
+            Text(load ?? "").font(BFont.mono(12)).monospacedDigit().foregroundStyle(Color.muted).frame(width: 44, alignment: .trailing)
+            Sparkline(points: points, color: color, range: range, zeroLine: zeroLine).frame(height: 40).frame(maxWidth: .infinity)
+        }
+        .padding(.vertical, 8)
+        .overlay(alignment: .bottom) { Rectangle().fill(Color.rule).frame(height: 1) }
     }
 
     @ViewBuilder
     private func content(_ m: PhoneMetrics, _ h: MetricsHistory) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            // CPU
-            VStack(alignment: .leading, spacing: 6) {
-                Text("CPU").font(.subheadline.bold()).foregroundStyle(.secondary)
-                ForEach(m.clusters, id: \.id) { c in
-                    let peak = max(c.maxKhz ?? 0, h.peakKhz(c.id), c.nominalMaxKhz)
-                    HStack(spacing: 10) {
-                        VStack(alignment: .leading, spacing: 0) {
-                            Text("\(c.name)").font(.callout.bold())
-                            Text("CPU \(c.cpus.first ?? 0)-\(c.cpus.last ?? 0)").font(.caption2).foregroundStyle(.tertiary)
-                        }.frame(width: 62, alignment: .leading)
-                        VStack(alignment: .leading, spacing: 3) {
-                            FreqBar(fraction: c.curKhz.map { Double($0) / Double(peak) }, color: .blue)
-                            Text(c.modeText).font(.caption).foregroundStyle(.secondary)
-                        }
-                        Text(c.curKhz.map(formatKhz) ?? "unknown").font(.callout.monospacedDigit()).frame(width: 78, alignment: .trailing)
-                        Text(c.loadPct.map { String(format: "%.0f%%", $0) } ?? "--").font(.callout.monospacedDigit()).foregroundStyle(.secondary).frame(width: 40, alignment: .trailing)
-                        Sparkline(points: h.cpu(c.id), color: .blue, range: 0...Double(peak)).frame(width: 110, height: 26)
-                    }
-                }
-                if !m.cpuLoad.isEmpty {
-                    HStack(spacing: 3) {
-                        Text("load").font(.caption2).foregroundStyle(.tertiary).frame(width: 62, alignment: .leading)
-                        ForEach(Array(m.cpuLoad.enumerated()), id: \.offset) { _, l in
-                            FreqBar(fraction: l / 100, color: .teal, height: 5)
-                        }
-                    }
-                }
+        Panel(title: "CPU", symbol: "cpu") {
+            ForEach(m.clusters, id: \.id) { c in
+                let peak = max(c.maxKhz ?? 0, h.peakKhz(c.id), c.nominalMaxKhz)
+                meter(c.name, "CPU \(c.cpus.first ?? 0)-\(c.cpus.last ?? 0)", fraction: c.curKhz.map { Double($0) / Double(peak) },
+                      value: c.curKhz.map(formatKhz) ?? "unknown", load: c.loadPct.map { String(format: "%.0f%%", $0) } ?? "--",
+                      color: .text, points: h.cpu(c.id), range: 0...Double(peak), note: c.modeText)
             }
-            Divider()
-            // GPU + renderer
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("GPU  Adreno 630").font(.subheadline.bold()).foregroundStyle(.secondary)
-                    Text(m.gpu.state.uppercased()).font(.caption.bold()).padding(.horizontal, 7).padding(.vertical, 1)
-                        .background(gpuStateColor(m.gpu.state).opacity(0.25), in: Capsule()).foregroundStyle(gpuStateColor(m.gpu.state))
-                    Spacer()
-                    RendererBadge(r: m.renderer)
+            if !m.cpuLoad.isEmpty {
+                HStack(spacing: 4) {
+                    Text("load per core").font(BFont.mono(10.5)).foregroundStyle(Color.muted).frame(width: 108, alignment: .leading)
+                    ForEach(Array(m.cpuLoad.enumerated()), id: \.offset) { _, l in FreqBar(fraction: l / 100, color: .leafText, height: 6) }
                 }
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        FreqBar(fraction: m.gpu.mhz.map { $0 / (m.gpu.maxMhz ?? 710) }, color: .purple)
-                        Text(gpuLine(m.gpu)).font(.caption).foregroundStyle(.secondary)
-                    }
-                    Text(m.gpu.mhz.map { String(format: "%.0f MHz", $0) } ?? "unknown").font(.callout.monospacedDigit()).frame(width: 78, alignment: .trailing)
-                    Text(m.gpu.busyPct.map { String(format: "%.0f%%", $0) } ?? "--").font(.callout.monospacedDigit()).foregroundStyle(.secondary).frame(width: 40, alignment: .trailing)
-                    Sparkline(points: h.gpu, color: .purple, range: 0...(m.gpu.maxMhz ?? 710)).frame(width: 110, height: 26)
-                }
-                Row(k: "Renderer", v: rendererDetail(m.renderer))
+                .padding(.top, 6)
             }
-            Divider()
-            // Battery
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Battery").font(.subheadline.bold()).foregroundStyle(.secondary)
-                HStack(spacing: 10) {
-                    Text(m.battery.percent.map { String(format: "%.0f%%", $0) } ?? "--").font(.title3.bold().monospacedDigit()).frame(width: 62, alignment: .leading)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(batteryLine(m.battery)).font(.callout)
-                        if let t = m.batteryTempC { Text(String(format: "%.1f \u{00B0}C", t)).font(.caption).foregroundStyle(.secondary) }
-                    }
-                    Spacer()
-                    Text(m.battery.currentMa.map(formatMa) ?? "mA unknown").font(.callout.monospacedDigit())
-                    Sparkline(points: h.battery, color: .green, zeroLine: true).frame(width: 110, height: 26)
-                }
-            }
-            let waiting = metricsWaiting(m)
-            if !waiting.isEmpty || !m.errors.isEmpty {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(waiting, id: \.self) { Label($0, systemImage: "hourglass").font(.caption).foregroundStyle(.secondary) }
-                }
-            }
-            Text("sample \(m.fetched.formatted(date: .omitted, time: .standard)), last 2 min in the plots (sweetmetrics schema \(m.schema))")
-                .font(.caption2).foregroundStyle(.tertiary)
-            if let e = model.monitor.metricsError { Text(e).font(.caption).foregroundStyle(.orange) }
         }
+        Panel(title: "GPU  Adreno 630", symbol: "square.stack.3d.up") {
+            HStack(spacing: 8) {
+                Pill(text: m.gpu.state, tone: gpuStateTone(m.gpu.state))
+                Text(rendererDetail(m.renderer)).font(.callout).foregroundStyle(Color.muted).lineLimit(1).truncationMode(.tail)
+            }
+            meter("A630", m.gpu.maxMhz.map { String(format: "max %.0f MHz", $0) } ?? "max 710 MHz",
+                  fraction: m.gpu.mhz.map { $0 / (m.gpu.maxMhz ?? 710) }, value: m.gpu.mhz.map { String(format: "%.0f MHz", $0) } ?? "unknown",
+                  load: m.gpu.busyPct.map { String(format: "%.0f%%", $0) } ?? "--", color: .leafText, points: h.gpu,
+                  range: 0...(m.gpu.maxMhz ?? 710), note: gpuLine(m.gpu))
+        }
+        Panel(title: "Battery", symbol: "battery.75percent") {
+            meter(m.battery.percent.map { String(format: "%.0f%%", $0) } ?? "--",
+                  m.batteryTempC.map { String(format: "%.1f \u{00B0}C", $0) } ?? "battery",
+                  fraction: m.battery.percent.map { $0 / 100 }, value: m.battery.currentMa.map(formatMa) ?? "mA unknown", load: nil,
+                  color: (m.battery.percent ?? 100) < 20 ? .alertText : .text, points: h.battery, range: nil, zeroLine: true,
+                  note: batteryLine(m.battery))
+        }
+        let waiting = metricsWaiting(m)
+        if !waiting.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(waiting, id: \.self) { Label($0, systemImage: "hourglass").font(.caption).foregroundStyle(Color.muted).lineLimit(1) }
+            }
+        }
+        Text("sample \(m.fetched.formatted(date: .omitted, time: .standard))  ·  sweetmetrics schema \(m.schema)")
+            .font(BFont.mono(10.5)).foregroundStyle(Color.muted)
+        if let e = model.monitor.metricsError { Notice(text: e) }
     }
 
     private func gpuLine(_ g: GPUMetrics) -> String {
@@ -216,7 +201,7 @@ func batteryLine(_ b: BatteryMetrics) -> String {
 
 // MARK: Control Plane strip
 
-/// Compact, dark, scaled like the Control Plane tiles (`s` is its layout scale).
+/// The metrics on the Control Plane's ink, scaled like its tiles (`s` is its layout scale).
 struct MetricsStrip: View {
     @Environment(AppModel.self) private var model
     var s: CGFloat
@@ -230,73 +215,82 @@ struct MetricsStrip: View {
                     gpuCard(m, mon.metricsHistory)
                     batteryCard(m, mon.metricsHistory)
                 } else {
-                    card { Text("METRICS").font(.system(size: 16 * s, weight: .bold)).foregroundStyle(.secondary)
-                        Text(mon.metricsError ?? "waiting for sweetmetrics...").font(.system(size: 18 * s)).foregroundStyle(.orange).lineLimit(2) }
+                    CPTile(s: s) {
+                        CPLabel(text: "Metrics", s: s)
+                        Text(mon.metricsError ?? "waiting for sweetmetrics...").font(BFont.mono(16 * s)).foregroundStyle(Color.amber).lineLimit(2)
+                    }
                 }
             }
             .fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    private func card<C: View>(@ViewBuilder _ c: () -> C) -> some View {
-        VStack(alignment: .leading, spacing: 6 * s) { c() }
-            .padding(14 * s).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 16 * s))
-    }
-
     private func cpuCard(_ m: PhoneMetrics, _ h: MetricsHistory) -> some View {
-        card {
-            Text("CPU").font(.system(size: 16 * s, weight: .bold)).foregroundStyle(.secondary)
+        CPTile(s: s) {
+            CPLabel(text: "CPU", s: s)
             ForEach(m.clusters, id: \.id) { c in
                 let peak = max(c.maxKhz ?? 0, h.peakKhz(c.id), c.nominalMaxKhz)
                 HStack(spacing: 10 * s) {
-                    Text(c.name).font(.system(size: 18 * s, weight: .bold)).frame(width: 52 * s, alignment: .leading)
-                    FreqBar(fraction: c.curKhz.map { Double($0) / Double(peak) }, color: .blue, height: 10 * s)
-                    Text(c.curKhz.map(formatKhz) ?? "unknown").font(.system(size: 18 * s, weight: .semibold, design: .rounded).monospacedDigit())
-                        .frame(width: 96 * s, alignment: .trailing)
-                    Text(c.loadPct.map { String(format: "%.0f%%", $0) } ?? "--").font(.system(size: 16 * s).monospacedDigit()).foregroundStyle(.secondary)
-                        .frame(width: 44 * s, alignment: .trailing)
-                    Sparkline(points: h.cpu(c.id), color: .blue, range: 0...Double(peak)).frame(width: 90 * s, height: 22 * s)
+                    Text(c.name).font(BFont.display(17 * s)).foregroundStyle(Color.paper).frame(width: 62 * s, alignment: .leading)
+                    FreqBar(fraction: c.curKhz.map { Double($0) / Double(peak) }, color: .paper, height: 9 * s)
+                    Text(c.curKhz.map(formatKhz) ?? "unknown").font(BFont.mono(17 * s, 600)).monospacedDigit().foregroundStyle(Color.paper)
+                        .frame(width: 100 * s, alignment: .trailing)
+                    Text(c.loadPct.map { String(format: "%.0f%%", $0) } ?? "--").font(BFont.mono(14 * s)).monospacedDigit().foregroundStyle(Color.consoleMuted)
+                        .frame(width: 46 * s, alignment: .trailing)
                 }
             }
         }
     }
 
     private func gpuCard(_ m: PhoneMetrics, _ h: MetricsHistory) -> some View {
-        card {
+        CPTile(s: s) {
             HStack(spacing: 8 * s) {
-                Text("GPU").font(.system(size: 16 * s, weight: .bold)).foregroundStyle(.secondary)
-                Text(m.gpu.state.uppercased()).font(.system(size: 13 * s, weight: .heavy)).padding(.horizontal, 7 * s).padding(.vertical, 1)
-                    .background(gpuStateColor(m.gpu.state).opacity(0.3), in: Capsule()).foregroundStyle(gpuStateColor(m.gpu.state))
+                CPLabel(text: "GPU", s: s)
+                Pill(text: m.gpu.state, tone: gpuStateTone(m.gpu.state), size: 11 * s)
                 Spacer(minLength: 0)
-                RendererBadge(r: m.renderer, size: 13 * s)
+                RendererBadge(r: m.renderer, size: 11 * s)
             }
             HStack(spacing: 10 * s) {
-                FreqBar(fraction: m.gpu.mhz.map { $0 / (m.gpu.maxMhz ?? 710) }, color: .purple, height: 10 * s)
-                Text(m.gpu.mhz.map { String(format: "%.0f MHz", $0) } ?? "unknown").font(.system(size: 18 * s, weight: .semibold, design: .rounded).monospacedDigit())
-                    .frame(width: 92 * s, alignment: .trailing)
-                Text(m.gpu.busyPct.map { String(format: "%.0f%%", $0) } ?? "--").font(.system(size: 16 * s).monospacedDigit()).foregroundStyle(.secondary)
-                    .frame(width: 44 * s, alignment: .trailing)
-                Sparkline(points: h.gpu, color: .purple, range: 0...(m.gpu.maxMhz ?? 710)).frame(width: 90 * s, height: 22 * s)
+                FreqBar(fraction: m.gpu.mhz.map { $0 / (m.gpu.maxMhz ?? 710) }, color: .lime, height: 9 * s)
+                Text(m.gpu.mhz.map { String(format: "%.0f MHz", $0) } ?? "unknown").font(BFont.mono(17 * s, 600)).monospacedDigit().foregroundStyle(Color.paper)
+                    .frame(width: 96 * s, alignment: .trailing)
+                Text(m.gpu.busyPct.map { String(format: "%.0f%%", $0) } ?? "--").font(BFont.mono(14 * s)).monospacedDigit().foregroundStyle(Color.consoleMuted)
+                    .frame(width: 46 * s, alignment: .trailing)
             }
             Text((m.gpu.hasDCVS ? "" : (m.gpu.state == "absent" ? "no GPU driver in this kernel, " : "level/MHz/busy: waiting on the GPU DCVS interface, ")) + rendererDetail(m.renderer))
-                .font(.system(size: 13 * s)).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
+                .font(.system(size: 12 * s)).foregroundStyle(Color.consoleMuted).lineLimit(1).minimumScaleFactor(0.7)
         }
     }
 
     private func batteryCard(_ m: PhoneMetrics, _ h: MetricsHistory) -> some View {
-        card {
-            Text("BATTERY  DRAW").font(.system(size: 16 * s, weight: .bold)).foregroundStyle(.secondary)
-            HStack(spacing: 10 * s) {
-                Text(m.battery.percent.map { String(format: "%.0f%%", $0) } ?? "--").font(.system(size: 30 * s, weight: .heavy, design: .rounded))
-                    .foregroundStyle((m.battery.percent ?? 100) < 20 ? .red : .green)
+        CPTile(s: s) {
+            CPLabel(text: "Battery draw", s: s)
+            HStack(spacing: 12 * s) {
                 VStack(alignment: .leading, spacing: 0) {
-                    Text(m.battery.currentMa.map(formatMa) ?? "mA unknown").font(.system(size: 20 * s, weight: .semibold, design: .rounded).monospacedDigit())
-                    Text(batteryLine(m.battery)).font(.system(size: 13 * s)).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.7)
+                    Text(m.battery.currentMa.map(formatMa) ?? "mA unknown").font(BFont.mono(18 * s, 600)).monospacedDigit().foregroundStyle(Color.paper)
+                    Text(batteryLine(m.battery)).font(.system(size: 12 * s)).foregroundStyle(Color.consoleMuted).lineLimit(1).minimumScaleFactor(0.7)
                 }
-                Sparkline(points: h.battery, color: .green, zeroLine: true).frame(width: 90 * s, height: 30 * s)
             }
         }
-        .frame(width: 330 * s)
+        .frame(width: 340 * s)
     }
+}
+
+/// A Control Plane tile: a raised ink panel with a console hairline.
+struct CPTile<Content: View>: View {
+    var s: CGFloat
+    @ViewBuilder var content: Content
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8 * s) { content }
+            .padding(16 * s).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(Color(hex: 0x1d1d1b), in: RoundedRectangle(cornerRadius: 14 * s))
+            .overlay(RoundedRectangle(cornerRadius: 14 * s).strokeBorder(Color.consoleLine))
+    }
+}
+
+/// Section label on the Control Plane: mono capitals, scaled.
+struct CPLabel: View {
+    let text: String
+    var s: CGFloat
+    var body: some View { Text(caps(text)).font(BFont.mono(12 * s, 800)).tracking(1.4 * s).foregroundStyle(Color.consoleMuted) }
 }

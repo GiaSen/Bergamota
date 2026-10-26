@@ -13,7 +13,7 @@ to opt out; ABL appends its flag after ours). PM8998 `PON_REASON1` (0x808, bit4 
 power-on reason, so a warm reboot from iOS would be misdetected. Normal boots: one cmdline scan, no PMIC/USB/display access.
 
 ## Behaviour
-- Screen: logo, BERGAMOTA/CHARGING, battery icon filled to SOC (red <=15 % not charging, amber <=15 % charging, bolt while charging), big percent, `Charging · 4.12 V · 1.1 A` / `Charged` / `Not charging` / `Battery info unavailable` (`--%`, `?` icon), bar, diag lines, footer `Vol - fastboot · Power hold: start iOS`. Polled every 5 s, only changed regions are redrawn.
+- Screen (Bergamota identity, `tools/identity/IDENTITY.md`): wordmark, a state pill (CHARGING leaf green, CHARGED, NOT CHARGING, LOW BATTERY red when <=15 % and not charging, BATTERY when there are no readings), the state of charge as giant white Archivo numerals behind Newton (`--` when unavailable; the small `%` is dropped only at 100), and on the ink panel below his coat `Charging | 4.12 V | 1.1 A` / `Charged` / `Not charging` / `Battery info unavailable`, a 20-segment bar (5 % each), the notice line, key hints `Vol - fastboot  hold Power start iOS` and the diag lines. Polled every 5 s, only changed regions are redrawn.
 - Keys (PM8998 PON INT_RT_STS 0x810, SID 0, polled every 40 ms, two equal samples): bit0 KPDPWR (Power), bit1 RESIN (Volume Down), as in the kernel's SWEET KEYS.
   Power short = blank/wake toggle; Power hold 2 s = leave charging mode, the normal flow in `enxerto_main` continues (iOS payload, or Bergamota fastboot if none).
   Volume Down = `usb_power_up()` + `bergamota_fastboot()` (USB is only started now; if fastboot cannot start/ends, the charging screen returns with a red notice). While the screen is dark, any key only wakes it.
@@ -29,7 +29,7 @@ The ONLY writes: SID3 WLED brightness 0xd957/0xd967 and sink SYNC 0xd947 (same w
 `BOARD=beryllium enxerto/build.sh` builds `enxerto/out/charge-test.img` (empty ramdisk, cmdline `console=null bergamota.charge=1`) next to `enxerto-boot.img`. Run through the Bergamota queue (`fastboot boot enxerto/out/charge-test.img`)
 with the cable in: expect the charging screen with real numbers and the diag lines (`msoc`, `chg`, `usbin`, `apsd`, `pon`, `wled`). Check: 20 s idle blanks, Power wakes, Volume Down starts fastboot (host sees VID 18d1:4ee0),
 Power hold 2 s falls through to the normal flow. Real ABL path: power the phone off, plug a charger (no key) and see whether the boot.img with the real Enxerto shows it (`androidboot.mode=charger`);
-with a payload in the ramdisk, hold Power 2 s to start iOS. Host previews: `enxerto/out/preview/charge-*.png` (15 %, 62 %, 100 %, 8 % not charging, unavailable, update+notice).
+with a payload in the ramdisk, hold Power 2 s to start iOS. Host previews: `tools/identity/mkpreviews.sh` -> `tools/identity/out/screens/charge-*.png` (15 %, 62 %, 100 %, 8 % not charging, unavailable, update+notice).
 
 ## Risks
 - Hypervisor/XPU may fault MMU-off access to the SPMI regions from Enxerto (the kernel does the same reads after ABL, so likely fine); a fault shows the Enxerto panic screen.
