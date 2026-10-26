@@ -3,3 +3,5 @@ dist/
 .wrangler/
 .impeccable/preview/
 .impeccable/mocks/
+src/patcher/renegade.wasm
+public/tools/

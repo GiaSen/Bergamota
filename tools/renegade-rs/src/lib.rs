@@ -15,22 +15,32 @@
 //! - [`hfsedit`]: the owner/mode pass and owner map (`hfsroot_owners.py`, mkroot-full.py), free runs (`hfs_trim.py`)
 //! - [`plist`]: plistlib's reader and writers (binary and XML, byte-identical)
 //! - [`tweaks`]: the tweaks stage (root_tweaks18.py), the self-contained part
+//! - [`apfs`]: a read-only APFS reader (the IPSW's OS and cryptex volumes without a mount)
 //! - [`hfswrite`]: a new HFSX writer (the Python build uses newfs_hfs + a mount + ditto instead)
 
+pub mod apfs;
+pub mod aea;
 pub mod bundle;
 pub mod codesign;
+pub mod dsc;
 pub mod fixups;
 pub mod hfs;
 pub mod hfsedit;
 pub mod hfswrite;
+#[cfg(not(target_family = "wasm"))]
+pub mod http;
 pub mod io;
+pub mod ipsw;
 pub mod macho;
 pub mod machostage;
 pub mod pacstrip;
 pub mod plist;
+pub mod rootbuild;
 pub mod sparse;
+pub mod tools;
 pub mod tree;
 pub mod tweaks;
+pub mod zip;
 
 /// Big- and little-endian reads from byte slices (the Mach-O and HFS+ structures are both).
 pub(crate) mod bytes {
@@ -64,3 +74,11 @@ pub(crate) mod bytes {
         String::from_utf8_lossy(&b[..end]).into_owned()
     }
 }
+
+/// The browser build needs no random numbers (the crypto crates link a RNG they never call): a source that fails.
+#[cfg(target_family = "wasm")]
+fn no_random(_: &mut [u8]) -> std::result::Result<(), getrandom::Error> {
+    Err(getrandom::Error::UNSUPPORTED)
+}
+#[cfg(target_family = "wasm")]
+getrandom::register_custom_getrandom!(no_random);

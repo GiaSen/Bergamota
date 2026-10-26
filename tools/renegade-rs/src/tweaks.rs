@@ -40,6 +40,10 @@ pub trait Fs {
     fn copy(&mut self, from: &str, to: &str) -> Result<()>;
     /// Every path under `p` (recursive), sorted.
     fn walk(&self, p: &str) -> Result<Vec<String>>;
+    /// os.symlink: `link` becomes a symlink to `target`.
+    fn symlink(&mut self, target: &str, link: &str) -> Result<()>;
+    /// os.path.islink / os.readlink: the target when `p` is a symlink (not followed).
+    fn readlink(&self, p: &str) -> Option<String>;
     /// The recorded owners (relative path -> (uid, gid)).
     fn owners(&self) -> &BTreeMap<String, (u32, u32)>;
 }
@@ -109,6 +113,12 @@ impl Fs for DirFs {
     }
     fn copy(&mut self, from: &str, to: &str) -> Result<()> {
         std::fs::copy(self.p(from), self.p(to)).map(|_| ())
+    }
+    fn symlink(&mut self, target: &str, link: &str) -> Result<()> {
+        std::os::unix::fs::symlink(target, self.p(link))
+    }
+    fn readlink(&self, p: &str) -> Option<String> {
+        std::fs::read_link(self.p(p)).ok().map(|t| t.to_string_lossy().into_owned())
     }
     fn walk(&self, p: &str) -> Result<Vec<String>> {
         let mut out = Vec::new();
@@ -404,7 +414,7 @@ pub fn add_job(fs: &mut dyn Fs, label: &str, job: &Value) -> Result<()> {
 }
 
 /// A file from the tool build into the root (copy2 or install_file: root:wheel, the given mode).
-fn install(fs: &mut dyn Fs, data: &[u8], dst: &str, mode: u32) -> Result<()> {
+pub(crate) fn install(fs: &mut dyn Fs, data: &[u8], dst: &str, mode: u32) -> Result<()> {
     if let Some((dir, _)) = dst.rsplit_once('/') {
         fs.makedirs(dir)?;
     }
@@ -582,7 +592,7 @@ pub fn bluetoothd_env(pl: &mut Value) -> usize {
 }
 
 /// The launchd part of bluetooth() (the BlueTool stub, hcitest and firmware are not ported yet).
-pub fn bluetooth_env(fs: &mut dyn Fs, log: &mut Log) -> Result<()> {
+pub fn bluetooth_env(fs: &mut dyn Fs, log: &mut Log, stub_available: bool) -> Result<()> {
     let (uid, gid, mode) = fs.stat(LAUNCHD_PLIST)?;
     let mut pl = load(fs, LAUNCHD_PLIST)?;
     if bluetoothd_env(&mut pl) == 0 {
@@ -591,7 +601,9 @@ pub fn bluetooth_env(fs: &mut dyn Fs, log: &mut Log) -> Result<()> {
     }
     save(fs, LAUNCHD_PLIST, &pl, uid, gid, mode, Fmt::Binary)?;
     log.push(format!("bluetooth: BT_HCI_TRANSPORT set for {BT_LABEL}"));
-    log.push("bluetooth: BlueTool stub not built (tools/sweetnet/build.sh): BlueTool left alone".into());
+    if !stub_available {
+        log.push("bluetooth: BlueTool stub not built (tools/sweetnet/build.sh): BlueTool left alone".into());
+    }
     Ok(())
 }
 
@@ -629,6 +641,12 @@ pub struct Config {
     pub sweetreboot: Option<Vec<u8>>,
     /// How paths are shown in messages (Python prints absolute paths under the root it was given).
     pub root_display: String,
+    /// The prebuilt on-device tools (berga-tools.zip); None: every feature that installs one is skipped.
+    pub tools: Option<crate::tools::Tools>,
+    /// The public key SSH logs in with (one `ssh-ed25519 AAAA...` line); without it the ssh tweak is skipped.
+    pub ssh_key: Option<String>,
+    /// Where the key came from, for the log line (default: "the public key you gave").
+    pub ssh_key_name: Option<String>,
 }
 
 /// The ported part of root_tweaks18.base() + auto(), in their order (ssh, sweetprefs, PosterBoard, bgmtl, the
@@ -645,12 +663,14 @@ pub fn run(fs: &mut dyn Fs, cfg: &Config, log: &mut Log) -> Result<()> {
     usbnet(fs, log)?;
     netcfg(fs, log, cfg.netcfg.as_deref())?;
     sweetreboot(fs, log, cfg.sweetreboot.as_deref())?;
+    crate::tools::run_ssh(fs, cfg, log)?;
     audio(fs, log)?;
     activation(fs, log, r, &cfg.build, &cfg.version)?;
     stage_prefs(fs, log, &cfg.build)?;
     iosroot_dirs(fs)?;
     staged_apps(fs, log)?;
-    bluetooth_env(fs, log)
+    bluetooth_env(fs, log, cfg.tools.as_ref().is_some_and(|t| t.get(crate::tools::BLUETOOL_STUB).is_some()))?;
+    crate::tools::run_rest(fs, cfg, log)
 }
 
 pub const REGISTER_LIST: &str = "usr/local/share/renegade/register-apps";
@@ -700,6 +720,11 @@ pub struct TreeFs<'a> {
     /// Sources below `base` are the caller's (the scanned files).
     pub base: usize,
     read_source: Box<dyn Fn(usize) -> Result<Vec<u8>> + 'a>,
+    /// Reads the first bytes of a scanned file without reading the whole of it (set by callers with big files).
+    #[allow(clippy::type_complexity)]
+    peek_source: Option<Box<dyn Fn(usize, usize) -> Result<Vec<u8>> + 'a>>,
+    /// Entry indices in path order (built on the first walk, kept up to date by the pushes, dropped by removals).
+    sorted: std::cell::RefCell<Option<Vec<usize>>>,
     owners: BTreeMap<String, (u32, u32)>,
     now: u32,
     /// OwnerRecorder's rule: a chown to the user who owns the scanned files (the image is mounted noowners in
@@ -710,10 +735,21 @@ pub struct TreeFs<'a> {
 impl<'a> TreeFs<'a> {
     pub fn new(entries: Vec<crate::hfswrite::Entry>, base: usize, now: u32, read_source: impl Fn(usize) -> Result<Vec<u8>> + 'a) -> Self {
         let index = entries.iter().enumerate().map(|(i, e)| (e.path.clone(), i)).collect();
-        Self { entries, index, overlay: Vec::new(), base, read_source: Box::new(read_source), owners: BTreeMap::new(), now, skip_owner: None }
+        Self { entries, index, overlay: Vec::new(), base, read_source: Box::new(read_source), peek_source: None, sorted: Default::default(), owners: BTreeMap::new(), now, skip_owner: None }
+    }
+
+    /// Call after an entry was pushed.
+    fn note_push(&mut self) {
+        let i = self.entries.len() - 1;
+        if let Some(v) = self.sorted.get_mut() {
+            let path = &self.entries[i].path;
+            let pos = v.partition_point(|&j| self.entries[j].path < *path);
+            v.insert(pos, i);
+        }
     }
 
     fn reindex(&mut self) {
+        *self.sorted.get_mut() = None;
         self.index = self.entries.iter().enumerate().map(|(i, e)| (e.path.clone(), i)).collect();
     }
 
@@ -774,6 +810,22 @@ impl<'a> TreeFs<'a> {
         self.index.get(&full).map(|&i| self.entries[i].kind.clone())
     }
 
+    /// A reader of the first `n` bytes of a scanned file (the data of an overlay file is in memory anyway).
+    pub fn set_peek(&mut self, f: impl Fn(usize, usize) -> Result<Vec<u8>> + 'a) {
+        self.peek_source = Some(Box::new(f));
+    }
+
+    /// The first `n` bytes (fewer for a shorter file) of a file entry.
+    pub fn head(&self, source: usize, n: usize) -> Result<Vec<u8>> {
+        if source >= self.base {
+            return Ok(self.overlay[source - self.base][..n.min(self.overlay[source - self.base].len())].to_vec());
+        }
+        match &self.peek_source {
+            Some(f) => f(source, n),
+            None => Ok((self.read_source)(source)?.into_iter().take(n).collect()),
+        }
+    }
+
     /// The content of a file entry.
     pub fn data(&self, source: usize) -> Result<Vec<u8>> {
         if source >= self.base { Ok(self.overlay[source - self.base].clone()) } else { (self.read_source)(source) }
@@ -814,6 +866,7 @@ impl Fs for TreeFs<'_> {
                     return Err(bad(format!("{p}: parent folder missing")));
                 }
                 self.entries.push(crate::hfswrite::Entry { path: path.clone(), kind: crate::hfswrite::Kind::File { len, source }, uid: 0, gid: 0, perm: 0o644, mtime: self.now, link_group: None });
+                self.note_push();
                 self.index.insert(path, self.entries.len() - 1);
             }
         }
@@ -828,6 +881,7 @@ impl Fs for TreeFs<'_> {
                 continue;
             }
             self.entries.push(crate::hfswrite::Entry { path: cur.clone(), kind: crate::hfswrite::Kind::Dir, uid: 0, gid: 0, perm: 0o755, mtime: self.now, link_group: None });
+            self.note_push();
             self.index.insert(cur.clone(), self.entries.len() - 1);
         }
         Ok(())
@@ -884,12 +938,37 @@ impl Fs for TreeFs<'_> {
         self.write(to, &data)?;
         self.chmod(to, mode)
     }
+    fn symlink(&mut self, target: &str, link: &str) -> Result<()> {
+        let path = Self::norm(link);
+        if self.index.contains_key(&path) {
+            return Err(bad(format!("{link}: file exists")));
+        }
+        let parent = path.rsplit_once('/').map(|x| x.0).unwrap_or("");
+        if !self.is_dir(parent) {
+            return Err(bad(format!("{link}: parent folder missing")));
+        }
+        self.entries.push(crate::hfswrite::Entry { path: path.clone(), kind: crate::hfswrite::Kind::Symlink { target: target.to_string() }, uid: 0, gid: 0, perm: 0o755, mtime: self.now, link_group: None });
+        self.note_push();
+        self.index.insert(path, self.entries.len() - 1);
+        Ok(())
+    }
+    fn readlink(&self, p: &str) -> Option<String> {
+        match self.index.get(&Self::norm(p)).map(|&i| &self.entries[i].kind) {
+            Some(crate::hfswrite::Kind::Symlink { target }) => Some(target.clone()),
+            _ => None,
+        }
+    }
     fn walk(&self, p: &str) -> Result<Vec<String>> {
         let dir = Self::norm(p);
         let pre = format!("{dir}/");
-        let mut v: Vec<String> = self.entries.iter().filter(|e| e.path.starts_with(&pre)).map(|e| e.path.clone()).collect();
-        v.sort();
-        Ok(v)
+        let mut sorted = self.sorted.borrow_mut();
+        let idx = sorted.get_or_insert_with(|| {
+            let mut v: Vec<usize> = (0..self.entries.len()).collect();
+            v.sort_by(|&a, &b| self.entries[a].path.cmp(&self.entries[b].path));
+            v
+        });
+        let start = idx.partition_point(|&j| self.entries[j].path.as_str() < pre.as_str());
+        Ok(idx[start..].iter().map(|&j| &self.entries[j].path).take_while(|q| q.starts_with(&pre)).cloned().collect())
     }
     fn owners(&self) -> &BTreeMap<String, (u32, u32)> {
         &self.owners

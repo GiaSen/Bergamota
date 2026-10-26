@@ -40,16 +40,25 @@ fn tree(d: &Path) -> Vec<(String, u32, Vec<u8>)> {
 }
 
 fn compare(quiet: bool) {
+    compare_with(quiet, false)
+}
+
+fn compare_with(quiet: bool, with_tools: bool) {
     if Command::new("python3").arg("--version").output().is_err() {
         eprintln!("python3 not found: skipping");
         return;
     }
-    let base = std::env::temp_dir().join(format!("renegade-rs-tweaks-{}-{quiet}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("renegade-rs-tweaks-{}-{quiet}-{with_tools}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
     let (py_root, rs_root, tools) = (base.join("py"), base.join("rs"), base.join("tools"));
     let script = root().join("tests/tweaks_fixture.py");
     for r in [&py_root, &rs_root] {
-        let o = Command::new("python3").arg("-I").arg(&script).arg("make").arg(r).arg(&tools).output().unwrap();
+        let mut mk = Command::new("python3");
+        mk.arg("-I").arg(&script).arg("make").arg(r).arg(&tools);
+        if with_tools {
+            mk.arg("--with-tools");
+        }
+        let o = mk.output().unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     }
     let mut py = Command::new("python3");
@@ -57,18 +66,28 @@ fn compare(quiet: bool) {
     if quiet {
         py.arg("--quiet");
     }
+    if with_tools {
+        py.arg("--with-tools");
+    }
     let p = py.output().unwrap();
     assert!(p.status.success(), "python: {}", String::from_utf8_lossy(&p.stderr));
     let mut rs = Command::new(env!("CARGO_BIN_EXE_renegade-rs"));
     rs.arg("tweaks").arg(&rs_root).args(["--build", "22H352", "--version", "18.7.8", "--board", "N841", "--adt-target", "D22"]);
     rs.arg("--netcfg").arg(tools.join("sweetnetcfg")).arg("--sweetreboot").arg(tools.join("sweetreboot"));
     rs.arg("--display").arg(&py_root);
+    if with_tools {
+        rs.arg("--tools-dir").arg(&tools).args(["--ssh-key", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkey test@bergamota", "--ssh-key-name", "test.pub"]);
+    }
     if quiet {
         rs.arg("--quiet");
     }
     let r = rs.output().unwrap();
     assert!(r.status.success(), "rust: {}", String::from_utf8_lossy(&r.stderr));
-    let (pl, rl) = (String::from_utf8_lossy(&p.stdout).into_owned(), String::from_utf8_lossy(&r.stdout).into_owned());
+    // the Python names the directory the GL payload came from; the library has no directory
+    let strip_src = |t: String| -> String {
+        t.lines().map(|l| match l.find("payload from ") { Some(i) if l.contains(" installed in ") => format!("{}payload{}", &l[..i], &l[l.find(" installed in ").unwrap()..]), _ => l.to_string() }).collect::<Vec<_>>().join("\n")
+    };
+    let (pl, rl) = (strip_src(String::from_utf8_lossy(&p.stdout).into_owned()), String::from_utf8_lossy(&r.stdout).into_owned());
     assert_eq!(rl.lines().collect::<Vec<_>>(), pl.lines().collect::<Vec<_>>(), "printed lines / owners differ");
     let (a, b) = (tree(&py_root), tree(&rs_root));
     for (x, y) in a.iter().zip(b.iter()) {
@@ -83,6 +102,12 @@ fn compare(quiet: bool) {
 #[test]
 fn tweaks_match_root_tweaks18() {
     compare(false);
+}
+
+/// ssh, the BlueTool stub, the first-boot job and its wallpaper tools, bglrender, sweetprefs and the console job.
+#[test]
+fn tweaks_with_tools_match_root_tweaks18() {
+    compare_with(false, true);
 }
 
 #[test]
@@ -120,6 +145,7 @@ fn tweaks_on_the_tree_match_root_tweaks18() {
         netcfg: Some(fs::read(tools.join("sweetnetcfg")).unwrap()),
         sweetreboot: Some(fs::read(tools.join("sweetreboot")).unwrap()),
         root_display: py_root.display().to_string(),
+        ..Default::default()
     };
     let mut log = Vec::new();
     renegade::tweaks::run(&mut t, &cfg, &mut log).unwrap();

@@ -14,6 +14,12 @@
 
 ### >>> START HERE: docs/HANDOFF-2026-10-25.md (iOS 26 state + recovery, Wi-Fi/BT, Renegade in Rust, web flasher) <<<
 
+### >>> Renegade in the browser (branch `renegade-wasm`, 2026-10-26): "Patch IPSW + flash" works end to end <<<
+IPSW in, sparse `userdata` out, all in Rust/WebAssembly: `tools/renegade-rs` (new: `zip`, `ipsw`, `aea`, `apfs`, `dsc`, `tools`,
+`rootbuild`, streaming `SparseWriter`, in-order HFS writer; CLI `renegade-rs root-ipsw`), `tools/renegade-wasm` (the module),
+`apps/web/src/patcher/` (worker: FileReaderSync in, OPFS out) and the patch step of the flasher. See tools/renegade-rs/README.md
+("The IPSW root build"). Observations vs guesses are in the final report of that session; the phone was never touched.
+
 ### >>> Renegade in Rust, phase 2 (branch `renegade-rs`, PR #4, 2026-10-25): tools/renegade-rs/README.md <<<
 - Crate `tools/renegade-rs` (lib + `renegade-rs` CLI, lib builds for wasm32). Reference: branch ios26 @ 6a66010. Part 1: img2simg/simg2img, hfsx reader, pacstrip (no --sign), fixupcheck. Part 2: hfsroot_owners.py + hfs_trim.py (byte-identical images), owners.tsv, a NEW HFSX writer (`mkhfs`, `rebuild`; fsck_hfs clean, mounts; rebuilt /usr and /Applications of the real ios26 root identical file by file), plistlib (binary + XML, byte-identical incl. shared containers), the self-contained root_tweaks18 tweaks (same files/owners/lines), and `renegade-rs root DIR OUT.simg` (layout fixes, tweaks, owners, strip, HFSX, img2simg --consume). Part 3: ad-hoc signing without codesign (`codesign.rs`, `bundle.rs`, `machostage.rs`; `strip --sign`, `sign`, `resign-check`): all 3,222 Mach-Os pacstrip.py re-signed in research/ios26/ios26-root-full.simg re-sign byte-identical (+2,368 bundle seals); root re-signs and seals bundles (deepest first: Python's pool left 68 bundles with stale nested hashes).
 - 23 tests (`cargo test --release`, needs python3; macOS checks with hdiutil/fsck_hfs/codesign). Not yet: ldid signing (Linux), the tool-installing tweaks (ssh, BlueTool stub, PosterBoard/sweetfp, bgmtl, bglrender, first boot, sweetprefs), jailbreak, IPSW/AEA + APFS extraction, the shared-cache stage, boot images. Found: `pacstrip.py --subtype arm64` crashes on arm64e.

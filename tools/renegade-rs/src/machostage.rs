@@ -76,8 +76,11 @@ pub fn plan(t: &mut TreeFs, dyld_dir: &str) -> Result<Plan> {
     // final hashes of rewritten files, for the CodeResources of the bundles around them
     let mut hashes: HashMap<usize, Item> = HashMap::new();
     for (path, source) in files {
+        if !is_macho(&t.head(source, 4)?) {
+            continue;
+        }
         let data = t.data(source)?;
-        if !is_macho(&data) {
+        if data.len() < 32 {
             continue;
         }
         p.machos += 1;

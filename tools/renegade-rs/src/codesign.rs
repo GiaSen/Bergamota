@@ -273,6 +273,9 @@ pub struct Params {
     pub entitlements: Option<Vec<u8>>,
     pub info_plist: Option<Vec<u8>>,
     pub code_resources: Option<Vec<u8>>,
+    /// log2 of the hashed page size (None: 14, 16 KiB, what codesign writes for a binary it signs first);
+    /// re-signing keeps the page size the old signature had (Apple's libramrod.dylib is signed with 4 KiB pages).
+    pub page_shift: Option<u8>,
 }
 
 struct Seg {
@@ -394,7 +397,9 @@ pub fn sign_slice(src: &[u8], p: &Params) -> Result<Vec<u8>> {
         _ => 88,
     };
     let code_limit = dataoff;
-    let ncode = code_limit.div_ceil(PAGE);
+    let shift = p.page_shift.unwrap_or(PAGE_SHIFT);
+    let page = 1usize << shift;
+    let ncode = code_limit.div_ceil(page);
     let mut ident = p.ident.as_bytes().to_vec();
     ident.push(0);
     let hash_off = hdr + ident.len() + 32 * nspecial;
@@ -412,7 +417,7 @@ pub fn sign_slice(src: &[u8], p: &Params) -> Result<Vec<u8>> {
     cd[36] = 32; // hash size
     cd[37] = 2; // SHA-256
     cd[38] = 0; // platform
-    cd[39] = PAGE_SHIFT;
+    cd[39] = shift;
     // 40 spare2, 44 scatter, 48 team, 52 spare3, 56 codeLimit64: zero
     if version >= 0x20400 {
         cd[64..72].copy_from_slice(&text_off.to_be_bytes());
@@ -454,9 +459,9 @@ pub fn sign_slice(src: &[u8], p: &Params) -> Result<Vec<u8>> {
     {
         let cd = &mut parts[0].1;
         for i in 0..ncode {
-            let page = &b[i * PAGE..((i + 1) * PAGE).min(code_limit)];
+            let pg = &b[i * page..((i + 1) * page).min(code_limit)];
             let at = hash_off + 32 * i;
-            cd[at..at + 32].copy_from_slice(&sha256(page));
+            cd[at..at + 32].copy_from_slice(&sha256(pg));
         }
     }
     let mut sb = Vec::with_capacity(datasize);
@@ -514,6 +519,8 @@ pub fn sign(file: &[u8], p: &Params) -> Result<Vec<u8>> {
 pub fn resign(file: &[u8], info_plist: Option<Vec<u8>>, code_resources: Option<Vec<u8>>) -> Result<Vec<u8>> {
     let old = identity(file).ok_or_else(|| bad("not signed: no identifier to keep"))?;
     let entitlements = old.entitlements.as_deref().map(codesign_xml).transpose()?;
-    let p = Params { ident: old.ident, flags: old.flags, entitlements, info_plist, code_resources };
+    // codesign replaces a linker-signed signature (4 KiB pages) with a 16 KiB one, and keeps the page size of any other
+    let keep = if old.flags & 0x2_0000 != 0 { None } else { page_shift(file) };
+    let p = Params { ident: old.ident, flags: old.flags, entitlements, info_plist, code_resources, page_shift: keep };
     sign(file, &p)
 }
