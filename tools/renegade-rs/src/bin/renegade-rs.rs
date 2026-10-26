@@ -88,6 +88,7 @@ fn cmd_mkhfs(args: &[String]) -> Res<ExitCode> {
         block_size: 4096,
         size: opts.get("--size").map(|s| parse_size(s)).transpose()?,
         date: opts.get("--date").map(|d| d.parse()).transpose()?.unwrap_or(0),
+        data_order: None,
     };
     let f = File::create(out)?;
     let mut w = renegade::io::FileRw::open(out)?;
@@ -133,6 +134,7 @@ fn cmd_rebuild(args: &[String]) -> Res<ExitCode> {
         block_size: 4096,
         size: opts.get("--size").map(|s| parse_size(s)).transpose()?,
         date: opts.get("--date").map(|d| d.parse()).transpose()?.unwrap_or(0),
+        data_order: None,
     };
     File::create(out)?;
     let mut w = renegade::io::FileRw::open(out)?;
@@ -254,6 +256,7 @@ fn cmd_root(args: &[String]) -> Res<ExitCode> {
         block_size: 4096,
         size: opts.get("--size").map(|s| parse_size(s)).transpose()?,
         date,
+        data_order: None,
     };
     let raw = opts.get("--raw").map(Path::new).map(Path::to_path_buf).unwrap_or_else(|| Path::new(out).with_extension("img"));
     File::create(&raw)?;
@@ -928,6 +931,29 @@ fn cmd_apfs(args: &[String]) -> Res<ExitCode> {
             let v = c.volume(vi)?;
             println!("{:#?}", v.fsck_stats()?);
             println!("{:.1}s", t.elapsed().as_secs_f64());
+        }
+        Some("hints") => {
+            let step: usize = rest.get(1).map(|v| v.parse()).transpose()?.unwrap_or(1);
+            let v = c.volume(vi)?;
+            let mut files = Vec::new();
+            v.walk(&mut |n| {
+                if matches!(n.kind, renegade::apfs::Kind::File) {
+                    files.push((n.ino, n.path.to_string()));
+                }
+                Ok(())
+            })?;
+            files.sort();
+            let mut hints = Vec::new();
+            for (ino, _p) in files.iter().step_by(step) {
+                if let Ok(f) = v.open_file(*ino) {
+                    let h = f.physical_hint();
+                    if h != u64::MAX {
+                        hints.push((*ino, h));
+                    }
+                }
+            }
+            let inv = hints.windows(2).filter(|w| w[1].1 < w[0].1).count();
+            println!("{} files with extents of {}; {} inversions by inode order; physical span {} MiB", hints.len(), files.len(), inv, hints.iter().map(|h| h.1).max().unwrap_or(0) >> 20);
         }
         Some("find") => {
             let needle = rest.get(1).ok_or("find SUBSTR")?;

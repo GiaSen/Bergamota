@@ -175,6 +175,36 @@ pub fn build<W: Write + Seek>(ipsw: &Ipsw, cfg: &mut Config, out: W, ev: &mut dy
         }
     }
 
+    // The first bytes of every file (the Mach-O test), read in the order the volumes store the files: a random
+    // order would decode a megabyte of the disk image for every four bytes.
+    ev(Event::Stage("scan"));
+    let mut heads: HashMap<usize, [u8; 4]> = HashMap::new();
+    {
+        let mut order: Vec<(u64, usize)> = Vec::new();
+        for e in &entries {
+            if let Kind::File { source, len } = e.kind
+                && source < files.len()
+                && len >= 32
+                && !e.path.starts_with(&dyld_prefix)
+            {
+                order.push((((files[source].0 as u64) << 56) | files[source].1.min((1 << 56) - 1), source));
+            }
+        }
+        order.sort_unstable();
+        order.dedup_by_key(|o| o.1);
+        for (n, &(_, source)) in order.iter().enumerate() {
+            let (v, ino) = files[source];
+            let f = vols[v].vol.open_file(ino)?;
+            let mut h = [0u8; 4];
+            if f.size() >= 4 {
+                f.read_at(0, &mut h)?;
+            }
+            heads.insert(source, h);
+            if n % 20000 == 0 {
+                ev(Event::Log(&format!("scanned {n} of {} files", order.len())));
+            }
+        }
+    }
     // --- tweaks ----------------------------------------------------------------------------------------------------
     let base = files.len();
     let vols_ref = &vols;
@@ -183,10 +213,13 @@ pub fn build<W: Write + Seek>(ipsw: &Ipsw, cfg: &mut Config, out: W, ev: &mut dy
         let (v, ino) = files_ref[s];
         read_all(&vols_ref[v].vol, ino)
     });
-    tfs.set_peek(|s, n| {
-        let (v, ino) = files_ref[s];
-        let f = vols_ref[v].vol.open_file(ino)?;
-        f.read_vec(0, (f.size() as usize).min(n))
+    tfs.set_peek(|s, n| match heads.get(&s) {
+        Some(h) => Ok(h[..n.min(4)].to_vec()),
+        None => {
+            let (v, ino) = files_ref[s];
+            let f = vols_ref[v].vol.open_file(ino)?;
+            f.read_vec(0, (f.size() as usize).min(n))
+        }
     });
     let mut map: std::collections::BTreeMap<String, (u32, u32, u32)> = Default::default();
     if cfg.tweaks {
@@ -265,7 +298,9 @@ pub fn build<W: Write + Seek>(ipsw: &Ipsw, cfg: &mut Config, out: W, ev: &mut dy
     }
     est += entries.len() as u64 * 700;
     let vol_size = cfg.volume_size.unwrap_or_else(|| (est + (6 << 30)).next_multiple_of(1 << 30).max(24 << 30));
-    let o = hfswrite::Options { volume_name: "iOSRoot".into(), block_size: 4096, size: Some(vol_size), date: cfg.now };
+    // data goes into the image in the order the volumes store it, so every disk image is read front to back
+    let order_key: Vec<u64> = files.iter().map(|&(v, ino)| ((v as u64) << 56) | ino.min((1 << 56) - 1)).collect();
+    let o = hfswrite::Options { volume_name: "iOSRoot".into(), block_size: 4096, size: Some(vol_size), date: cfg.now, data_order: Some(order_key) };
     let mut w = SparseWriter::new(out, 4096)?;
     let mut done = 0u64;
     let mut last_report = 0u64;

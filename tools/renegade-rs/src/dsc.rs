@@ -469,3 +469,107 @@ fn fix_signature(d: &mut [u8], off: u64, size: u64, changed: &BTreeSet<u64>) -> 
     }
     Ok(updated)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+
+    fn put32(b: &mut [u8], o: usize, v: u32) {
+        b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn put64(b: &mut [u8], o: usize, v: u64) {
+        b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// One cache file with one image whose __text holds PAC code, a stubs mapping, and a CodeDirectory with
+    /// 16 KiB pages, signed correctly.
+    fn synthetic() -> Vec<u8> {
+        let mut f = vec![0u8; 0x8000];
+        f[..16].copy_from_slice(b"dyld_v1  arm64e\0");
+        put32(&mut f, 0x10, 0x200); // mappings
+        put32(&mut f, 0x14, 1);
+        put64(&mut f, 0x28, 0x6000); // signature
+        put64(&mut f, 0x30, 0x1000);
+        put32(&mut f, 0x138, 0x240); // mappings with slide: one, flagged TEXT_STUBS
+        put32(&mut f, 0x13C, 1);
+        put32(&mut f, 0x1C0, 0x300); // images
+        put32(&mut f, 0x1C4, 1);
+        // mapping 0: the whole file, r-x
+        put64(&mut f, 0x200, 0x1_8000_0000);
+        put64(&mut f, 0x208, 0x8000);
+        put64(&mut f, 0x210, 0);
+        put32(&mut f, 0x21C, 5);
+        // mapping with slide: stubs at file offset 0x5000, 0x100 bytes
+        put64(&mut f, 0x240 + 8, 0x100);
+        put64(&mut f, 0x240 + 16, 0x5000);
+        put64(&mut f, 0x240 + 40, DYLD_CACHE_MAPPING_TEXT_STUBS);
+        // image 0 at VM 0x180004000 (file 0x4000), path at 0x400
+        put64(&mut f, 0x300, 0x1_8000_4000);
+        put32(&mut f, 0x318, 0x400);
+        f[0x400..0x400 + 24].copy_from_slice(b"/usr/lib/libobjc.A.dylib");
+        // the Mach-O: one segment with one __text section at VM 0x180004200, 0x100 bytes
+        let m = 0x4000;
+        put32(&mut f, m, MH_MAGIC_64);
+        put32(&mut f, m + 16, 1);
+        put32(&mut f, m + 20, 72 + 80);
+        put32(&mut f, m + 32, LC_SEGMENT_64);
+        put32(&mut f, m + 36, 72 + 80);
+        f[m + 40..m + 46].copy_from_slice(b"__TEXT");
+        put32(&mut f, m + 32 + 64, 1);
+        let s = m + 32 + 72;
+        f[s..s + 6].copy_from_slice(b"__text");
+        put64(&mut f, s + 32, 0x1_8000_4200);
+        put64(&mut f, s + 40, 0x100);
+        put32(&mut f, s + 64, S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
+        for i in 0..0x40 {
+            put32(&mut f, 0x4200 + 4 * i, if i % 2 == 0 { 0xD65F_0BFF } else { 0xD503_201F }); // RETAA / NOP
+        }
+        put32(&mut f, 0x5000, 0xD71F_0A10); // BRAA x16, x17 in the stubs
+        // signature: SuperBlob (1 blob) + CodeDirectory, 2 pages of 16 KiB (the last one short)
+        let sig = 0x6000;
+        f[sig..sig + 4].copy_from_slice(&CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
+        f[sig + 8..sig + 12].copy_from_slice(&1u32.to_be_bytes());
+        f[sig + 16..sig + 20].copy_from_slice(&20u32.to_be_bytes());
+        let cd = sig + 20;
+        f[cd..cd + 4].copy_from_slice(&CSMAGIC_CODEDIRECTORY.to_be_bytes());
+        f[cd + 16..cd + 20].copy_from_slice(&88u32.to_be_bytes()); // hashOffset
+        f[cd + 28..cd + 32].copy_from_slice(&2u32.to_be_bytes()); // nCodeSlots
+        f[cd + 32..cd + 36].copy_from_slice(&0x6000u32.to_be_bytes()); // codeLimit
+        f[cd + 36] = 32;
+        f[cd + 37] = 2;
+        f[cd + 39] = 14;
+        for p in 0..2 {
+            let h = Sha256::digest(&f[p * 0x4000..((p + 1) * 0x4000).min(0x6000)]);
+            f[cd + 88 + 32 * p..cd + 88 + 32 * p + 32].copy_from_slice(&h);
+        }
+        f
+    }
+
+    #[test]
+    fn rewrites_code_stubs_and_page_hashes() {
+        let orig = synthetic();
+        let src: Src = Rc::new(orig.clone());
+        let cache = Cache::open(vec![(MAIN_NAME.to_string(), src)]).unwrap();
+        let plans = cache.plan(&Options::default(), &mut |_| {}).unwrap();
+        let p = &plans[MAIN_NAME];
+        assert_eq!(p.ranges.len(), 2, "the image's __text and the stubs");
+        let mut d = orig.clone();
+        let st = p.apply(&mut d).unwrap();
+        assert_eq!(st.counts["RETAA"], 0x20);
+        assert_eq!(st.counts["BRAA"], 1);
+        assert_eq!(u32le(&d, 0x4200), 0xD65F_03C0, "RETAA -> RET");
+        assert_eq!(u32le(&d, 0x4204), 0xD503_201F, "NOP stays");
+        assert_eq!(u32le(&d, 0x5000), 0xD61F_0200 | (16 << 5) & 0x3E0, "BRAA x16, x17 -> BR x16");
+        // only the touched 16 KiB page has a new hash, and it is the hash of the new bytes
+        let cd = 0x6000 + 20 + 88;
+        assert_eq!(d[cd..cd + 32], orig[cd..cd + 32], "page 0 untouched");
+        assert_eq!(d[cd + 32..cd + 64], Sha256::digest(&d[0x4000..0x6000])[..]);
+        assert_ne!(d[cd + 32..cd + 64], orig[cd + 32..cd + 64]);
+        // without --stubs the stubs stay
+        let plans = cache.plan(&Options { stubs: false, ..Default::default() }, &mut |_| {}).unwrap();
+        let mut d2 = orig.clone();
+        plans[MAIN_NAME].apply(&mut d2).unwrap();
+        assert_eq!(u32le(&d2, 0x5000), 0xD71F_0A10);
+    }
+}

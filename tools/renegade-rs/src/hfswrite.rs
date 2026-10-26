@@ -53,11 +53,14 @@ pub struct Options {
     pub size: Option<u64>,
     /// Unix seconds for the volume dates (reproducible images).
     pub date: u32,
+    /// Where each file's data lies in the image, by file `source`: smaller first (default: path order). The
+    /// root build uses the source image's own order so that it reads it front to back.
+    pub data_order: Option<Vec<u64>>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { volume_name: "iOSRoot".into(), block_size: 4096, size: None, date: 0 }
+        Self { volume_name: "iOSRoot".into(), block_size: 4096, size: None, date: 0, data_order: None }
     }
 }
 
@@ -410,6 +413,13 @@ pub fn build<W: WriteAt>(entries: &[Entry], opts: &Options, out: &mut W, data: &
             Kind::Symlink { target } => file_bytes += blocks_of(target.len() as u64) as u64 * bs as u64,
             Kind::Dir => {}
         }
+    }
+    if let Some(key) = &opts.data_order {
+        let k = |i: usize| match entries[i].kind {
+            Kind::File { source, .. } => key.get(source).copied().unwrap_or(u64::MAX),
+            _ => u64::MAX,
+        };
+        data_files.sort_by_key(|&(i, _)| k(i)); // stable: ties keep path order
     }
     // catalog size estimate: records are at most ~ 520 + 248 bytes; leave room for index nodes
     let nrec = 2 * (order.len() + groups.len() + 3);

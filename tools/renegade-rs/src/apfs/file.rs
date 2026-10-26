@@ -123,6 +123,18 @@ impl<R: ReadAt> File<R> {
     pub fn compression(&self) -> u32 {
         self.compression
     }
+
+    /// Where the file's data starts in the container (lowest physical byte of its extents; `u64::MAX` for a
+    /// file stored in its attributes): visiting many files in this order reads the image front to back.
+    pub fn physical_hint(&self) -> u64 {
+        let bs = self.vol.sh.bs as u64;
+        let first = |s: &Stream| s.exts.iter().filter(|e| e.phys != 0).map(|e| e.phys.saturating_mul(bs)).min().unwrap_or(u64::MAX);
+        match &self.body {
+            Body::Stream(s) => first(s),
+            Body::Chunked { rsrc: Rsrc::Stream(s, _), .. } => first(s),
+            _ => u64::MAX,
+        }
+    }
 }
 
 /// The bytes of an extended attribute's value: inline, or read through its data stream.
