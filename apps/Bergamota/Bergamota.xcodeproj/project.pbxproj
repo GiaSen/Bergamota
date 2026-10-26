@@ -13,6 +13,7 @@
 		1AFD9BEBEC8D77117666AABB /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B0B92F02006A156A7A40A6A7 /* Assets.xcassets */; };
 		246CA0151193F5F83DE55484 /* ActivityBannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1287FE4F58266A0E0CB225D8 /* ActivityBannerView.swift */; };
 		27224D0BE64A7F5BDEB9C419 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2E0006BEE820A89BEF4C071C /* ContentView.swift */; };
+		34DD3CF051770AF035AB8A55 /* Bergamota.icon in Resources */ = {isa = PBXBuildFile; fileRef = 46A04B88F77F978BD19ABF5B /* Bergamota.icon */; };
 		3622277176025B99932F6D24 /* CIView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E9BB85C4769A7EEEB93854A /* CIView.swift */; };
 		3FE85DF37181E833C1FB0430 /* Notifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA4729BAD7FDDE0D68743AA /* Notifier.swift */; };
 		633D6E56FD67DFDB7FB12FE2 /* LogStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA529915B5B2FC1CC115AF32 /* LogStore.swift */; };
@@ -44,6 +45,7 @@
 		299DD6841170662BFEDCE97C /* FlashUserdataView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlashUserdataView.swift; sourceTree = "<group>"; };
 		2E0006BEE820A89BEF4C071C /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		38BE0EBD954A629D19871354 /* MetricsViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetricsViews.swift; sourceTree = "<group>"; };
+		46A04B88F77F978BD19ABF5B /* Bergamota.icon */ = {isa = PBXFileReference; lastKnownFileType = wrapper.icon; path = Bergamota.icon; sourceTree = "<group>"; };
 		47A42F44F37DC3FEED5F3D41 /* ControlPlaneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlPlaneView.swift; sourceTree = "<group>"; };
 		48D311CBC40367F62751677D /* Bergamota.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Bergamota.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		4A566265151DD90D00679BB5 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
@@ -103,6 +105,7 @@
 			isa = PBXGroup;
 			children = (
 				B0B92F02006A156A7A40A6A7 /* Assets.xcassets */,
+				46A04B88F77F978BD19ABF5B /* Bergamota.icon */,
 				D15B777B99E2D7E58AA383A1 /* BergamotaApp.swift */,
 				7659941D7DF3AD77C6D4C32B /* Core */,
 				E1AB4D115EE1173B0A28987E /* Views */,
@@ -198,6 +201,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				1AFD9BEBEC8D77117666AABB /* Assets.xcassets in Resources */,
+				34DD3CF051770AF035AB8A55 /* Bergamota.icon in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -244,7 +248,7 @@
 		064C777366EE40627482185A /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = Bergamota;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_PREVIEWS = YES;
@@ -268,7 +272,7 @@
 		22B782420DDFC744AFE41773 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = Bergamota;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_PREVIEWS = YES;

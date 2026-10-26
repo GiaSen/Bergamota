@@ -7,6 +7,7 @@
  * their own ground (artdraw.c). */
 #define BG_BOOT	0xfff4f3ecU	/* paper: text screens and log panels */
 #define BG_PANIC 0xffb3261eU	/* alert red: shim exceptions */
+#define BG_INK	0xff161616U	/* ink: the console panel of the fastboot screen (its log on a failed boot) */
 #define LABEL	0xff1a5933U	/* leaf green */
 #define TEXT	0xff161616U	/* ink */
 #define WHITE	0xffffffffU

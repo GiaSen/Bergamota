@@ -96,8 +96,8 @@ static struct img image_of(enum art_image im)
 		r.rle = art_num_26; r.w = ART_NUM_26_W; r.h = ART_NUM_26_H;
 	} else if (im == ART_NUM_18) {
 		r.rle = art_num_18; r.w = ART_NUM_18_W; r.h = ART_NUM_18_H;
-	} else if (im == ART_NUM_PCT) {
-		r.rle = art_num_pct; r.w = ART_NUM_PCT_W; r.h = ART_NUM_PCT_H;
+	} else if (im == ART_PCT) {
+		r.rle = art_pct; r.w = ART_PCT_W; r.h = ART_PCT_H;
 	} else {
 		r.rle = art_wordmark; r.w = ART_WORDMARK_W; r.h = ART_WORDMARK_H;
 	}
@@ -130,13 +130,13 @@ int art_portrait_h(int w)
 }
 
 /* Round dots again at this size: a pixel inks when its spot threshold is below the cell's density. */
-void art_portrait(int x0, int y0, int w)
+void art_portrait_rows(int x0, int y0, int w, int row0, int row1)
 {
 	int h = art_portrait_h(w);
 	uint32_t step = ((uint32_t)ART_NEWTON_COLS << 16) / (uint32_t)w;	/* cells per pixel, 16.16 */
 	for (int y = 0; y < h; y++) {
 		int sy = y0 + y;
-		if (sy < 0 || sy >= FB_H)
+		if (sy < 0 || sy >= FB_H || sy < row0 || sy >= row1)
 			continue;
 		uint32_t cyf = (uint32_t)y * step;
 		int row = cyf >> 16, fy = (cyf >> 12) & 15;
@@ -162,6 +162,77 @@ void art_portrait(int x0, int y0, int w)
 	}
 }
 
+void art_portrait(int x0, int y0, int w)
+{
+	art_portrait_rows(x0, y0, w, 0, FB_H);
+}
+
+static int big_index(char c)
+{
+	for (int i = 0; art_digits_chars[i]; i++)
+		if (art_digits_chars[i] == c)
+			return i;
+	return -1;
+}
+
+int art_big_w(const char *s, int gap)
+{
+	int w = 0;
+	for (; *s; s++) {
+		int i = big_index(*s);
+		if (i >= 0)
+			w += art_digits_widths[i] + (s[1] ? gap : 0);
+	}
+	return w;
+}
+
+int art_big_h(void)
+{
+	return ART_DIGITS_H;
+}
+
+void art_big(int x, int y, int gap, uint32_t color, const char *s, int row0, int row1)
+{
+	for (; *s; s++) {
+		int i = big_index(*s);
+		if (i < 0)
+			continue;
+		blit_rle4(art_digits + art_digits_offs[i], art_digits_widths[i], ART_DIGITS_H, x, y, color, row0, row1);
+		x += art_digits_widths[i] + gap;
+	}
+}
+
+#define DISSOLVE_CELL	12	/* px per halftone cell */
+
+void art_dissolve(int y0, int h, uint32_t color, int row0, int row1)
+{
+	for (int y = 0; y < h; y++) {
+		int sy = y0 + y;
+		if (sy < 0 || sy >= FB_H || sy < row0 || sy >= row1)
+			continue;
+		unsigned d = (unsigned)((y + 1) * 256 / h);	/* ink coverage 0..256, eased in: the first dots stay small */
+		d = d * d / 256;
+		const unsigned char *spot = art_spot16 + (y % DISSOLVE_CELL) * 16 / DISSOLVE_CELL * 16;
+		volatile uint32_t *row = px(0, sy);
+		for (int x = 0; x < FB_W; x++)
+			if (spot[(x % DISSOLVE_CELL) * 16 / DISSOLVE_CELL] < d)
+				row[x] = color;
+	}
+}
+
+int art_pill_h(void)
+{
+	return ART_MONO30_H + 20;
+}
+
+int art_pill(int cx, int y, uint32_t bg, uint32_t fg, const char *s)
+{
+	int tw = art_text_w(ART_MONO30, s), pw = tw + 56, ph = art_pill_h();
+	art_rrect(cx - pw / 2, y, pw, ph, ph / 2, bg);
+	art_text(ART_MONO30, cx - tw / 2, y + 10, fg, s);
+	return pw;
+}
+
 struct fnt { const unsigned char *g; const char *chars; int w, h; };
 
 static struct fnt font_of(enum art_font f)
@@ -169,8 +240,6 @@ static struct fnt font_of(enum art_font f)
 	struct fnt r;
 	if (f == ART_MONO22) {
 		r.g = art_mono22; r.chars = art_mono22_chars; r.w = ART_MONO22_W; r.h = ART_MONO22_H;
-	} else if (f == ART_MONO150) {
-		r.g = art_mono150; r.chars = art_mono150_chars; r.w = ART_MONO150_W; r.h = ART_MONO150_H;
 	} else {
 		r.g = art_mono30; r.chars = art_mono30_chars; r.w = ART_MONO30_W; r.h = ART_MONO30_H;
 	}
@@ -257,4 +326,18 @@ void art_rrect(int x, int y, int w, int h, int r, uint32_t color)
 				*d = mix(*d, color, in * 15 / 16);
 		}
 	}
+}
+
+void art_stage_front(int portrait_w, int row0, int row1)
+{
+	int ph = art_portrait_h(portrait_w);
+	int top = STAGE_PANEL_Y - STAGE_DISSOLVE_H;
+
+	art_portrait_rows((FB_W - portrait_w) / 2, FB_H - ph, portrait_w, row0, row1);
+	art_dissolve(top, STAGE_DISSOLVE_H, ID_INK, row0, row1);
+	if (row1 > STAGE_PANEL_Y) {
+		int y = row0 > STAGE_PANEL_Y ? row0 : STAGE_PANEL_Y;
+		con_rect(0, y, FB_W, (row1 < FB_H ? row1 : FB_H) - y, ID_INK);
+	}
+	art_image_rows(ART_WORDMARK, (FB_W - art_image_w(ART_WORDMARK)) / 2, STAGE_WORD_Y, ID_INK, row0, row1);
 }

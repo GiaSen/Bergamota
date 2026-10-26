@@ -59,6 +59,7 @@ Bus reset/disconnect ends all transfers, returns ep0 to SETUP and tells the prot
 `reboot` (restart reason 0x77665501, PSCI SYSTEM_RESET, PS_HOLD fallback), `reboot-bootloader` (IMEM 0x146bf65c = 0x77665500: ABL fastboot), `continue` (= reboot); unchanged.
 Everything else (`format`, `set_active`, `flashing`, logical-partition and snapshot commands, unknown `oem` ...) answers FAIL. Link loss drops the session state (download, staged data).
 If the loader fails after OKAY the error is shown on the boot screen and the phone resets into ABL fastboot after 20 s.
+Layout (Bergamota identity, `tools/identity/IDENTITY.md`, `enxerto/fbui.c`): wordmark, a leaf green FASTBOOT pill, the giant white iOS numerals behind Newton, whose coat dissolves in halftone into an ink panel holding the status, detail, progress bar, charge line, diagnostics and the key hint; on a failed boot the panel grows up over the portrait with the log tail. Host previews: `tools/identity/mkpreviews.sh`.
 Screen: USB state, buffer, last command/reply, download MiB, event/setup counters, DWC3/GCTL/QUSB2/SMMU diagnostics (for the first hardware run); during storage commands
 **FLASHING USERDATA 37%** with `<MiB done> / <MiB total> MiB  <MB/s>  total <MiB> MiB written`, **READING USERDATA** while hashing, **ERASING USERDATA**, and after the command
 `wrote userdata 512 MiB 187 MB/s (verified)`; while receiving `RECEIVING 45%` with the USB MB/s.

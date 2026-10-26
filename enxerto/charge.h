@@ -3,10 +3,11 @@
 #include "pmic.h"
 
 /*
- * Off-mode charging screen (docs/BERGAMOTA_CHARGE.md): Bergamota logo, big battery icon filled to
- * the state of charge, a large percentage, a status line ("Charging · 4.12 V · 1.1 A"), a progress
- * bar and the key hints. Pure drawing (host-testable, no hardware access); aligned 32-bit stores,
- * only the regions whose content changed are redrawn after charge_ui_init.
+ * Off-mode charging screen (docs/BERGAMOTA_CHARGE.md): the stage of artdraw.h (tools/identity/IDENTITY.md) with
+ * the state of charge as the giant white numerals behind Newton, the state on the pill (CHARGING, CHARGED, NOT
+ * CHARGING, LOW BATTERY), and on the ink console panel the status line ("Charging | 4.12 V | 1.1 A"), a segmented
+ * charge bar, a notice line, the key hints and diagnostics. Pure drawing (host-testable, no hardware access);
+ * aligned 32-bit stores, only the regions whose content changed are redrawn after charge_ui_init.
  */
 enum charge_state {
 	CHARGE_UNAVAILABLE,	/* no battery readings: "--%" and "Battery info unavailable" */

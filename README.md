@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="apps/Bergamota/Bergamota/Assets.xcassets/AppIcon.appiconset/icon_256x256@2x.png" width="168" alt="Bergamota">
+  <img src="tools/identity/icon-512.png" width="168" alt="Bergamota">
 </p>
 
 <h1 align="center">Bergamota Project</h1>

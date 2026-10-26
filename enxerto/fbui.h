@@ -2,11 +2,11 @@
 #include <stdint.h>
 
 /*
- * Bergamota fastboot screen (tools/identity/IDENTITY.md): wordmark, a leaf green FASTBOOT pill, a paper plate with the
- * status line, detail, progress bar, charge line and muted diagnostics, hints on the ground, and the Newton portrait
- * in front of the giant iOS numerals. Only the plate's lines are redrawn after fbui_init; all stores are aligned
- * 32-bit (MMU off safe). con_* log lines are muted (but recorded) while it is up and shown on a paper band on
- * fbui_error.
+ * Bergamota fastboot screen (tools/identity/IDENTITY.md): the stage of artdraw.h with a leaf green FASTBOOT pill, the
+ * iOS generation's giant numerals behind Newton, and on the ink console panel the status line, detail, progress
+ * bar, charge line, muted diagnostics and the key hint. Only the panel's lines are redrawn after fbui_init; all
+ * stores are aligned 32-bit (MMU off safe). con_* log lines are muted (but recorded) while it is up and shown on
+ * the ink, grown up over the portrait, on fbui_error.
  */
 #define FBUI_NOBAR	(-1)
 
