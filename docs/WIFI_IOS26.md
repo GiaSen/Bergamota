@@ -988,3 +988,36 @@ Image `shim/out/enxerto-boot-ios26full-boot46-wlan-wmi.img` (sha256 `2747296b...
 kernel + 1108-1119): boot 45's args plus `sweetwmi=1` (592 bytes). Expected: both HTC connects, SERVICE_READY with
 the firmware's capabilities, INIT, **WMI READY with the chip's MAC**, mode off confirmed. Not booted: needs the
 user's OK.
+
+### 5.24 Boot 46-wlan-wmi (1119, combined with a GPU boot, user present): **WMI READY**
+
+**2026-10-26, sent 16:27:28Z** (user OK in both sessions; one queue item after a logo-partition flash by the GPU
+session). Up to HTC READY as boot 45, then:
+
+```
+wmi: HTC connect 0x300 -> status 0 endpoint 1 max message 2000        (HTT)
+wmi: HTC connect 0x100 -> status 0 endpoint 2 max message 2040        (WMI)
+wmi: HTC setup complete sent; waiting for WMI SERVICE_READY
+wmi: SERVICE_AVAILABLE: tx ack rssi 0, extended address 0             (arrives before SERVICE_READY)
+wmi: service bitmap 128 bytes: 0000000d 00000007 0000000d 00000003 0000000f 00000009 0000000b 0000000f ...
+wmi: SERVICE_READY fw_build 0x20090216 abi 0x1000000/757 ns 0x5f414351 0x4c4d, phy_cap 0x3, 2 rf chains,
+     ht_cap 0x381b vht_cap 0x739139fa, tx power 63..63, 0 memory requests; regdomain 0x809c,
+     2 GHz 2312-2732, 5 GHz 4912-6100
+wmi: event 0x4009 (956 bytes)                                          (not handled; logged)
+wmi: INIT (220 bytes, 0 memory chunks, rx reorder offload on, tx ack rssi off)
+wmi: READY status 0, MAC 00:00:00:00:00:00: WMI is up
+wce: mode off confirmed
+```
+
+Then stop-ack 190 ms, teardown done, no panic. The service bitmap is 128 bytes, so ath10k's 4-services-per-word
+packing (review fix) was needed; RX_FULL_REORDER is on. The firmware asks for no host memory. The **zero MAC is
+expected**: ath10k takes the MAC from the device (`device_get_mac_address`, DT `local-mac-address`) and only falls
+back to the firmware's when that is zero; the host then sets it with WMI PDEV_SET_BASE_MACADDR. The 16-byte EP0
+message after READY is a credit report only (trailer record `01 04 00 01` + `02 01 f8 07`: endpoint 2 gets its
+credit back after INIT), logged as "HTC control message 1025 (0 bytes)": to be skipped quietly (next patch).
+Console: `research/ios26/logs-wlan/boot46-wlan-wmi-usb.txt` (main checkout, not in git).
+
+**The WCN3990 is up as an ath10k WMI-TLV target.** Next (1120): what ath10k does after READY in `core_start` and
+`ath10k_core_register`/`mac.c` up to a scan: PDEV_SET_BASE_MACADDR (a MAC: the ADT's `local-mac-address` of the
+wlan node, or a fixed locally administered one), HTT version request and HTT RX ring setup on CE4/CE1, PDEV params,
+VDEV create (station), START_SCAN on 2.4/5 GHz, and the SCAN and MGMT_RX events (beacons -> SSIDs logged).
