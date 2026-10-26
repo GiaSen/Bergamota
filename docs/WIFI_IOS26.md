@@ -1079,6 +1079,9 @@ Every command was accepted (credit returned each time), the firmware ran the who
 channel visits, CHAN_INFO 0x4002 events during it), and reported COMPLETED reason 0, but **no MGMT_RX event** came.
 Clean stop, no panic. Console: `research/ios26/logs-wlan/boot47-wlan-scan-usb.txt` (main checkout, not in git).
 
+Repeated on the GPU session's boot 47 variant (`-60hz-gpu7`: `sweetfb_hz=60 sweetgpufreq=7`, same kernel and
+Wi-Fi args, ~19:27Z): identical, STARTED -> COMPLETED reason 0 after 26 channel visits, 0 beacons.
+
 **Open question: is the radio receiving at all, or does the firmware keep the frames?** Next (1121), in order of
 cheapness:
 1. Parse **CHAN_INFO** (tag 38, 13 u32: noise floor, rx_clear_count, cycle_count, rx_frame_count, ...): non-zero
