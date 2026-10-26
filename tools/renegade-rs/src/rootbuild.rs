@@ -38,13 +38,15 @@ pub struct Config {
     pub ssh_key: Option<String>,
     /// volume size in bytes (None: used + 6 GiB, at least 24 GiB)
     pub volume_size: Option<u64>,
+    /// Debugging: keep only the entries at or under this path (and its folders); implies nothing else.
+    pub only: Option<String>,
     /// Called with (path, byte offset, chunk) for every chunk of every file written (tests compare with a reference).
     pub tap: Option<Box<dyn FnMut(&str, u64, &[u8])>>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { pems: Vec::new(), now: 0, verify_aea: false, macho: true, cache: Some(dsc::Options::default()), tweaks: true, quiet: false, tools: None, ssh_key: None, volume_size: None, tap: None }
+        Config { pems: Vec::new(), now: 0, verify_aea: false, macho: true, cache: Some(dsc::Options::default()), tweaks: true, quiet: false, tools: None, ssh_key: None, volume_size: None, only: None, tap: None }
     }
 }
 
@@ -162,6 +164,10 @@ pub fn build<W: Write + Seek>(ipsw: &Ipsw, cfg: &mut Config, out: W, ev: &mut dy
         ev(Event::Log(&format!("{}: {} entries so far", v.image.name(), entries.len())));
     }
     tree::layout_fixes(&mut entries, cfg.now)?;
+    if let Some(only) = &cfg.only {
+        let sub = format!("{only}/");
+        entries.retain(|e| e.path.is_empty() || e.path == *only || e.path.starts_with(&sub) || only.starts_with(&format!("{}/", e.path)));
+    }
     sum.entries = entries.len();
     ev(Event::Log(&format!("{} entries after the layout fixes", entries.len())));
 

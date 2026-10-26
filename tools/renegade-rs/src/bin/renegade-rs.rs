@@ -1039,7 +1039,7 @@ impl io::Seek for NullSeek {
 fn cmd_root_ipsw(args: &[String]) -> Res<ExitCode> {
     use std::cell::RefCell;
     use std::rc::Rc;
-    let (pos, opts, flags) = split(args, &["--pem", "--compare", "--now", "--size", "--tools", "--ssh-key"]);
+    let (pos, opts, flags) = split(args, &["--pem", "--compare", "--now", "--size", "--tools", "--ssh-key", "--only", "--dump"]);
     let [src, out] = &pos[..] else { return Err("root-ipsw IPSW(file or URL) OUT.simg|null [--pem FILE] [--no-macho] [--no-cache] [--no-tweaks] [--compare REF.simg] [--now UNIX] [--size 24g]".into()) };
     let ipsw = renegade::ipsw::Ipsw::open(open_src(src)?)?;
     let mut cfg = renegade::rootbuild::Config { now: opts.get("--now").map(|n| n.parse()).transpose()?.unwrap_or(0), ..Default::default() };
@@ -1050,6 +1050,7 @@ fn cmd_root_ipsw(args: &[String]) -> Res<ExitCode> {
     if let Some(k) = opts.get("--ssh-key") {
         cfg.ssh_key = Some(if Path::new(k).is_file() { fs::read_to_string(k)? } else { k.clone() });
     }
+    cfg.only = opts.get("--only").cloned();
     cfg.macho = !flags.iter().any(|f| f == "--no-macho");
     cfg.tweaks = !flags.iter().any(|f| f == "--no-tweaks");
     if flags.iter().any(|f| f == "--no-cache") {
@@ -1072,6 +1073,8 @@ fn cmd_root_ipsw(args: &[String]) -> Res<ExitCode> {
         let vol = Rc::new(renegade::hfs::Volume::open(Sparse::open(FileAt::open(refimg)?)?)?);
         let cur: Rc<RefCell<(String, Option<Vec<u8>>)>> = Rc::new(RefCell::new((String::new(), None)));
         let rep = report.clone();
+        let dump: Option<(String, String)> = opts.get("--dump").and_then(|d| d.split_once('=')).map(|(a, b)| (a.to_string(), b.to_string()));
+        let show = opts.contains_key("--show") || flags.iter().any(|f| f == "--show");
         cfg.tap = Some(Box::new(move |path, off, chunk| {
             let mut c = cur.borrow_mut();
             if c.0 != path || off == 0 {
@@ -1082,7 +1085,19 @@ fn cmd_root_ipsw(args: &[String]) -> Res<ExitCode> {
                 };
                 rep.borrow_mut().0 += 1;
             }
+            if let Some((dp, df)) = &dump
+                && dp == path
+            {
+                use std::io::Write as _;
+                let mut f = fs::OpenOptions::new().create(true).append(true).open(df).unwrap();
+                f.write_all(chunk).unwrap();
+            }
             let ok = c.1.as_ref().is_some_and(|r| r.get(off as usize..off as usize + chunk.len()) == Some(chunk));
+            if !ok && show {
+                let r = c.1.as_deref().unwrap_or(&[]);
+                let at = chunk.iter().zip(r.iter().skip(off as usize)).position(|(a, b)| a != b);
+                eprintln!("DIFF {path}: mine {} bytes at {off}, reference {} bytes, first difference at {:?}", chunk.len(), r.len(), at.map(|a| a as u64 + off));
+            }
             if !ok {
                 let mut r = rep.borrow_mut();
                 let missing = c.1.is_none();
@@ -1106,7 +1121,7 @@ fn cmd_root_ipsw(args: &[String]) -> Res<ExitCode> {
     let r = report.borrow();
     if r.0 > 0 {
         eprintln!("compared {} files, {} bytes; {} paths differ or are missing", r.0, r.1, r.2.len());
-        for (k, n) in r.2.iter().take(60) {
+        for (k, n) in r.2.iter().take(std::env::var("RENEGADE_LIST").ok().and_then(|v| v.parse().ok()).unwrap_or(60)) {
             eprintln!("  {k} ({n} chunks)");
         }
     }
