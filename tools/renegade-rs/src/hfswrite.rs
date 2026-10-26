@@ -588,7 +588,6 @@ pub fn build<W: WriteAt>(entries: &[Entry], opts: &Options, out: &mut W, data: &
     }
     mark(total_blocks - 1);
     let used = next_block + 1;
-    out.write_at(alloc_start as u64 * bs as u64, &bm)?;
 
     // --- volume headers ---------------------------------------------------------------------------------------
     let mut vh = vec![0u8; 512];
@@ -646,6 +645,9 @@ pub fn build<W: WriteAt>(entries: &[Entry], opts: &Options, out: &mut W, data: &
         let mut at = start as u64 * bs as u64;
         let mut got = 0u64;
         data(source, &mut |b: &[u8]| {
+            if b.is_empty() {
+                return Ok(());
+            }
             if got + b.len() as u64 > len {
                 return Err(bad(format!("{}: more data than its size", entries[i].path)));
             }
