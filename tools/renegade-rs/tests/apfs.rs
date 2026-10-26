@@ -194,6 +194,15 @@ mod mac {
         rep
     }
 
+    /// Removes the scratch directory when the test ends, panics included.
+    pub struct Cleanup(pub PathBuf);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     pub fn work_dir(name: &str) -> PathBuf {
         let base = std::env::var("RENEGADE_TEST_TMP").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
         let d = base.join(format!("renegade-apfs-{name}-{}", std::process::id()));
@@ -206,7 +215,11 @@ mod mac {
     pub fn make_image(work: &Path, tag: &str, case_sensitive: bool, mb: u32, populate: &dyn Fn(&Path)) -> Option<PathBuf> {
         let img = work.join(format!("{tag}.dmg"));
         let fs = if case_sensitive { "Case-sensitive APFS" } else { "APFS" };
-        let o = Command::new("hdiutil").args(["create", "-size", &format!("{mb}m"), "-layout", "NONE", "-fs", fs, "-volname", "T", "-type", "UDIF"]).arg(&img).output().ok()?;
+        let o = Command::new("hdiutil")
+            .args(["create", "-size", &format!("{mb}m"), "-layout", "NONE", "-fs", fs, "-volname", "T", "-type", "UDIF"])
+            .arg(&img)
+            .output()
+            .ok()?;
         if !o.status.success() {
             return None;
         }
@@ -234,13 +247,11 @@ mod mac {
     }
 }
 
-
 #[cfg(target_os = "macos")]
 mod synth {
     use super::mac::*;
-    use super::*;
     use std::io::Write;
-    use std::os::unix::fs::{symlink, FileExt, PermissionsExt};
+    use std::os::unix::fs::{FileExt, PermissionsExt, symlink};
     use std::path::Path;
 
     fn pseudo(n: usize, seed: u64) -> Vec<u8> {
@@ -374,9 +385,10 @@ fn synthetic(case_sensitive: bool, tag: &str) {
         return;
     }
     let work = work_dir(tag);
+    let _guard = Cleanup(work.clone());
     let src = work.join("src");
     std::fs::create_dir_all(&src).unwrap();
-    let Some(img) = make_image(&work, tag, case_sensitive, 700, &|root| synth::populate(root, case_sensitive, &src)) else {
+    let Some(img) = make_image(&work, tag, case_sensitive, 200, &|root| synth::populate(root, case_sensitive, &src)) else {
         eprintln!("hdiutil could not make the image; skipped");
         return;
     };
@@ -470,6 +482,7 @@ fn real_container_matches_mount() {
         return;
     }
     let work = mac::work_dir("real");
+    let _guard = mac::Cleanup(work.clone());
     let rep = mac::compare(std::path::Path::new(&p), &work, "real", true);
     println!("{rep:#?}");
     assert!(rep.mismatches.is_empty(), "{:#?}", rep.mismatches);
@@ -490,4 +503,182 @@ fn real_container_stats_are_consistent() {
     println!("{s}");
     assert!(s.consistent(), "{s}");
     assert!(v.info().sealed);
+    assert!(v.snapshots().unwrap().is_empty());
+    assert!(v.at_snapshot(1).is_err());
+}
+
+// ---- corrupt input: errors, never panics or runaway allocations ----
+
+fn fletcher64(b: &[u8]) -> u64 {
+    const M: u64 = 0xffff_ffff;
+    let (mut s1, mut s2) = (0u64, 0u64);
+    for w in b.chunks_exact(4) {
+        s1 = (s1 + u32::from_le_bytes([w[0], w[1], w[2], w[3]]) as u64) % M;
+        s2 = (s2 + s1) % M;
+    }
+    let c1 = M - (s1 + s2) % M;
+    let c2 = M - (s1 + c1) % M;
+    c2 << 32 | c1
+}
+
+/// Opens the image and exercises every code path; any outcome but a panic is acceptable.
+fn exercise(img: Vec<u8>) {
+    let Ok(c) = Container::open(img) else { return };
+    let Ok(vols) = c.volumes() else { return };
+    for vi in vols {
+        let Ok(v) = c.volume(vi.index) else { continue };
+        let _ = v.fsck_stats();
+        let mut inos = Vec::new();
+        let _ = v.walk(&mut |n| {
+            if n.kind == Kind::File && inos.len() < 3000 {
+                inos.push(n.ino);
+            }
+            Ok(())
+        });
+        let _ = v.lookup("System/Library");
+        let _ = v.read_dir(2);
+        for ino in inos {
+            if let Ok(f) = v.open_file(ino) {
+                let n = f.size().min(1 << 20) as usize;
+                let mut b = vec![0u8; n];
+                let _ = f.read_at(0, &mut b);
+            }
+        }
+    }
+}
+
+#[test]
+fn garbage_inputs_do_not_panic() {
+    exercise(Vec::new());
+    exercise(vec![0u8; 1 << 16]);
+    let mut x = 0x1234_5678_9abc_def1u64;
+    let rnd: Vec<u8> = (0..1 << 20)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    exercise(rnd.clone());
+    // a plausible superblock followed by noise
+    let mut sb = rnd;
+    sb[32..36].copy_from_slice(b"NXSB");
+    sb[36..40].copy_from_slice(&4096u32.to_le_bytes());
+    let ck = fletcher64(&sb[8..4096]);
+    sb[..8].copy_from_slice(&ck.to_le_bytes());
+    exercise(sb);
+}
+
+#[test]
+fn mutated_real_container_does_not_panic() {
+    let Some(p) = real_image() else { return };
+    let base = std::fs::read(&p).unwrap();
+    let nblocks = base.len() / 4096;
+    let used: Vec<usize> = (0..nblocks).filter(|&b| base[b * 4096..(b + 1) * 4096].iter().any(|&x| x != 0)).collect();
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let started = std::time::Instant::now();
+    for iter in 0..400 {
+        let mut img = base.clone();
+        let mut touched = Vec::new();
+        for _ in 0..1 + next() % 6 {
+            let blk = used[(next() % used.len() as u64) as usize];
+            let off = blk * 4096 + (next() % 4096) as usize;
+            // biased to the header and table areas, where the structure is
+            let off = if next() % 2 == 0 { blk * 4096 + (next() % 128) as usize } else { off };
+            img[off] = match next() % 3 {
+                0 => 0xff,
+                1 => 0,
+                _ => next() as u8,
+            };
+            touched.push(blk);
+        }
+        // keep the checksum valid where the block had one, so the parsers see the damage
+        for blk in touched {
+            let r = blk * 4096..(blk + 1) * 4096;
+            if base[r.clone()][8..].len() % 4 == 0
+                && u64::from_le_bytes(base[r.start..r.start + 8].try_into().unwrap()) == fletcher64(&base[r.start + 8..r.end])
+            {
+                let ck = fletcher64(&img[r.start + 8..r.end]);
+                img[r.start..r.start + 8].copy_from_slice(&ck.to_le_bytes());
+            }
+        }
+        let r = std::panic::catch_unwind(|| exercise(img));
+        assert!(r.is_ok(), "iteration {iter} panicked");
+    }
+    println!("400 mutated images in {:?}", started.elapsed());
+}
+
+/// Listing and read speed on a bigger volume: `RENEGADE_TEST_PERF=files cargo test --release --test apfs perf -- --ignored --nocapture`
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore]
+fn perf_big_synthetic() {
+    use mac::*;
+    let Some(n) = std::env::var("RENEGADE_TEST_PERF").ok().and_then(|s| s.parse::<usize>().ok()) else { return };
+    if !have_hdiutil() {
+        return;
+    }
+    let work = work_dir("perf");
+    let _guard = Cleanup(work.clone());
+    let img = make_image(&work, "perf", true, 700, &|root| {
+        for i in 0..n {
+            let d = root.join(format!("d{:04}/s{:02}", i / 1000, (i / 50) % 20));
+            if i % 50 == 0 {
+                std::fs::create_dir_all(&d).unwrap();
+            }
+            let p = d.join(format!("file-{i:07}.dat"));
+            if i % 7 == 0 {
+                std::fs::write(&p, [b'x'; 100]).unwrap()
+            } else {
+                std::fs::File::create(&p).unwrap();
+            }
+        }
+        let mut big = Vec::with_capacity(200 << 20);
+        let mut x = 88172645463325252u64;
+        while big.len() < 200 << 20 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            big.extend_from_slice(&x.to_le_bytes());
+        }
+        std::fs::write(root.join("big.bin"), &big).unwrap();
+    })
+    .expect("image");
+    let c = Container::open(FileAt::open(&img).unwrap()).unwrap();
+    let v = c.volume(0).unwrap();
+    let t = std::time::Instant::now();
+    let tree = v.tree().unwrap();
+    let scan = t.elapsed();
+    let t = std::time::Instant::now();
+    let mut count = 0usize;
+    tree.walk(&mut |_| {
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
+    let walk = t.elapsed();
+    println!(
+        "{count} nodes: scan {scan:?} ({:.0} nodes/s), walk {walk:?}; cache (misses, hits) {:?}",
+        count as f64 / scan.as_secs_f64(),
+        c.cache_stats()
+    );
+    let ino = v.lookup("big.bin").unwrap().unwrap().ino;
+    let f = v.open_file(ino).unwrap();
+    let mut buf = vec![0u8; 1 << 20];
+    let t = std::time::Instant::now();
+    let mut off = 0;
+    while off < f.size() {
+        let n = ((f.size() - off) as usize).min(buf.len());
+        f.read_at(off, &mut buf[..n]).unwrap();
+        off += n as u64;
+    }
+    println!("read {} MB in {:?}", f.size() >> 20, t.elapsed());
+    let _ = std::fs::remove_dir_all(&work);
 }

@@ -1,10 +1,10 @@
 //! File data: data-stream extents (with holes) and transparent decmpfs decompression.
 
+use super::VolCore;
 use super::btree::{Cursor, Space, Tree};
 use super::fs::*;
 use super::obj::*;
-use super::VolCore;
-use crate::io::{bad, short, ReadAt};
+use crate::io::{ReadAt, bad, short};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::io::Result;
@@ -43,7 +43,7 @@ impl Stream {
             let n;
             match idx.checked_sub(1).map(|i| self.exts[i]) {
                 Some(e) if pos < e.logical.saturating_add(e.len) => {
-                    n = (end - pos).min(e.logical + e.len - pos);
+                    n = (end - pos).min(e.logical.saturating_add(e.len) - pos);
                     if e.phys != 0 {
                         let base = e.phys.checked_mul(bs).ok_or_else(|| bad("extent address overflows"))?;
                         src = Some(base.checked_add(pos - e.logical).ok_or_else(|| bad("extent address overflows"))?);
@@ -96,9 +96,18 @@ impl Rsrc {
 enum Body {
     Stream(Stream),
     /// decmpfs data in the attribute itself, decoded on first use.
-    Inline { ty: u32, raw: Vec<u8>, decoded: RefCell<Option<Rc<Vec<u8>>>> },
+    Inline {
+        ty: u32,
+        raw: Vec<u8>,
+        decoded: RefCell<Option<Rc<Vec<u8>>>>,
+    },
     /// 64 KiB chunks in the resource fork: (offset in the fork, compressed length) of each.
-    Chunked { ty: u32, rsrc: Rsrc, blocks: Vec<(u64, u32)>, cache: RefCell<Vec<(usize, Rc<Vec<u8>>)>> },
+    Chunked {
+        ty: u32,
+        rsrc: Rsrc,
+        blocks: Vec<(u64, u32)>,
+        cache: RefCell<Vec<(usize, Rc<Vec<u8>>)>>,
+    },
 }
 
 /// A regular file's content, random access: [`ReadAt`] over the decompressed bytes.
@@ -198,7 +207,8 @@ fn open_compressed<R: ReadAt>(vol: &Rc<VolCore<R>>, tree: &Tree<'_, R>, ino: u64
             Ok(mk(Body::Inline { ty, raw: attr[16..].to_vec(), decoded: RefCell::new(None) }))
         }
         4 | 8 | 10 | 12 | 14 => {
-            let (fl, d) = vol.xattr(tree, ino, XA_RSRC)?.ok_or_else(|| bad(format!("inode {ino}: compressed file without a resource fork")))?;
+            let (fl, d) =
+                vol.xattr(tree, ino, XA_RSRC)?.ok_or_else(|| bad(format!("inode {ino}: compressed file without a resource fork")))?;
             let rsrc = if fl & XATTR_DATA_EMBEDDED != 0 {
                 Rsrc::Embedded(d)
             } else if fl & XATTR_DATA_STREAM != 0 {
@@ -292,7 +302,8 @@ fn decode_block(lz: &LzCell, ty: u32, raw: &[u8], expect: usize) -> Result<Vec<u
             if first & 0x0f == 0x0f {
                 raw[1..].to_vec()
             } else {
-                miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(raw, expect).map_err(|e| bad(format!("zlib block: {:?}", e.status)))?
+                miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(raw, expect)
+                    .map_err(|e| bad(format!("zlib block: {:?}", e.status)))?
             }
         }
         7 | 8 => {
@@ -510,10 +521,15 @@ mod tests {
     fn chunked_types_round_trip() {
         let data = sample(150_000);
         roundtrip(4, &data, &zlib_chunk, &fork_zlib);
-        roundtrip(12, &data, &|c| {
-            let e = lzfse(c);
-            if e.len() < c.len() { e } else { [&[0xffu8][..], c].concat() }
-        }, &fork_offsets);
+        roundtrip(
+            12,
+            &data,
+            &|c| {
+                let e = lzfse(c);
+                if e.len() < c.len() { e } else { [&[0xffu8][..], c].concat() }
+            },
+            &fork_offsets,
+        );
         roundtrip(10, &data, &|c| [&[0xccu8][..], c].concat(), &fork_offsets);
         // LZVN chunks of 64 KiB are not what the encoder makes bvxn blocks of, so cut the data into
         // small pieces for the stream (one "chunk" per piece is enough to exercise the decoder)

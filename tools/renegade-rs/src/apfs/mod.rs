@@ -34,8 +34,8 @@ mod obj;
 pub use file::File;
 pub use fs::FsckStats;
 
-use crate::io::{bad, ReadAt};
-use btree::{Cursor, Omap};
+use crate::io::{ReadAt, bad};
+use btree::{Cursor, Omap, Space, Tree as BTree};
 use fs::*;
 use obj::*;
 use std::io::Result;
@@ -199,6 +199,20 @@ impl VolumeInfo {
     }
 }
 
+/// A volume snapshot (from the snapshot metadata tree).
+#[derive(Clone, Debug)]
+pub struct SnapshotInfo {
+    /// The transaction id the snapshot was taken at.
+    pub xid: u64,
+    pub name: String,
+    /// Unix seconds.
+    pub create_time: i64,
+    pub change_time: i64,
+    /// The block holding the volume superblock as it was.
+    pub sblock_oid: u64,
+    pub flags: u32,
+}
+
 pub(crate) struct VolCore<R: ReadAt> {
     pub sh: Rc<Shared<R>>,
     pub omap: Omap,
@@ -247,7 +261,11 @@ impl<R: ReadAt> Container<R> {
         let desc_blocks = (le32(&blk0, 104)? & 0x7fff_ffff).min(4096) as u64;
         for i in 0..desc_blocks {
             let Ok(b) = sh.block(desc_base.saturating_add(i)) else { continue };
-            if hdr_type(&b)? & TYPE_MASK == T_NX_SUPERBLOCK && le32(&b, 32)? == NXSB_MAGIC && le32(&b, 36)? as usize == bs && hdr_xid(&b)? > hdr_xid(&best)? {
+            if hdr_type(&b)? & TYPE_MASK == T_NX_SUPERBLOCK
+                && le32(&b, 32)? == NXSB_MAGIC
+                && le32(&b, 36)? as usize == bs
+                && hdr_xid(&b)? > hdr_xid(&best)?
+            {
                 best = (*b).clone();
             }
         }
@@ -303,48 +321,10 @@ impl<R: ReadAt> Container<R> {
     }
 
     fn vol_info(&self, index: usize, oid: u64) -> Result<VolumeInfo> {
-        let val = self.omap.lookup(&self.sh, oid)?.ok_or_else(|| bad(format!("volume object {oid:#x} is not in the container object map")))?;
+        let val =
+            self.omap.lookup(&self.sh, oid)?.ok_or_else(|| bad(format!("volume object {oid:#x} is not in the container object map")))?;
         let b = self.sh.block(val.paddr)?;
-        if hdr_type(&b)? & TYPE_MASK != T_FS || le32(&b, 32)? != APSB_MAGIC {
-            return Err(bad(format!("block {} is not a volume superblock", val.paddr)));
-        }
-        if b.len() < 1100 {
-            return Err(bad("volume superblock truncated"));
-        }
-        let incompat = le64(&b, 56)?;
-        let flags = le64(&b, 264)?;
-        let name_raw = &b[704..960];
-        let end = name_raw.iter().position(|&c| c == 0).unwrap_or(256);
-        let mut uuid = [0u8; 16];
-        uuid.copy_from_slice(&b[240..256]);
-        Ok(VolumeInfo {
-            index,
-            oid,
-            xid: hdr_xid(&b)?,
-            name: String::from_utf8_lossy(&name_raw[..end]).into_owned(),
-            role: le16(&b, 964)?,
-            uuid,
-            features: le64(&b, 40)?,
-            readonly_compat_features: le64(&b, 48)?,
-            incompat_features: incompat,
-            fs_flags: flags,
-            case_insensitive: incompat & INCOMPAT_CASE_INSENSITIVE != 0,
-            normalization_insensitive: incompat & INCOMPAT_NORMALIZATION_INSENSITIVE != 0,
-            sealed: incompat & INCOMPAT_SEALED_VOLUME != 0,
-            encrypted: flags & FS_UNENCRYPTED == 0,
-            omap_oid: le64(&b, 128)?,
-            root_tree_oid: le64(&b, 136)?,
-            extentref_tree_oid: le64(&b, 144)?,
-            snap_meta_tree_oid: le64(&b, 152)?,
-            integrity_meta_oid: le64(&b, 1024)?,
-            fext_tree_oid: le64(&b, 1032)?,
-            num_files: le64(&b, 184)?,
-            num_directories: le64(&b, 192)?,
-            num_symlinks: le64(&b, 200)?,
-            num_other: le64(&b, 208)?,
-            num_snapshots: le64(&b, 216)?,
-            last_mod: (le64(&b, 256)? / 1_000_000_000) as i64,
-        })
+        parse_volume_info(&b, index, oid)
     }
 
     /// Opens the volume in slot `index` (the `index` field of [`Container::volumes`]).
@@ -360,6 +340,49 @@ impl<R: ReadAt> Container<R> {
         let omap = Omap::open(&self.sh, info.omap_oid, info.xid)?;
         Ok(Volume(Rc::new(VolCore { sh: self.sh.clone(), omap, root_oid: info.root_tree_oid, info, lzfse: Default::default() })))
     }
+}
+
+fn parse_volume_info(b: &[u8], index: usize, oid: u64) -> Result<VolumeInfo> {
+    if hdr_type(b)? & TYPE_MASK != T_FS || le32(&b, 32)? != APSB_MAGIC {
+        return Err(bad("not a volume superblock (APSB)"));
+    }
+    if b.len() < 1100 {
+        return Err(bad("volume superblock truncated"));
+    }
+    let incompat = le64(&b, 56)?;
+    let flags = le64(&b, 264)?;
+    let name_raw = &b[704..960];
+    let end = name_raw.iter().position(|&c| c == 0).unwrap_or(256);
+    let mut uuid = [0u8; 16];
+    uuid.copy_from_slice(&b[240..256]);
+    Ok(VolumeInfo {
+        index,
+        oid,
+        xid: hdr_xid(b)?,
+        name: String::from_utf8_lossy(&name_raw[..end]).into_owned(),
+        role: le16(&b, 964)?,
+        uuid,
+        features: le64(&b, 40)?,
+        readonly_compat_features: le64(&b, 48)?,
+        incompat_features: incompat,
+        fs_flags: flags,
+        case_insensitive: incompat & INCOMPAT_CASE_INSENSITIVE != 0,
+        normalization_insensitive: incompat & INCOMPAT_NORMALIZATION_INSENSITIVE != 0,
+        sealed: incompat & INCOMPAT_SEALED_VOLUME != 0,
+        encrypted: flags & FS_UNENCRYPTED == 0,
+        omap_oid: le64(&b, 128)?,
+        root_tree_oid: le64(&b, 136)?,
+        extentref_tree_oid: le64(&b, 144)?,
+        snap_meta_tree_oid: le64(&b, 152)?,
+        integrity_meta_oid: le64(&b, 1024)?,
+        fext_tree_oid: le64(&b, 1032)?,
+        num_files: le64(&b, 184)?,
+        num_directories: le64(&b, 192)?,
+        num_symlinks: le64(&b, 200)?,
+        num_other: le64(&b, 208)?,
+        num_snapshots: le64(&b, 216)?,
+        last_mod: (le64(&b, 256)? / 1_000_000_000) as i64,
+    })
 }
 
 /// One volume's current file-system tree.
@@ -428,6 +451,47 @@ impl<R: ReadAt> Volume<R> {
             Ok(true)
         })?;
         Ok(out)
+    }
+
+    /// The volume's snapshots, oldest first. [`Volume::walk`] and friends read the live tree, not these.
+    pub fn snapshots(&self) -> Result<Vec<SnapshotInfo>> {
+        let oid = self.0.info.snap_meta_tree_oid;
+        let mut out = Vec::new();
+        if oid == 0 {
+            return Ok(out);
+        }
+        let t = BTree::open(&self.0.sh, Space::Phys, oid)?;
+        let mut c = Cursor::first(&t);
+        while let Some(r) = c.next()? {
+            let (xid, ty) = key_hdr(r.key())?;
+            if ty != 1 {
+                continue;
+            }
+            let v = r.val();
+            let name_len = le16(v, 48)? as usize;
+            let name = v.get(50..50 + name_len).ok_or_else(|| bad("snapshot record truncated"))?;
+            let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+            out.push(SnapshotInfo {
+                xid,
+                name: String::from_utf8_lossy(&name[..end]).into_owned(),
+                create_time: (le64(v, 16)? / 1_000_000_000) as i64,
+                change_time: (le64(v, 24)? / 1_000_000_000) as i64,
+                sblock_oid: le64(v, 8)?,
+                flags: le32(v, 44)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The volume as of a snapshot (its file-system tree and object map at that transaction).
+    /// Not exercised against a real snapshot (none could be made on the test machine).
+    pub fn at_snapshot(&self, xid: u64) -> Result<Volume<R>> {
+        let snap = self.snapshots()?.into_iter().find(|s| s.xid == xid).ok_or_else(|| bad(format!("no snapshot with xid {xid}")))?;
+        let b = self.0.sh.block(snap.sblock_oid)?;
+        let mut info = parse_volume_info(&b, self.0.info.index, self.0.info.oid)?;
+        info.xid = xid;
+        let omap = Omap::open(&self.0.sh, info.omap_oid, xid)?;
+        Ok(Volume(Rc::new(VolCore { sh: self.0.sh.clone(), omap, root_oid: info.root_tree_oid, info, lzfse: Default::default() })))
     }
 
     /// Opens a regular file's content for random access: the data stream (holes read as zeros) or,

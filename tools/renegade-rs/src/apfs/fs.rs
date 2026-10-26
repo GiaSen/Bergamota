@@ -3,7 +3,7 @@
 use super::btree::{Cursor, Rec, Space, Tree};
 use super::obj::*;
 use super::{Stat, VolCore};
-use crate::io::{bad, ReadAt};
+use crate::io::{ReadAt, bad};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io::Result;
@@ -54,7 +54,6 @@ pub(crate) struct InodeRaw {
     pub uid: u32,
     pub gid: u32,
     pub mode: u16,
-    pub uncompressed_size: u64,
     pub dstream_size: Option<u64>,
 }
 
@@ -70,7 +69,6 @@ pub(crate) fn parse_inode(v: &[u8]) -> Result<InodeRaw> {
         uid: le32(v, 72)?,
         gid: le32(v, 76)?,
         mode: le16(v, 80)?,
-        uncompressed_size: le64(v, 84)?,
         dstream_size: None,
     };
     // extended fields: count, used bytes, (type, flags, size) descriptors, then 8-aligned data
@@ -149,7 +147,6 @@ pub(crate) struct Drec {
     pub child: u64,
     pub name: u32,
     pub name_len: u16,
-    pub dtype: u8,
 }
 
 pub(crate) fn cmp_type_byte(t: u32) -> u8 {
@@ -186,7 +183,14 @@ pub(crate) struct Scan {
 pub(crate) fn scan<R: ReadAt>(vol: &VolCore<R>) -> Result<Scan> {
     let tree = vol.fs_tree()?;
     let mut cur = Cursor::first(&tree);
-    let mut s = Scan { inodes: Vec::new(), drecs: Vec::new(), names: Vec::new(), targets: Default::default(), stats: ScanStats::default(), lossy_names: 0 };
+    let mut s = Scan {
+        inodes: Vec::new(),
+        drecs: Vec::new(),
+        names: Vec::new(),
+        targets: Default::default(),
+        stats: ScanStats::default(),
+        lossy_names: 0,
+    };
     let side = vol.fs_tree()?; // for attributes kept in data streams
     let mut cur_flags = 0u32;
     let nblocks = vol.sh.nblocks;
@@ -222,7 +226,7 @@ pub(crate) fn scan<R: ReadAt>(vol: &VolCore<R>) -> Result<Scan> {
             }
             T_DREC => {
                 let name = drec_name(rec.key())?;
-                let (child, dtype) = parse_drec(rec.val())?;
+                let (child, _dtype) = parse_drec(rec.val())?;
                 let off = s.names.len();
                 match std::str::from_utf8(name) {
                     Ok(_) => s.names.extend_from_slice(name),
@@ -235,7 +239,7 @@ pub(crate) fn scan<R: ReadAt>(vol: &VolCore<R>) -> Result<Scan> {
                 if off > u32::MAX as usize || len > u16::MAX as usize {
                     return Err(bad("name table overflows"));
                 }
-                s.drecs.push(Drec { parent: id, child, name: off as u32, name_len: len as u16, dtype });
+                s.drecs.push(Drec { parent: id, child, name: off as u32, name_len: len as u16 });
             }
             T_XATTR => {
                 let Some(last) = s.inodes.last_mut() else { continue };
@@ -449,14 +453,26 @@ impl FsckStats {
 
 impl std::fmt::Display for FsckStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "inodes {} (dirs {}, files {}, symlinks {}, other {})", self.inodes, self.dirs, self.files, self.symlinks, self.others)?;
-        writeln!(f, "superblock counts: dirs {}, files {}, symlinks {}, other {}", self.sb_dirs, self.sb_files, self.sb_symlinks, self.sb_others)?;
+        writeln!(
+            f,
+            "inodes {} (dirs {}, files {}, symlinks {}, other {})",
+            self.inodes, self.dirs, self.files, self.symlinks, self.others
+        )?;
+        writeln!(
+            f,
+            "superblock counts: dirs {}, files {}, symlinks {}, other {}",
+            self.sb_dirs, self.sb_files, self.sb_symlinks, self.sb_others
+        )?;
         writeln!(f, "names {}, hard-link groups {} ({} extra names)", self.nodes, self.hardlink_groups, self.hardlink_extra_names)?;
         writeln!(f, "total file size {} bytes", self.total_size)?;
         for (t, n) in &self.compressed {
             writeln!(f, "compressed type {t}: {n}")?;
         }
-        writeln!(f, "file extents {} ({} sparse, {} bytes mapped, {} bad)", self.file_extents, self.sparse_extents, self.mapped_bytes, self.bad_extents)?;
+        writeln!(
+            f,
+            "file extents {} ({} sparse, {} bytes mapped, {} bad)",
+            self.file_extents, self.sparse_extents, self.mapped_bytes, self.bad_extents
+        )?;
         writeln!(
             f,
             "unreachable inodes {}, dangling names {}, directory cycles {}, nlink mismatches {}, non-UTF-8 names {}",

@@ -15,6 +15,7 @@
 //! - [`hfsedit`]: the owner/mode pass and owner map (`hfsroot_owners.py`, mkroot-full.py), free runs (`hfs_trim.py`)
 //! - [`plist`]: plistlib's reader and writers (binary and XML, byte-identical)
 //! - [`tweaks`]: the tweaks stage (root_tweaks18.py), the self-contained part
+//! - [`apfs`]: a read-only APFS reader (the IPSW's OS and cryptex volumes without a mount)
 //! - [`hfswrite`]: a new HFSX writer (the Python build uses newfs_hfs + a mount + ditto instead)
 
 pub mod apfs;

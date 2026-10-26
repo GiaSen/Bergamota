@@ -6,7 +6,7 @@
 //! not number levels one by one, so only a strict decrease is required).
 
 use super::obj::*;
-use crate::io::{bad, ReadAt};
+use crate::io::{ReadAt, bad};
 use std::cmp::Ordering;
 use std::io::Result;
 use std::ops::Range;
@@ -101,7 +101,6 @@ impl BNode {
 #[derive(Clone, Copy)]
 pub(crate) struct OmapVal {
     pub flags: u32,
-    pub size: u32,
     pub paddr: u64,
 }
 
@@ -152,7 +151,7 @@ impl Omap {
                     return Ok(None);
                 }
                 let v = &node.blk[v];
-                let val = OmapVal { flags: le32(v, 0)?, size: le32(v, 4)?, paddr: le64(v, 8)? };
+                let val = OmapVal { flags: le32(v, 0)?, paddr: le64(v, 8)? };
                 if val.flags & OMAP_VAL_DELETED != 0 {
                     return Ok(None);
                 }
@@ -205,7 +204,8 @@ impl<'a, R: ReadAt> Tree<'a, R> {
 
     fn load_child(&self, parent: &BNode, oid: u64) -> Result<Rc<BNode>> {
         // sealed volumes: a hashed index node's child pointer is relative to the tree's root oid
-        let oid = if parent.flags & BT_HASHED != 0 { self.root_ref.checked_add(oid).ok_or_else(|| bad("child oid overflows"))? } else { oid };
+        let oid =
+            if parent.flags & BT_HASHED != 0 { self.root_ref.checked_add(oid).ok_or_else(|| bad("child oid overflows"))? } else { oid };
         let blk = fetch(self.sh, self.space, oid)?;
         let n = BNode::parse(blk, self.fixed)?;
         if n.level >= parent.level {

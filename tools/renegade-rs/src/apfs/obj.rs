@@ -1,6 +1,6 @@
 //! APFS objects: checksummed blocks, the block cache and bounds-checked little-endian reads.
 
-use crate::io::{bad, ReadAt};
+use crate::io::{ReadAt, bad};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::Result;
