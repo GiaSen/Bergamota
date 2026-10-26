@@ -1183,3 +1183,31 @@ eleventh independent review matched every byte and the order against v6.12 (`htt
 Image `shim/out/enxerto-boot-ios26full-boot49-wlan-htt.img` (kernel 1120-1123): boot 48r's args unchanged
 (develop's Enxerto, `sweetrfclk=1`, 603 bytes). Expected: "HTT setup sent", then beacons as MGMT_RX (or HTT RX
 indications in the tally) during the scan. Not booted: needs the user's OK.
+
+### 5.30 Boot 49-wlan-htt (1123, user present): **FIRST WI-FI SCAN RESULTS: 12 networks**
+
+**2026-10-26 ~20:41Z** (user OK "boot 49-wlan-htt now (one queue item)"; queued by this session, the Turnip
+session told). Develop's Enxerto, `sweetrfclk=1`. Up to WMI READY as before, then:
+
+```
+scan: HTT version request sent / HTT version 3.73
+scan: HTT setup sent: frag bank 1056 x 72 at 0xe0500000, RX ring 2048 (2047 posted) at 0xe0520000, aggr 64/3
+scan: (chain masks, channel list, regdomain, vdev, encap: all accepted)
+scan: STARTED (scan id 0xa000)
+scan: bss 0 ..  bss 11  (BSSID, MHz, dBm, SSID per network)
+scan: COMPLETED reason 0 after 26 channel visits: 13 beacons/probe responses, 12 BSS
+scan summary event 0x7001 x 13 (MGMT_RX), 0x3001 x 78, 0x4002 x 27, HTT 0x10000 (version conf) x 1
+wce: mode off confirmed; stop-ack 190 ms; teardown done
+```
+
+**The WCN3990 hears and reports real networks on iOS 26.** 12 BSS: 8 on 2.4 GHz (2412-2462 MHz) and 4 on 5 GHz
+(5180, 5300 MHz), -41 to -93 dBm, 2 with hidden SSIDs; all through WMI MGMT_RX, passive (nothing transmitted).
+The missing piece of boots 47/48r was the **host RX path**: with the HTT frag bank, RX ring and RX_RING_CFG in place
+the firmware passes management frames up (over WMI); no HTT RX indication was needed for the scan. The neighbours'
+SSIDs/BSSIDs are in the console only (`research/ios26/logs-wlan/boot49-wlan-htt-usb.txt`, main checkout, not in
+git), not in these docs. The RF clock vote stays on (boot 48 without it was never needed).
+
+**Next:** make it usable from iOS. The kernel side needs a long-lived WLAN service instead of a 120 s test stage
+(keep the modem and the WLAN firmware up, scan on request, then association: VDEV_START/UP, peer, keys,
+HTT TX/RX data path with RX_IN_ORD_PADDR_IND handling and buffer recycling), and an iOS-facing interface
+(an IO80211 / Skywalk netif driver or a simpler userspace bridge) so the Settings app and `wifid` can see networks.
