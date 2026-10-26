@@ -959,6 +959,14 @@ fn cmd_apfs(args: &[String]) -> Res<ExitCode> {
             let inv = hints.windows(2).filter(|w| w[1].1 < w[0].1).count();
             println!("{} files with extents of {}; {} inversions by inode order; physical span {} MiB", hints.len(), files.len(), inv, hints.iter().map(|h| h.1).max().unwrap_or(0) >> 20);
         }
+        Some("cat") => {
+            let path = rest.get(1).ok_or("cat PATH OUT")?;
+            let out = rest.get(2).ok_or("cat PATH OUT")?;
+            let v = c.volume(vi)?;
+            let st = v.lookup(path)?.ok_or("no such path")?;
+            let f = v.open_file(st.ino)?;
+            fs::write(out, f.read_vec(0, f.size() as usize)?)?;
+        }
         Some("readall") => {
             let v = c.volume(vi)?;
             let mut files = Vec::new();
@@ -1099,13 +1107,16 @@ fn cmd_root_ipsw(args: &[String]) -> Res<ExitCode> {
                     only_mine.push(p.to_string());
                 }
             }
+            let jb = only_ref.iter().filter(|p| p.starts_with("private/var/jb")).count();
+            only_ref.retain(|p| !p.starts_with("private/var/jb"));
+            eprintln!("TREE: {jb} entries of the reference are under private/var/jb (the jailbreak stage)");
             only_ref.sort();
             only_mine.sort();
             meta.sort();
             kind.sort();
             eprintln!("TREE: {} entries mine, {} in the reference; {} only in the reference, {} only in mine, {} kind differences, {} owner/mode differences", mine.len(), theirs.len(), only_ref.len(), only_mine.len(), kind.len(), meta.len());
             for (name, v) in [("ONLY-REF", &only_ref), ("ONLY-MINE", &only_mine), ("KIND", &kind), ("META", &meta)] {
-                for l in v.iter().take(40) {
+                for l in v.iter().filter(|l| !l.contains("dyld_shared_cache")).take(300) {
                     eprintln!("TREE {name} {l}");
                 }
             }
