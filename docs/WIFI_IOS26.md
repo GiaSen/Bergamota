@@ -1240,6 +1240,13 @@ baseline args of the `-enxdev` image with the 11 Wi-Fi args replaced by `sweetwl
 `sweetgpuboost=7` back). Test: the phone stays up 10+ minutes, the status line every minute with ECHOs answered,
 the service thread's CPU small in `top`. Not booted: needs the user's OK.
 
+**Boot 50-wlan-svc (2026-10-26 ~20:58Z, user OK, user present): WL1 works.** The service came up as boot 49
+(startup passive scan: 10 networks, summary printed once) and **stayed up**: status lines every 60 s for 10+
+minutes with **every WMI ECHO answered** (9/9 at 600 s, round trip 20-22 ms), the WMI credit back each time,
+the modem up, rmtfs 3 reads / 1 write (kept in RAM). Polling: ~3040 loops/min, of which ~176 busy (the ECHO
+and the 100 ms SMP2P polls), so the thread sleeps 20 ms almost all the time (~50 wakeups/s). No panic.
+Console: `research/ios26/logs-wlan/boot50-wlan-svc-usb.txt` (main checkout, not in git).
+
 ### 6.2 WL2 / 1125: real networks for wifid and Settings (`sweet80211=3`): built, NOT run
 
 `1125-beryllium-wlan-scan-backend.patch` (beryllium_wlan.c, sweet_80211.c, new `bsd/dev/sweet_wlan.h`):
