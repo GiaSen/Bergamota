@@ -49,7 +49,10 @@ interface Exports {
 export class PatcherError extends Error {}
 
 export class Renegade {
-  private constructor(private x: Exports) {}
+  private x: Exports;
+  private constructor(x: Exports) {
+    this.x = x;
+  }
 
   static async load(module: WebAssembly.Module | BufferSource, io: HostIO): Promise<Renegade> {
     let mem: WebAssembly.Memory;

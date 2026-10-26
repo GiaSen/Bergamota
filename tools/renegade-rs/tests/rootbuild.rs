@@ -118,6 +118,9 @@ fn synthetic_ipsw_builds_a_root() {
     let zipper = "import sys,zipfile\nz=zipfile.ZipFile(sys.argv[1],'w',zipfile.ZIP_STORED)\nfor a in sys.argv[2:]:\n    n,p=a.split('=',1)\n    z.write(p,n)\nz.close()\n";
     assert!(run(Command::new("python3").args(["-I", "-c", zipper]).arg(&ipsw).arg(format!("BuildManifest.plist={}", manifest.display())).arg(format!("os.dmg={}", os.display())).arg(format!("sys.dmg={}", sys.display())).arg(format!("app.dmg={}", app.display()))));
 
+    if let Some(keep) = std::env::var_os("RENEGADE_KEEP_SYNTH_IPSW") {
+        fs::copy(&ipsw, keep).unwrap(); // for the browser tests (apps/web/test/wasm.test.ts)
+    }
     let ip = renegade::ipsw::Ipsw::open(Rc::new(FileAt::open(&ipsw).unwrap())).unwrap();
     assert_eq!((ip.manifest.device.as_str(), ip.manifest.build.as_str()), ("iPhone11,8", "22H352"));
     let mut cfg = renegade::rootbuild::Config { now: 1_700_000_000, volume_size: Some(64 << 20), ..Default::default() };
