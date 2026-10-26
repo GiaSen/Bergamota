@@ -845,3 +845,40 @@ Image `shim/out/enxerto-boot-ios26full-boot44-wlan-wlfw.img` (sha256 `98d496e7..
 kernel + 1108-1117): boot 43's args plus `sweetwlfw=1`, hold 120 s (was 90). Expected: CAP values (board id ->
 which `bdwlan.*`), BDF accepted, **FW READY**. Not booted: needs the user's OK; one queue item, or combined with a
 GPU boot through the GPU session.
+
+### 5.20 Boot 44-wlan-wlfw (1117, combined with a GPU boot): **WLAN firmware READY**
+
+**2026-10-26 14:44:30Z** (user OK "combine it with the GPU session's next boot"; queued by the GPU session as the
+only item). The boot that ran is the GPU session's recovery variant
+`shim/out/enxerto-boot-ios26full-boot44-wlan-wlfw-notrace.img`: same kernel, `sweethidlog=1` removed (608-byte
+boot-args field) and `sweetdenypath=bgmtl.trace` added; every Wi-Fi arg unchanged. Two earlier attempts with this
+kernel (14:34Z, 14:40:47Z) ended in initproc panics from the GPU session's trace code **before stage 4 started** (no
+`wlfw` rails line in the console): not Wi-Fi related. Modem, rmtfs, TFTP (`wlanmdsp.mbn` 3645892 B), pd-mapper as boot 43; then the WLFW client:
+
+```
+wlfw: WCN3990 rails voted on: ldoa5=0 ldoa7=0 ldoa17=0 ldoa25=0 ldoa23=0
+wlfw: ind-register result 0 error 0, fw_status 0
+wlfw: msa region 0: 0x8e300000 + 0x4000 secure 1
+wlfw: msa region 1: 0x8e304000 + 0xfc000 secure 0
+hyp-assign wlan msa 0x8e300000+0x4000 vmid 3 -> 15 perm 6 + 24 perm 6: status=0
+hyp-assign wlan msa 0x8e304000+0xfc000 vmid 3 -> 15 perm 6 + 24 perm 6 + 25 perm 6: status=0
+wlfw: MSA ready indication
+wlfw: msa-ready result 0 error 0
+wlfw: chip_id 0x30214 chip_family 0x4001 board_id 0xff soc_id 0x40030001 fw_version 0x20090216
+      "2019-12-18 08:15" "QC_IMAGE_VERSION_STRING=WLAN.HL.2.0.c3-00534-QCAHLSWMTPLZ-1"
+wlfw: board id 0xff -> bdwlan.bin (26328 bytes) from the modem partition
+wlfw: board data sent in 5 segments          (end segment accepted: result 0, no CRC complaint)
+wlfw: cal-report result 0 error 0; waiting for FW READY
+wlfw: FW READY indication: the WLAN firmware runs
+```
+
+Summary `wlfw client: FW READY; chip 0x30214 board 0xff soc 0x40030001 fw 0x20090216, bdwlan.bin 26328 bytes in
+5 segments`. Teardown: stop-ack 190 ms, both MSA regions back to HLOS (status 0), rmtfs buffer back, no panic.
+The MSA_READY indication arrived before the MSA_READY response (handled). No RF_CLK2 vote was needed.
+Console: `research/ios26/logs-wlan/boot44-wlan-wlfw-usb.txt` (main checkout, not in git).
+
+**The WLFW control path is done: the WCN3990 firmware runs with the phone's own board data.** Next (1118): the
+data path of ath10k `snoc.c`: WLAN SMMU context for stream 0x40/0x41 (identity map of a DMA pool below 4 GiB), copy
+engine rings at membase 0x18800000 + 0x240000 (CE0..CE11, `target_ce_config_wlan` / `target_service_to_ce_map_wlan`
+and shadow registers of `snoc.c`), WLAN_CFG with those tables, mode ON (mission), then HTC ready over CE (polled):
+the first message from the chip itself.
