@@ -13,9 +13,12 @@ struct BootView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("", selection: $tab) { ForEach(BootTab.allCases) { Text($0.rawValue).tag($0) } }
-                .pickerStyle(.segmented).labelsHidden().frame(maxWidth: 360).padding(10)
-            Divider()
+            PageHeader(title: "Boot Queue", subtitle: "One fastboot boot per fastboot appearance, never retried. Flashes write only userdata, boot and logo.") {
+                Picker("", selection: $tab) { ForEach(BootTab.allCases) { Text($0.rawValue).tag($0) } }
+                    .pickerStyle(.segmented).labelsHidden().frame(width: 300)
+            }
+            .padding(.horizontal, 28).padding(.top, 28).padding(.bottom, 16)
+            Rectangle().fill(Color.rule).frame(height: 1)
             switch tab {
             case .queue: QueuePane()
             case .images: ImagesPane(tab: $tab)
@@ -23,7 +26,7 @@ struct BootView: View {
             case .flash: FlashPane()
             }
         }
-        .navigationTitle("Boot Queue")
+        .page("Boot Queue")
         .onAppear { model.build.rescan() }
     }
 }
@@ -39,53 +42,47 @@ private struct QueuePane: View {
         let q = model.queue
         VStack(spacing: 0) {
             HStack(spacing: 14) {
-                Image(systemName: q.armed ? "scope" : "pause.circle").font(.title)
-                    .foregroundStyle(q.armed ? stateColor(model.monitor.state) : .secondary)
+                Image(systemName: q.armed ? "scope" : "pause.circle").font(.system(size: 26, weight: .semibold))
+                    .foregroundStyle(q.armed ? Color.amberText : Color.muted)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 8) {
-                        Text(q.armed ? "Armed" : "Stopped").font(.headline)
+                        Text(q.armed ? "Armed" : "Stopped").font(BFont.display(22))
                         if settings.allowRemoteStart {
-                            Label("remote control on", systemImage: "antenna.radiowaves.left.and.right").font(.caption2.bold())
-                                .padding(.horizontal, 7).padding(.vertical, 2).background(.blue.opacity(0.18), in: Capsule()).foregroundStyle(.blue)
+                            Label("remote control on", systemImage: "antenna.radiowaves.left.and.right").font(BFont.mono(10.5, 600)).foregroundStyle(Color.muted)
                         }
                     }
                     if let b = q.autoRebootBadge {
-                        Label(b, systemImage: "arrow.triangle.2.circlepath").font(.caption2.bold())
-                            .padding(.horizontal, 7).padding(.vertical, 2)
-                            .background((b.contains("manual") ? Color.orange : Color.green).opacity(0.18), in: Capsule())
-                            .foregroundStyle(b.contains("manual") ? Color.orange : Color.green)
+                        Label(b, systemImage: "arrow.triangle.2.circlepath").font(BFont.mono(10.5, 600)).foregroundStyle(b.contains("manual") ? Color.amberText : Color.muted)
                     }
-                    Text(q.statusText).foregroundStyle(.secondary)
-                    if let a = q.autoStatusText, a != q.statusText { Text(a).font(.caption).foregroundStyle(.secondary) }
-                    if let n = q.note { Text(n).font(.caption).foregroundStyle(.orange) }
+                    Text(q.statusText).foregroundStyle(Color.muted)
+                    if let a = q.autoStatusText, a != q.statusText { Text(a).font(.caption).foregroundStyle(Color.muted) }
+                    if let n = q.note { Text(n).font(.caption).foregroundStyle(Color.amberText) }
                 }
                 Spacer()
-                Text(model.monitor.state.title).padding(.horizontal, 10).padding(.vertical, 4)
-                    .background(stateColor(model.monitor.state).opacity(0.2), in: Capsule())
-                if q.armed { Button("Stop") { q.disarm() } }
-                else { Button("Start") { q.arm() }.buttonStyle(.borderedProminent).disabled(q.pending.isEmpty) }
+                Pill(text: model.monitor.state.title, tone: stateTone(model.monitor.state))
+                if q.armed { Button("Stop") { q.disarm() }.controlSize(.large) }
+                else { Button("Start") { q.arm() }.buttonStyle(.borderedProminent).tint(.leaf).controlSize(.large).disabled(q.pending.isEmpty) }
             }
-            .padding(14)
-            Divider()
+            .padding(.horizontal, 28).padding(.vertical, 16)
+            Rectangle().fill(Color.rule).frame(height: 1)
             HStack {
                 Toggle("If in OrangeFox, `adb reboot bootloader` first", isOn: $settings.rebootFromRecovery)
                 Spacer()
-                Text("One `fastboot boot` per fastboot appearance, never retried.").font(.caption).foregroundStyle(.secondary)
                 Button("Clear finished") { q.clearFinished() }.disabled(!q.items.contains { $0.status == .sent || $0.status == .failed })
             }
-            .padding(10)
-            Divider()
+            .padding(.horizontal, 28).padding(.vertical, 10)
+            Rectangle().fill(Color.rule).frame(height: 1)
             List {
                 ForEach(q.items) { item in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             statusIcon(item.status)
-                            Text(item.name).font(.body.bold())
-                            if item.flashesUserdata { Image(systemName: "externaldrive.fill.badge.exclamationmark").foregroundStyle(.red).help("flashes userdata first") }
+                            Text(item.name).font(BFont.mono(13, 600)).foregroundStyle(Color.text).lineLimit(1).truncationMode(.middle)
+                            if item.flashesUserdata { Pill(text: "writes \(item.flashTarget)", tone: .alert, size: 9.5).help("flashes \(item.flashTarget) first") }
                             Spacer()
-                            if let t = item.sentAt { Text(t.formatted(date: .omitted, time: .standard)).foregroundStyle(.secondary) }
+                            if let t = item.sentAt { Text(t.formatted(date: .omitted, time: .standard)).font(BFont.mono(11)).foregroundStyle(Color.muted) }
                             if item.status == .pending, item.id == q.pending.first?.id, model.monitor.state.isFastboot, q.sending == nil, !q.flashing {
-                                Button("Send now") { confirmSend = true }.controlSize(.small).tint(.orange)
+                                Button("Send now") { confirmSend = true }.buttonStyle(.borderedProminent).controlSize(.small).tint(.amber).foregroundStyle(Color.ink)
                             }
                             if item.status == .pending {
                                 Button { q.move(item.id, by: -1) } label: { Image(systemName: "chevron.up") }.buttonStyle(.borderless)
@@ -94,39 +91,39 @@ private struct QueuePane: View {
                             if item.status != .sending { Button { q.remove(item.id) } label: { Image(systemName: "xmark") }.buttonStyle(.borderless) }
                         }
                         if item.flashesUserdata, item.name != item.autoLabel {
-                            Label(item.autoLabel, systemImage: "externaldrive.fill").font(.caption).foregroundStyle(.red)
+                            Label(item.autoLabel, systemImage: "externaldrive.fill").font(.caption).foregroundStyle(Color.alertText)
                         }
                         if item.needsManualFastboot {
-                            Label("needs manual fastboot (hold Power + Volume Down)", systemImage: "hand.tap.fill").font(.caption).foregroundStyle(.orange)
+                            Label("needs manual fastboot (hold Power + Volume Down)", systemImage: "hand.tap.fill").font(.caption).foregroundStyle(Color.amberText)
                         } else if item.autoRebootTried, item.status == .pending {
-                            Label("auto-reboot to fastboot sent", systemImage: "arrow.triangle.2.circlepath").font(.caption).foregroundStyle(.secondary)
+                            Label("auto-reboot to fastboot sent", systemImage: "arrow.triangle.2.circlepath").font(.caption).foregroundStyle(Color.muted)
                         }
                         if q.largeWarns(item) {
                             Label("\(BootQueue.largeWarning) (\(sizeFmt.string(fromByteCount: item.size)))", systemImage: "exclamationmark.triangle.fill")
-                                .font(.caption).foregroundStyle(.yellow)
+                                .font(.caption).foregroundStyle(Color.amberText)
                         }
                         if !item.output.isEmpty {
-                            Text(item.output).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
+                            Text(item.output).font(BFont.mono(11)).foregroundStyle(Color.muted).textSelection(.enabled)
                         }
                     }
-                    .padding(.vertical, 2)
+                    .padding(.vertical, 6)
+                    .listRowSeparatorTint(Color.rule)
                 }
             }
+            .scrollContentBackground(.hidden)
             .confirmationDialog("Send the next image now?", isPresented: $confirmSend, titleVisibility: .visible) {
                 Button("Send fastboot boot now", role: .destructive) { Task { _ = await q.sendNow() } }
             } message: {
                 Text("If the last boot left ABL hung, sending again can hang it further. Press only after re-entering fastboot (hold Power + Volume Down).")
             }
-            .overlay { if q.items.isEmpty { ContentUnavailableView("Queue is empty", systemImage: "tray", description: Text("Add images from the Images or Build tab.")) } }
+            .overlay { if q.items.isEmpty { EmptyStage(title: "Queue is empty", text: "Add images from the Images or Build tab, or queue them from an agent with scripts/bergamota enqueue.", symbol: "tray") } }
         }
     }
 
     @ViewBuilder private func statusIcon(_ s: QueueItem.Status) -> some View {
         switch s {
-        case .pending: Image(systemName: "clock").foregroundStyle(.secondary)
         case .sending: ProgressView().controlSize(.small)
-        case .sent: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-        case .failed: Image(systemName: "xmark.octagon.fill").foregroundStyle(.red)
+        default: Image(systemName: queueStatusSymbol(s)).foregroundStyle(queueStatusColor(s))
         }
     }
 }
@@ -140,20 +137,19 @@ private struct ImagesPane: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("\(model.settings.bootDir)/out/*.img (\(model.build.images.count))").font(.headline)
+                Text("\(model.settings.bootDir)/out/*.img  ·  \(model.build.images.count) images").font(BFont.mono(12)).foregroundStyle(Color.muted)
                 Spacer()
                 Button { model.build.rescan() } label: { Label("Rescan", systemImage: "arrow.clockwise") }
-            }.padding(10)
-            Divider()
+            }.padding(.horizontal, 28).padding(.vertical, 10)
             Table(model.build.images) {
-                TableColumn("Name") { Text($0.name) }
+                TableColumn("Name") { Text($0.name).font(BFont.mono(12)) }
                 TableColumn("Size") { img in
                     HStack(spacing: 4) {
-                        Text(sizeFmt.string(fromByteCount: img.size))
-                        if model.queue.largeWarns(img.size) { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow).help(BootQueue.largeWarning) }
+                        Text(sizeFmt.string(fromByteCount: img.size)).font(BFont.mono(12))
+                        if model.queue.largeWarns(img.size) { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Color.amberText).help(BootQueue.largeWarning) }
                     }
                 }.width(110)
-                TableColumn("Date") { Text($0.date.formatted(date: .abbreviated, time: .shortened)) }.width(150)
+                TableColumn("Date") { Text($0.date.formatted(date: .abbreviated, time: .shortened)).foregroundStyle(Color.muted) }.width(150)
                 TableColumn("") { img in
                     Button("Add to queue") { model.queue.add(img.path); tab = .queue }.controlSize(.small)
                 }.width(110)
@@ -185,56 +181,44 @@ private struct BuildPane: View {
                     }
                     TextField("Image name", text: $b.imageName, prompt: Text("e.g. 0131"))
                     if !b.imageName.isEmpty && !BuildModel.validName(b.imageName) {
-                        Text("Use letters, digits, . _ - only.").font(.caption).foregroundStyle(.red)
+                        Text("Use letters, digits, . _ - only.").font(.caption).foregroundStyle(Color.alertText)
                     }
                     if b.targetExists && !b.imageName.isEmpty {
-                        Text("\(model.settings.bootImageBase)-\(b.imageName).img already exists and will be replaced.").font(.caption).foregroundStyle(.orange)
+                        Text("\(model.settings.bootImageBase)-\(b.imageName).img already exists and will be replaced.").font(.caption).foregroundStyle(Color.amberText)
                     }
                 }
                 Section("Cmdline") {
                     Picker("Preset", selection: Binding(get: { b.selectedPresetID }, set: { b.applyPreset($0) })) {
                         ForEach(b.presets) { Text($0.name).tag(Optional($0.id)) }
                     }
-                    TextEditor(text: $b.cmdline).font(.system(size: 11, design: .monospaced)).frame(height: 130)
+                    TextEditor(text: $b.cmdline).font(BFont.mono(11.5)).frame(height: 130)
                     HStack {
                         TextField("Save as preset", text: $presetName).textFieldStyle(.roundedBorder)
                         Button("Save") { b.saveCurrentAsPreset(named: presetName); presetName = "" }.disabled(presetName.trimmingCharacters(in: .whitespaces).isEmpty)
                         Button("Delete selected") { b.deleteSelectedPreset() }.disabled(b.selectedPresetID == nil)
                     }
-                    Text(Presets.fileURL.path).font(.caption2).foregroundStyle(.tertiary).textSelection(.enabled)
+                    Text(Presets.fileURL.path).font(BFont.mono(10.5)).foregroundStyle(Color.muted).textSelection(.enabled)
                 }
                 Section {
                     HStack {
                         Button {
                             if b.targetExists { confirmOverwrite = true } else { b.build() }
                         } label: { Label("Build image", systemImage: "hammer.fill") }
-                            .buttonStyle(.borderedProminent).disabled(!b.canBuild)
+                            .buttonStyle(.borderedProminent).tint(.leaf).disabled(!b.canBuild)
                         if b.building { ProgressView().controlSize(.small) }
                         if let img = b.lastBuiltImage, model.queue.largeWarns(BootQueue.fileSize(img)) {
-                            Label(BootQueue.largeWarning, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.yellow)
+                            Label(BootQueue.largeWarning, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(Color.amberText)
                         }
-                        if let r = b.lastResult { Text(r).foregroundStyle(b.lastBuiltImage != nil ? .green : .red) }
+                        if let r = b.lastResult { Text(r).foregroundStyle(b.lastBuiltImage != nil ? Color.leafText : Color.alertText) }
                         Spacer()
                         if let img = b.lastBuiltImage { Button("Add to queue") { model.queue.add(img); tab = .queue } }
                     }
                 }
             }
             .formStyle(.grouped)
-            .frame(width: 440)
-            Divider()
-            VStack(alignment: .leading, spacing: 0) {
-                Text("Output").font(.headline).padding(10)
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        Text(b.output.isEmpty ? "Build output appears here." : b.output)
-                            .font(.system(size: 11, design: .monospaced)).foregroundStyle(b.output.isEmpty ? .secondary : .primary)
-                            .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10)
-                        Color.clear.frame(height: 1).id("end")
-                    }
-                    .background(Color(nsColor: .textBackgroundColor))
-                    .onChange(of: b.output) { _, _ in proxy.scrollTo("end", anchor: .bottom) }
-                }
-            }
+            .scrollContentBackground(.hidden)
+            .frame(width: 460)
+            ConsolePane(text: b.output, placeholder: "mkpayload.py and build.sh print here.")
         }
         .confirmationDialog("Replace \(model.settings.bootImageBase)-\(b.imageName).img?", isPresented: $confirmOverwrite) {
             Button("Replace and build", role: .destructive) { b.build() }

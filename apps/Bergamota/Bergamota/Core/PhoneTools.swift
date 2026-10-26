@@ -158,7 +158,7 @@ final class PhoneTools {
     }
 
     func refreshInstalled() async {
-        guard !listing else { return }
+        guard !listing, !DesignPreview.active else { return }
         guard iosUp, let ssh = settings.ssh else { listError = disabledReason ?? "ssh not found"; return }
         listing = true
         defer { listing = false }

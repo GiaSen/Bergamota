@@ -159,6 +159,12 @@ final class LogStore {
 
     func restart() { stop(); start() }
 
+    /// Design preview: sample lines without a listener.
+    func injectPreview(_ lines: [String]) {
+        pending.add(lines.map { ($0, LogTag.classify($0)) })
+        flush()
+    }
+
     func clear() {
         ring.removeAll(); visible = []; bufferedCount = 0
     }
@@ -170,7 +176,7 @@ final class LogStore {
             return
         }
         totalReceived += new.count
-        if settings.autoSaveLog && !recording && !autoSuspended { startRecording() }
+        if settings.autoSaveLog && !recording && !autoSuspended && !DesignPreview.active { startRecording() }
         updateRate(new.count)
         var batch: [LogLine] = []
         batch.reserveCapacity(new.count)

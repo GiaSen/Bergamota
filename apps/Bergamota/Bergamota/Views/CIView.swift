@@ -6,71 +6,65 @@ struct CIView: View {
 
     var body: some View {
         let ci = model.ci
-        VStack(spacing: 0) {
-            HStack {
-                Text("xnu.yml on main, ios18, ci-cache").font(.headline)
-                Spacer()
-                if ci.loading { ProgressView().controlSize(.small) }
-                if let t = ci.lastRefresh { Text("updated \(t.formatted(date: .omitted, time: .standard))").font(.caption).foregroundStyle(.secondary) }
-                Button { Task { await ci.refresh() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }.disabled(ci.loading)
+        VStack(alignment: .leading, spacing: 0) {
+            PageHeader(title: "CI", subtitle: "xnu.yml on " + CIModel.branches.joined(separator: ", ") + (ci.lastRefresh.map { ", updated " + $0.formatted(date: .omitted, time: .standard) } ?? "")) {
+                HStack(spacing: 8) {
+                    if ci.loading { ProgressView().controlSize(.small) }
+                    Button { Task { await ci.refresh() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }.disabled(ci.loading)
+                }
             }
-            .padding(12)
-            if let e = ci.error {
-                Label(e, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
-                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12).textSelection(.enabled)
-            }
-            Divider()
+            .padding(.horizontal, 28).padding(.top, 28).padding(.bottom, 14)
+            if let e = ci.error { Notice(text: e).padding(.horizontal, 28).padding(.bottom, 10) }
             List(ci.runs) { run in
-                HStack(spacing: 12) {
-                    statusIcon(run).frame(width: 22)
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack {
-                            Text(run.headBranch).font(.body.bold())
-                            Text(run.shortSha).font(.system(.callout, design: .monospaced)).foregroundStyle(.secondary)
+                HStack(spacing: 14) {
+                    statusIcon(run).font(.system(size: 15)).frame(width: 22)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 10) {
+                            Text(run.headBranch).font(BFont.mono(13, 700)).foregroundStyle(Color.text)
+                            Text(run.shortSha).font(BFont.mono(12)).foregroundStyle(Color.muted)
                         }
-                        Text(run.displayTitle).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                        Text(run.displayTitle).font(.callout).foregroundStyle(Color.muted).lineLimit(1)
                     }
                     Spacer()
-                    VStack(alignment: .trailing, spacing: 2) {
-                        Text(run.createdAt.formatted(.relative(presentation: .named))).font(.callout)
-                        Text(run.duration.map { formatUptime($0) } ?? "-").font(.caption).foregroundStyle(.secondary)
+                    VStack(alignment: .trailing, spacing: 3) {
+                        Text(run.createdAt.formatted(.relative(presentation: .named))).font(.callout).foregroundStyle(Color.text)
+                        Text(run.duration.map { formatUptime($0) } ?? "-").font(BFont.mono(11)).foregroundStyle(Color.muted)
                     }
                     downloadControl(run)
-                    if let u = run.url, let url = URL(string: u) { Link(destination: url) { Image(systemName: "safari") }.help("Open on GitHub") }
+                    if let u = run.url, let url = URL(string: u) { Link(destination: url) { Image(systemName: "arrow.up.right.square") }.help("Open on GitHub") }
                 }
-                .padding(.vertical, 3)
+                .padding(.vertical, 5)
+                .listRowSeparator(.hidden)
             }
-            .overlay { if ci.runs.isEmpty && !ci.loading { ContentUnavailableView("No runs loaded", systemImage: "hammer", description: Text("Press Refresh.")) } }
-            Divider()
-            DisclosureGroup("Download log", isExpanded: $showLog) {
-                ScrollView { Text(ci.downloadLog.isEmpty ? "(empty)" : ci.downloadLog).font(.system(size: 11, design: .monospaced))
-                    .frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled) }
-                    .frame(height: 110)
-            }
-            .padding(10)
+            .scrollContentBackground(.hidden)
+            .overlay { if ci.runs.isEmpty && !ci.loading { EmptyStage(title: "No runs loaded", text: "Refresh runs gh run list for xnu.yml (needs gh auth login).", symbol: "hammer") } }
+            DisclosureGroup(isExpanded: $showLog) {
+                ConsolePane(text: ci.downloadLog, placeholder: "Kernel downloads print here.").frame(height: 140).clipShape(RoundedRectangle(cornerRadius: 10))
+            } label: { Label12(text: "Download log") }
+            .padding(.horizontal, 28).padding(.vertical, 14)
         }
-        .navigationTitle("CI")
+        .page("CI")
         .task { if model.ci.runs.isEmpty { await model.ci.refresh() } }
     }
 
     @ViewBuilder private func statusIcon(_ r: CIRun) -> some View {
-        if !r.isDone { Image(systemName: "circle.dotted").foregroundStyle(.orange).symbolEffect(.pulse) }
-        else if r.conclusion == "success" { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) }
-        else if r.conclusion == "cancelled" || r.conclusion == "skipped" { Image(systemName: "slash.circle").foregroundStyle(.secondary) }
-        else { Image(systemName: "xmark.circle.fill").foregroundStyle(.red) }
+        if !r.isDone { Image(systemName: "circle.dotted").foregroundStyle(Color.amberText).symbolEffect(.pulse) }
+        else if r.conclusion == "success" { Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.leafText) }
+        else if r.conclusion == "cancelled" || r.conclusion == "skipped" { Image(systemName: "slash.circle").foregroundStyle(Color.muted) }
+        else { Image(systemName: "xmark.circle.fill").foregroundStyle(Color.alertText) }
     }
 
     @ViewBuilder private func downloadControl(_ r: CIRun) -> some View {
         let ci = model.ci
         switch ci.downloads[r.id] {
-        case .running: ProgressView().controlSize(.small).frame(width: 130)
-        case .done(let d): Label("Saved", systemImage: "checkmark").foregroundStyle(.green).help(d).frame(width: 130)
-        case .failed(let e): Button("Retry download") { Task { await ci.downloadKernel(r); model.build.rescan() } }.help(e).foregroundStyle(.red).frame(width: 130)
+        case .running: ProgressView().controlSize(.small).frame(width: 156)
+        case .done(let d): Label("Saved", systemImage: "checkmark").foregroundStyle(Color.leafText).help(d).frame(width: 156)
+        case .failed(let e): Button("Retry download") { Task { await ci.downloadKernel(r); model.build.rescan() } }.help(e).foregroundStyle(Color.alertText).frame(width: 156)
         case nil:
-            if ci.isDownloaded(r) { Label("Downloaded", systemImage: "checkmark.circle").foregroundStyle(.secondary).frame(width: 130) }
+            if ci.isDownloaded(r) { Label("Downloaded", systemImage: "checkmark.circle").foregroundStyle(Color.muted).frame(width: 156) }
             else {
                 Button { Task { await ci.downloadKernel(r); model.build.rescan() } } label: { Label("Download kernel", systemImage: "arrow.down.circle") }
-                    .disabled(r.conclusion != "success").frame(width: 130)
+                    .disabled(r.conclusion != "success").frame(width: 156)
             }
         }
     }

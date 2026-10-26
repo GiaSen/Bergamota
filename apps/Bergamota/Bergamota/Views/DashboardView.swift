@@ -7,43 +7,19 @@ func formatUptime(_ t: TimeInterval) -> String {
     return "\(m)m \(s % 60)s"
 }
 
-struct Card<Content: View>: View {
-    let title: String
-    let symbol: String
-    @ViewBuilder var content: Content
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label(title, systemImage: symbol).font(.headline)
-            Divider()
-            content
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
-    }
-}
-
-struct Row: View {
-    let k: String
-    let v: String
-    var ok: Bool? = nil
-    var body: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(k).foregroundStyle(.secondary)
-            Spacer(minLength: 12)
-            if let ok { Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle").foregroundStyle(ok ? .green : .secondary) }
-            Text(v).multilineTextAlignment(.trailing).textSelection(.enabled)
-        }
-        .font(.callout)
-    }
-}
-
 struct DashboardView: View {
     @Environment(AppModel.self) private var model
     @State private var confirmReboot = false
     @State private var confirmRebootBergamota = false
     @State private var confirmEnterBergamota = false
     @State private var rebootResult: (ok: Bool, text: String)?
+
+    @ViewBuilder private var resultLabel: some View {
+        if let r = rebootResult {
+            Label(r.text, systemImage: r.ok ? "checkmark.circle" : "exclamationmark.triangle").font(.caption)
+                .foregroundStyle(r.ok ? Color.leafText : Color.amberText).textSelection(.enabled)
+        }
+    }
 
     private var hint: String {
         switch model.monitor.state {
@@ -64,131 +40,100 @@ struct DashboardView: View {
     var body: some View {
         let m = model.monitor
         ScrollView {
-            VStack(spacing: 16) {
-                ActivityBannerView()
-                HStack(spacing: 16) {
-                    Image(systemName: m.state.symbol)
-                        .font(.system(size: 40))
-                        .foregroundStyle(stateColor(m.state))
-                        .frame(width: 64)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(m.state.title).font(.largeTitle.bold())
-                        Text(hint).foregroundStyle(.secondary)
-                        Text("in this state since \(m.stateSince.formatted(date: .omitted, time: .standard))")
-                            .font(.caption).foregroundStyle(.tertiary)
-                    }
-                    Spacer()
-                    if let l = m.lastPoll { Text("polled \(l.formatted(date: .omitted, time: .standard))").font(.caption).foregroundStyle(.tertiary) }
+            VStack(alignment: .leading, spacing: 22) {
+                PageHeader(title: "Dashboard", subtitle: hint) {
+                    if let l = m.lastPoll { Text("polled " + l.formatted(date: .omitted, time: .standard)).font(BFont.mono(11)).foregroundStyle(Color.muted) }
                 }
-                .padding(18)
-                .background(stateColor(m.state).opacity(0.12), in: RoundedRectangle(cornerRadius: 14))
 
                 if m.macHidden {
-                    Label("macOS is hiding MAC addresses from Bergamota (Local Network permission not granted). Allow it in System Settings > Privacy & Security > Local Network > Bergamota. Using subnet detection meanwhile.", systemImage: "network.slash")
-                        .foregroundStyle(.orange).frame(maxWidth: .infinity, alignment: .leading)
+                    Notice(text: "macOS is hiding MAC addresses from Bergamota (Local Network permission not granted). Allow it in System Settings > Privacy & Security > Local Network > Bergamota. Using subnet detection meanwhile.", symbol: "network.slash")
                 }
                 if m.noRoute {
-                    Label("Local Network access may be denied: System Settings > Privacy & Security > Local Network > Bergamota.", systemImage: "network.slash")
-                        .foregroundStyle(.orange).frame(maxWidth: .infinity, alignment: .leading)
+                    Notice(text: "Local Network access may be denied: System Settings > Privacy & Security > Local Network > Bergamota.", symbol: "network.slash")
                 }
-                if !m.toolWarnings.isEmpty {
-                    ForEach(m.toolWarnings, id: \.self) { w in
-                        Label(w, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
+                ForEach(m.toolWarnings, id: \.self) { Notice(text: $0) }
 
-                Grid(horizontalSpacing: 16, verticalSpacing: 16) {
-                    GridRow {
-                        Card(title: "Detection", symbol: "dot.radiowaves.left.and.right") {
+                Grid(horizontalSpacing: 18, verticalSpacing: 18) {
+                    GridRow(alignment: .top) {
+                        Panel(title: "Detection", symbol: "dot.radiowaves.left.and.right") {
                             Row(k: "fastboot", v: m.fastbootSerial.map { $0 + " (" + (m.state == .bergamotaFastboot ? "Bergamota" : "ABL") + ")" } ?? "none", ok: m.fastbootSerial != nil)
                             Row(k: "adb", v: m.adbState.map { "\($0) (\(m.adbSerial ?? ""))" } ?? "none", ok: m.adbState != nil)
                             Row(k: "USB Ethernet", v: m.ifaceName.map { $0 + (m.ifaceUp ? " up" : " down") + (m.ifaceHasIP ? "" : ", no IP") + (m.ifaceInferred ? " (by subnet)" : "") } ?? "not found", ok: m.ifaceName != nil)
                             Row(k: "ping \(model.settings.phoneIP)", v: m.pingOK ? "reply" : "no reply", ok: m.pingOK)
                             Row(k: "TCP 22", v: m.sshOpen ? "open" : "closed", ok: m.sshOpen)
                         }
-                        Card(title: "Mac side", symbol: "laptopcomputer") {
-                            Row(k: "IP forwarding", v: m.natForwarding.map { $0 == "1" ? "on (NAT shared)" : "off" } ?? "unknown",
-                                ok: m.natForwarding == "1")
+                        Panel(title: "Mac side", symbol: "laptopcomputer") {
+                            Row(k: "IP forwarding", v: m.natForwarding.map { $0 == "1" ? "on (NAT shared)" : "off" } ?? "unknown", ok: m.natForwarding == "1")
                             Row(k: "Phone MAC", v: PhoneMonitor.usbMAC)
                             Row(k: "Log listener", v: model.logs.listening ? "udp/5140" : (model.logs.listenError ?? "stopped"), ok: model.logs.listening)
-                            Text("Enable NAT with tools/sweet-mac-nat.sh (needs sudo).").font(.caption).foregroundStyle(.tertiary)
+                            Text("Enable NAT with tools/sweet-mac-nat.sh (needs sudo).").font(.caption).foregroundStyle(Color.muted).padding(.top, 4)
                         }
                     }
                 }
 
                 if m.state == .fastboot || m.state == .bergamotaFastboot {
-                    Card(title: m.state == .fastboot ? "ABL fastboot" : "Bergamota fastboot", symbol: m.state.symbol) {
+                    Panel(title: m.state == .fastboot ? "ABL fastboot" : "Bergamota fastboot", symbol: m.state.symbol) {
                         if m.state == .fastboot {
                             Text("Qualcomm ABL: `fastboot boot` and flash commands. \"Enter Bergamota fastboot\" boots Enxerto's own fastboot (1 GiB downloads, the main flash route; flashing enters it automatically).")
-                                .font(.callout).foregroundStyle(.secondary)
-                            HStack {
+                                .font(.callout).foregroundStyle(Color.muted).fixedSize(horizontal: false, vertical: true)
+                            HStack(spacing: 10) {
                                 Button { confirmEnterBergamota = true } label: { Label("Enter Bergamota fastboot", systemImage: "leaf.circle.fill") }
-                                    .controlSize(.small).tint(.lime).disabled(model.tools.enteringBergamota || model.queue.sending != nil || model.queue.flashing)
+                                    .buttonStyle(.borderedProminent).tint(.leaf)
+                                    .disabled(model.tools.enteringBergamota || model.queue.sending != nil || model.queue.flashing)
                                 if model.tools.enteringBergamota { ProgressView().controlSize(.small) }
-                                if let r = rebootResult {
-                                    Label(r.text, systemImage: r.ok ? "checkmark.circle" : "exclamationmark.triangle").font(.caption)
-                                        .foregroundStyle(r.ok ? .green : .orange).textSelection(.enabled)
-                                }
+                                resultLabel
                             }
                         } else {
                             Text("Enxerto's fastboot (\(m.fastbootVersion.flatMap { $0.isEmpty ? nil : $0 } ?? "version-bootloader bergamota-N")): `fastboot boot` up to 1 GiB and flash userdata/boot/logo (delta by default). ABL fastboot stays the fallback.")
-                                .font(.callout).foregroundStyle(.secondary)
+                                .font(.callout).foregroundStyle(Color.muted).fixedSize(horizontal: false, vertical: true)
                         }
                     }
                 }
 
-                PerformanceCard()
-
-                Card(title: "iOS device", symbol: "iphone") {
+                Panel(title: "iOS device", symbol: "iphone") {
                     if m.state != .ios {
-                        Text("Available when iOS is up.").foregroundStyle(.secondary)
+                        Text("Available when iOS is up.").foregroundStyle(Color.muted)
                     } else if let i = m.info {
-                        HStack(spacing: 20) {
-                            VStack(alignment: .leading) {
-                                if let p = i.batteryPercent {
-                                    Gauge(value: Double(p), in: 0...100) { Text("Battery") } currentValueLabel: { Text("\(p)%") }
-                                        .gaugeStyle(.accessoryCircularCapacity).tint(p < 20 ? .red : .green).scaleEffect(1.4).frame(width: 70, height: 70)
-                                } else { Text("Battery n/a").foregroundStyle(.secondary) }
+                        HStack(alignment: .top, spacing: 28) {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(i.batteryPercent.map { "\($0)%" } ?? "--").font(BFont.display(44))
+                                    .foregroundStyle((i.batteryPercent ?? 100) < 20 ? Color.alertText : Color.text)
+                                Text("battery").font(BFont.mono(11)).foregroundStyle(Color.muted)
                             }
-                            VStack(spacing: 8) {
+                            .frame(width: 130, alignment: .leading)
+                            VStack(spacing: 6) {
                                 Row(k: "Charging", v: i.isCharging.map { $0 ? "yes" : "no" } ?? "unknown")
                                 Row(k: "Power source", v: i.powerSource ?? "unknown")
                                 Row(k: "Uptime", v: i.uptime.map(formatUptime) ?? "unknown (phone has no sysctl)")
                                 Row(k: "Seen up since", v: m.stateSince.formatted(date: .omitted, time: .standard) + " (" + formatUptime(Date().timeIntervalSince(m.stateSince)) + ")")
+                                Row(k: "Kernel", v: i.uname)
                             }
                         }
-                        Row(k: "Kernel", v: i.uname)
                     } else if let e = m.infoError {
-                        Label(e, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled)
+                        Notice(text: e)
                     } else {
-                        HStack { ProgressView().controlSize(.small); Text("Querying over SSH...") }
+                        HStack { ProgressView().controlSize(.small); Text("Querying over SSH...").foregroundStyle(Color.muted) }
                     }
-                    if m.state == .ios, m.info != nil, let e = m.infoError { Text(e).font(.caption).foregroundStyle(.orange) }
+                    if m.state == .ios, m.info != nil, let e = m.infoError { Text(e).font(.caption).foregroundStyle(Color.amberText) }
                     if m.state == .ios {
-                        HStack {
-                            Button("Refresh now") { Task { await m.refreshInfoIfNeeded(force: true) } }.controlSize(.small)
-                            Button {
-                                confirmReboot = true
-                            } label: { Label("Reboot to ABL fastboot", systemImage: "bolt.horizontal.circle") }
-                                .controlSize(.small).tint(.orange)
+                        HStack(spacing: 10) {
+                            Button("Refresh now") { Task { await m.refreshInfoIfNeeded(force: true) } }
+                            Button { confirmRebootBergamota = true } label: { Label("Reboot to Bergamota fastboot", systemImage: "leaf.circle.fill") }
+                                .buttonStyle(.borderedProminent).tint(.leaf)
                                 .disabled(model.tools.rebooting != nil || model.tools.busy)
-                            Button {
-                                confirmRebootBergamota = true
-                            } label: { Label("Reboot to Bergamota fastboot", systemImage: "leaf.circle.fill") }
-                                .controlSize(.small).tint(.lime)
+                            Button { confirmReboot = true } label: { Label("Reboot to ABL fastboot", systemImage: "bolt.horizontal.circle") }
                                 .disabled(model.tools.rebooting != nil || model.tools.busy)
-                            if let t = model.tools.rebooting { ProgressView().controlSize(.small); Text("rebooting to \(t)...").font(.caption).foregroundStyle(.secondary) }
-                            if let r = rebootResult {
-                                Label(r.text, systemImage: r.ok ? "checkmark.circle" : "exclamationmark.triangle").font(.caption)
-                                    .foregroundStyle(r.ok ? .green : .orange).textSelection(.enabled)
-                            }
+                            if let t = model.tools.rebooting { ProgressView().controlSize(.small); Text("rebooting to \(t)...").font(.caption).foregroundStyle(Color.muted) }
+                            resultLabel
                         }
+                        .padding(.top, 6)
                     }
                 }
             }
-            .padding(20)
+            .padding(28)
+            .frame(maxWidth: 980, alignment: .leading)
         }
-        .navigationTitle("Dashboard")
+        .page("Dashboard")
         .confirmationDialog("Reboot the phone into Bergamota fastboot?", isPresented: $confirmRebootBergamota, titleVisibility: .visible) {
             Button("Reboot to Bergamota fastboot", role: .destructive) {
                 Task { let r = await model.tools.rebootIOS(to: "bergamota"); rebootResult = (r.0, r.1) }
