@@ -70,6 +70,15 @@ if [ "${IOS18:-1}" = 1 ]; then
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetmetrics"
 	python3 -I "$pacstrip" --sign "$out18/sweetmetrics"
 	b18 sweetposterset sweetposterset.m posterset.entitlements
+	# a picture as the lock and home wallpaper through PosterBoard's Photos poster (tools/identity/mkwallpaper.sh)
+	b18 sweetwallpaper sweetwallpaper.m posterset.entitlements
+	# iOS 26: the Bergamota picture as the legacy wallpaper, drawn by PosterBoard's LegacyPoster (no HEIC, no Photos pipeline)
+	b18 sweetlegacywall sweetlegacywall.m posterset.entitlements -framework UIKit
+	# iOS 26: PosterBoard on the HFS root without data protection (file protection, purgeable, the empty StandBy role)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -fobjc-arc -dynamiclib \
+		-install_name /usr/local/lib/sweetpb26.dylib -framework Foundation "$here/sweetpb26.m" -o "$out18/sweetpb26.dylib"
+	codesign -s - -f "$out18/sweetpb26.dylib"
+	python3 -I "$pacstrip" --sign "$out18/sweetpb26.dylib"
 	b18 sweeticonstyle sweeticonstyle.m iconstyle.entitlements -framework UIKit
 	b18 sweetopen sweetopen.m uicache.entitlements
 	# remote testing over SSH: screenshot of the panel (PNG) and synthetic touch/buttons
@@ -79,6 +88,11 @@ if [ "${IOS18:-1}" = 1 ]; then
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetsample.c" -o "$out18/sweetsample"
 	codesign -s - -f --entitlements "$here/sample.entitlements" "$out18/sweetsample"
 	python3 -I "$pacstrip" --sign "$out18/sweetsample"
+	# Wi-Fi over SSH (iOS 26 stand-in, docs/WIFI_IOS26.md): Apple80211 info/power/scan without wifid or the UI
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework CoreFoundation \
+		"$here/sweetwifi.c" -o "$out18/sweetwifi"
+	codesign -s - -f --entitlements "$here/wifi.entitlements" "$out18/sweetwifi"
+	python3 -I "$pacstrip" --sign "$out18/sweetwifi"
 	# the unified log over SSH (no `log` tool on iOS)
 	b18 sweetlog sweetlog.m log.entitlements -framework OSLog
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework CoreFoundation -framework IOKit \

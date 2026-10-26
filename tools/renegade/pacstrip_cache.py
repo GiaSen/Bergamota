@@ -67,6 +67,19 @@ def read_mappings(buf, h):
     return maps
 
 
+DYLD_CACHE_MAPPING_TEXT_STUBS = 1 << 3
+
+
+def stub_mappings(buf, h):
+    """(file offset, size) of the mappings flagged TEXT_STUBS (dyld_cache_mapping_and_slide_info, 56 bytes each)"""
+    out = []
+    for i in range(h['mappingWithSlideCount']):
+        addr, size, foff, _, _, flags = struct.unpack_from('<QQQQQQ', buf, h['mappingWithSlideOffset'] + 56 * i)
+        if flags & DYLD_CACHE_MAPPING_TEXT_STUBS:
+            out.append((foff, size))
+    return out
+
+
 def cache_files(d):
     """Main cache file and the sub-cache files (suffixes from the main header), in order."""
     main = None
@@ -92,6 +105,7 @@ class Cache:
         self.main, self.subs = cache_files(d)
         self.files = [self.main] + self.subs
         self.maps = []                       # (addr, size, fileoff, initprot, filename)
+        self.stubs = {}                      # filename -> [(fileoff, size)] of the TEXT_STUBS mappings
         self.bufs = {}
         for fn in self.files:
             f = open(os.path.join(d, fn), 'rb')
@@ -100,6 +114,8 @@ class Cache:
             h = read_header(b)
             for m in read_mappings(b, h):
                 self.maps.append(m + (fn,))
+            if h['mappingWithSlideCount']:
+                self.stubs[fn] = stub_mappings(b, h)
             if fn == self.main:
                 self.hdr = h
         self.maps.sort()
@@ -313,6 +329,9 @@ def main():
     ap.add_argument('--no-resign', action='store_true')
     ap.add_argument('--whitelist-ldra', nargs='*', default=None)
     ap.add_argument('--islands', action='store_true', help='also rewrite r-x ranges outside image sections')
+    ap.add_argument('--stubs', action='store_true',
+                    help='also rewrite the TEXT_STUBS mappings (iOS 26: cross-image stubs ending in BRAA x16, x17); '
+                         'unlike --islands it leaves non-code bytes of __TEXT (strings, constants, the cache header) alone')
     ap.add_argument('--verify-sig', action='store_true', help='verify all page hashes of every file, then continue')
     ap.add_argument('--limit', type=int, default=0, help='only the first N images (testing)')
     a = ap.parse_args()
@@ -366,6 +385,12 @@ def main():
                     pos = max(pos, e)
         for fn, r in isl.items():
             per_file.setdefault(fn, []).extend(r)
+    if a.stubs and not a.islands:
+        for fn, r in c.stubs.items():
+            for foff, size in r:
+                per_file.setdefault(fn, []).append((foff, foff + size, 'stubs', False))
+        print('TEXT_STUBS mappings:', sum(len(r) for r in c.stubs.values()),
+              f'({sum(sz for r in c.stubs.values() for _, sz in r) >> 10} KiB)')
     for b in c.bufs.values():
         b.close()
     jobs = []

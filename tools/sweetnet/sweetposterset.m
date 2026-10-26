@@ -126,6 +126,35 @@ int main(int argc, char **argv) {
 			}
 			return 0;
 		}
+		if (argc == 3 && !strcmp(argv[1], "--delete")) {
+			/* --delete UUID: delete one configuration. Emptying the lock role makes PosterBoard set up its default poster again:
+			 * a LegacyPoster of the legacy wallpaper once that is an image (sweetlegacywall) */
+			dlopen("/System/Library/PrivateFrameworks/PosterBoardServices.framework/PosterBoardServices", RTLD_NOW);
+			svc = [[NSClassFromString(@"PRSService") alloc] init];
+			__block id e = nil;
+			dispatch_semaphore_t s3 = dispatch_semaphore_create(0);
+			[svc deletePosterConfigurationsMatchingUUID:[[NSUUID alloc] initWithUUIDString:[NSString stringWithUTF8String:argv[2]]]
+			                                 completion:^(id a) { e = a; dispatch_semaphore_signal(s3); }];
+			wt(s3);
+			printf("delete %s: %s\n", argv[2], e ? D(e).UTF8String : "ok");
+			return e ? 3 : 0;
+		}
+		if (argc == 3 && !strcmp(argv[1], "--uuid")) {
+			/* --uuid UUID: select an existing lock configuration by its UUID (from --list), e.g. a Photos poster that
+			 * sweetwallpaper created but PosterBoard did not select because its snapshot step failed */
+			dlopen("/System/Library/PrivateFrameworks/PosterBoardServices.framework/PosterBoardServices", RTLD_NOW);
+			svc = [[NSClassFromString(@"PRSService") alloc] init];
+			NSString *want = [NSString stringWithUTF8String:argv[2]];
+			dispatch_semaphore_t s2 = dispatch_semaphore_create(0);
+			[svc updateToSelectedConfigurationMatchingUUID:[[NSUUID alloc] initWithUUIDString:want] role:role completion:^(id e) {
+				printf("select error=%s\n", D(e).UTF8String); dispatch_semaphore_signal(s2); }];
+			wt(s2);
+			BOOL ok;
+			id sel = fetch_selected(&ok);
+			if (ok && sel && [uuid_of(sel) caseInsensitiveCompare:want] == NSOrderedSame) { printf("selected %s\n", want.UTF8String); return 0; }
+			printf("not selected after the update: %s\n", D(sel).UTF8String);
+			return 3;
+		}
 		BOOL cleanup = argc > 1 && !strcmp(argv[1], "--cleanup");
 		if (argc - cleanup != 3) { fprintf(stderr, "usage: sweetposterset [--cleanup] PROVIDER DESCRIPTOR_ID\n"); return 2; }
 		prov = [NSString stringWithUTF8String:argv[1 + cleanup]];

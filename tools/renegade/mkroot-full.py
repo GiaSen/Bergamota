@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Renegade root build (`renegade root`): build the FULL iOS 18.7.8 (iPhone11,8, 22H352) root as a flashable HFS+ image for the userdata partition.
+"""Renegade root build (`renegade root`): build the FULL iOS root of the Renegade target (targets.py: 26.6.2 iPhone12,1 by default, RENEGADE_TARGET=ios18 for 18.7.8 iPhone11,8) as a flashable HFS+ image for the userdata partition.
 
   mkroot-full.py [--ipsw-dir DIR] [--out IMG] [--size 20g] [--stages copy,macho,cache,tweaks,seal] [--simg OUT.simg]
 
@@ -41,10 +41,11 @@ ROOT = os.path.abspath(os.path.join(HERE, '..', '..'))
 sys.path.insert(0, HERE)
 import pacstrip  # noqa: E402
 import renegade_platform as rplat  # noqa: E402
+from targets import T as TARGET  # noqa: E402
 
 MAGICS = {b'\xcf\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf'}
-MIN_FREE = 5 << 30
-W = os.path.join(ROOT, 'research/ios18/full')              # work dir (mount points, map)
+MIN_FREE = int(os.environ.get('RENEGADE_MIN_FREE_GB', '5')) << 30     # free-space floor kept on the host disk
+W = os.path.join(ROOT, TARGET['work'], 'full')             # work dir (mount points, map)
 
 
 def log(*a):
@@ -64,7 +65,7 @@ def need_free(what):
     fb = free_bytes()
     log(f'free disk: {fb / 2**30:.1f} GiB ({what})')
     if fb < MIN_FREE:
-        sys.exit(f'STOP: only {fb / 2**30:.1f} GiB free (< 5 GiB) before {what}')
+        sys.exit(f'STOP: only {fb / 2**30:.1f} GiB free (< {MIN_FREE >> 30} GiB) before {what}')
 
 
 def attach(img, mnt, readonly=True, owners=False):
@@ -191,7 +192,7 @@ def stage_copy(a, img, rootmnt, dmgs):
             detach(dev)             # macOS: owners-on mounts hide root-only files, so the copy uses a second, noowners mount
         log(f'owner map: {name} {n} entries, {size / 2**30:.2f} GiB apparent')
         if free_bytes() < size + MIN_FREE:
-            sys.exit(f'STOP: copying {name} ({size / 2**30:.1f} GiB) would leave < 5 GiB free '
+            sys.exit(f'STOP: copying {name} ({size / 2**30:.1f} GiB) would leave < {MIN_FREE >> 30} GiB free '
                      f'({free_bytes() / 2**30:.1f} GiB free now)')
         if not rplat.is_linux():
             dev = rplat.attach_ipsw(dmgs[name], mnt, owners=False)
@@ -362,14 +363,16 @@ def stage_macho(a, root):
     log(f'{len(idents)} re-signed Mach-Os, identities recorded ({sum(1 for i in idents.values() if not i)} were unsigned)')
     if failed:
         open(os.path.join(W, 'macho-failed.txt'), 'w').write('\n'.join(f'{p}\t{s}' for p, s in failed))
-        sys.exit(f'{len(failed)} Mach-O files failed (research/ios18/full/macho-failed.txt): the build must not continue')
+        sys.exit(f'{len(failed)} Mach-O files failed ({W}/macho-failed.txt): the build must not continue')
 
 
 # --- stage: cache ---------------------------------------------------------------------------------------------------
 def stage_cache(a, root):
     need_free('cache stage')
     d = os.path.join(root, 'System/Library/Caches/com.apple.dyld')
-    run([sys.executable, '-I', os.path.join(HERE, 'pacstrip_cache.py'), d, '--jobs', str(a.jobs)])
+    # --stubs: iOS 26 caches keep cross-image stubs in __TEXT_STUBS sub-caches outside every image section, ending
+    # in BRAA x16, x17 (first iOS 26 boot: launchd SIGILL there); iOS 18's islands were plain adrp/add/br
+    run([sys.executable, '-I', os.path.join(HERE, 'pacstrip_cache.py'), d, '--jobs', str(a.jobs), '--stubs'])
     run([sys.executable, '-I', os.path.join(HERE, 'fips_rehmac.py'), d, '--patch'])   # corecrypto FIPS POST integrity HMAC
 
 
@@ -415,7 +418,7 @@ def stage_tweaks(a, root):
             rt.quiet(root)
         rt.containers(root)
         chowned[os.path.join(root, 'private/var/containers/Bundle')] = (33, 33)
-        rt.event_timing(root)       # D22.{Default,Touch}.plist from N841: UIKit's 'Misconfigured Device' alert otherwise
+        rt.event_timing(root)       # <ADT target>.{Default,Touch}.plist when the ADT claims another device (ios18: D22 from N841)
         rt.usbnet(root)
         rt.netcfg(root)
         rt.sweetreboot(root)
@@ -652,6 +655,11 @@ def stage_verify(a, img, rootmnt):
                     badl.append((rel, ident, new))
             chk(bad == 0, f'identity (identifier/team/CS flags) unchanged on all {n} re-signed Mach-Os, {bad} mismatches {badl[:3]}')
         boot_task_audit(R, chk)
+        if not rplat.is_linux():
+            # the owners-on mount hides root-only files (0600 root: /private/etc/master.passwd, ...) from this user;
+            # the content checks below read every file, so they run on a read-only noowners mount
+            detach(dev)
+            dev = attach(img, rootmnt, readonly=True, owners=False)
         # every Mach-O's chained fixups against its own bytes, as the kernel's dyld pager walks them at page-in: a file that
         # was damaged on its way into the image panics the phone at boot ("fixupPageAuth64(): chain ... out of range")
         import fixupcheck
@@ -760,8 +768,8 @@ def dry_plan(a, img, rootmnt, dmgs, stages):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
-    ap.add_argument('--ipsw-dir', default=os.path.join(ROOT, 'research/ios18/ipsw/22H352__iPhone11,8'))
-    ap.add_argument('--out', default=os.path.join(ROOT, 'research/ios18/ios18-root-full.img'))
+    ap.add_argument('--ipsw-dir', default=os.path.join(ROOT, TARGET['ipsw_dir']))
+    ap.add_argument('--out', default=os.path.join(ROOT, TARGET['root_img']))
     ap.add_argument('--size', default='20g')
     ap.add_argument('--stages', default='copy,macho,cache,tweaks,seal,verify,simg')
     ap.add_argument('--simg', default=None)

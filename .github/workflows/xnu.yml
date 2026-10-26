@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       macos_version:
-        description: macOS release whose xnu to build (13.5 = xnu-8796 / iOS 16 era; 15.3 = xnu-11215.81.4 / iOS 18.3 era)
+        description: macOS release whose xnu to build (13.5 = xnu-8796 / iOS 16 era; 15.3 = xnu-11215.81.4 / iOS 18.3 era; 26.5 = xnu-12377.121.6 / iOS 26.5 era)
         default: "15.3"
       xcode_version:
-        description: Xcode on the runner (empty = oldest installed for 13.x/14.x, 16.2 for 15.x)
+        description: Xcode on the runner (empty = oldest installed for 13.x/14.x, 16.2 for 15.x, 26.1 for 26.x)
         default: ""
       kernel_config:
         description: RELEASE / DEVELOPMENT / DEBUG
@@ -15,14 +15,18 @@ on:
       machine_config:
         description: xnu MACHINE_CONFIG
         default: SWEET
+      use_kdk:
+        description: 26.x only - download the KDK (true) or build without it (false; CoreEntitlements V2 stubs, but TrustCache/API.h is KDK-only)
+        default: "true"
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
   push:
-    branches: [main, develop, xnu11215]
+    branches: [main, develop, xnu11215, ios26]
     paths:
       - "xnu/patches/**"
       - "xnu/patches-11215/**"
+      - "xnu/patches-12377/**"
       - ".github/workflows/xnu.yml"
 
 concurrency:
@@ -32,7 +36,7 @@ concurrency:
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
-  MACOS_VERSION: ${{ inputs.macos_version || (github.ref_name == 'main' && '13.5' || '15.3') }}
+  MACOS_VERSION: ${{ inputs.macos_version || (github.ref_name == 'main' && '13.5' || (github.ref_name == 'ios26' && '26.5' || '15.3')) }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
   # Bump to throw away every cache (host tools + ccache) at once. See docs/CI_CACHE.md.
@@ -55,7 +59,8 @@ jobs:
     # 13.x/14.x sources: macos-14 still ships Xcode 15.x, whose iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which that xnu lacks).
     # 15.x sources (xnu-11215): macos-15 with Xcode 16.2 (the macOS 15.2/15.3 era toolchain).
-    runs-on: ${{ startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || '15.3'), '15.') && 'macos-15' || 'macos-14' }}
+    # 26.x sources (xnu-12377): macos-26 with Xcode 26.1 (what dxb's own CI builds 26.5 with).
+    runs-on: ${{ startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || (github.ref_name == 'ios26' && '26.5' || '15.3')), '26.') && 'macos-26' || (startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || '15.3'), '15.') && 'macos-15' || 'macos-14') }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -65,7 +70,24 @@ jobs:
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
-          if [[ "$MACOS_VERSION" == 15.* ]]; then
+          if [[ "$MACOS_VERSION" == 26.* ]]; then
+            # xnu-12377 series (docs/XNU12377_MIGRATION.md): same scheme as 15.x, dxb's patches/26.0
+            # (its 00_setup_coreentitlements.sh and fixes) first, ours after them.
+            for f in xnu/patches-12377/*.patch xnu/patches-12377/*.sh; do
+              [ -e "$f" ] || continue
+              cp "$f" "dxb/patches/26.0/sweet-$(basename "$f")"
+            done
+            PDIR=dxb/patches/26.0
+            if [ "${{ inputs.use_kdk || 'true' }}" != "true" ]; then
+              # SWEET needs nothing from the KDK (link_kdk only force-loads closed libs for Apple SoCs,
+              # kernel collections are not built): drop dxb's KDK header copy (our
+              # 0027-stage-coreentitlements-v2-stub.sh stands in) and point KDKROOT at an empty dir so
+              # build.sh does not download one.
+              rm "$PDIR/00_setup_coreentitlements.sh"
+              mkdir -p "$RUNNER_TEMP/no-kdk"
+              echo "KDKROOT=$RUNNER_TEMP/no-kdk" >> "$GITHUB_ENV"
+            fi
+          elif [[ "$MACOS_VERSION" == 15.* ]]; then
             # xnu-11215 series (docs/XNU11215_MIGRATION.md). dxb applies patches/15.0/*.sh, then
             # patches/15.0/*.patch in name order: its own fixes (disable_bti, entitlements, iokit,
             # link_kdk, skywalk, ...) come first and ours ("sweet-" prefix) after them.
@@ -104,6 +126,9 @@ jobs:
           ls -d /Applications/Xcode*.app
           if [ -n "${{ inputs.xcode_version }}" ]; then
             XC=$(ls -d /Applications/Xcode_${{ inputs.xcode_version }}*.app | sort -V | tail -1)
+          elif [[ "$MACOS_VERSION" == 26.* ]]; then
+            XC=$(ls -d /Applications/Xcode_26.1*.app 2>/dev/null | sort -V | tail -1)
+            [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_26.*.app | sort -V | head -1)
           elif [[ "$MACOS_VERSION" == 15.* ]]; then
             XC=$(ls -d /Applications/Xcode_16.2*.app 2>/dev/null | sort -V | tail -1)
             [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_16.*.app | sort -V | head -1)
@@ -169,7 +194,39 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        # the full log is hundreds of MB of warnings: keep it as a file, summarise the errors
+        run: |
+          set +e
+          bash build.sh > build.log 2>&1
+          rc=$?
+          grep -aE "error:|our patch does not apply|Staged|Applying patch|Skipping patch" build.log | grep -v "warning" | head -300
+          tail -40 build.log
+          exit $rc
+
+      - name: Error summary
+        if: always()
+        run: |
+          mkdir -p out
+          grep -aoE "[A-Za-z0-9_./+-]+\.(c|cpp|h|hpp|s|exports|iig)(:[0-9]+){1,2}: (fatal )?error: .*" dxb/build.log \
+            | sed 's|.*/dxb/||' | sort | uniq -c | sort -rn > out/errors.txt || true
+          grep -aE "^ld: |Undefined symbols|ld: symbol|error: linker" -A3 dxb/build.log | head -200 > out/link-errors.txt || true
+          wc -l out/errors.txt out/link-errors.txt
+          head -100 out/errors.txt
+          { echo '### compile errors (first 60)'; echo '```'; head -60 out/errors.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          gzip -c dxb/build.log > out/build.log.gz || true
+          # parallel make interleaves compiler output: re-run every failed compile serially for clean errors
+          objs=$(grep -aoE "\[[A-Za-z0-9_+-]+\.(o|cpo)\] Error" dxb/build.log | sed -E 's/^\[(.*)\.(o|cpo)\] Error$/\1/' | sort -u)
+          srcs=""
+          for o in $objs; do
+            f=$(find dxb/xnu -name "$o.c" -o -name "$o.cpp" -o -name "$o.s" | head -1)
+            [ -n "$f" ] && srcs="$srcs ${f#dxb/xnu/}"
+          done
+          echo "failed objects: $objs"
+          if [ -n "$srcs" ]; then
+            XNU_CC_TARGET=arm64-apple-macos26.0 python3 tools/xnu-cc.py dxb/build.log dxb $srcs --per-file > out/recompile.txt 2>&1 || true
+            grep -E "error" out/recompile.txt | head -150
+            { echo '### failed compiles, re-run serially'; echo '```'; grep -E "error" out/recompile.txt | head -80; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: ccache stats
         if: always()
@@ -226,6 +283,7 @@ jobs:
         run: |
           mkdir -p out/kdk-libs
           for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+            [ -e "$lib" ] || continue
             b=$(basename "$lib" .a)
             ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
             nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true

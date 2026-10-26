@@ -82,9 +82,19 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 #   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
 
+# --identity: which real iPhone the ADT claims to be (root compatible/model = hw.model/hw.machine, /product
+# from that device's own tree). d22ap = iPhone X, the iOS 16/18 images. n104ap = iPhone 11 (A13), the oldest
+# identity iOS 26 supports (docs/IOS26_FEASIBILITY.md); its tree comes from the 26.7.1 OTA:
+#   ipsw extract -r --dtree -o DIR <OTA URL>; ipsw img4 im4p extract DIR/.../DeviceTree.n104ap.im4p -o n104ap.adt
+IDENTITIES = {
+    'd22ap': dict(target='D22AP', machine='iPhone10,3', target_type='D22', adt=D22AP_ADT),
+    'n104ap': dict(target='N104AP', machine='iPhone12,1', target_type='N104',
+                   adt=os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ios26/n104ap.adt')),
+}
+
 
 def d22ap_product(path=D22AP_ADT):
-    """/product properties of the real D22AP tree, without the syscfg
+    """/product properties of the real device tree (D22AP or --identity), without the syscfg
     placeholders iBoot would fill in (flag bit set) and the node bookkeeping."""
     if not os.path.exists(path):
         print(f'warning: {path} missing, no /product node', file=sys.stderr)
@@ -142,7 +152,9 @@ def bluetooth_node(ph):
     ])
 
 
-def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, points=(375, 812), lowpool=None):
+def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, points=(375, 812), lowpool=None,
+          identity='d22ap'):
+    ident = IDENTITIES[identity]
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     b = BOARDS[board]
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
@@ -160,7 +172,9 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
         if lp_base < phys_base + mem_size and phys_base < lp_base + lp_size:
             raise SystemExit(f'--lowpool {lp_base:#x}:{lp_size:#x} overlaps the kernel RAM {phys_base:#x}+{mem_size:#x}')
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
-    seed = seed if seed is not None else os.urandom(64)
+    # 256 bytes: xnu-12377 asks the bootloader for 4 * SHA-512 (prng_random.c, panics "Expected 256 seed bytes from
+    # bootloader, but got 64"); older kernels copy only the 64 they ask for (PE_get_random_seed clamps)
+    seed = seed if seed is not None else os.urandom(256)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
 
@@ -169,6 +183,9 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
         ('dram-base', u64(phys_base)),
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
+        # xnu-12377 asserts iBoot wrote this (ml_unsafe_kernel_text, machine_routines.c). 1 = kernel text treated as
+        # read-only, which is xnu-11215's default (pmap_ppl_disable FALSE without -unsafe_kernel_text); older kernels ignore it
+        ('kernel-ctrr-to-be-enabled', u32(1)),
         ('debug-enabled', u32(1)),
         ('firmware-version', cstr('enxerto')),
         ('system-firmware-version', cstr('enxerto')),
@@ -304,7 +321,7 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
-    product_props = d22ap_product()
+    product_props = d22ap_product(ident['adt'])
     # Our framebuffer is sRGB 8-bit. With the iPhone X's 'P3' MobileGestalt says
     # HasExtendedColorDisplay and WebKit renders page tiles into 10-bit surfaces
     # ('w30r', 'b3a8') this kernel does not provide: Safari pages stay blank.
@@ -313,15 +330,15 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
         product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
-    # Identity of the iPhone X whose userland runs here: compatible[0] is
-    # hw.model/hw.target (D22AP), model is hw.machine/hw.product
-    # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
+    # Identity of the iPhone whose userland runs here: compatible[0] is
+    # hw.model/hw.target (D22AP / N104AP), model is hw.machine/hw.product
+    # (iPhone10,3 / iPhone12,1). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + b''.join(cstr(c) for c in b['compat']) + cstr('AppleARM')),
-        ('model', cstr('iPhone10,3')),
-        ('target-type', cstr('D22')),
-        ('target-sub-type', cstr('D22AP')),
+        ('compatible', cstr(ident['target']) + cstr(ident['machine']) + b''.join(cstr(c) for c in b['compat']) + cstr('AppleARM')),
+        ('model', cstr(ident['machine'])),
+        ('target-type', cstr(ident['target_type'])),
+        ('target-sub-type', cstr(ident['target'])),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
@@ -333,7 +350,9 @@ if __name__ == '__main__':
     scale = int(sys.argv[sys.argv.index('--display-scale') + 1]) if '--display-scale' in sys.argv else 3
     points = tuple(int(v) for v in sys.argv[sys.argv.index('--points') + 1].split('x')) if '--points' in sys.argv else (375, 812)
     lowpool = parse_lowpool(sys.argv[sys.argv.index('--lowpool') + 1]) if '--lowpool' in sys.argv else None
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, board=board, display_scale=scale, points=points, lowpool=lowpool)
+    identity = sys.argv[sys.argv.index('--identity') + 1] if '--identity' in sys.argv else 'd22ap'
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, board=board, display_scale=scale, points=points,
+                 lowpool=lowpool, identity=identity)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

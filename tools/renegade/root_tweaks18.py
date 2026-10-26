@@ -81,7 +81,8 @@ def skip_summary():
     for f, r in rows:
         print('  - %s: %s' % (f, r))
 
-BUILD, VERSION = '22H352', '18.7.8'
+from targets import T as TARGET  # noqa: E402  (tools/renegade/targets.py, RENEGADE_TARGET)
+BUILD, VERSION = TARGET['build'], TARGET['version']
 MOBILE = 501
 
 
@@ -649,11 +650,14 @@ def staged_apps(root):
 
 def event_timing(root):
     # UIKit looks up /System/Library/EventTimingProfiles/<target>.Default.plist with the ADT
-    # target-type (D22, iPhone X) while the 22H352 userland ships N841 profiles only:
-    # 'Misconfigured Device: Default Event Timing Profile is missing'.
+    # target-type, which on ios18 (D22, iPhone X) is not the device the userland is for (N841 profiles only):
+    # 'Misconfigured Device: Default Event Timing Profile is missing'. On ios26 both are N104: nothing to do.
     d = os.path.join(root, 'System/Library/EventTimingProfiles')
+    if TARGET['board'] == TARGET['adt_target']:
+        return
     for kind in ('Default', 'Touch'):
-        s, t = os.path.join(d, 'N841.%s.plist' % kind), os.path.join(d, 'D22.%s.plist' % kind)
+        s = os.path.join(d, '%s.%s.plist' % (TARGET['board'], kind))
+        t = os.path.join(d, '%s.%s.plist' % (TARGET['adt_target'], kind))
         if os.path.exists(s) and not os.path.exists(t):
             shutil.copy2(s, t)
             print('event timing profile', t)
