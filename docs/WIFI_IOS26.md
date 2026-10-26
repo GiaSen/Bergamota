@@ -1127,3 +1127,33 @@ The baseline args are those of `...-boot47-60hz-boost7b-enxdev.img` (60 Hz, no `
 reproduces that `-enxdev` image byte for byte with the 1120 kernel, so only the kernel (and in 48r one arg)
 differs. The first boot 48 build (kernel 1121 alone, `11b9d29c...`) is superseded by the one above. Neither image
 is booted: each needs the user's OK.
+
+### 5.28 Boot 48r-wlan-rfclk (1121 + 1122, `sweetrfclk=1`, user present): **the radio hears traffic; no frame reaches the host**
+
+**2026-10-26 ~20:27Z** (user OK "boot 48r-wlan-rfclk now (one queue item)"; queued by this session, the Turnip
+session told). First boot of a Wi-Fi image on develop's Enxerto. `SWEET RPMH: RF clock rfclka2 enable at 0x4c404`,
+`wlfw: RF reference clock rfclka2 -> 0`; then as boot 47: HTT 3.73, all commands accepted, scan STARTED ->
+COMPLETED reason 0 after 26 channel visits, **0 beacons, no MGMT_RX event** (event tally: SCAN 0x3001 x 78,
+CHAN_INFO 0x4002 x 27, nothing else). Mode off confirmed, stop-ack 190 ms, clean teardown.
+
+**CHAN_INFO counters (one per visit, flags 0; the last entry is an all-zero COMPLETE marker, so the per-channel
+"COMPLETE" totals of the summary stay empty: the per-visit lines are the data).** Per ~150 ms dwell at mac_clk
+120 MHz (`cycles` ~18.0 M):
+
+| band | noise floor | rx_clear / cycles | rx_frame / cycles |
+|------|-------------|-------------------|-------------------|
+| 2.4 GHz ch 1-13 | -118 dBm | 15-61 % busy | 1-55 % (ch 1: 9.67 M / 17.7 M) |
+| 5 GHz 36-64 (52-64 DFS) | -106 dBm | 0.1-3 % | 0.1-3 % |
+| 5 GHz 149-165 | -108..-110 dBm | 0-1 % (157/165: 0) | 0-1 % |
+
+**Reading:** the RF path works (with the reference clock voted): the receiver is busy decoding frames on every
+2.4 GHz channel and most 5 GHz ones, nothing is transmitted (tx 0), but the firmware hands **no** management frame
+to the host. So the zero beacons of boots 47/48r are a **delivery** problem, not RF. (Whether `rfclka2` is needed
+at all would take boot 48 without the vote; it is harmless, so it stays on from now on.) Console:
+`research/ios26/logs-wlan/boot48r-wlan-rfclk-usb.txt` (main checkout, not in git).
+
+**Next (1123):** the rest of `ath10k_htt_setup()` that ath10k always completes before scanning: HTT
+FRAG_DESC_BANK_CFG (64-bit), the **HTT RX ring** (RX_RING_CFG 64-bit, buffers posted, the fw index shadow word) and
+AGGR_CFG, on CE4; the firmware's receive dispatch may need a configured host RX path before it delivers anything,
+including the WMI management frames. Second suspect: the vdev filter (ath10k's mac80211 path sets the rx filter
+through vdev/pdev params when the interface is up).
