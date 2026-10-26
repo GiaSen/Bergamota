@@ -723,3 +723,30 @@ tells the modem which PDs exist (`wlan/fw` -> `msm/modem/wlan_pd`, instance 74).
 SERVREG_NOTIFIER (0x42). **Next (1115): a kernel pd-mapper** (service 0x40 v1, GET_DOMAIN_LIST answering from the
 beryllium/sdm845 JSON of linux-msm/pd-mapper); then the WLAN PD should load `wlanmdsp.mbn` over this TFTP server and
 WLFW (0x45) should appear.
+
+### 5.16 1115: kernel pd-mapper (SERVREG_LOCATOR) for the WLAN protection domain: built, NOT run
+
+`1115-beryllium-mpss-pd-mapper.patch`, gate **`sweetpdm=1`** (on top of `sweetrmtfs=1`, normally with `sweettftp=1`),
+a copy of Linux v6.12 `drivers/soc/qcom/qcom_pd_mapper.c`:
+* **Service**: QMI SERVREG_LOCATOR, QRTR service 0x40, instance field 0x101 (`qmi_add_server`: version 0x101 |
+  instance 0 << 8) at 1:0x4002, announced with rmtfs/TFTP after the modem's HELLO.
+* **GET_DOMAIN_LIST (0x21)**: service name (TLV 1), optional offset (TLV 0x10) -> result, total_domains (0x10),
+  db_rev_count 1 (0x11), domain list (0x12: u8 count, entries {u8 name length, name, u32 instance, u8 0, u32 0}),
+  TLVs in `servreg_get_domain_list_resp_ei` order; an unknown service gets total 0 and no list, as in Linux.
+  **PFR (0x24)**: logged and answered with success. Every request is logged.
+* **Table**: `sdm845_domains`: msm/adsp/audio_pd (74, avs/audio), msm/adsp/root_pd (74), msm/cdsp/root_pd (76),
+  msm/modem/root_pd (180), **msm/modem/wlan_pd (180, kernel/elf_loader + wlan/fw)**, msm/slpi/root_pd (90),
+  msm/slpi/sensor_pd (90); every domain also serves `tms/servreg`. (Correction to 5.15: the modem PDs are instance
+  180; 74 is the ADSP.)
+* A NEW_SERVER for service 0x45 is logged as `WLFW is up`; the 1115 summary line counts pd-mapper requests and
+  says whether WLFW appeared.
+
+Checked: a userspace harness around `pdm_rx` (wlan/fw, tms/servreg with offsets 0/5, an unknown service,
+kernel/elf_loader), and a fifth independent review that decoded the responses against Linux `qmi_encdec.c`: no
+defects (harmless differences: malformed requests get MALFORMED_MSG instead of being dropped).
+
+Image `shim/out/enxerto-boot-ios26full-boot42-wlan-pdm.img` (sha256 `626043b5...`, kernel `76b6c142...` = boot 33b's
+kernel + 1108-1115; same recipe that rebuilds boot 41's image byte for byte): boot 41's args plus `sweetpdm=1`, and
+`sweetmpsshold=90` (was 60) so `wlanmdsp.mbn` (3645892 B) has time to load. Expected: GET_DOMAIN_LIST requests
+(e.g. `wlan/fw`, `tms/servreg`), then TFTP RRQ for `wlanmdsp.mbn`, then `WLFW is up` (service 0x45). Not booted:
+needs the user's OK; queue exactly one item.
