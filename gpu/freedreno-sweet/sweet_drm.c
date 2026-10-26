@@ -460,12 +460,74 @@ drmGetCap(int fd, uint64_t cap, uint64_t *value)
 	return 0;
 }
 
+/*
+ * "Prime fds" for Turnip's dma-buf import (Chlorophyll on Turnip, chl_texture_from_iosurface): an IOSurface made a BO by
+ * SURFACE_BO, handed to Vulkan as VkImportMemoryFdInfoKHR. The fd is a dup of /dev/null registered here with the BO's handle
+ * and size; drmPrimeFDToHandle answers the handle, sweet_drm_prime_size the size (Turnip's msm_bo_init_dmabuf asks lseek
+ * otherwise, patches/mesa-26.2/turnip-ios.patch). Vulkan owns and closes the fd after the import.
+ */
+EXPORT int sweet_drm_surface_bo(int fd, struct sweet_gpu_surface_bo *io);
+#define PRIME_MAX 256
+static struct { int fd; uint32_t handle; uint64_t size; } g_prime[PRIME_MAX];
+static pthread_mutex_t g_prime_lock = PTHREAD_MUTEX_INITIALIZER;
+
+EXPORT int
+sweet_drm_surface_prime(int surface_id, struct sweet_gpu_surface_bo *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->surface_id = (uint32_t)surface_id;
+	int r = sweet_drm_surface_bo(-1, out);
+	if (r) {
+		errno = -r;
+		return -1;
+	}
+	int pfd = open("/dev/null", O_RDWR | O_CLOEXEC);
+	if (pfd < 0)
+		return -1;
+	pthread_mutex_lock(&g_prime_lock);
+	int slot = -1;
+	for (int i = 0; i < PRIME_MAX && slot < 0; i++)
+		if (g_prime[i].fd == pfd || g_prime[i].fd == 0)
+			slot = i;
+	if (slot < 0)
+		slot = pfd % PRIME_MAX;
+	g_prime[slot].fd = pfd;
+	g_prime[slot].handle = out->handle;
+	g_prime[slot].size = out->size;
+	pthread_mutex_unlock(&g_prime_lock);
+	return pfd;
+}
+
+EXPORT int64_t
+sweet_drm_prime_size(int prime_fd)
+{
+	int64_t size = -1;
+	pthread_mutex_lock(&g_prime_lock);
+	for (int i = 0; i < PRIME_MAX; i++)
+		if (g_prime[i].fd == prime_fd && prime_fd > 0) {
+			size = (int64_t)g_prime[i].size;
+			break;
+		}
+	pthread_mutex_unlock(&g_prime_lock);
+	return size;
+}
+
 EXPORT int
 drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 {
-	(void)fd; (void)prime_fd; (void)handle;
-	errno = ENOSYS;
-	return -1;
+	(void)fd;
+	int r = -1;
+	pthread_mutex_lock(&g_prime_lock);
+	for (int i = 0; i < PRIME_MAX; i++)
+		if (g_prime[i].fd == prime_fd && prime_fd > 0) {
+			*handle = g_prime[i].handle;
+			r = 0;
+			break;
+		}
+	pthread_mutex_unlock(&g_prime_lock);
+	if (r)
+		errno = EINVAL;
+	return r;
 }
 
 EXPORT int
