@@ -33,7 +33,7 @@ Added for the browser path (IPSW in, sparse `userdata` out; see "The IPSW root b
 | Python | Rust | Status |
 | --- | --- | --- |
 | `ipsw` + `fetch-root.sh` (zip, BuildManifest) | `zip`, `ipsw`, `renegade-rs ipsw SRC` | reads the IPSW through any `ReadAt` (file, URL by HTTP range, the browser's `File`) |
-| `ipsw fw aea` | `aea` (HKDF/AES-CTR segments, LZFSE; the HPKE key unwrap) | decrypts on the fly, random access; same bytes as `ipsw fw aea` (the 5.2 GB SystemOS image decrypts with every segment checksum valid) |
+| `ipsw fw aea` | `aea` (HKDF/AES-CTR segments, LZFSE; the HPKE key unwrap) | decrypts on the fly, random access (the first 64 MB of the SystemOS image checked segment by segment against the archive's SHA-256 checksums; both encrypted images read end to end through the APFS reader without a failure) |
 | `hdiutil attach` / `apfs-fuse` + `walk_owners` + `ditto` | `apfs` (agent-written reader, see below), `rootbuild` copy stage | the three volumes merged as ditto does, owners from the inodes |
 | `pacstrip_cache.py --stubs` + `fips_rehmac.py --patch` | `dsc` | rewrites every cache file, page hashes of the touched pages, corecrypto's FIPS HMAC |
 | `root_tweaks18.py`: ssh, BlueTool stub + hcitest, first-boot job (+ SweetRun, sweetposterset, sweeticonstyle, sweetopen), PosterBoard + sweetfp (addlc), bglrender, sweetprefs/shot/touch, the console job | `tools` (from `berga-tools.zip`), `renegade-rs tweaks DIR --tools-dir D --ssh-key K` | same files, modes, recorded owners and printed lines as root_tweaks18.py (host keys are left to `dropbear -R` on the phone) |
@@ -104,6 +104,18 @@ range requests) is the whole of `renegade root` for the iOS 26 profile in one pa
    stage (`dsc`), then the HFSX volume (`hfswrite`) written in the order the disk images store their files, so each
    image is read front to back, into a `SparseWriter`. Nothing is held that is bigger than one file (a cache file
    is 256 MiB at most); the catalog of the ~465,000 entries is the only large structure.
+
+Checked on the real iOS 26.6.2 (23G90) IPSW against the root the Python Renegade built from it
+(`root-ipsw IPSW null --compare REFERENCE.simg`, which also compares the trees; the full run takes about an hour over
+HTTP and writes nothing). Of the 216,808 files it writes, every one is byte-identical except: 1,867 files of bundles
+whose Python seal is stale (the Python process pool sealed them before their nested code was re-signed; here a bundle
+is sealed after what is inside it, so `Applications/Books.app`'s CodeResources holds the hash of the file that is
+really in the image), the tools the reference has and this run had none of (`launchd.plist`, `BlueTool`, the
+jailbreak payload), and 28 file names with a colon (the reference stores POSIX `:` as `/` in the catalog; the writer
+now does the same). All 74 rewritten cache files (code, stubs, FIPS HMAC, page hashes) are byte-identical, and so
+are the 3,216 re-signed Mach-Os (one needed the old signature's 4 KiB page size kept). A 1.5 GB root of
+`usr/lib` built the same way is fsck_hfs clean and mounts. What was not checked: fsck of the full 24 GiB image
+(no room for it on the Mac), booting it on the phone.
 
 The browser build is `tools/renegade-wasm` (a C ABI, no wasm-bindgen: `host.read/size/write/event` imports, see
 its `src/lib.rs`), loaded by `apps/web/src/patcher/`.
