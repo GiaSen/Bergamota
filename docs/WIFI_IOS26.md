@@ -1239,3 +1239,30 @@ Image `shim/out/enxerto-boot-ios26full-boot50-wlan-svc.img` (kernel 1120-1124): 
 baseline args of the `-enxdev` image with the 11 Wi-Fi args replaced by `sweetwlan=5` (**484 bytes**, 122 free;
 `sweetgpuboost=7` back). Test: the phone stays up 10+ minutes, the status line every minute with ECHOs answered,
 the service thread's CPU small in `top`. Not booted: needs the user's OK.
+
+### 6.2 WL2 / 1125: real networks for wifid and Settings (`sweet80211=3`): built, NOT run
+
+`1125-beryllium-wlan-scan-backend.patch` (beryllium_wlan.c, sweet_80211.c, new `bsd/dev/sweet_wlan.h`):
+* **Interface** (`sweet_wlan.h`): `sweet_wlan_scan_request()`, `sweet_wlan_bss_get(i, &bss)` (BSSID, MHz, RSSI,
+  noise, beacon interval, capability, raw SSID, the frame's IEs up to 1 KiB) and the callback
+  `sweet80211_scan_done()`.
+* **Service side**: the MGMT_RX list becomes a **BSS cache** (48 networks, IEs in a 48 KiB buffer, whole elements
+  only, latest RSSI) behind a mutex. A scan request sets a flag; the service thread starts a new passive
+  START_SCAN (new scan id) once the previous scan is done and the WMI credit is back; on COMPLETED it calls the
+  callback. Request flag, notice flag and state change under the same lock; a scan that fails, or a modem that
+  goes down, still completes the pending request (no results) so wifid never waits forever. Only the first scan
+  logs every network.
+* **iOS side** (`sweet80211=3`): SCAN_REQ / SCAN_REQ_MULTIPLE -> the service (before the service is up: the old
+  immediate completion with no networks); SCAN_DONE posted from the callback; SCAN_RESULT walks the cache into
+  the `apple80211_scan_result` layout boot 29 proved (channel number and band flags from MHz, RSSI/noise/SNR,
+  beacon interval, capability incl. the privacy bit, BSSID, rates from IEs 1 and 50 without membership
+  selectors, SSID, the IEs so the framework sees WPA2/RSN, HT/VHT, WPS). DRIVER_VERSION says
+  "WCN3990 scan backend". POWER is still a flag (no firmware action). Joining still fails (ENXIO).
+Checked: built clean; thirteenth review: no overflow/leak/layout defect; applied its fixes (the scan-done
+handshake under the lock, pending notices delivered on failure and modem death, liveness check, rate selectors
+skipped, IEs cut at element boundaries). Known minor: a client enumerating results while another client's new
+scan starts may see a shorter list.
+
+Image `shim/out/enxerto-boot-ios26full-boot51-wlan-settings.img` (kernel 1120-1125): boot 50's args with
+`sweet80211=3` instead of 2. Test (user): Settings › Wi-Fi lists the real nearby networks (lock icons on secured
+ones) and refreshes; `sweetwifi scan` over SSH lists them too. Not booted: needs the user's OK.
