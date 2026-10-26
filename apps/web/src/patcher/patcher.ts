@@ -65,7 +65,7 @@ export class Patcher {
   async build(info: IpswInfo, config: BuildConfig = {}, tools?: File): Promise<{ file: File; summary: BuildSummary }> {
     const pems: Record<string, string> = { ...config.pems };
     for (const url of new Set(info.images.map((i) => i.keyUrl).filter((u): u is string => !!u))) pems[url] ??= await fetchKey(url);
-    const r = await this.call({ type: "build", config: { ...config, pems }, tools });
+    const r = await this.call({ type: "build", config: { ...config, pems, tools: !!tools }, tools });
     const summary = (r as Extract<FromWorker, { type: "done" }>).summary as BuildSummary;
     const root = await navigator.storage.getDirectory();
     const fh = await root.getFileHandle("bergamota-userdata.simg");
@@ -75,6 +75,27 @@ export class Patcher {
   terminate() {
     this.worker.terminate();
   }
+}
+
+/** The prebuilt on-device tools (SSH server, first-boot helpers) this site hosts: null when the site has none. */
+export async function fetchTools(): Promise<File | null> {
+  try {
+    const r = await fetch("/tools/berga-tools.zip");
+    if (!r.ok || !(r.headers.get("content-type") ?? "").match(/zip|octet-stream/)) return null;
+    return new File([await r.blob()], "berga-tools.zip");
+  } catch {
+    return null;
+  }
+}
+
+/** One-line check of an SSH public key; returns a problem or null. */
+export function sshKeyProblem(key: string): string | null {
+  const k = key.trim();
+  if (!k) return null;
+  if (k.includes("\n")) return "Paste one line: the contents of your id_ed25519.pub.";
+  if (/PRIVATE KEY/.test(k)) return "That is a private key. Never paste it anywhere: use the .pub file.";
+  if (!/^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp\d+|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+( .*)?$/.test(k)) return "That is not an SSH public key (it starts with ssh-ed25519, ssh-rsa or ecdsa-).";
+  return null;
 }
 
 /** Deletes the finished image from the browser's storage. */

@@ -4,7 +4,7 @@
 import { ALLOWED_PARTITIONS, FastbootDevice, FastbootError, type LogKind, type Partition } from "../lib/fastboot.ts";
 import { checkImage, flash, identify, phoneProblems, SAFE_PIECE, type Checked, type PhoneInfo, type Progress } from "../lib/flasher.ts";
 import { blobSource, type ByteSource } from "../lib/sparse.ts";
-import { discardImage, NEEDED_BYTES, Patcher, storageRoom } from "../patcher/patcher.ts";
+import { discardImage, fetchTools, NEEDED_BYTES, Patcher, sshKeyProblem, storageRoom } from "../patcher/patcher.ts";
 import type { BuildSummary, IpswInfo } from "../patcher/wasm.ts";
 
 export type Path = "patch" | "image";
@@ -54,6 +54,7 @@ class Session {
   patchStage = $state<string>("");
   patchBytes = $state({ done: 0, total: 0 });
   patchStartedAt = $state(0);
+  sshKey = $state(safeGet("bergamota.sshKey"));
   patchInfo = $state.raw<IpswInfo | null>(null);
   patchSummary = $state.raw<BuildSummary | null>(null);
   private patcher: Patcher | null = null;
@@ -177,7 +178,12 @@ class Session {
       };
       const info = await p.open(ipsw);
       this.patchInfo = info;
-      const { file, summary } = await p.build(info);
+      const tools = await fetchTools();
+      if (!tools) this.addLog("note", "no tools bundle on this site: the root gets no SSH server and no first-boot helpers");
+      const key = this.sshKey.trim();
+      if (key && sshKeyProblem(key)) throw new Error(sshKeyProblem(key)!);
+      safeSet("bergamota.sshKey", key);
+      const { file, summary } = await p.build(info, { sshKey: key }, tools ?? undefined);
       this.patchSummary = summary;
       this.patchState = "done";
       await this.pick(file, file.name, "browser");
@@ -255,6 +261,21 @@ class Session {
     this.flashError = null;
     this.progress = null;
     this.go("Confirm");
+  }
+}
+
+function safeGet(k: string): string {
+  try {
+    return localStorage.getItem(k) ?? "";
+  } catch {
+    return "";
+  }
+}
+function safeSet(k: string, v: string) {
+  try {
+    localStorage.setItem(k, v);
+  } catch {
+    /* private window: fine */
   }
 }
 

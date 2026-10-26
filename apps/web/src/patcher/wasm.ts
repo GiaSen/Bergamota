@@ -26,6 +26,10 @@ export interface BuildConfig {
   cache?: boolean;
   tweaks?: boolean;
   verify?: boolean;
+  /** The tools bundle (berga-tools.zip) is source 1: SSH, first-boot job, ... */
+  tools?: boolean;
+  /** The public key SSH logs in with (one line). */
+  sshKey?: string;
 }
 
 export interface BuildSummary {
@@ -101,7 +105,7 @@ export class Renegade {
   }
 
   build(cfg: BuildConfig): BuildSummary {
-    const flat: Record<string, unknown> = { now: cfg.now ?? Math.floor(Date.now() / 1000), macho: cfg.macho ?? true, cache: cfg.cache ?? true, tweaks: cfg.tweaks ?? true, verify: cfg.verify ?? false };
+    const flat: Record<string, unknown> = { now: cfg.now ?? Math.floor(Date.now() / 1000), macho: cfg.macho ?? true, cache: cfg.cache ?? true, tweaks: cfg.tweaks ?? true, verify: cfg.verify ?? false, tools: cfg.tools ?? false, ssh_key: cfg.sshKey ?? "" };
     for (const [url, pem] of Object.entries(cfg.pems ?? {})) flat[`pem:${url}`] = pem;
     const bytes = new TextEncoder().encode(JSON.stringify(flat));
     const p = this.x.rr_alloc(bytes.length);

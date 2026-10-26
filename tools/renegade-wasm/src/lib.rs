@@ -220,7 +220,7 @@ pub extern "C" fn rr_open_ipsw() -> i32 {
 }
 
 /// Runs the build. Config JSON: {"pem:<key URL>": "<PEM>" (one per key URL of the IPSW), "now": unix seconds, "macho": bool, "cache": bool, "tweaks": bool,
-/// "toolsHandle": 1 when a tools bundle is source 1}. The image goes out through `host.write`.
+/// "tools": true when a tools bundle is source 1, "ssh_key": "ssh-ed25519 AAAA..."}. The image goes out through `host.write`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rr_build(cfg_ptr: *const u8, cfg_len: usize) -> i32 {
     // SAFETY: the host passes a buffer it got from rr_alloc
@@ -235,6 +235,11 @@ pub unsafe extern "C" fn rr_build(cfg_ptr: *const u8, cfg_len: usize) -> i32 {
             cfg.cache = None;
         }
         cfg.verify_aea = on("verify", false);
+        if on("tools", false) {
+            // the tools bundle (berga-tools.zip) is host source 1
+            cfg.tools = Some(renegade::tools::Tools::from_zip(Rc::new(HostSrc::new(1)))?);
+            cfg.ssh_key = c.get("ssh_key").filter(|k| !k.trim().is_empty()).cloned();
+        }
         let mut ev = |e: renegade::rootbuild::Event| match e {
             renegade::rootbuild::Event::Stage(s) => event(0, s, 0.0, 0.0),
             renegade::rootbuild::Event::Log(l) => event(1, l, 0.0, 0.0),

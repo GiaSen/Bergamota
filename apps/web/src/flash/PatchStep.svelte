@@ -1,6 +1,6 @@
 <script lang="ts">
   import { session, PATCH_STAGES } from "./session.svelte.ts";
-  import { patcherSupported, NEEDED_BYTES } from "../patcher/patcher.ts";
+  import { patcherSupported, NEEDED_BYTES, sshKeyProblem } from "../patcher/patcher.ts";
   import { fmtBytes, fmtDuration } from "../lib/flasher.ts";
 
   const supported = patcherSupported();
@@ -12,6 +12,7 @@
   });
   const at = $derived(PATCH_STAGES.findIndex(([k]) => k === session.patchStage));
   const elapsed = $derived((now - session.patchStartedAt) / 1000);
+  const keyProblem = $derived(sshKeyProblem(session.sshKey));
   const frac = $derived(session.patchBytes.total ? session.patchBytes.done / session.patchBytes.total : 0);
 </script>
 
@@ -26,9 +27,14 @@
     <ol class="stages">
       {#each PATCH_STAGES as [, text]}<li>{text}</li>{/each}
     </ol>
+    <label class="key">
+      <span><b>Your SSH public key</b> (optional, recommended)</span>
+      <input bind:value={session.sshKey} placeholder="ssh-ed25519 AAAA… you@computer" autocomplete="off" spellcheck="false" aria-invalid={!!keyProblem} />
+      <small class:problem={!!keyProblem}>{keyProblem ?? "The phone runs an SSH server (over the USB cable) that only this key can open. Without a key there is no SSH. Paste the contents of ~/.ssh/id_ed25519.pub, never the private key."}</small>
+    </label>
     <p class="muted">It takes a while: tens of minutes on a laptop. Keep this tab open and the computer awake.</p>
     <div class="row">
-      <button class="btn leaf" onclick={() => session.startPatch()}>Start patching</button>
+      <button class="btn leaf" disabled={!!keyProblem} onclick={() => session.startPatch()}>Start patching</button>
       <button class="btn ghost" onclick={() => session.setPath("image")}>Flash an image I built</button>
     </div>
   {:else if session.patchState === "running"}
@@ -60,6 +66,11 @@
 </section>
 
 <style>
+  .key { display: grid; gap: 6px; margin: 4px 0 18px; font-size: 15px; }
+  .key input { font: 500 14px var(--mono); padding: 12px 14px; border: 2px solid var(--ink); border-radius: 4px; background: var(--white); min-width: 0; }
+  .key input[aria-invalid="true"] { border-color: #b3261e; }
+  .key small { color: var(--ink-soft); }
+  .key small.problem { color: #6b1d0c; }
   .stages { margin: 6px 0 18px; padding-left: 22px; display: grid; gap: 4px; color: var(--ink-soft); }
   .live li.done { color: var(--ink); text-decoration: line-through; text-decoration-thickness: 2px; }
   .live li.now { color: var(--ink); font-weight: 800; }

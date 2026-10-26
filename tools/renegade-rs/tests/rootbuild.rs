@@ -74,6 +74,9 @@ fn synthetic_ipsw_builds_a_root() {
         let o = Command::new("python3").arg("-I").arg(here().join("tests/tweaks_fixture.py")).arg("make").arg(m).arg(&tools).output().unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         fs::create_dir_all(m.join("usr/lib")).unwrap();
+        fs::create_dir_all(m.join("private/etc")).unwrap();
+        fs::write(m.join("private/etc/shells"), "/bin/bash\n").unwrap();
+        fs::write(m.join("private/etc/passwd"), "root:*:0:0:System Administrator:/var/root:/bin/sh\n").unwrap();
         fs::copy(fixtures.join("libpac.dylib"), m.join("usr/lib/libpac.dylib")).unwrap();
         fs::write(m.join("usr/lib/both.txt"), "from the OS volume").unwrap();
         fs::write(m.join("usr/lib/hello.txt"), "hello").unwrap();
@@ -178,5 +181,23 @@ fn synthetic_ipsw_builds_a_root() {
         let text = format!("{}{}", String::from_utf8_lossy(&f.stdout), String::from_utf8_lossy(&f.stderr));
         assert!(f.status.success() && text.contains("appears to be OK"), "fsck_hfs:\n{text}");
     }
+    // the same IPSW with a tools bundle and an SSH key: the SSH server, its key and the first-boot job are in the image
+    let tools_zip = work.join("berga-tools.zip");
+    let mk = "import sys,zipfile,hashlib,json\nz=zipfile.ZipFile(sys.argv[1],'w',zipfile.ZIP_DEFLATED)\nfiles=[]\nfor n,d in [('ssh/dropbear',b'db\\0'),('ssh/dash',b'sh'),('ssh/toybox',b'tb\\0ls\\0cat\\0'),('sweetnet/sweetnetcfg',b'cfg'),('sweetnet/ios18/sweetuicache',b'uic')]:\n    z.writestr(n,d); files.append({'path':n,'sha256':hashlib.sha256(d).hexdigest()})\nz.writestr('berga-tools.json',json.dumps({'files':files}))\nz.close()\n";
+    assert!(run(Command::new("python3").args(["-I", "-c", mk]).arg(&tools_zip)));
+    let mut cfg = renegade::rootbuild::Config { now: 1_700_000_000, volume_size: Some(64 << 20), ..Default::default() };
+    cfg.tools = Some(renegade::tools::Tools::from_zip(Rc::new(FileAt::open(&tools_zip).unwrap())).unwrap());
+    cfg.ssh_key = Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkey me@laptop".into());
+    let (out2, _) = renegade::rootbuild::build(&ip, &mut cfg, Cursor::new(Vec::new()), &mut |_| {}).unwrap();
+    let img2 = work.join("root2.simg");
+    fs::write(&img2, out2.into_inner()).unwrap();
+    let v2 = Volume::open(Sparse::open(FileAt::open(&img2).unwrap()).unwrap()).unwrap();
+    let read2 = |p: &str| v2.read_file(v2.lookup(p, false).unwrap().unwrap_or_else(|| panic!("{p} is not in the image"))).unwrap();
+    assert_eq!(read2("usr/local/bin/dropbear"), b"db\0");
+    assert_eq!(read2("bin/sh"), b"sh");
+    assert_eq!(read2("private/var/root/.ssh/authorized_keys"), b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkey me@laptop\n");
+    assert!(read2("private/etc/shells").ends_with(b"/bin/sh\n"));
+    assert!(v2.lookup("usr/local/bin/ls", false).unwrap().is_some(), "toybox applets are linked");
+    assert!(v2.lookup("usr/local/libexec/renegade-firstboot.sh", false).unwrap().is_some());
     let _ = fs::remove_dir_all(&work);
 }
