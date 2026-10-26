@@ -17,6 +17,7 @@
 //! - [`tweaks`]: the tweaks stage (root_tweaks18.py), the self-contained part
 //! - [`hfswrite`]: a new HFSX writer (the Python build uses newfs_hfs + a mount + ditto instead)
 
+pub mod apfs;
 pub mod bundle;
 pub mod codesign;
 pub mod fixups;
