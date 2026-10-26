@@ -195,7 +195,9 @@ class Session {
       await this.pick(file, file.name, "browser");
     } catch (e) {
       this.patchState = "error";
-      this.patchError = (e as Error).message;
+      const m = (e as Error).message;
+      // a Rust panic aborts the module with a bare "unreachable"; the module logged the reason just before
+      this.patchError = /unreachable|out of memory|memory access/i.test(m) && this.patchNote ? `${this.patchNote} (${m})` : m;
     } finally {
       this.patcher?.terminate();
       this.patcher = null;
