@@ -719,6 +719,7 @@ drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles, int64_t timeout_
 EXPORT int drmSyncobjTimelineSignal(int fd, const uint32_t *h, uint64_t *p, uint32_t n) { (void)fd; (void)h; (void)p; (void)n; return sobj_err(ENOSYS); }
 EXPORT int drmSyncobjTimelineWait(int fd, uint32_t *h, uint64_t *p, unsigned n, int64_t t, unsigned f, uint32_t *first) { (void)fd; (void)h; (void)p; (void)n; (void)t; (void)f; (void)first; return sobj_err(ENOSYS); }
 EXPORT int drmSyncobjQuery(int fd, uint32_t *h, uint64_t *p, uint32_t n) { (void)fd; (void)h; (void)p; (void)n; return sobj_err(ENOSYS); }
+EXPORT int drmSyncobjQuery2(int fd, uint32_t *h, uint64_t *p, uint32_t n, uint32_t f) { (void)fd; (void)h; (void)p; (void)n; (void)f; return sobj_err(ENOSYS); }
 EXPORT int drmSyncobjTransfer(int fd, uint32_t dh, uint64_t dp, uint32_t sh, uint64_t sp, uint32_t f) { (void)fd; (void)dh; (void)dp; (void)sh; (void)sp; (void)f; return sobj_err(ENOSYS); }
 EXPORT int drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd) { (void)fd; (void)handle; (void)obj_fd; return sobj_err(ENOSYS); }
 EXPORT int drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle) { (void)fd; (void)obj_fd; (void)handle; return sobj_err(ENOSYS); }
