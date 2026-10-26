@@ -84,11 +84,11 @@ impl<T: ReadAt + ?Sized> ReadAt for &T {
     }
 }
 
-pub(crate) fn short(off: u64) -> Error {
+pub fn short(off: u64) -> Error {
     Error::new(ErrorKind::UnexpectedEof, format!("read past the end at byte {off}"))
 }
 
-pub(crate) fn bad(msg: impl Into<String>) -> Error {
+pub fn bad(msg: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidData, msg.into())
 }
 

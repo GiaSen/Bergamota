@@ -89,6 +89,10 @@ impl Ipsw {
     pub fn member(&self, im: Image) -> Result<Src> {
         let p = self.path_of(im);
         let e = self.zip.find(p).ok_or_else(|| bad(format!("{p}: not in the IPSW")))?;
+        if e.method == 8 {
+            // a deflated image (the small AppOS one): inflated whole
+            return Ok(Rc::new(self.zip.read_all(e)?));
+        }
         Ok(Rc::new(self.zip.stored(e)?))
     }
 

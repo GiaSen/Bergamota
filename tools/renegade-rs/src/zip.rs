@@ -103,7 +103,7 @@ impl Zip {
 
     /// The whole member, inflated if needed (checks the CRC-32).
     pub fn read_all(&self, e: &ZipEntry) -> Result<Vec<u8>> {
-        if e.size > (1 << 30) {
+        if e.size > (2 << 30) {
             return Err(bad(format!("{}: too big to read whole", e.name)));
         }
         let raw = self.src.read_vec(self.data_offset(e)?, e.csize as usize)?;

@@ -4,6 +4,8 @@
 import { ALLOWED_PARTITIONS, FastbootDevice, FastbootError, type LogKind, type Partition } from "../lib/fastboot.ts";
 import { checkImage, flash, identify, phoneProblems, SAFE_PIECE, type Checked, type PhoneInfo, type Progress } from "../lib/flasher.ts";
 import { blobSource, type ByteSource } from "../lib/sparse.ts";
+import { discardImage, NEEDED_BYTES, Patcher, storageRoom } from "../patcher/patcher.ts";
+import type { BuildSummary, IpswInfo } from "../patcher/wasm.ts";
 
 export type Path = "patch" | "image";
 export const STEPS: Record<Path, string[]> = {
@@ -16,6 +18,16 @@ export interface LogLine {
   text: string;
   at: number;
 }
+
+/** The patcher's stages in the order the module reports them, with what to tell the user. */
+export const PATCH_STAGES: [string, string][] = [
+  ["open", "Open the IPSW and decrypt its disk images"],
+  ["copy", "Merge the root and the cryptexes"],
+  ["tweaks", "Apply Bergamota's first-boot changes"],
+  ["macho", "Rewrite and re-sign every program"],
+  ["cache", "Rewrite the shared cache"],
+  ["seal", "Write the HFS+ root as a sparse image"],
+];
 
 export interface Picked {
   name: string;
@@ -36,6 +48,15 @@ class Session {
   connectError = $state<string | null>(null);
 
   ipsw = $state.raw<File | null>(null);
+
+  patchState = $state<"idle" | "running" | "done" | "error">("idle");
+  patchError = $state<string | null>(null);
+  patchStage = $state<string>("");
+  patchBytes = $state({ done: 0, total: 0 });
+  patchStartedAt = $state(0);
+  patchInfo = $state.raw<IpswInfo | null>(null);
+  patchSummary = $state.raw<BuildSummary | null>(null);
+  private patcher: Patcher | null = null;
 
   partition = $state<Partition>("userdata");
   picked = $state.raw<Picked | null>(null);
@@ -129,6 +150,51 @@ class Session {
     } finally {
       this.checking = false;
     }
+  }
+
+  /** Runs the in-browser patcher over the chosen IPSW; the image lands in OPFS and becomes the picked image. */
+  async startPatch() {
+    const ipsw = this.ipsw;
+    if (!ipsw || this.patchState === "running") return;
+    this.patchState = "running";
+    this.patchError = null;
+    this.patchStage = "open";
+    this.patchBytes = { done: 0, total: 0 };
+    this.patchStartedAt = performance.now();
+    this.patchSummary = null;
+    let lock: WakeLockSentinel | null = null;
+    try {
+      lock = await navigator.wakeLock?.request("screen").catch(() => null) ?? null;
+      const room = await storageRoom();
+      if (!room.ok) throw new Error(`This browser has only ${(room.free / 2 ** 30).toFixed(0)} GB of private storage left; the root image needs about ${NEEDED_BYTES / 2 ** 30} GB. Free some disk space and try again.`);
+      await discardImage();
+      this.patcher?.terminate();
+      const p = (this.patcher = new Patcher());
+      p.onEvent = (e) => {
+        if (e.kind === "stage") this.patchStage = e.text;
+        else if (e.kind === "bytes") this.patchBytes = { done: e.done, total: e.total };
+        else this.addLog("note", e.text);
+      };
+      const info = await p.open(ipsw);
+      this.patchInfo = info;
+      const { file, summary } = await p.build(info);
+      this.patchSummary = summary;
+      this.patchState = "done";
+      await this.pick(file, file.name, "browser");
+    } catch (e) {
+      this.patchState = "error";
+      this.patchError = (e as Error).message;
+    } finally {
+      this.patcher?.terminate();
+      this.patcher = null;
+      await lock?.release().catch(() => {});
+    }
+  }
+
+  cancelPatch() {
+    this.patcher?.terminate();
+    this.patcher = null;
+    this.patchState = "idle";
   }
 
   async setPartition(p: Partition) {

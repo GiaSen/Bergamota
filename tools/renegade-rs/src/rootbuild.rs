@@ -21,8 +21,8 @@ use std::rc::Rc;
 use unicode_normalization::UnicodeNormalization;
 
 pub struct Config {
-    /// the AEA key's private key (PEM) when the IPSW has `.aea` images
-    pub pem: Option<String>,
+    /// The AEA keys' private keys (PEM) by the key URL the archives name, when the IPSW has `.aea` images.
+    pub pems: Vec<(String, String)>,
     /// unix seconds for dates of new files and the volume
     pub now: u32,
     pub verify_aea: bool,
@@ -42,7 +42,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { pem: None, now: 0, verify_aea: false, macho: true, cache: Some(dsc::Options::default()), tweaks: true, quiet: false, netcfg: None, sweetreboot: None, volume_size: None, tap: None }
+        Config { pems: Vec::new(), now: 0, verify_aea: false, macho: true, cache: Some(dsc::Options::default()), tweaks: true, quiet: false, netcfg: None, sweetreboot: None, volume_size: None, tap: None }
     }
 }
 
@@ -110,7 +110,11 @@ pub fn build<W: Write + Seek>(ipsw: &Ipsw, cfg: &mut Config, out: W, ev: &mut dy
     ev(Event::Log(&format!("{} {} ({})", ipsw.manifest.device, ipsw.manifest.version, ipsw.manifest.build)));
     let mut vols: Vec<Vol> = Vec::new();
     for im in Image::ALL {
-        let src = ipsw.open_image(im, cfg.pem.as_deref(), cfg.verify_aea)?;
+        let pem = match ipsw.key_url(im)? {
+            Some(u) => Some(cfg.pems.iter().find(|(k, _)| *k == u).map(|(_, p)| p.as_str()).ok_or_else(|| bad(format!("{}: the key at {u} was not provided", im.name())))?),
+            None => None,
+        };
+        let src = ipsw.open_image(im, pem, cfg.verify_aea)?;
         let c = Container::open(src)?;
         let v = pick_volume(&c, im)?;
         ev(Event::Log(&format!("{}: volume {:?}, {} files", im.name(), v.info().name, v.info().num_files)));

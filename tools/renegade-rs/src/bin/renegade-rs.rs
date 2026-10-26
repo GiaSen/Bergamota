@@ -986,10 +986,16 @@ fn cmd_root_ipsw(args: &[String]) -> Res<ExitCode> {
     if flags.iter().any(|f| f == "--no-cache") {
         cfg.cache = None;
     }
-    if let Some(f) = opts.get("--pem") {
-        cfg.pem = Some(fs::read_to_string(f)?);
-    } else if let Some(u) = ipsw.key_url(renegade::ipsw::Image::Os)? {
-        cfg.pem = Some(http_get(&u)?);
+    for im in renegade::ipsw::Image::ALL {
+        if let Some(u) = ipsw.key_url(im)?
+            && !cfg.pems.iter().any(|(k, _)| *k == u)
+        {
+            let pem = match opts.get("--pem") {
+                Some(f) => fs::read_to_string(f)?,
+                None => http_get(&u)?,
+            };
+            cfg.pems.push((u, pem));
+        }
     }
     // --compare: every file written is checked against the same path in a finished (Python-built) image
     let report: Rc<RefCell<(u64, u64, BTreeMap<String, u64>)>> = Rc::new(RefCell::new((0, 0, BTreeMap::new())));

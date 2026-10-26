@@ -16,9 +16,9 @@
 
   {#if ok}
     <h2 id="connect-title">Your phone is connected.</h2>
-    <p>Nothing has been written. Next, choose what to put on it.</p>
+    <p>Nothing has been written. Next, {session.path === "patch" ? "confirm what goes on it" : "choose what to put on it"}.</p>
     <div class="row">
-      <button class="btn leaf" onclick={() => session.go("Choose")}>Continue</button>
+      <button class="btn leaf" onclick={() => session.go(session.path === "patch" ? "Confirm" : "Choose")}>Continue</button>
       <button class="btn ghost" onclick={() => session.connect()}>Use another phone</button>
     </div>
   {:else}

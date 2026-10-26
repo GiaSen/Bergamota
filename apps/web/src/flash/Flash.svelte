@@ -19,7 +19,10 @@
     if (session.path === "patch") {
       if (name === "IPSW") return true;
       if (name === "Patch") return !!session.ipsw;
-      return false; // the in-browser patcher is not here yet
+      if (name === "Connect") return session.patchState === "done";
+      const ready = session.patchState === "done" && !!session.phone && !session.phoneProblems.length;
+      if (name === "Confirm") return ready && !!session.checked && !session.checked.problems.length;
+      return ready && session.flashState !== "idle";
     }
     if (name === "Connect") return true;
     const phoneOk = !!session.phone && !session.phoneProblems.length;
