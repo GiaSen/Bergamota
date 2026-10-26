@@ -234,6 +234,228 @@ mod mac {
     }
 }
 
+
+#[cfg(target_os = "macos")]
+mod synth {
+    use super::mac::*;
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::{symlink, FileExt, PermissionsExt};
+    use std::path::Path;
+
+    fn pseudo(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9e3779b97f4a7c15) | 1;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn text(n: usize) -> Vec<u8> {
+        let line = b"the quick brown fox jumps over the lazy dog 0123456789 \n";
+        line.iter().cycle().take(n).copied().collect()
+    }
+
+    pub fn populate(root: &Path, case_sensitive: bool, src: &Path) {
+        let w = |p: &str, d: &[u8]| {
+            let p = root.join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, d).unwrap();
+        };
+        // plain files of awkward sizes
+        for (i, n) in [0usize, 1, 511, 4095, 4096, 4097, 65535, 65536, 65537, 1 << 20, (3 << 20) + 17].into_iter().enumerate() {
+            w(&format!("sizes/f{n}"), &pseudo(n, i as u64 + 1));
+        }
+        // names
+        w("names/with space/ünï cödé.txt", b"unicode");
+        w("names/日本語/ファイル.txt", b"cjk");
+        w("names/emoji-\u{1F600}", b"emoji");
+        w("names/Mixed Case/UPPER", b"u");
+        w("names/Mixed Case/lower", b"l");
+        w("names/.hidden", b"h");
+        w("names/long-".to_string().as_str(), b"x");
+        w(&format!("names/{}", "n".repeat(250)), b"255-ish");
+        if case_sensitive {
+            w("names/cs/Abc", b"1");
+            w("names/cs/abc", b"2");
+            w("names/cs/e\u{301}", b"nfd");
+            w("names/cs/\u{e9}", b"nfc");
+        }
+        // permissions
+        for (n, m) in [("m4755", 0o4755), ("m2755", 0o2755), ("m0600", 0o600), ("m0000", 0o000), ("m0444", 0o444)] {
+            w(&format!("perm/{n}"), b"p");
+            std::fs::set_permissions(root.join("perm").join(n), std::fs::Permissions::from_mode(m)).unwrap();
+        }
+        std::fs::create_dir_all(root.join("perm/sticky")).unwrap();
+        std::fs::set_permissions(root.join("perm/sticky"), std::fs::Permissions::from_mode(0o1777)).unwrap();
+        // fragmented multi-extent files: two files grown alternately
+        {
+            let mut a = std::fs::File::create(root.join("frag-a")).unwrap();
+            let mut b = std::fs::File::create(root.join("frag-b")).unwrap();
+            for i in 0..300u64 {
+                a.write_all(&pseudo(10_000, i)).unwrap();
+                a.sync_all().unwrap();
+                b.write_all(&pseudo(7_000, i + 1000)).unwrap();
+                b.sync_all().unwrap();
+            }
+        }
+        // sparse files: holes between written islands, and a hole at the end
+        {
+            let f = std::fs::File::create(root.join("sparse")).unwrap();
+            f.set_len(300 << 20).unwrap();
+            f.write_all_at(b"head", 0).unwrap();
+            f.write_all_at(&pseudo(20_000, 5), 100 << 20).unwrap();
+            f.write_all_at(b"tail", (300 << 20) - 4).unwrap();
+            let g = std::fs::File::create(root.join("sparse-hole-only")).unwrap();
+            g.set_len(10 << 20).unwrap();
+        }
+        // links
+        w("links/target", b"hard link target");
+        std::fs::create_dir_all(root.join("links/d1/d2")).unwrap();
+        std::fs::hard_link(root.join("links/target"), root.join("links/d1/second")).unwrap();
+        std::fs::hard_link(root.join("links/target"), root.join("links/d1/d2/third")).unwrap();
+        w("links/other", b"o");
+        std::fs::hard_link(root.join("links/other"), root.join("links/other2")).unwrap();
+        symlink("target", root.join("links/rel")).unwrap();
+        symlink("/abs/path/elsewhere", root.join("links/abs")).unwrap();
+        symlink("does-not-exist", root.join("links/dangling")).unwrap();
+        symlink("d1/d2", root.join("links/dirlink")).unwrap();
+        symlink("é".repeat(400), root.join("links/long")).unwrap();
+        // special files
+        sh(&format!("mkfifo '{}'", root.join("links/fifo").display()));
+        // (bound from inside the directory: the mount path is longer than a socket path may be)
+        sh(&format!("cd '{}' && python3 -c \"import socket; socket.socket(socket.AF_UNIX).bind('sock')\"", root.join("links").display()));
+        // clone, then change the middle of the clone
+        w("clone/orig", &pseudo(1 << 20, 77));
+        sh(&format!("cp -c '{}' '{}'", root.join("clone/orig").display(), root.join("clone/copy").display()));
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(root.join("clone/copy")).unwrap();
+            f.write_all_at(&pseudo(5000, 78), 300_000).unwrap();
+        }
+        // extended attributes (the reader skips them)
+        w("xattr/file", b"has xattrs");
+        sh(&format!("xattr -w user.test value '{}'", root.join("xattr/file").display()));
+        // many names: a multi-level file-system tree
+        for d in 0..40 {
+            for i in 0..200 {
+                std::fs::create_dir_all(root.join(format!("many/d{d:03}"))).unwrap();
+                std::fs::File::create(root.join(format!("many/d{d:03}/file-{i:05}-with-a-longish-name"))).unwrap();
+            }
+        }
+        // compressed with ditto (zlib in the attribute, zlib in the resource fork)
+        let d = root.join("compressed");
+        std::fs::create_dir_all(&d).unwrap();
+        let mut cases: Vec<(String, Vec<u8>)> = vec![
+            ("tiny.txt".into(), text(100)),
+            ("small.txt".into(), text(3000)),
+            ("empty.txt".into(), Vec::new()),
+            ("exact64k.txt".into(), text(65536)),
+            ("over64k.txt".into(), text(65537)),
+            ("big.txt".into(), text(3 << 20)),
+            ("random.bin".into(), pseudo(300_000, 9)),
+            ("mixed.bin".into(), [text(70_000), pseudo(70_000, 3), text(50_000)].concat()),
+        ];
+        cases.push(("zeros.bin".into(), vec![0u8; 500_000]));
+        for (n, data) in &cases {
+            std::fs::write(src.join(n), data).unwrap();
+        }
+        sh(&format!("ditto --hfsCompression '{}' '{}'", src.display(), d.display()));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn synthetic(case_sensitive: bool, tag: &str) {
+    use mac::*;
+    if !have_hdiutil() {
+        return;
+    }
+    let work = work_dir(tag);
+    let src = work.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let Some(img) = make_image(&work, tag, case_sensitive, 700, &|root| synth::populate(root, case_sensitive, &src)) else {
+        eprintln!("hdiutil could not make the image; skipped");
+        return;
+    };
+    let rep = compare(&img, &work, tag, true);
+    println!("{rep:#?}");
+    assert!(rep.mismatches.is_empty(), "{:#?}", rep.mismatches);
+    assert!(rep.hardlink_groups >= 2);
+    assert_eq!(rep.unreadable, 1, "only the mode-000 file is unreadable on the mount");
+
+    let c = Container::open(FileAt::open(&img).unwrap()).unwrap();
+    let vols = c.volumes().unwrap();
+    assert_eq!(vols.len(), 1);
+    assert_eq!(vols[0].name, "T");
+    assert_eq!(vols[0].case_insensitive, !case_sensitive);
+    assert!(!vols[0].sealed && !vols[0].encrypted);
+    let v = c.volume(0).unwrap();
+    let st = v.fsck_stats().unwrap();
+    println!("{st}");
+    assert!(st.consistent(), "{st}");
+    assert!(st.hardlink_groups >= 2);
+    assert!(st.symlinks >= 5);
+    assert!(st.others >= 2, "fifo and socket");
+    assert!(st.sparse_extents > 0 || st.file_extents > 0);
+    println!("compressed types seen: {:?}", st.compressed);
+    assert!(!st.compressed.is_empty(), "ditto --hfsCompression made no compressed file");
+
+    // lookup, read_link, read_dir
+    let big = v.lookup("compressed/big.txt").unwrap().unwrap();
+    assert_eq!(big.size, 3 << 20);
+    assert_ne!(big.compression, 0);
+    let t = v.lookup("links/target").unwrap().unwrap();
+    assert_eq!(t.nlink, 3);
+    assert_eq!(v.lookup("links/d1/second").unwrap().unwrap().ino, t.ino);
+    assert_eq!(v.lookup("links/d1/d2/third").unwrap().unwrap().ino, t.ino);
+    assert!(v.lookup("links/nothing").unwrap().is_none());
+    assert!(v.lookup("links/target/x").unwrap().is_none());
+    assert_eq!(v.lookup("").unwrap().unwrap().ino, 2);
+    let rel = v.lookup("links/rel").unwrap().unwrap();
+    assert_eq!(rel.kind, Kind::Symlink);
+    assert_eq!(v.read_link(rel.ino).unwrap(), "target");
+    assert_eq!(v.lookup("Names/MIXED case/Upper").unwrap().is_some(), !case_sensitive);
+    assert_eq!(v.read_dir(v.lookup("many/d007").unwrap().unwrap().ino).unwrap().len(), 200);
+    assert_eq!(v.lookup("names/cs/Abc").unwrap().is_some(), case_sensitive);
+
+    // random access into a multi-extent file, a sparse file and compressed files
+    let sp = v.lookup("sparse").unwrap().unwrap();
+    assert_eq!(sp.size, 300 << 20);
+    let f = v.open_file(sp.ino).unwrap();
+    let mut b = vec![0xffu8; 4];
+    f.read_at(0, &mut b).unwrap();
+    assert_eq!(&b, b"head");
+    f.read_at((300 << 20) - 4, &mut b).unwrap();
+    assert_eq!(&b, b"tail");
+    let mut z = vec![0xffu8; 1 << 20];
+    f.read_at(50 << 20, &mut z).unwrap();
+    assert!(z.iter().all(|&x| x == 0), "hole reads as zeros");
+    let mut over = vec![0u8; 10];
+    assert!(f.read_at((300 << 20) - 5, &mut over).is_err(), "reads past the end fail");
+    let hole = v.open_file(v.lookup("sparse-hole-only").unwrap().unwrap().ino).unwrap();
+    let mut z = vec![1u8; 4096];
+    hole.read_at(5 << 20, &mut z).unwrap();
+    assert!(z.iter().all(|&x| x == 0));
+    assert!(v.open_file(2).is_err(), "directories cannot be opened as files");
+    drop(c);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn synthetic_case_insensitive_matches_mount() {
+    synthetic(false, "ci");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn synthetic_case_sensitive_matches_mount() {
+    synthetic(true, "cs");
+}
+
 fn real_image() -> Option<String> {
     std::env::var("RENEGADE_TEST_APFS").ok().filter(|p| std::path::Path::new(p).exists())
 }

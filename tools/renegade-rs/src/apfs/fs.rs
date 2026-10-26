@@ -187,6 +187,7 @@ pub(crate) fn scan<R: ReadAt>(vol: &VolCore<R>) -> Result<Scan> {
     let tree = vol.fs_tree()?;
     let mut cur = Cursor::first(&tree);
     let mut s = Scan { inodes: Vec::new(), drecs: Vec::new(), names: Vec::new(), targets: Default::default(), stats: ScanStats::default(), lossy_names: 0 };
+    let side = vol.fs_tree()?; // for attributes kept in data streams
     let mut cur_flags = 0u32;
     let nblocks = vol.sh.nblocks;
     let bs = vol.sh.bs as u64;
@@ -252,11 +253,9 @@ pub(crate) fn scan<R: ReadAt>(vol: &VolCore<R>) -> Result<Scan> {
                     }
                 } else if name == XA_DECMPFS && cur_flags & UF_COMPRESSED != 0 {
                     let (flags, data) = parse_xattr(rec.val())?;
-                    if flags & XATTR_DATA_EMBEDDED != 0 {
-                        if let Some((t, size)) = decmpfs_header(data) {
-                            last.cmp = cmp_type_byte(t);
-                            last.size = size;
-                        }
+                    if let Some((t, size)) = decmpfs_header(&super::file::xattr_bytes(vol, &side, flags, data)?) {
+                        last.cmp = cmp_type_byte(t);
+                        last.size = size;
                     }
                 }
             }
@@ -365,11 +364,9 @@ impl<R: ReadAt> VolCore<R> {
             }
         } else if r.mode & S_IFMT == S_IFREG && r.bsd_flags & UF_COMPRESSED != 0 {
             if let Some((f, d)) = self.xattr(tree, id, XA_DECMPFS)? {
-                if f & XATTR_DATA_EMBEDDED != 0 {
-                    if let Some((t, s)) = decmpfs_header(&d) {
-                        compression = t;
-                        size = s;
-                    }
+                if let Some((t, s)) = decmpfs_header(&super::file::xattr_bytes(self, tree, f, &d)?) {
+                    compression = t;
+                    size = s;
                 }
             }
         }

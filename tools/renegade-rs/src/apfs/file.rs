@@ -18,6 +18,8 @@ const MAX_CHUNK_RAW: u64 = CHUNK + 4096;
 const MAX_INLINE: u64 = 64 << 20;
 const CACHED_CHUNKS: usize = 8;
 
+pub(crate) type LzCell = RefCell<Option<lzfse_rust::LzfseRingDecoder>>;
+
 #[derive(Clone, Copy)]
 struct Ext {
     logical: u64,
@@ -114,6 +116,25 @@ impl<R: ReadAt> File<R> {
     }
 }
 
+/// The bytes of an extended attribute's value: inline, or read through its data stream.
+pub(crate) fn xattr_bytes<R: ReadAt>(vol: &VolCore<R>, tree: &Tree<'_, R>, flags: u16, data: &[u8]) -> Result<Vec<u8>> {
+    if flags & XATTR_DATA_EMBEDDED != 0 {
+        return Ok(data.to_vec());
+    }
+    if flags & XATTR_DATA_STREAM == 0 {
+        return Err(bad("extended attribute has no data"));
+    }
+    let id = le64(data, 0)?;
+    let size = le64(data, 8)?;
+    if size > MAX_INLINE {
+        return Err(bad(format!("extended attribute stream of {size} bytes is too large")));
+    }
+    let s = load_extents(vol, tree, id)?;
+    let mut b = vec![0u8; size as usize];
+    s.read(&vol.sh, 0, &mut b)?;
+    Ok(b)
+}
+
 fn load_extents<R: ReadAt>(vol: &VolCore<R>, tree: &Tree<'_, R>, id: u64) -> Result<Stream> {
     let mut exts: Vec<Ext> = Vec::new();
     fn add(exts: &mut Vec<Ext>, id: u64, logical: u64, v: &[u8]) -> Result<()> {
@@ -156,10 +177,8 @@ pub(crate) fn open<R: ReadAt>(vol: &Rc<VolCore<R>>, ino: u64) -> Result<File<R>>
         return Err(bad(format!("inode {ino} is a dataless file (its data is not on the volume)")));
     }
     if r.bsd_flags & UF_COMPRESSED != 0 {
-        if let Some((fl, attr)) = vol.xattr(&tree, ino, XA_DECMPFS)? {
-            if fl & XATTR_DATA_EMBEDDED == 0 {
-                return Err(bad("decmpfs attribute is not embedded"));
-            }
+        if let Some((fl, raw)) = vol.xattr(&tree, ino, XA_DECMPFS)? {
+            let attr = xattr_bytes(vol, &tree, fl, &raw)?;
             return open_compressed(vol, &tree, ino, &attr);
         }
     }
@@ -189,7 +208,7 @@ fn open_compressed<R: ReadAt>(vol: &Rc<VolCore<R>>, tree: &Tree<'_, R>, ino: u64
             } else {
                 return Err(bad("resource fork attribute has no data"));
             };
-            let blocks = chunk_table(vol, ty, &rsrc, size)?;
+            let blocks = chunk_table(&vol.sh, ty, &rsrc, size)?;
             Ok(mk(Body::Chunked { ty, rsrc, blocks, cache: RefCell::new(Vec::new()) }))
         }
         5 => Err(bad(format!("inode {ino}: decmpfs type 5 (dataless / sparse compressed file) is not supported"))),
@@ -199,7 +218,7 @@ fn open_compressed<R: ReadAt>(vol: &Rc<VolCore<R>>, tree: &Tree<'_, R>, ino: u64
 }
 
 /// (offset, length) of each 64 KiB chunk in the resource fork.
-fn chunk_table<R: ReadAt>(vol: &VolCore<R>, ty: u32, rsrc: &Rsrc, size: u64) -> Result<Vec<(u64, u32)>> {
+fn chunk_table<R: ReadAt>(sh: &Shared<R>, ty: u32, rsrc: &Rsrc, size: u64) -> Result<Vec<(u64, u32)>> {
     let n = size.div_ceil(CHUNK);
     let fsz = rsrc.size();
     let mut out = Vec::new();
@@ -212,7 +231,7 @@ fn chunk_table<R: ReadAt>(vol: &VolCore<R>, ty: u32, rsrc: &Rsrc, size: u64) -> 
         if need > fsz {
             return Err(bad("zlib resource fork is too small for its chunk table"));
         }
-        let t = rsrc.read(&vol.sh, 0x104, 4 + 8 * n as usize)?;
+        let t = rsrc.read(sh, 0x104, 4 + 8 * n as usize)?;
         if le32(&t, 0)? as u64 != n {
             return Err(bad("zlib resource fork: chunk count does not match the file size"));
         }
@@ -229,7 +248,7 @@ fn chunk_table<R: ReadAt>(vol: &VolCore<R>, ty: u32, rsrc: &Rsrc, size: u64) -> 
         if (n + 1) * 4 > fsz {
             return Err(bad("resource fork is too small for its chunk table"));
         }
-        let t = rsrc.read(&vol.sh, 0, 4 * (n as usize + 1))?;
+        let t = rsrc.read(sh, 0, 4 * (n as usize + 1))?;
         let mut prev = le32(&t, 0)? as u64;
         if prev < 4 * (n + 1) {
             return Err(bad("resource fork: first chunk overlaps the chunk table"));
@@ -265,7 +284,7 @@ impl std::io::Write for Bounded {
 }
 
 /// Decodes one decmpfs block (a whole inline attribute or one 64 KiB chunk) to exactly `expect` bytes.
-fn decode_block<R: ReadAt>(vol: &VolCore<R>, ty: u32, raw: &[u8], expect: usize) -> Result<Vec<u8>> {
+fn decode_block(lz: &LzCell, ty: u32, raw: &[u8], expect: usize) -> Result<Vec<u8>> {
     let first = *raw.first().ok_or_else(|| bad("empty compressed block"))?;
     let out = match ty {
         1 => raw.to_vec(),
@@ -287,7 +306,7 @@ fn decode_block<R: ReadAt>(vol: &VolCore<R>, ty: u32, raw: &[u8], expect: usize)
             if first == 0xff {
                 raw[1..].to_vec()
             } else {
-                let mut slot = vol.lzfse.borrow_mut();
+                let mut slot = lz.borrow_mut();
                 let dec = slot.get_or_insert_with(Default::default);
                 let mut w = Bounded { v: Vec::with_capacity(expect), max: expect };
                 match dec.decode(&mut &raw[..], &mut w) {
@@ -323,7 +342,7 @@ impl<R: ReadAt> File<R> {
         if let Some(d) = decoded.borrow().as_ref() {
             return Ok(d.clone());
         }
-        let d = if self.size == 0 { Vec::new() } else { decode_block(&self.vol, *ty, raw, self.size as usize)? };
+        let d = if self.size == 0 { Vec::new() } else { decode_block(&self.vol.lzfse, *ty, raw, self.size as usize)? };
         let d = Rc::new(d);
         *decoded.borrow_mut() = Some(d.clone());
         Ok(d)
@@ -343,7 +362,7 @@ impl<R: ReadAt> File<R> {
         let (off, len) = *blocks.get(i).ok_or_else(|| bad("chunk index out of range"))?;
         let raw = rsrc.read(&self.vol.sh, off, len as usize)?;
         let expect = (self.size - i as u64 * CHUNK).min(CHUNK) as usize;
-        let out = Rc::new(decode_block(&self.vol, *ty, &raw, expect)?);
+        let out = Rc::new(decode_block(&self.vol.lzfse, *ty, &raw, expect)?);
         let mut c = cache.borrow_mut();
         if c.len() >= CACHED_CHUNKS {
             c.remove(0);
@@ -384,6 +403,165 @@ impl<R: ReadAt> ReadAt for File<R> {
                 }
                 Ok(())
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pseudo(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9e3779b97f4a7c15) | 1;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn sample(n: usize) -> Vec<u8> {
+        // compressible text with a few incompressible stretches
+        let mut v = Vec::new();
+        let mut i = 0u64;
+        while v.len() < n {
+            v.extend_from_slice(format!("line {i} of some quite repetitive text, repeated, repeated\n").as_bytes());
+            if i % 400 == 399 {
+                v.extend(pseudo(3000, i));
+            }
+            i += 1;
+        }
+        v.truncate(n);
+        v
+    }
+
+    fn lzfse(d: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        lzfse_rust::encode_bytes(d, &mut out).unwrap();
+        out
+    }
+
+    /// A raw LZVN stream, taken out of the "bvxn" block the LZFSE encoder writes for small inputs.
+    fn lzvn(d: &[u8]) -> Option<Vec<u8>> {
+        let e = lzfse(d);
+        if e.get(..4) != Some(b"bvxn") {
+            return None;
+        }
+        let n = u32::from_le_bytes(e[8..12].try_into().unwrap()) as usize;
+        Some(e[12..12 + n].to_vec())
+    }
+
+    /// Chunk encoder: the compressed bytes of one chunk, with decmpfs's "stored" marker when that is shorter.
+    fn zlib_chunk(c: &[u8]) -> Vec<u8> {
+        let z = miniz_oxide::deflate::compress_to_vec_zlib(c, 6);
+        if z.len() < c.len() { z } else { [&[0xffu8][..], c].concat() }
+    }
+
+    fn fork_zlib(chunks: &[Vec<u8>]) -> Vec<u8> {
+        let mut f = vec![0u8; 0x104];
+        f.extend((chunks.len() as u32).to_le_bytes());
+        let mut off = 4 + 8 * chunks.len() as u32;
+        for c in chunks {
+            f.extend(off.to_le_bytes());
+            f.extend((c.len() as u32).to_le_bytes());
+            off += c.len() as u32;
+        }
+        for c in chunks {
+            f.extend(c);
+        }
+        f.extend([0u8; 50]);
+        f
+    }
+
+    fn fork_offsets(chunks: &[Vec<u8>]) -> Vec<u8> {
+        let mut f = Vec::new();
+        let mut off = 4 * (chunks.len() as u32 + 1);
+        for c in chunks {
+            f.extend(off.to_le_bytes());
+            off += c.len() as u32;
+        }
+        f.extend(off.to_le_bytes());
+        for c in chunks {
+            f.extend(c);
+        }
+        f
+    }
+
+    fn roundtrip(ty: u32, data: &[u8], enc: &dyn Fn(&[u8]) -> Vec<u8>, fork: &dyn Fn(&[Vec<u8>]) -> Vec<u8>) {
+        let sh = Shared::new(Vec::<u8>::new(), 4096, 0);
+        let lz = LzCell::default();
+        let chunks: Vec<Vec<u8>> = data.chunks(65536).map(enc).collect();
+        let rsrc = Rsrc::Embedded(fork(&chunks));
+        let table = chunk_table(&sh, ty, &rsrc, data.len() as u64).unwrap();
+        assert_eq!(table.len(), chunks.len());
+        let mut out = Vec::new();
+        for (i, (off, len)) in table.iter().enumerate() {
+            let raw = rsrc.read(&sh, *off, *len as usize).unwrap();
+            let expect = (data.len() - i * 65536).min(65536);
+            out.extend(decode_block(&lz, ty, &raw, expect).unwrap());
+        }
+        assert_eq!(out, data, "type {ty}");
+    }
+
+    #[test]
+    fn chunked_types_round_trip() {
+        let data = sample(150_000);
+        roundtrip(4, &data, &zlib_chunk, &fork_zlib);
+        roundtrip(12, &data, &|c| {
+            let e = lzfse(c);
+            if e.len() < c.len() { e } else { [&[0xffu8][..], c].concat() }
+        }, &fork_offsets);
+        roundtrip(10, &data, &|c| [&[0xccu8][..], c].concat(), &fork_offsets);
+        // LZVN chunks of 64 KiB are not what the encoder makes bvxn blocks of, so cut the data into
+        // small pieces for the stream (one "chunk" per piece is enough to exercise the decoder)
+        let small = sample(3000);
+        let enc = lzvn(&small).expect("small input encodes as bvxn");
+        assert_eq!(super::super::lzvn::decode(&enc, small.len()).unwrap(), small);
+        roundtrip(8, &small, &|c| lzvn(c).unwrap(), &fork_offsets);
+        // stored chunk marker
+        roundtrip(8, &pseudo(2000, 4), &|c| [&[0x06u8][..], c].concat(), &fork_offsets);
+    }
+
+    #[test]
+    fn inline_types_round_trip() {
+        let lz = LzCell::default();
+        let d = sample(3000);
+        assert_eq!(decode_block(&lz, 1, &d, d.len()).unwrap(), d);
+        assert_eq!(decode_block(&lz, 3, &zlib_chunk(&d), d.len()).unwrap(), d);
+        assert_eq!(decode_block(&lz, 7, &lzvn(&d).unwrap(), d.len()).unwrap(), d);
+        assert_eq!(decode_block(&lz, 11, &lzfse(&d), d.len()).unwrap(), d);
+        assert_eq!(decode_block(&lz, 9, &d, d.len()).unwrap(), d);
+        // a long (multi-block) LZFSE stream
+        let big = sample(1 << 20);
+        assert_eq!(decode_block(&lz, 11, &lzfse(&big), big.len()).unwrap(), big);
+    }
+
+    #[test]
+    fn decoders_reject_garbage() {
+        let lz = LzCell::default();
+        let g = pseudo(5000, 11);
+        for ty in [3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 99] {
+            for first in [0u8, 0x78, 0x62, 0xff, 0x06, 0xcc, b'Z'] {
+                let mut d = g.clone();
+                d[0] = first;
+                // must be an error or the right length, never a panic or an oversized allocation
+                let _ = decode_block(&lz, ty, &d, 65536);
+                let _ = decode_block(&lz, ty, &d[..3], 100);
+            }
+        }
+        // a decompression bomb is cut at the expected size
+        let z = miniz_oxide::deflate::compress_to_vec_zlib(&vec![0u8; 50_000_000], 9);
+        assert!(decode_block(&lz, 3, &z, 65536).is_err());
+        let bomb = lzfse(&vec![0u8; 20_000_000]);
+        assert!(decode_block(&lz, 11, &bomb, 65536).is_err());
+        // the resource-fork tables refuse absurd counts without allocating for them
+        let sh = Shared::new(Vec::<u8>::new(), 4096, 0);
+        let rsrc = Rsrc::Embedded(vec![0u8; 64]);
+        for ty in [4, 8, 12] {
+            assert!(chunk_table(&sh, ty, &rsrc, u64::MAX).is_err());
         }
     }
 }

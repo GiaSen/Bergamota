@@ -204,7 +204,7 @@ pub(crate) struct VolCore<R: ReadAt> {
     pub omap: Omap,
     pub root_oid: u64,
     pub info: VolumeInfo,
-    pub lzfse: std::cell::RefCell<Option<lzfse_rust::LzfseRingDecoder>>,
+    pub lzfse: file::LzCell,
 }
 
 /// An APFS container: the newest checkpoint of the superblock, the container object map and the volumes.
