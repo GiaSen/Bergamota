@@ -62,6 +62,8 @@ fn compare_with(quiet: bool, with_tools: bool) {
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     }
     let mut py = Command::new("python3");
+    // the iOS 18 profile these tests emulate (22H352 on N841 with a D22 ADT); targets.py defaults to ios26
+    py.env("RENEGADE_TARGET", "ios18");
     py.arg("-I").arg(&script).arg("run").arg(&py_root).arg(&tools);
     if quiet {
         py.arg("--quiet");
@@ -129,7 +131,7 @@ fn tweaks_on_the_tree_match_root_tweaks18() {
     for r in [&py_root, &src] {
         assert!(Command::new("python3").arg("-I").arg(&script).arg("make").arg(r).arg(&tools).status().unwrap().success());
     }
-    let p = Command::new("python3").arg("-I").arg(&script).arg("run").arg(&py_root).arg(&tools).output().unwrap();
+    let p = Command::new("python3").env("RENEGADE_TARGET", "ios18").arg("-I").arg(&script).arg("run").arg(&py_root).arg(&tools).output().unwrap();
     assert!(p.status.success(), "{}", String::from_utf8_lossy(&p.stderr));
     let (entries, paths, _) = renegade::tree::scan_dir(&src).unwrap();
     let n = paths.len();
