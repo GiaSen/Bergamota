@@ -331,16 +331,19 @@ pub fn build<W: Write + Seek>(ipsw: &Ipsw, cfg: &mut Config, out: W, ev: &mut dy
                 return put(&overlay[source - base]);
             }
             let (v, ino) = files[source];
-            if let Some(p) = cache_plans.get(&source) {
-                let mut d = read_all(&vols[v].vol, ino)?;
-                p.apply(&mut d)?;
-                return put(&d);
-            }
-            if plan.signed.contains_key(&source) {
-                let d = machostage::final_bytes(&plan, source, read_all(&vols[v].vol, ino)?)?;
-                return put(&d);
-            }
-            stream(&vols[v].vol, ino, &mut put)
+            let mut one = || -> Result<()> {
+                if let Some(p) = cache_plans.get(&source) {
+                    let mut d = read_all(&vols[v].vol, ino)?;
+                    p.apply(&mut d)?;
+                    return put(&d);
+                }
+                if plan.signed.contains_key(&source) {
+                    let d = machostage::final_bytes(&plan, source, read_all(&vols[v].vol, ino)?)?;
+                    return put(&d);
+                }
+                stream(&vols[v].vol, ino, &mut put)
+            };
+            one().map_err(|e| bad(format!("{path}: {e}")))
         };
         hfswrite::build(&entries, &o, &mut w, &mut feed)?
     };
