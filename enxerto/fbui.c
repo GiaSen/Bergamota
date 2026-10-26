@@ -1,40 +1,27 @@
 /*
- * Bergamota fastboot screen, see fbui.h. Style follows bootui.c (same palette, logo helper).
+ * Bergamota fastboot screen, see fbui.h. The stage of artdraw.h (wordmark, pill, the giant iOS numerals behind
+ * Newton, his coat dissolving into the ink console panel); the state lives on the panel.
  * Layout for a 1080-wide a8r8g8b8 framebuffer, everything below the 128 px notch area.
  */
 #include "artdraw.h"
-#include "bootui.h"
 #include "console.h"
 #include "fbui.h"
 
-/* tools/identity/IDENTITY.md: wordmark and a FASTBOOT pill at the top, a paper plate with the state, hints on the
- * ground, the portrait bottom-left in front of the giant numerals. */
-#define PILL_Y		350
-#define PLATE_X		96
-#define PLATE_W		(FB_W - 2 * PLATE_X)
-#define PLATE_Y		470
-#define PLATE_H		420
-#define PLATE_BORDER	4
-#define IN_X		(PLATE_X + 44)
-#define IN_W		(PLATE_W - 88)
-#define STATUS_Y	(PLATE_Y + 40)
-#define DETAIL_Y	(STATUS_Y + 52)
+#define IN_X		96
+#define IN_W		(FB_W - 2 * IN_X)
+#define STATUS_Y	(STAGE_PANEL_Y + 40)
+#define DETAIL_Y	(STATUS_Y + 54)
 #define BAR_Y		(DETAIL_Y + 52)
 #define BAR_W		IN_W
-#define BAR_H		12
+#define BAR_H		14
 #define BAR_X		IN_X
 #define CHG_Y		(BAR_Y + 36)
-#define DIAG_Y		(CHG_Y + 48)
-#define HINT_Y		(PLATE_Y + PLATE_H + 34)
+#define DIAG_Y		(CHG_Y + 44)
+#define HINT_Y		(FB_H - 118)
 #define ENTRY_Y		(HINT_Y + 40)
-#define LOG_Y		(PLATE_Y + PLATE_H + 24)
-#define LOG_ROWS	24
-#define PORTRAIT_W	800
-#define PORTRAIT_X	(-90)
-
-#define BAR_TRACK	0xffdfdcd3U	/* ink at 8 % over the paper */
-#define MUTED		0xff7a7976U	/* ink at 55 % over the paper */
-#define MUTED_GROUND	0xff5d6638U	/* ink at 55 % over the lime */
+/* failed boot: the log on the ink, from LOG_Y down to the panel; the dissolve moves up above it */
+#define LOG_ROWS	22
+#define LOG_Y		(STAGE_PANEL_Y - LOG_ROWS * 32 - 24)
 
 #define STR_MAX		96
 
@@ -61,21 +48,21 @@ static int same(const char *a, const char *b)
 	return *a == *b;
 }
 
-/* Paper inside the plate, from y for h rows. */
-static void plate_clear(int y, int h)
+/* Ink across the panel's text column, from y for h rows. */
+static void panel_clear(int y, int h)
 {
-	con_rect(PLATE_X + PLATE_BORDER + 2, y, PLATE_W - 2 * (PLATE_BORDER + 2), h, ID_PAPER);
+	con_rect(IN_X - 8, y, IN_W + 16, h, ID_INK);
 }
 
-/* A line of mono text inside the plate, cut to its width. */
-static void plate_text(enum art_font f, int y, uint32_t fg, const char *s)
+/* A line of mono text on the panel, cut to the column's width. */
+static void panel_text(enum art_font f, int y, uint32_t fg, const char *s)
 {
 	char buf[STR_MAX];
 	int max = IN_W / art_text_w(f, "M"), i = 0;
 	for (; s[i] && i < max && i < STR_MAX - 1; i++)
 		buf[i] = s[i];
 	buf[i] = 0;
-	plate_clear(y, art_text_h(f));
+	panel_clear(y, art_text_h(f));
 	art_text(f, IN_X, y, fg, buf);
 }
 
@@ -83,7 +70,7 @@ static void draw_bar(int permille)
 {
 	if (permille < 0) {
 		if (bar_px >= 0)
-			plate_clear(BAR_Y, BAR_H);
+			panel_clear(BAR_Y, BAR_H);
 		bar_px = -1;
 		return;
 	}
@@ -92,26 +79,21 @@ static void draw_bar(int permille)
 	int px = BAR_W * permille / 1000;
 	if (px == bar_px)
 		return;
-	plate_clear(BAR_Y, BAR_H);
-	art_rrect(BAR_X, BAR_Y, BAR_W, BAR_H, BAR_H / 2, BAR_TRACK);
+	panel_clear(BAR_Y, BAR_H);
+	art_rrect(BAR_X, BAR_Y, BAR_W, BAR_H, BAR_H / 2, STAGE_TRACK);
 	if (px >= BAR_H)
-		art_rrect(BAR_X, BAR_Y, px, BAR_H, BAR_H / 2, ID_LEAF);
+		art_rrect(BAR_X, BAR_Y, px, BAR_H, BAR_H / 2, ID_LIME);
 	bar_px = px;
 }
 
 void fbui_init(const char *entry)
 {
 	enum art_image num = art_ios_numerals();
-	bootui_scene(PORTRAIT_X, PORTRAIT_W, FB_W - art_image_w(num) + 40, 110, num);
-	/* the FASTBOOT pill */
-	int tw = art_text_w(ART_MONO30, "FASTBOOT"), pw = tw + 56, ph = art_text_h(ART_MONO30) + 20;
-	art_rrect((FB_W - pw) / 2, PILL_Y, pw, ph, ph / 2, ID_LEAF);
-	art_text(ART_MONO30, (FB_W - tw) / 2, PILL_Y + 10, ID_PAPER, "FASTBOOT");
-	/* the plate */
-	art_rrect(PLATE_X, PLATE_Y, PLATE_W, PLATE_H, 28, ID_INK);
-	art_rrect(PLATE_X + PLATE_BORDER, PLATE_Y + PLATE_BORDER, PLATE_W - 2 * PLATE_BORDER, PLATE_H - 2 * PLATE_BORDER,
-		  28 - PLATE_BORDER, ID_PAPER);
-	art_text_centered(ART_MONO22, HINT_Y, ID_INK, "Hold Power + Volume Down for the bootloader");
+	art_ground(0, 0, FB_W, FB_H);
+	art_image(num, (FB_W - art_image_w(num)) / 2, STAGE_NUM_Y, ID_WHITE);
+	art_stage_front(STAGE_PORTRAIT_W, 0, FB_H);
+	art_pill(FB_W / 2, STAGE_PILL_Y, ID_LEAF, ID_PAPER, "FASTBOOT");
+	art_text_centered(ART_MONO22, HINT_Y, ID_PAPER, "Hold Power + Volume Down for the bootloader");
 	entry_txt[0] = 0;
 	if (entry) {
 		int i = 0;
@@ -120,29 +102,32 @@ void fbui_init(const char *entry)
 		for (; *entry && i < (int)sizeof(entry_txt) - 1; entry++)
 			entry_txt[i++] = *entry;
 		entry_txt[i] = 0;
-		art_text_centered(ART_MONO22, ENTRY_Y, MUTED_GROUND, entry_txt);
+		art_text_centered(ART_MONO22, ENTRY_Y, STAGE_MUTED, entry_txt);
 	}
 	cur_text[0] = cur_detail[0] = 0;
 	cur_diag[0][0] = cur_diag[1][0] = cur_diag[2][0] = cur_chg[0] = 0;
 	cur_color_set = 0;
 	bar_px = -1;
-	con_set_bg(BG_BOOT);
+	con_set_bg(BG_INK);
 	con_set_scale(2);
 	con_window(0, -1);	/* log lines are recorded, not drawn */
 }
 
 void fbui_status(const char *text, const char *detail, int permille, uint32_t fg)
 {
-	if (!cur_color_set || fg != cur_fg || !same(cur_text, text)) {
-		plate_text(ART_MONO30, STATUS_Y, fg, text);
+	/* callers pass ink (FBUI_OK_COLOR, TEXT) or alert red, colours for the paper: on the ink panel they are
+	 * paper and the lightened alert */
+	uint32_t c = fg == FBUI_ERR_COLOR ? STAGE_ALERT : ID_PAPER;
+	if (!cur_color_set || c != cur_fg || !same(cur_text, text)) {
+		panel_text(ART_MONO30, STATUS_Y, c, text);
 		copy(cur_text, text);
-		cur_fg = fg;
+		cur_fg = c;
 		cur_color_set = 1;
 	}
 	if (!detail)
 		detail = "";
 	if (!same(cur_detail, detail)) {
-		plate_text(ART_MONO22, DETAIL_Y, ID_LEAF, detail);
+		panel_text(ART_MONO22, DETAIL_Y, ID_LIME, detail);
 		copy(cur_detail, detail);
 	}
 	draw_bar(permille);
@@ -154,7 +139,7 @@ void fbui_charge(const char *s)
 		s = "";
 	if (same(cur_chg, s))
 		return;
-	plate_text(ART_MONO22, CHG_Y, MUTED, s);
+	panel_text(ART_MONO22, CHG_Y, STAGE_MUTED, s);
 	copy(cur_chg, s);
 }
 
@@ -165,8 +150,8 @@ void fbui_diag(const char *l0, const char *l1, const char *l2)
 		const char *s = l[i] ? l[i] : "";
 		if (same(cur_diag[i], s))
 			continue;
-		plate_clear(DIAG_Y + i * 18, 16);
-		con_text(IN_X, DIAG_Y + i * 18, 1, 0, MUTED, s);
+		panel_clear(DIAG_Y + i * 18, 16);
+		con_text(IN_X, DIAG_Y + i * 18, 1, 0, STAGE_MUTED, s);
 		copy(cur_diag[i], s);
 	}
 }
@@ -181,11 +166,10 @@ void fbui_error(const char *why, const char *detail)
 		buf[i++] = *why;
 	buf[i] = 0;
 	fbui_status(buf, detail, FBUI_NOBAR, FBUI_ERR_COLOR);
-	/* the log tail on a full-width paper band over the portrait, ink rules above and below (console.c draws its
-	 * rows across the whole width, on BG_BOOT: the paper) */
-	con_rect(0, LOG_Y - 20, FB_W, LOG_ROWS * 32 + 40, ID_PAPER);
-	con_rect(0, LOG_Y - 24, FB_W, 4, ID_INK);
-	con_rect(0, LOG_Y + LOG_ROWS * 32 + 20, FB_W, 4, ID_INK);
+	/* the panel grows up over the portrait for the log tail (console.c draws its rows across the whole width, on
+	 * BG_INK: paper text, lime labels), its top edge dissolving like the panel's own */
+	art_dissolve(LOG_Y - 24 - STAGE_DISSOLVE_H, STAGE_DISSOLVE_H, ID_INK, 0, FB_H);
+	con_rect(0, LOG_Y - 24, FB_W, STAGE_PANEL_Y - LOG_Y + 24, ID_INK);
 	con_set_scale(2);
 	con_window(LOG_Y, LOG_ROWS);
 	con_replay_tail(LOG_ROWS - 1);

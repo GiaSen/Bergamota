@@ -147,6 +147,8 @@ static void put_char(int col, char ch, uint32_t fg)
 	hist_put(col, ch, fg);
 	if (con_bg == BG_PANIC)		/* ink on the alert red does not read: paper text, pale labels */
 		fg = fg == LABEL ? 0xffffcfc4U : 0xfff4f3ecU;
+	else if (con_bg == BG_INK)	/* nor on ink: paper text, lime labels */
+		fg = fg == LABEL ? 0xffd7e98aU : 0xfff4f3ecU;
 	if (win_rows < 0)
 		return;
 	if (x0 + CH_W > FB_W || y0 + CH_H > FB_H)
