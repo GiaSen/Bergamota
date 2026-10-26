@@ -787,3 +787,24 @@ run: image `shim/out/enxerto-boot-ios26full-boot43-wlan-events.img` (sha256 `fc9
 Next boot (43) = 1116 with boot
 42's args, to see which domains the modem asked for, whether `wlanmdsp.mbn` came over TFTP, and WLFW; then the WLFW
 client (capabilities, BDF from `bdwlan.*`, mode on).
+
+### 5.18 Boot 43-wlan-events (1116, run by the GPU session with the user's OK): **wlanmdsp.mbn loaded over TFTP, WLFW up**
+
+Boot 43 ran at 11:57Z (recovery after the boot 42 freeze), 13:10Z and 14:01Z, each combined with GPU work. The
+end-of-stage event replay (`SWEET IPC: events N:`) is in the USB console twice so far, with identical results:
+
+* **pd-mapper requests** (5): `tms/pddump_disabled` (0 domains), `tms/pdr_enabled` (0), `avs/audio`
+  (msm/adsp/audio_pd/74, twice), **`kernel/elf_loader` -> msm/modem/wlan_pd/180**. No `wlan/fw` or `tms/servreg` query,
+  and no PFR.
+* **TFTP**: `/readwrite/server_check.txt` 5 bytes (fixed by 1116's ports), then **RRQ
+  `/readonly/vendor/firmware_mnt/image/wlanmdsp.mbn`**: two size checks ("end of transfer"), then **3645892 bytes
+  served** from the modem partition; mcfg as before.
+* **Services**: ~45 offered, including 0x42 SERVREG_NOTIFIER (instance 180), then after wlanmdsp: 0x10, 0x33,
+  **0x45 WLFW at 0:0x48**, 0x21, 0x12.
+* 90 s, 156 packets in, 525 out; clean stop (stop-ack 190 ms), no panic.
+
+The 1.5 KiB event record filled up just before the end (its last line is cut in the mcfg entries); nothing after
+WLFW was lost. **The chip half is done up to WLFW.** Next (1117): the WLFW client, ath10k `qmi.c` order:
+IND_REGISTER, CAP (chip/board/soc ids, firmware version), MSA info/ready if needed, BDF download (`bdwlan.*` for
+the board id, from the modem partition, read-only), WLAN config (CE/service tables of `ath10k/snoc`), mode ON; then
+the copy engine/SNOC data path.
