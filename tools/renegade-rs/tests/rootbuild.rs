@@ -80,6 +80,7 @@ fn synthetic_ipsw_builds_a_root() {
         fs::copy(fixtures.join("libpac.dylib"), m.join("usr/lib/libpac.dylib")).unwrap();
         fs::write(m.join("usr/lib/both.txt"), "from the OS volume").unwrap();
         fs::write(m.join("usr/lib/hello.txt"), "hello").unwrap();
+        fs::write(m.join("usr/lib/co:lon.txt"), "colon").unwrap();
         fs::hard_link(m.join("usr/lib/hello.txt"), m.join("usr/lib/hard.txt")).unwrap();
         std::os::unix::fs::symlink("/usr/lib/hello.txt", m.join("usr/lib/abs-link")).unwrap();
         let big: Vec<u8> = (0..3_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
@@ -177,7 +178,18 @@ fn synthetic_ipsw_builds_a_root() {
     if o.status.success() {
         let dev = String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap().to_string();
         let f = Command::new("fsck_hfs").args(["-fn", &dev.replace("/dev/disk", "/dev/rdisk")]).output().unwrap();
+        // names with a colon go through the catalog's colon/slash swap and read back as they were
+        let mnt = work.join("mnt-root");
+        fs::create_dir_all(&mnt).unwrap();
         let _ = Command::new("hdiutil").args(["detach", &dev]).output();
+        let o = Command::new("hdiutil").args(["attach", "-readonly", "-nobrowse", "-noverify", "-mountpoint"]).arg(&mnt).arg(&raw).output().unwrap();
+        if o.status.success() {
+            let got = fs::read(mnt.join("usr/lib/co:lon.txt"));
+            let _ = Command::new("hdiutil").args(["detach"]).arg(&mnt).output();
+            assert_eq!(got.unwrap(), b"colon");
+        } else {
+            eprintln!("could not mount the image read-only: {}", String::from_utf8_lossy(&o.stderr));
+        }
         let text = format!("{}{}", String::from_utf8_lossy(&f.stdout), String::from_utf8_lossy(&f.stderr));
         assert!(f.status.success() && text.contains("appears to be OK"), "fsck_hfs:\n{text}");
     }

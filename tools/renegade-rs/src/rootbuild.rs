@@ -165,6 +165,8 @@ pub fn build<W: Write + Seek>(ipsw: &Ipsw, cfg: &mut Config, out: W, ev: &mut dy
         })?;
         ev(Event::Log(&format!("{}: {} entries so far", v.image.name(), entries.len())));
     }
+    // the OS volume's root has a `.file` entry the Python copy (ditto: "Permission denied") never gets to copy
+    entries.retain(|e| e.path != ".file");
     tree::layout_fixes(&mut entries, cfg.now)?;
     if let Some(only) = &cfg.only {
         let sub = format!("{only}/");

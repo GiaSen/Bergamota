@@ -87,7 +87,8 @@ pub fn hfs_name(name: &str) -> Vec<u16> {
             s.extend(std::iter::once(c).nfd());
         }
     }
-    s.encode_utf16().collect()
+    // POSIX ':' is '/' in the catalog (the colon/slash swap of the HFS+ kernel layer: what ditto onto a mounted HFS+ writes)
+    s.encode_utf16().map(|c| if c == b':' as u16 { b'/' as u16 } else { c }).collect()
 }
 
 /// One catalog record: key (parent, name) and data.
