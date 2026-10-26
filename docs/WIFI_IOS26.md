@@ -882,3 +882,43 @@ data path of ath10k `snoc.c`: WLAN SMMU context for stream 0x40/0x41 (identity m
 engine rings at membase 0x18800000 + 0x240000 (CE0..CE11, `target_ce_config_wlan` / `target_service_to_ce_map_wlan`
 and shadow registers of `snoc.c`), WLAN_CFG with those tables, mode ON (mission), then HTC ready over CE (polled):
 the first message from the chip itself.
+
+### 5.21 1118: copy engines, WLAN_CFG, mode ON, wait for HTC READY (`sweetce=1`): built, NOT run
+
+`1118-beryllium-wlan-copy-engines.patch`, gate **`sweetce=1`** (needs `sweetwlfw=1`); after FW READY, in the order
+of ath10k `snoc.c` `ath10k_snoc_hif_power_up()` + `hif_start()`:
+1. **apps SMMU**: WLAN streams 0x40 and 0x41 (`iommus = <&apps_smmu 0x40 0x1>`) to the shared identity-mapping
+   context bank of `sweet_smmu.c` (exact SMRs; an unmatched stream faults and resets the SoC once the chip DMAs).
+2. **DMA pool**: the fixed slice **0xe0100000, 1 MiB** (below 4 GiB, outside xnu RAM, after the MPSS metadata at
+   0xe0000000), mapped Normal-NC, IOVA == PA; RRI at +0, CE0/CE3/CE1/CE2 rings at +0x1000..+0x4000, rx buffers
+   (2 KiB) at +0x10000 (CE1, 32) and +0x20000 (CE2, 64). **Never reuse this slice**: if mode off is not confirmed
+   the CE may still hold addresses in it.
+3. **WLAN_CFG** (QMI 0x23): `target_ce_config_wlan` (12), `target_service_to_ce_map_wlan` (21 entries, terminator
+   included as ath10k sends it), `target_shadow_reg_cfg_map` (12); then **WLAN_MODE mission** (0x22, mode 0,
+   hw_debug 0).
+4. Only after the mode-ON response (CE block powered, as in Linux): membase 0x18800000 mapped, a flushed log line
+   and 200 ms pause before the **first CE register access**, RRI address (0x24c004/8) + CTRL1 UPD bit 19 on all 12
+   CEs, source rings CE0 (16) / CE3 (32) and destination rings CE1 (32) / CE2 (64) per `wcn3990_ce_regs` (base
+   lo/hi with the 5-bit high mask, size, dmax, byte swap off, watermarks low 0 / high n), free slots of CE1/CE2
+   filled with buffers (`CE_RING_DELTA`). CE4..CE11 host rings are not set up (the target uses them only after
+   HTC connect); host ring sizes are smaller than ath10k's.
+5. **Polled** (no CE interrupts): destination descriptors with nbytes != 0 (volatile read + `dmb ld`), each
+   message logged (first 8, 32 bytes hex), the slot re-posted at once; endpoint 0 message 1 = **HTC READY**
+   (credits, credit size, endpoints, HTC version) -> state `HTC READY`. Nothing is sent on the rings yet.
+6. End of the service loop (modem still up): **WLAN_MODE off** (4) whenever mission mode was requested, confirmed
+   or not, waiting up to 3 s; skipped if the modem died. Teardown unmaps only the pool; the SMMU bank and the
+   register mapping stay.
+
+Checked: the harness drove WLFW -> FW READY -> WLAN_CFG (559 bytes: TLV 0x11 241 B / 12, 0x12 253 B / 21, 0x13
+49 B / 12) -> mode -> CE setup on simulated registers -> a fake HTC READY in CE2 slot 0 -> repost -> mode off.
+Seventh independent review against `snoc.c`, `ce.c`, `hw.c`, `htc.h` and the wlfw tables: wire formats, tables,
+register offsets/bitfields and order all match; no defect that could plausibly hurt the phone; applied its fixes
+(mode off also when mission mode was only requested, free-slot count for rx posting, descriptor read barrier, HTC
+READY only while waiting, state kept after mode off). Residual risk as in Linux: the first CE register access.
+
+Image `shim/out/enxerto-boot-ios26full-boot45-wlan-ce.img` (sha256 `27712142...`, kernel `2e658e59...` = boot 33b's
+kernel + 1108-1118), built from the boot-args that ran boot 44 (the GPU session's `-notrace` variant: no
+`sweethidlog`, `sweetdenypath=bgmtl.trace`) plus `sweetce=1`, minus `sweetbtfast=1 sweetbtibs=1` (ignored outside
+the Bluetooth stage; needed to stay within the 607 usable bytes of the 608-byte boot-args field, which
+`mkpayload.py` truncates silently). Expected: SMMU map 0/0, wlan-cfg 0/0, mode mission 0/0, CE rings, **HTC READY**,
+mode off confirmed. Not booted: needs the user's OK; run it with the user present (first CE access).
