@@ -956,3 +956,35 @@ send CONNECT_SERVICE for WMI_CONTROL (0x100) on CE0, read the response (endpoint
 then the target's WMI SERVICE_READY event on CE2 (the firmware's capabilities: PHY, bands, MAC address, services)
 and WMI INIT -> READY event. The source ring write index goes through the shadow register (0x32000 for CE0, 0x3200c
 for CE3) as ath10k does for WCN3990.
+
+### 5.23 1119: HTC connect + WMI service ready / init / ready (`sweetwmi=1`): built, NOT run
+
+`1119-beryllium-wlan-htc-wmi.patch`, gate **`sweetwmi=1`** (needs `sweetce=1`), after HTC READY in the order of
+ath10k `core.c` `ath10k_core_start()`:
+1. **HTC connect HTT_DATA_MSG** (0x300, flags DISABLE_CREDIT_FLOW_CTRL) then **WMI_CONTROL** (0x100, RECV_ALLOC 1:
+   WCN3990 has `use_fw_tx_credits = false`, so one transmit credit) on endpoint 0 / CE0; responses (endpoint,
+   max message size) on CE2. pktlog is not connected (its service is IN-only in `snoc.c`, as ath10k finds).
+2. **SETUP_COMPLETE_EX** (snoc: flags 0, 20 bytes).
+3. **WMI SERVICE_READY** (event 0x1, WMI TLV): ABI check (0x01000000 / "QCA_" "ML"), capabilities logged
+   (fw build, PHY, RF chains, HT/VHT caps, tx power, regdomain, 2/5 GHz channel range), the raw service bitmap
+   logged and decoded exactly as `wmi_tlv_svc_map()` (legacy packing below the TLV length, extended above it);
+   host memory requests (`num_unit_info` peers/vdevs as ath10k: 34 / 5 units) placed in the pool from +1 MiB,
+   4 KiB aligned; the pool is now **4 MiB (0xe0100000..0xe0500000)**, zeroed before use.
+4. **SERVICE_AVAILABLE** (0x3, up to 300 ms): tx-ack-rssi (174) and extended-address (179) bits.
+5. **WMI INIT** (cmd 0x1) on CE3 (meta data = endpoint << 4, HTC NEED_CREDIT_UPDATE, shadow write index 0x3200c):
+   INIT_CMD TLV (ABI + chunk count), RESOURCE_CONFIG (the 44 values of `ath10k_wmi_tlv_op_gen_init` for WCN3990:
+   4 vdevs, 33 peers, 66 tids, native-wifi decap, 1056 MSDU descriptors, 22 WoW filters, ...), HOST_MEMORY_CHUNK
+   array.
+6. **WMI READY** (0x2): status and **MAC address** -> state `WMI READY`. Then mode off at the end as before.
+HTC trailers (4-byte record headers) are parsed for WMI credit reports; HTT messages on CE1 are only logged.
+
+Checked: the harness simulated the target (READY, both connect responses with a credit trailer, a SERVICE_READY
+with one memory request, SERVICE_AVAILABLE, READY): connect requests, setup complete, INIT (TLVs 74/75/18/76,
+resource config values) and the READY parse as expected. Eighth independent review: no phone-safety defect;
+applied its fixes (service bitmap decoded with ath10k's packing instead of a flat map, 4-byte HTC trailer record
+headers, the memory-request count cross-checked and capped at 16, HTC/WMI state reset when the WLFW server leaves).
+
+Image `shim/out/enxerto-boot-ios26full-boot46-wlan-wmi.img` (sha256 `2747296b...`, kernel `ea12055c...` = boot 33b's
+kernel + 1108-1119): boot 45's args plus `sweetwmi=1` (592 bytes). Expected: both HTC connects, SERVICE_READY with
+the firmware's capabilities, INIT, **WMI READY with the chip's MAC**, mode off confirmed. Not booted: needs the
+user's OK.
