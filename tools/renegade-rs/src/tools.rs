@@ -542,3 +542,39 @@ pub fn run_rest(fs: &mut dyn Fs, cfg: &Config, log: &mut Log) -> Result<()> {
     sweetprefs_tools(fs, log, t)?;
     console_job(fs, log)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A thin Mach-O header with one segment and one section whose data starts at `sect_off`.
+    fn macho(sect_off: u32) -> Vec<u8> {
+        let mut d = vec![0u8; 0x1000];
+        d[0..4].copy_from_slice(&0xFEED_FACFu32.to_le_bytes());
+        d[16..20].copy_from_slice(&1u32.to_le_bytes());
+        d[20..24].copy_from_slice(&(72u32 + 80).to_le_bytes());
+        d[32..36].copy_from_slice(&0x19u32.to_le_bytes());
+        d[36..40].copy_from_slice(&(72u32 + 80).to_le_bytes());
+        d[32 + 64..32 + 68].copy_from_slice(&1u32.to_le_bytes());
+        d[32 + 72 + 48..32 + 72 + 52].copy_from_slice(&sect_off.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn adds_a_load_command_in_the_slack_like_addlc_py() {
+        let mut d = macho(0x400);
+        assert!(!has_dylib(&d, SWEETFP_PATH));
+        add_load_dylib(&mut d, SWEETFP_PATH).unwrap();
+        assert!(has_dylib(&d, SWEETFP_PATH));
+        assert_eq!(u32::from_le_bytes(d[16..20].try_into().unwrap()), 2);
+        let want = (24 + SWEETFP_PATH.len() + 1 + 7) & !7;
+        assert_eq!(u32::from_le_bytes(d[20..24].try_into().unwrap()) as usize, 72 + 80 + want);
+        // struct.pack('<IIIIII', 0xc, cmdsz, 24, 2, 0x10000, 0x10000) + name
+        let at = 32 + 72 + 80;
+        assert_eq!(&d[at..at + 4], &0xCu32.to_le_bytes());
+        assert_eq!(&d[at + 24..at + 24 + SWEETFP_PATH.len()], SWEETFP_PATH.as_bytes());
+        // no slack: refused, nothing changed
+        let mut tight = macho(32 + 152 + 8);
+        assert!(add_load_dylib(&mut tight, SWEETFP_PATH).is_err());
+    }
+}
