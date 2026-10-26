@@ -723,6 +723,8 @@ pub struct TreeFs<'a> {
     /// Reads the first bytes of a scanned file without reading the whole of it (set by callers with big files).
     #[allow(clippy::type_complexity)]
     peek_source: Option<Box<dyn Fn(usize, usize) -> Result<Vec<u8>> + 'a>>,
+    /// Entry indices in path order (built on the first walk, kept up to date by the pushes, dropped by removals).
+    sorted: std::cell::RefCell<Option<Vec<usize>>>,
     owners: BTreeMap<String, (u32, u32)>,
     now: u32,
     /// OwnerRecorder's rule: a chown to the user who owns the scanned files (the image is mounted noowners in
@@ -733,10 +735,21 @@ pub struct TreeFs<'a> {
 impl<'a> TreeFs<'a> {
     pub fn new(entries: Vec<crate::hfswrite::Entry>, base: usize, now: u32, read_source: impl Fn(usize) -> Result<Vec<u8>> + 'a) -> Self {
         let index = entries.iter().enumerate().map(|(i, e)| (e.path.clone(), i)).collect();
-        Self { entries, index, overlay: Vec::new(), base, read_source: Box::new(read_source), peek_source: None, owners: BTreeMap::new(), now, skip_owner: None }
+        Self { entries, index, overlay: Vec::new(), base, read_source: Box::new(read_source), peek_source: None, sorted: Default::default(), owners: BTreeMap::new(), now, skip_owner: None }
+    }
+
+    /// Call after an entry was pushed.
+    fn note_push(&mut self) {
+        let i = self.entries.len() - 1;
+        if let Some(v) = self.sorted.get_mut() {
+            let path = &self.entries[i].path;
+            let pos = v.partition_point(|&j| self.entries[j].path < *path);
+            v.insert(pos, i);
+        }
     }
 
     fn reindex(&mut self) {
+        *self.sorted.get_mut() = None;
         self.index = self.entries.iter().enumerate().map(|(i, e)| (e.path.clone(), i)).collect();
     }
 
@@ -853,6 +866,7 @@ impl Fs for TreeFs<'_> {
                     return Err(bad(format!("{p}: parent folder missing")));
                 }
                 self.entries.push(crate::hfswrite::Entry { path: path.clone(), kind: crate::hfswrite::Kind::File { len, source }, uid: 0, gid: 0, perm: 0o644, mtime: self.now, link_group: None });
+                self.note_push();
                 self.index.insert(path, self.entries.len() - 1);
             }
         }
@@ -867,6 +881,7 @@ impl Fs for TreeFs<'_> {
                 continue;
             }
             self.entries.push(crate::hfswrite::Entry { path: cur.clone(), kind: crate::hfswrite::Kind::Dir, uid: 0, gid: 0, perm: 0o755, mtime: self.now, link_group: None });
+            self.note_push();
             self.index.insert(cur.clone(), self.entries.len() - 1);
         }
         Ok(())
@@ -933,6 +948,7 @@ impl Fs for TreeFs<'_> {
             return Err(bad(format!("{link}: parent folder missing")));
         }
         self.entries.push(crate::hfswrite::Entry { path: path.clone(), kind: crate::hfswrite::Kind::Symlink { target: target.to_string() }, uid: 0, gid: 0, perm: 0o755, mtime: self.now, link_group: None });
+        self.note_push();
         self.index.insert(path, self.entries.len() - 1);
         Ok(())
     }
@@ -945,9 +961,14 @@ impl Fs for TreeFs<'_> {
     fn walk(&self, p: &str) -> Result<Vec<String>> {
         let dir = Self::norm(p);
         let pre = format!("{dir}/");
-        let mut v: Vec<String> = self.entries.iter().filter(|e| e.path.starts_with(&pre)).map(|e| e.path.clone()).collect();
-        v.sort();
-        Ok(v)
+        let mut sorted = self.sorted.borrow_mut();
+        let idx = sorted.get_or_insert_with(|| {
+            let mut v: Vec<usize> = (0..self.entries.len()).collect();
+            v.sort_by(|&a, &b| self.entries[a].path.cmp(&self.entries[b].path));
+            v
+        });
+        let start = idx.partition_point(|&j| self.entries[j].path.as_str() < pre.as_str());
+        Ok(idx[start..].iter().map(|&j| &self.entries[j].path).take_while(|q| q.starts_with(&pre)).cloned().collect())
     }
     fn owners(&self) -> &BTreeMap<String, (u32, u32)> {
         &self.owners
