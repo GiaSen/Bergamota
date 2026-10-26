@@ -1157,3 +1157,29 @@ FRAG_DESC_BANK_CFG (64-bit), the **HTT RX ring** (RX_RING_CFG 64-bit, buffers po
 AGGR_CFG, on CE4; the firmware's receive dispatch may need a configured host RX path before it delivers anything,
 including the WMI management frames. Second suspect: the vdev filter (ath10k's mac80211 path sets the rx filter
 through vdev/pdev params when the interface is up).
+
+### 5.29 1123: the rest of the HTT setup (frag-desc bank, RX ring, aggr): built, NOT run
+
+`1123-beryllium-wlan-htt-setup.patch` (part of `sweetscan=1`, no new gate: ath10k always does it before scanning).
+After the HTT VERSION_CONF (and only then, as `ath10k_htt_setup()`; and only with an HTT endpoint), on CE4,
+the 64-bit WCN3990 variants of `htt_tx.c`:
+* **FRAG_DESC_BANK_CFG** (64 B): info 0, 1 bank of 1056 x 72-byte `htt_msdu_ext_desc_64` at pool +4 MiB, bank ids
+  0..1055, q_state 0 with record size 1 (no PEER_FLOW_CONTROL).
+* The **HTT RX ring** (`ath10k_htt_rx_ring_refill`): 2048 le64 addresses at pool +4 MiB + 128 KiB, **2047 buffers**
+  of 2 KiB posted from pool +8 MiB (attention words zero: the pool is zeroed), the alloc-index word = 2047.
+* **RX_RING_CFG** (48 B): fw-index word and ring addresses, 2048 entries, 2048-byte buffers, all 16 rx flags
+  (0xffff incl. MGMT_RX), init index 2047, the `htt_rx_desc_v2` offsets 74/90/27/37/4/26/7/12/1/2 (computed by
+  compiling Linux's `rx_desc.h`: a 360-byte descriptor).
+* **AGGR_CFG** v2 `05 40 03 00` (A-MPDU 64, A-MSDU 3).
+* HTT T2H messages are tallied by type (`0x100xx` in the event list of the summary). Buffers are not recycled
+  (2047 is plenty for one scan).
+The DMA pool grows to **12 MiB (0xe0100000..0xe0d00000)**, still outside xnu RAM and every reserved-memory region
+of the beryllium DT, identity-mapped by the apps SMMU; host-memory chunks stay below +4 MiB.
+
+Checked: a harness dumped the three messages (frag 64 B, ring 48 B, aggr 4 B) and the ring contents; the
+eleventh independent review matched every byte and the order against v6.12 (`htt_tx.c`, `htt.h`, `htt_rx.c`,
+`core.c`), found no DMA outside the pool; applied its fix (no HTT setup without VERSION_CONF / HTT endpoint).
+
+Image `shim/out/enxerto-boot-ios26full-boot49-wlan-htt.img` (kernel 1120-1123): boot 48r's args unchanged
+(develop's Enxerto, `sweetrfclk=1`, 603 bytes). Expected: "HTT setup sent", then beacons as MGMT_RX (or HTT RX
+indications in the tally) during the scan. Not booted: needs the user's OK.
