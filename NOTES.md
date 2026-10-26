@@ -3,6 +3,21 @@
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> Chlorophyll on Turnip (Chlorophyll branch `turnip` 6a27a3b, Bergamota branch `claude/chlorophyll-turnip-c432e2`), 2026-10-26: Turnip RUNS on the A630 <<<
+* **INSTALLED SYSTEM-WIDE (2026-10-26 ~15:00-15:25 phone time, boot 51, user: "install libchlorophyll + the inject for backboardd", then "kill the dead, move everything to the new turnip one").** Chlorophyll `turnip` 7d34aac.
+  * `/usr/local/lib/bgmtl/` now holds only `bgmtl-inject.dylib` (built from chl), `libchlorophyll.dylib` and the new `libdrm.2.dylib`. **Gallium/libbgair is removed from the phone.**
+    * Backups: `/var/root/bgmtl-gallium-2026-10-26/` (inject 8c7a6d0e, libbgair 25ccfc5d, libdrm 90f707f5) and on the Mac at `work-chlorophyll/phone-backup-gallium-2026-10-26/`.
+    * Revert: copy the three files back into `/usr/local/lib/bgmtl/` (temp name + mv), then remove `libchlorophyll.dylib`.
+  * The same inject file is loaded by backboardd, iconservicesagent and Mercury (their own load command) and by SpringBoard and PosterBoard (`/usr/local/bgi.dylib` symlink). So every Chlorophyll process takes chl at its next start.
+  * **backboardd is still running the old libbgair** it mapped at boot. It moves to chl at the next boot. That needs the user's OK; do not restart it by hand.
+  * **Bugs found by SpringBoard on chl:**
+    * RenderBox's uber fragments (`uber_vertex + fa16*mha4`) took 7 s each in ir3, and drawing them hung the GPU (hang 1). Cause: the frontend inlined a callee's early `return` without `nir_lower_returns`. Fixed in 7d34aac: they now build in about 3.5 s cold and SpringBoard drew them for a couple of minutes, about 50-75 fps while animating, with no failures.
+    * Scratch (private memory) on Turnip checked with the new `bg_scratch`: `chl_test` 30/30.
+  * **Hang 2 (cause unknown):** it came right after I killed the old Gallium iconservicesagent and a PosterBoard. SpringBoard's and Mercury's dead-man switches tripped, so both run stock now (`bgmtl.off.com.apple.springboard`, `bgmtl.off.com.apple.MercuryPoster`). The new iconservicesagent registered on chl.
+    * `kern.sweet_gpu` now reads `recoveries=2 hangs=2`. One more hang this boot and the GPU is lost until a reboot. So no more GPU experiments on boot 51.
+    * Read the counters with `/var/root/sweetgpu` (source `gpu/kernel-test/sweetgpu.c`). The kernel log ring is only readable from recovery.
+  * PosterBoard's old kill switch (Gallium era) was moved to `/var/root/bgmtl.off.PosterBoard.gallium`.
+  * New diagnostic: `/private/var/tmp/bgmtl.refuse` (fragment-name prefixes; it is empty now) makes bgmtl dump and refuse those pipelines; `bgmtl.refuse.build` builds and times them without drawing.
+  * **Next, at the next boot (user OK needed):** first clear `bgmtl.off.com.apple.springboard` and `bgmtl.off.com.apple.MercuryPoster` so everything starts on chl. Then watch `sweetgpu` (hangs) and `bgmtl.log` (failures, DEAD-MAN). If hangs come back, find out which process they follow before anything else.
 * **LATEST (2026-10-26 late): the Metal device (`src/bgmtl.m`) runs on chl, and every Metal probe passes on the phone.** Chlorophyll `turnip` 6a27a3b; details in `docs/TURNIP.md` section 3b, "Metal on chl".
   * `bgmtl.m` is rewritten onto chl. Encoders record straight into chl command buffers; there is no BGWork and no bg_lock. The Gallium version is in git history only.
   * Built by Chlorophyll `turnip/build-metal.sh`. It needs `GPU_METAL_WORK=~/git/iAndroid/work-chlorophyll` and `BERGAMOTA_GPU=<a Bergamota checkout>/gpu`; without `BERGAMOTA_GPU`, pacstrip silently does not run and the binaries die with SIGILL on the phone. Test copies are in `/var/root/metal-turnip`.
