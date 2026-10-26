@@ -750,3 +750,40 @@ kernel + 1108-1115; same recipe that rebuilds boot 41's image byte for byte): bo
 `sweetmpsshold=90` (was 60) so `wlanmdsp.mbn` (3645892 B) has time to load. Expected: GET_DOMAIN_LIST requests
 (e.g. `wlan/fw`, `tms/servreg`), then TFTP RRQ for `wlanmdsp.mbn`, then `WLFW is up` (service 0x45). Not booted:
 needs the user's OK; queue exactly one item.
+
+### 5.17 Boot 42-wlan-pdm (combined with a GPU log test): **WLFW is up**; then my raw-disk read froze the phone
+
+**2026-10-26 ~11:41Z** (the user approved "Combine (boot 42)" to the GPU session, which queued the single item;
+nothing in the image for the GPU side). MBA ALIVE (PBL 0x1 after 65 ms), metadata status 3, 28 segments in 1 s,
+MPSS up, rmtfs (modemst 2 MiB read), TFTP (server check, mcfg configs as boot 41), then the 90 s summary:
+
+```
+SWEET IPC: 90 s: glink versioned, IPCRTR open, qrtr hello seen; 155 packets in, 523 out; rmtfs 3 reads (2097152 bytes),
+0 writes kept in RAM (0 bytes); pd-mapper 7 requests; WLFW up
+```
+
+**The modem asked the pd-mapper 7 times and then offered WLFW (QMI service 0x45): the WLAN protection domain runs.**
+Clean stop (stop-ack 190 ms, rmtfs buffer back, QMP load_state off), no panic. Packets out went from 31 (boot 41) to
+523, consistent with a large TFTP read (`wlanmdsp.mbn`), but the USB console **dropped most kernel lines** of this
+stage (userspace was very busy: of ~40 "modem offers" lines only 2 arrived; no pd-mapper request line, no `WLFW is up`
+line, no wlanmdsp line). Console: `research/ios26/logs-wlan/boot42-wlan-pdm-usb.txt` (main checkout, not in git).
+
+**Bug found:** TFTP transfer ports started at 0x4002 = the pd-mapper's port. The modem's server-check upload
+(`/readwrite/server_check.txt`, port 0x4002) went to the pd-mapper (`unknown request 0x6801` = TFTP DATA) and stayed
+0 bytes; the modem carried on anyway. Fixed in 1116.
+
+**Then I froze the phone (~11:47Z).** To read the full log I ran read-only `dd` on `/dev/rufsroot0` over SSH (binary
+search for the device end, probes up to 64 GiB, past the end of userdata). Right after, SSH, ping and the USB console
+stopped (last lines `exec sh` / `exec toybox`, no panic text) and the screen would not wake. Nothing was written. The
+user handed recovery to the GPU session. **Lesson: never read the raw root device (`/dev/rufsroot0`, `/dev/ufsroot0`)
+on the running phone**; read the console ring only from recovery (`tools/sweet-log-pull.sh`), and make the kernel
+re-print what matters (1116).
+
+**1116** (`1116-beryllium-mpss-tftp-ports-events.patch`): TFTP transfer ports from 0x4010 (clear of the fixed
+server ports 0x4000-0x4002); the stage keeps its key events (services offered/removed, pd-mapper requests and
+answers, PFRs, every TFTP transfer with its byte count) in a 1.5 KiB record and prints it again in 160-character
+`SWEET IPC: events N:` lines after the summary, with a flush and 50 ms between lines. Built (no new warnings), NOT
+run: image `shim/out/enxerto-boot-ios26full-boot43-wlan-events.img` (sha256 `fc9b6240...`, kernel `37794f3f...`).
+Next boot (43) = 1116 with boot
+42's args, to see which domains the modem asked for, whether `wlanmdsp.mbn` came over TFTP, and WLFW; then the WLFW
+client (capabilities, BDF from `bdwlan.*`, mode on).
