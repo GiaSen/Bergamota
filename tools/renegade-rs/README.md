@@ -28,11 +28,19 @@ the web flasher (`apps/web`, phase 3).
 | `hdiutil attach` / `apfs-fuse` of the IPSW's OS and cryptex dmgs (+ `ditto --nohfsCompression`) | `apfs::Container`, `Volume::walk` / `open_file` / `fsck_stats` | read-only APFS reader, no mount: sealed (SSV) and plain volumes, hashed fs-tree, fext tree, decmpfs zlib/LZVN/LZFSE/LZBITMAP/raw read as plain bytes; lstat and file bytes identical to a macOS mount of the real iOS 26.6.2 AppOS cryptex and of synthetic volumes |
 | copy-stage layout fixes, tweaks, owner map (+ the tweaks' owners as OWNER_EXTRA), macho stage (strip + re-sign, bundles sealed), seal, img2simg --consume | `renegade-rs root DIR OUT.simg --build B --version V [--no-macho]` | tweaked files identical to root_tweaks18.py's, Mach-Os and CodeResources identical to pacstrip.py --sign's, fsck_hfs clean |
 
-Not ported yet: ldid signing (pacstrip.py `--sign` on Linux), the tweaks that install prebuilt tools
-with host steps (ssh: dropbear + host-generated keys; the BlueTool stub, hcitest and firmware; PosterBoard +
-sweetfp via addlc.py; bgmtl; bglrender; the first-boot job; sweetprefs), the console bring-up job, the
-jailbreak stage, IPSW/AEA extraction and the APFS volumes (the root build starts from an extracted folder),
-the shared-cache stage (`pacstrip_cache.py`, still changing on the `ios26` branch: `--stubs`),
+Added for the browser path (IPSW in, sparse `userdata` out; see "The IPSW root build" below):
+
+| Python | Rust | Status |
+| --- | --- | --- |
+| `ipsw` + `fetch-root.sh` (zip, BuildManifest) | `zip`, `ipsw`, `renegade-rs ipsw SRC` | reads the IPSW through any `ReadAt` (file, URL by HTTP range, the browser's `File`) |
+| `ipsw fw aea` | `aea` (HKDF/AES-CTR segments, LZFSE; the HPKE key unwrap) | decrypts on the fly, random access; same bytes as `ipsw fw aea` (the 5.2 GB SystemOS image decrypts with every segment checksum valid) |
+| `hdiutil attach` / `apfs-fuse` + `walk_owners` + `ditto` | `apfs` (agent-written reader, see below), `rootbuild` copy stage | the three volumes merged as ditto does, owners from the inodes |
+| `pacstrip_cache.py --stubs` + `fips_rehmac.py --patch` | `dsc` | rewrites every cache file, page hashes of the touched pages, corecrypto's FIPS HMAC |
+| `root_tweaks18.py`: ssh, BlueTool stub + hcitest, first-boot job (+ SweetRun, sweetposterset, sweeticonstyle, sweetopen), PosterBoard + sweetfp (addlc), bglrender, sweetprefs/shot/touch, the console job | `tools` (from `berga-tools.zip`), `renegade-rs tweaks DIR --tools-dir D --ssh-key K` | same files, modes, recorded owners and printed lines as root_tweaks18.py (host keys are left to `dropbear -R` on the phone) |
+| `img2simg.py` on the mounted image | `sparse::SparseWriter`, the HFS writer in image order | the image is written once, front to back, straight into the sparse stream |
+
+Not ported yet: ldid signing (pacstrip.py `--sign` on Linux), bgmtl (the Metal injection of the Mercury poster, needs
+the separate `bgmtl-*` release), the jailbreak stage (Procursus, Sileo and TrollStore: downloads and ldid),
 `simg_putfile.py`, and the boot images (`mkboot-full.sh`). Reference for the port: branch `ios26` at `6a66010`.
 
 ### Ad-hoc signing
@@ -83,11 +91,28 @@ Differences from the Python on purpose:
   root build gives the iNode the entry of a mapped link. In a real build every link of a file has the same
   entry (one lstat of the IPSW volume), so the results agree.
 
+## The IPSW root build
+
+`renegade-rs root-ipsw IPSW OUT.simg [--tools berga-tools.zip --ssh-key KEY]` (IPSW: a file or an https URL, read by
+range requests) is the whole of `renegade root` for the iOS 26 profile in one pass, and it is what the browser runs:
+
+1. `ipsw`: the zip, the BuildManifest, the three disk images (the `.aea` ones decrypted on the fly: the key is
+   HPKE-unwrapped with the private key Apple publishes at the archive's `fcs-key-url`, fetched by the caller).
+2. `apfs`: the OS volume, then the SystemOS and AppOS cryptexes (cryptexes first, the OS volume on top, a symlink
+   never replaces a folder), owners and modes from the inodes; compressed files are read decompressed.
+3. layout fixes (`tree::layout_fixes`), tweaks (`tweaks` + `tools`), the Mach-O stage (`machostage`), the cache
+   stage (`dsc`), then the HFSX volume (`hfswrite`) written in the order the disk images store their files, so each
+   image is read front to back, into a `SparseWriter`. Nothing is held that is bigger than one file (a cache file
+   is 256 MiB at most); the catalog of the ~465,000 entries is the only large structure.
+
+The browser build is `tools/renegade-wasm` (a C ABI, no wasm-bindgen: `host.read/size/write/event` imports, see
+its `src/lib.rs`), loaded by `apps/web/src/patcher/`.
+
 ## Build and test
 
 ```sh
 cargo build --release                                  # target/release/renegade-rs
-cargo build --release --lib --target wasm32-unknown-unknown
+cargo build --release --lib --target wasm32-unknown-unknown      # the library; the module itself: tools/renegade-wasm
 cargo test --release                                   # needs python3: compares with ../renegade on the same inputs
 python3 tests/fixtures/make.py                         # (macOS) rebuild the fixtures: hdiutil + clang, our own content only
 ```
