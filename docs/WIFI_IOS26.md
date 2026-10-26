@@ -1285,3 +1285,67 @@ checkout, not in git; the networks' names stay out of these docs).
 
 **WL1 and WL2 are done.** Next is WL3 (join an open network, IP traffic), the first step that transmits: decisions D1
 and D3 of docs/WIFI_IOS26_PHASE2.md (the user's OK to transmit; an open test network the user controls).
+
+### 6.3 WL3+WL4 / 1126-1127: join a WPA2-Personal network (`sweet80211=3`): built, NOT run
+
+The user chose to skip the open-network step ("go directly to WPA2"; transmitting is OK, decision D1). Two research
+passes fixed the contract on both sides before any code:
+
+**What iOS sends (IO80211 1565.3 from the iOS 26.6.2 shared cache; wifid itself is not on disk).**
+* `CARD_CAPABILITIES` (12) is a **bare 21-byte bit map**, not `{version, bits}`. A join needs byte 0 bit 3 (AES-CCM) and
+  byte 1 bit 6 (WPA2), otherwise IO80211 fails locally with -3903 before calling the driver. SAE (byte 9 bit 3) must
+  stay clear: with it, WPA2-PSK joins carry the passphrase instead of the PMK.
+* `ASSOCIATE` (20) is a 908-byte set: version 1 @0, mode 2 @4, auth lower 1 @8 / upper 8 (WPA2-PSK) @0xc, SSID length
+  @0x10 + SSID @0x14, BSSID @0x34 (normally zero: the driver picks the BSS), key {version 1, length 32, cipher 6 = PMK}
+  @0x3c with the **PMK** @0x4c (IO80211 runs PBKDF2 in the wifid process), the RSN element for the association request
+  (length u16 @0xd0, bytes @0xd2), flags @0x1d3, flags2 @0x1fc (4 = PSK).
+* **The 4-way handshake is the driver's job**: IO80211 does no EAPOL I/O and sets no keys.
+* The sync join polls `ASSOCIATE_RESULT` (21, value in `req_val`) every 20 ms for 8 s: 0 running, 1 success, other =
+  failure code (25 BSS not found, 27/29 no auth/assoc response, 22 supplicant timeout, 30 EAPOL failure, ...). After a
+  failed join it sends `DISASSOCIATE` (22).
+* Events: SSID_CHANGED 2, BSSID_CHANGED 3, LINK_CHANGED 4 (32 bytes: down flag @0, rssi @4, snr @8, noise @10, reason @20),
+  ASSOC_DONE 9 ({u32 status}), RSN_HANDSHAKE_DONE 20, DEAUTH_RECEIVED 34. `CURRENT_NETWORK` is type **103** (a scan
+  result for the current BSS), not 115.
+* Open question: whether wifid uses the async join API, which wants a >= 460-byte ASSOC_DONE that `kev_post_msg`
+  cannot carry. The image assumes the sync API (GET 21); the boot log will show which.
+
+**What the chip needs (ath10k + mac80211 v6.12, WCN3990 TLV/SNOC branches).** VDEV_START (0x5003, VDEV_START_RESP) ->
+STA_POWERSAVE_MODE 0, beacon interval, management rate -> PEER_CREATE (0x6001; done when HTT PEER_MAP arrives; the peer
+must exist before the first frame) -> open-system authentication and the association request by WMI MGMT_TX_SEND by
+reference (0x7008, tag 422; completion 0x7006 or bundled 0x7007), or HTT TX_FRM type MGMT without service 76 ->
+PEER_ASSOC (0x6005: legacy + HT rates, never an HT peer without HT rates: firmware assert) + SMPS -> VDEV_UP (0x5005) ->
+EAPOL over the data path -> VDEV_INSTALL_KEY (0x5009, CCM = 4; done on HTT SEC_IND) pairwise, PEER_SET_PARAM authorize,
+group. Data: HTT TX_FRM with a 72-byte ext descriptor per msdu id in the frag bank and two CE4 gather descriptors
+(28-byte HTC+HTT header, then a 50-byte prefetch of the frame); TX_COMPL_IND frees ids; RX arrives as
+RX_IN_ORD_PADDR_IND (0x12) pointing at RX ring buffers (payload at +360, native wifi), which are posted again at once.
+
+**1126** (`bsd/dev/sweet_wpa.c/.h`, `bsd/dev/sweet_wlan_frames.c/.h`, conf/files):
+* `sweet_wpa`: EAPOL-Key messages 1-4 and the group-key handshake for AKM PSK / key descriptor version 2 (PTK =
+  PRF-384, HMAC-SHA1-128 MIC, RFC 3394 unwrap of the GTK KDE, replay counter set only by MIC-checked frames, AP RSN
+  element byte-compared in message 3, message 4 re-sent if the AP retries 3), on the kernel's SHA-1 and AES.
+* `sweet_wlan_frames`: authentication, association request (mac80211's IE order: SSID, rates without basic bits, RSN,
+  HT capabilities HT20 2x2, WMM info), association response, deauthentication, Ethernet II <-> native wifi.
+* Mac harnesses (scratchpad `wpa/test_wpa.c`, `wpa/test_frames.c`): the 802.11 PRF-512 and PSK test vectors, RFC 3394,
+  a full 4-way handshake + group rekey + bad-MIC / replay / wrong-RSN-element cases against an authenticator built on
+  CommonCrypto, and the frame layouts: all pass.
+
+**1127** (beryllium_wlan.c, sweet_80211.c, sweet_wlan.h):
+* Service: a station state machine (stop-scan, vdev-start, peer, auth, assoc, up, 4-way, keys, CONNECTED, teardown) run
+  by the service thread; WMI commands queued behind the one credit; auth/assoc retried 3 x 200 ms; a 7.5 s join
+  watchdog; EAPOL message 1 held until PEER_ASSOC / VDEV_UP are through; teardown in steps (deauth out, VDEV_DOWN +
+  PEER_DELETE, PEER_UNMAP, VDEV_STOP / VDEV_STOPPED); scans are answered from the cache while a join runs or the
+  station is associated; CE4 host ring 64 entries; status line every 30 s while connected.
+* iOS side: the capability bitmap, ASSOCIATE (logged without the key), GET 21, STATE RUN, SSID / BSSID / CHANNEL / RSSI /
+  NOISE / RATE / TXPOWER / AUTH_TYPE / CURRENT_NETWORK while associated, the link events above, `IFM_ACTIVE`,
+  `IFF_RUNNING` and KEV_DL_LINK_ON/OFF for configd, en0 output queued to the service and received frames to `ifnet_input`.
+* Review (fourteenth): fixed a build break, stale per-join state (could have reported a link without keys), a
+  join-after-leave race that dropped the join, the KEV_DL payload offset (24, not 28), result-before-link ordering,
+  no abort when the service fails, missing timeouts, msdu ids leaked over a teardown, one management buffer reused
+  while queued, DEAUTH_RECEIVED on our own leave, our own broadcasts echoed back by the AP.
+* Not done yet: TKIP groups (mixed WPA/WPA2 APs are refused by IO80211 because TKIP is not advertised), PMF / WPA3,
+  roaming, power save, 40 MHz, interrupts instead of polling.
+
+Image `shim/out/enxerto-boot-ios26full-boot52-wlan-wpa2.img` (kernel 1127, boot 51's args). Test (user): Settings ›
+Wi-Fi, tap the home WPA2 network, enter the password; expected: it joins within a few seconds and gets an address by
+DHCP; then over SSH `ping` the gateway. The console shows each step (`SWEET WLAN sta:` and `SWEET 80211:` lines, the
+ASSOCIATE layout, the RSN element; never the key). Not booted: needs the user's OK.

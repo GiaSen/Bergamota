@@ -65,7 +65,7 @@ periodic WMI ECHO round trip), the thread's CPU share in `top` is small.
 **Boot test (user):** Settings › Wi-Fi lists the real nearby networks with signal bars and lock icons, and
 refreshes them. Joining still fails cleanly.
 
-### WL3. Join an open network, IP traffic (1126-1128)
+### WL3. Join an open network, IP traffic (merged into WL4: 1126-1127, see docs/WIFI_IOS26.md 6.3)
 The largest step. What ath10k + mac80211 do for a station, done in the service:
 * **Host MLME:** authentication (open system) and association request frames built in the kernel, sent with
   WMI management TX; responses taken from MGMT_RX; timeouts and retries.
