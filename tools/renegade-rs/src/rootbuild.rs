@@ -32,8 +32,10 @@ pub struct Config {
     pub cache: Option<dsc::Options>,
     pub tweaks: bool,
     pub quiet: bool,
-    pub netcfg: Option<Vec<u8>>,
-    pub sweetreboot: Option<Vec<u8>>,
+    /// The prebuilt on-device tools (berga-tools.zip); without them the root has no SSH, no first-boot job, ...
+    pub tools: Option<crate::tools::Tools>,
+    /// The public key SSH logs in with (needs `tools`).
+    pub ssh_key: Option<String>,
     /// volume size in bytes (None: used + 6 GiB, at least 24 GiB)
     pub volume_size: Option<u64>,
     /// Called with (path, byte offset, chunk) for every chunk of every file written (tests compare with a reference).
@@ -42,7 +44,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { pems: Vec::new(), now: 0, verify_aea: false, macho: true, cache: Some(dsc::Options::default()), tweaks: true, quiet: false, netcfg: None, sweetreboot: None, volume_size: None, tap: None }
+        Config { pems: Vec::new(), now: 0, verify_aea: false, macho: true, cache: Some(dsc::Options::default()), tweaks: true, quiet: false, tools: None, ssh_key: None, volume_size: None, tap: None }
     }
 }
 
@@ -231,9 +233,12 @@ pub fn build<W: Write + Seek>(ipsw: &Ipsw, cfg: &mut Config, out: W, ev: &mut dy
             board: board.into(),
             adt_target: adt.into(),
             quiet: cfg.quiet,
-            netcfg: cfg.netcfg.clone(),
-            sweetreboot: cfg.sweetreboot.clone(),
+            netcfg: cfg.tools.as_ref().and_then(|t| t.get("sweetnet/sweetnetcfg")).map(<[u8]>::to_vec),
+            sweetreboot: cfg.tools.as_ref().and_then(|t| t.get("sweetnet/sweetreboot")).map(<[u8]>::to_vec),
             root_display: String::new(),
+            tools: cfg.tools.clone(),
+            ssh_key: cfg.ssh_key.clone(),
+            ssh_key_name: None,
         };
         let mut log = Vec::new();
         tweaks::run(&mut tfs, &tc, &mut log)?;

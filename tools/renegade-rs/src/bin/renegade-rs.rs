@@ -219,6 +219,7 @@ fn cmd_root(args: &[String]) -> Res<ExitCode> {
             netcfg: read("--netcfg")?,
             sweetreboot: read("--sweetreboot")?,
             root_display: String::new(),
+            ..Default::default()
         };
         let mut log = Vec::new();
         renegade::tweaks::run(&mut tfs, &cfg, &mut log)?;
@@ -299,7 +300,7 @@ fn cmd_plist(args: &[String]) -> Res<ExitCode> {
 /// The ported tweaks on a root folder (what root_tweaks18.py does to the mounted image): prints the same lines,
 /// then the recorded owners ("OWNER path uid gid").
 fn cmd_tweaks(args: &[String]) -> Res<ExitCode> {
-    let (pos, opts, flags) = split(args, &["--build", "--version", "--board", "--adt-target", "--netcfg", "--sweetreboot", "--display"]);
+    let (pos, opts, flags) = split(args, &["--build", "--version", "--board", "--adt-target", "--netcfg", "--sweetreboot", "--display", "--tools-dir", "--ssh-key", "--ssh-key-name"]);
     let [root] = &pos[..] else { return Err("tweaks ROOT_DIR --build B --version V [--board N841 --adt-target D22] [--quiet] [--netcfg FILE] [--sweetreboot FILE] [--display PATH]".into()) };
     let read = |k: &str| opts.get(k).map(fs::read).transpose();
     let cfg = renegade::tweaks::Config {
@@ -311,6 +312,9 @@ fn cmd_tweaks(args: &[String]) -> Res<ExitCode> {
         netcfg: read("--netcfg")?,
         sweetreboot: read("--sweetreboot")?,
         root_display: opts.get("--display").cloned().unwrap_or(root.clone()),
+        tools: opts.get("--tools-dir").map(|d| tools_from_dir(Path::new(d))).transpose()?,
+        ssh_key: opts.get("--ssh-key").cloned(),
+        ssh_key_name: opts.get("--ssh-key-name").cloned(),
     };
     let mut f = renegade::tweaks::DirFs::new(root);
     let mut log = Vec::new();
@@ -1002,11 +1006,17 @@ impl io::Seek for NullSeek {
 fn cmd_root_ipsw(args: &[String]) -> Res<ExitCode> {
     use std::cell::RefCell;
     use std::rc::Rc;
-    let (pos, opts, flags) = split(args, &["--pem", "--compare", "--now", "--size"]);
+    let (pos, opts, flags) = split(args, &["--pem", "--compare", "--now", "--size", "--tools", "--ssh-key"]);
     let [src, out] = &pos[..] else { return Err("root-ipsw IPSW(file or URL) OUT.simg|null [--pem FILE] [--no-macho] [--no-cache] [--no-tweaks] [--compare REF.simg] [--now UNIX] [--size 24g]".into()) };
     let ipsw = renegade::ipsw::Ipsw::open(open_src(src)?)?;
     let mut cfg = renegade::rootbuild::Config { now: opts.get("--now").map(|n| n.parse()).transpose()?.unwrap_or(0), ..Default::default() };
     cfg.volume_size = opts.get("--size").map(|s| parse_size(s)).transpose()?;
+    if let Some(t) = opts.get("--tools") {
+        cfg.tools = Some(renegade::tools::Tools::from_zip(open_src(t)?)?);
+    }
+    if let Some(k) = opts.get("--ssh-key") {
+        cfg.ssh_key = Some(if Path::new(k).is_file() { fs::read_to_string(k)? } else { k.clone() });
+    }
     cfg.macho = !flags.iter().any(|f| f == "--no-macho");
     cfg.tweaks = !flags.iter().any(|f| f == "--no-tweaks");
     if flags.iter().any(|f| f == "--no-cache") {
@@ -1068,4 +1078,24 @@ fn cmd_root_ipsw(args: &[String]) -> Res<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// A folder laid out like berga-tools.zip as a [`renegade::tools::Tools`] (tests and local builds).
+fn tools_from_dir(dir: &Path) -> Res<renegade::tools::Tools> {
+    let mut files = BTreeMap::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in fs::read_dir(&d)? {
+            let p = e?.path();
+            if p.is_dir() {
+                todo.push(p);
+            } else if p.is_file() {
+                let rel = p.strip_prefix(dir)?.to_string_lossy().into_owned();
+                if ["ssh/", "sweetnet/", "bergamota-gl/"].iter().any(|x| rel.starts_with(x)) {
+                    files.insert(rel, fs::read(&p)?);
+                }
+            }
+        }
+    }
+    Ok(renegade::tools::Tools::from_files(files))
 }

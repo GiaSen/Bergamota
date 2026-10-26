@@ -37,6 +37,7 @@ pub mod pacstrip;
 pub mod plist;
 pub mod rootbuild;
 pub mod sparse;
+pub mod tools;
 pub mod tree;
 pub mod tweaks;
 pub mod zip;

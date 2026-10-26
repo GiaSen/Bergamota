@@ -40,6 +40,10 @@ pub trait Fs {
     fn copy(&mut self, from: &str, to: &str) -> Result<()>;
     /// Every path under `p` (recursive), sorted.
     fn walk(&self, p: &str) -> Result<Vec<String>>;
+    /// os.symlink: `link` becomes a symlink to `target`.
+    fn symlink(&mut self, target: &str, link: &str) -> Result<()>;
+    /// os.path.islink / os.readlink: the target when `p` is a symlink (not followed).
+    fn readlink(&self, p: &str) -> Option<String>;
     /// The recorded owners (relative path -> (uid, gid)).
     fn owners(&self) -> &BTreeMap<String, (u32, u32)>;
 }
@@ -109,6 +113,12 @@ impl Fs for DirFs {
     }
     fn copy(&mut self, from: &str, to: &str) -> Result<()> {
         std::fs::copy(self.p(from), self.p(to)).map(|_| ())
+    }
+    fn symlink(&mut self, target: &str, link: &str) -> Result<()> {
+        std::os::unix::fs::symlink(target, self.p(link))
+    }
+    fn readlink(&self, p: &str) -> Option<String> {
+        std::fs::read_link(self.p(p)).ok().map(|t| t.to_string_lossy().into_owned())
     }
     fn walk(&self, p: &str) -> Result<Vec<String>> {
         let mut out = Vec::new();
@@ -404,7 +414,7 @@ pub fn add_job(fs: &mut dyn Fs, label: &str, job: &Value) -> Result<()> {
 }
 
 /// A file from the tool build into the root (copy2 or install_file: root:wheel, the given mode).
-fn install(fs: &mut dyn Fs, data: &[u8], dst: &str, mode: u32) -> Result<()> {
+pub(crate) fn install(fs: &mut dyn Fs, data: &[u8], dst: &str, mode: u32) -> Result<()> {
     if let Some((dir, _)) = dst.rsplit_once('/') {
         fs.makedirs(dir)?;
     }
@@ -582,7 +592,7 @@ pub fn bluetoothd_env(pl: &mut Value) -> usize {
 }
 
 /// The launchd part of bluetooth() (the BlueTool stub, hcitest and firmware are not ported yet).
-pub fn bluetooth_env(fs: &mut dyn Fs, log: &mut Log) -> Result<()> {
+pub fn bluetooth_env(fs: &mut dyn Fs, log: &mut Log, stub_available: bool) -> Result<()> {
     let (uid, gid, mode) = fs.stat(LAUNCHD_PLIST)?;
     let mut pl = load(fs, LAUNCHD_PLIST)?;
     if bluetoothd_env(&mut pl) == 0 {
@@ -591,7 +601,9 @@ pub fn bluetooth_env(fs: &mut dyn Fs, log: &mut Log) -> Result<()> {
     }
     save(fs, LAUNCHD_PLIST, &pl, uid, gid, mode, Fmt::Binary)?;
     log.push(format!("bluetooth: BT_HCI_TRANSPORT set for {BT_LABEL}"));
-    log.push("bluetooth: BlueTool stub not built (tools/sweetnet/build.sh): BlueTool left alone".into());
+    if !stub_available {
+        log.push("bluetooth: BlueTool stub not built (tools/sweetnet/build.sh): BlueTool left alone".into());
+    }
     Ok(())
 }
 
@@ -629,6 +641,12 @@ pub struct Config {
     pub sweetreboot: Option<Vec<u8>>,
     /// How paths are shown in messages (Python prints absolute paths under the root it was given).
     pub root_display: String,
+    /// The prebuilt on-device tools (berga-tools.zip); None: every feature that installs one is skipped.
+    pub tools: Option<crate::tools::Tools>,
+    /// The public key SSH logs in with (one `ssh-ed25519 AAAA...` line); without it the ssh tweak is skipped.
+    pub ssh_key: Option<String>,
+    /// Where the key came from, for the log line (default: "the public key you gave").
+    pub ssh_key_name: Option<String>,
 }
 
 /// The ported part of root_tweaks18.base() + auto(), in their order (ssh, sweetprefs, PosterBoard, bgmtl, the
@@ -645,12 +663,14 @@ pub fn run(fs: &mut dyn Fs, cfg: &Config, log: &mut Log) -> Result<()> {
     usbnet(fs, log)?;
     netcfg(fs, log, cfg.netcfg.as_deref())?;
     sweetreboot(fs, log, cfg.sweetreboot.as_deref())?;
+    crate::tools::run_ssh(fs, cfg, log)?;
     audio(fs, log)?;
     activation(fs, log, r, &cfg.build, &cfg.version)?;
     stage_prefs(fs, log, &cfg.build)?;
     iosroot_dirs(fs)?;
     staged_apps(fs, log)?;
-    bluetooth_env(fs, log)
+    bluetooth_env(fs, log, cfg.tools.as_ref().is_some_and(|t| t.get(crate::tools::BLUETOOL_STUB).is_some()))?;
+    crate::tools::run_rest(fs, cfg, log)
 }
 
 pub const REGISTER_LIST: &str = "usr/local/share/renegade/register-apps";
@@ -902,6 +922,25 @@ impl Fs for TreeFs<'_> {
         let (_, _, mode) = self.stat(from)?;
         self.write(to, &data)?;
         self.chmod(to, mode)
+    }
+    fn symlink(&mut self, target: &str, link: &str) -> Result<()> {
+        let path = Self::norm(link);
+        if self.index.contains_key(&path) {
+            return Err(bad(format!("{link}: file exists")));
+        }
+        let parent = path.rsplit_once('/').map(|x| x.0).unwrap_or("");
+        if !self.is_dir(parent) {
+            return Err(bad(format!("{link}: parent folder missing")));
+        }
+        self.entries.push(crate::hfswrite::Entry { path: path.clone(), kind: crate::hfswrite::Kind::Symlink { target: target.to_string() }, uid: 0, gid: 0, perm: 0o755, mtime: self.now, link_group: None });
+        self.index.insert(path, self.entries.len() - 1);
+        Ok(())
+    }
+    fn readlink(&self, p: &str) -> Option<String> {
+        match self.index.get(&Self::norm(p)).map(|&i| &self.entries[i].kind) {
+            Some(crate::hfswrite::Kind::Symlink { target }) => Some(target.clone()),
+            _ => None,
+        }
     }
     fn walk(&self, p: &str) -> Result<Vec<String>> {
         let dir = Self::norm(p);
