@@ -1021,3 +1021,40 @@ Console: `research/ios26/logs-wlan/boot46-wlan-wmi-usb.txt` (main checkout, not 
 `ath10k_core_register`/`mac.c` up to a scan: PDEV_SET_BASE_MACADDR (a MAC: the ADT's `local-mac-address` of the
 wlan node, or a fixed locally administered one), HTT version request and HTT RX ring setup on CE4/CE1, PDEV params,
 VDEV create (station), START_SCAN on 2.4/5 GHz, and the SCAN and MGMT_RX events (beacons -> SSIDs logged).
+
+### 5.25 1120: first scan, passive only (`sweetscan=1`): built, NOT run
+
+`1120-beryllium-wlan-first-scan.patch`, gate **`sweetscan=1`** (needs `sweetwmi=1`). What ath10k (`core.c`
+`ath10k_core_start` -> `mac.c` `ath10k_start`, `add_interface`, `hw_scan`) sends for a station before scanning,
+reduced to the commands that matter (reference extracted from Linux v6.12 into the session notes):
+1. **HTT VERSION_REQ** (4 bytes, type 0) on a new **CE4** source ring (16 entries, dmax 256, pool +0x5000, buffers
+   +0x58000, shadow write index 0x32010, initialised only with `sweetscan=1`); VERSION_CONF (type 0, minor, major)
+   on CE1, waited for 3 s (scan results come over WMI either way). HTT frag-desc / RX ring / aggr config are not
+   sent: management frames come over WMI MGMT_RX ("firmware is guaranteed to report all essential management
+   frames via WMI", wmi.c); they are the first thing to add if no beacons arrive.
+2. WMI commands **one at a time**: the WMI endpoint's single credit is now tracked (taken by each send, returned by
+   the HTC trailer credit reports, capped at 1). In order: PDEV_SET_PARAM tx/rx chain mask 3 (2 RF chains);
+   **SCAN_CHAN_LIST** of 26 channels (2.4 GHz 1-13; 5 GHz 36-64, 52-64 flagged DFS; 149-165: regdomain 0x809c =
+   CN), **every channel PASSIVE**, mode 11G/11A + ALLOW_HT/VHT, 20 dBm caps; **PDEV_SET_REGDOMAIN** 0x52 (APL1),
+   CTL 2 GHz 0x30 / 5 GHz 0x10, as ath10k derives from 0x809c; **VDEV_CREATE** vdev 0 station with the ADT's
+   `arm-io/wlan local-mac-address` **02:00:5e:77:e0:01** (ath10k never sends PDEV_SET_BASE_MACADDR for WMI-TLV;
+   the READY MAC is zero); VDEV_SET_PARAM tx_encap native wifi; **START_SCAN** passive (scan_ctrl_flags 0x31: the
+   TLV firmware's inverted FILTER_PROBE_REQ, no SSIDs, broadcast BSSID, dwell 150 ms passive, max 20 s).
+3. **RF: listen only.** Passive scan flag, no SSIDs, PASSIVE on every channel (ath10k notes the firmware probes DFS
+   channels actively otherwise), the vdev is never started or up, no peer: nothing is transmitted.
+4. SCAN_EVENT (tag 36: STARTED, FOREIGN_CHANNEL visits, COMPLETED with reason, START_FAILED) and **MGMT_RX** (tag 44
+   header: channel, SNR -> dBm, status; tag 17: the 802.11 frame): beacons/probe responses (CRC/decrypt/key-miss
+   frames dropped), BSSID + channel + RSSI + SSID (non-printables as `?`), each BSS logged once (48 max) and listed
+   again at the end of the stage (`scan summary`). Then WLAN_MODE off as before.
+Also: an endpoint-0 message that is only a credit trailer is no longer logged as a control message.
+
+Checked: the harness drove HTT version -> the seven WMI commands one credit at a time -> STARTED -> a beacon ->
+COMPLETED -> summary (it caught a SCAN_EVENT length check that would have dropped every event). Ninth independent
+review: ids, tags, struct layouts, param ids (TLV maps), regdomain, scan flags and HTT format match Linux, RF
+listen-only confirmed, no blocking defect; applied its fixes (scan events only with `sweetscan=1`, credit capped
+at 1, per-step timeout). The SSIDs seen on the phone's console are not copied into these docs.
+
+Image `shim/out/enxerto-boot-ios26full-boot47-wlan-scan.img` (sha256 `471a50c2...`, kernel `bb2120ab...` = boot 33b's
+kernel + 1108-1120): boot 46's args plus `sweetscan=1` (**604 bytes of 607**: little room left in the boot-args
+field). Expected: HTT version, the seven commands, scan STARTED, channel visits, beacons from nearby networks,
+COMPLETED, summary, mode off. Not booted: needs the user's OK.
