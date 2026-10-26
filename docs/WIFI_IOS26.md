@@ -1211,3 +1211,31 @@ git), not in these docs. The RF clock vote stays on (boot 48 without it was neve
 (keep the modem and the WLAN firmware up, scan on request, then association: VDEV_START/UP, peer, keys,
 HTT TX/RX data path with RX_IN_ORD_PADDR_IND handling and buffer recycling), and an iOS-facing interface
 (an IO80211 / Skywalk netif driver or a simpler userspace bridge) so the Settings app and `wifid` can see networks.
+
+## 6. Phase 2 (plan: docs/WIFI_IOS26_PHASE2.md)
+
+### 6.1 WL1 / 1124: the long-lived WLAN service (`sweetwlan=5`): built, NOT run
+
+`1124-beryllium-wlan-service.patch`:
+* **`sweetwlan=5`** = the service: every Wi-Fi gate (`sweetmss`, `sweetmsskeep`, `sweetmpss`, `sweetrmtfs`,
+  `sweettftp`, `sweetpdm`, `sweetwlfw`, `sweetce`, `sweetwmi`, `sweetscan`, `sweetrfclk`) defaults to **on**
+  (`wl_gate()`; the boot-arg still overrides, e.g. `sweetscan=0`); `sweetwlan=4` is unchanged (gates default off).
+* **No hold time, no teardown**: `ms_ipc_run(0)` runs until the modem reports fatal (then the old teardown).
+  The startup sequence is boot 49's (WLFW, CE, HTC/WMI, HTT setup, one passive scan, summary once); Wi-Fi stays
+  in mission mode afterwards.
+* **Adaptive polling**: 1 ms while anything moves (GLINK packets, HTC messages, a pending WMI command, a TFTP
+  transfer, a scan, the GLINK TX queue) and for 200 ms after; 20 ms when idle. `wl_sleep` blocks the thread
+  (`assert_wait_deadline`), so idle costs ~50 wakeups/s.
+* **Status every 60 s**: `SWEET WLAN svc: up N s, state, loops (busy), glink in/out, wmi events, credit,
+  echo ok/sent (last rtt, skipped), rmtfs reads/writes, modem up/FATAL`, and a **WMI ECHO** (cmd 0x1d001,
+  tag 149; reply event 0x1d001, tag 54, ids/tags checked in Linux's `wmi-tlv.h`) each time to show the firmware
+  still answers; an unanswered ECHO with no WMI credit back is logged as "WMI commands are blocked".
+* Boot-args folded: the 11 Wi-Fi args are replaced by `sweetwlan=5` (`sweetwlandelay=60` stays).
+
+Checked: built with no new warnings; review (twelfth): `sweetwlan=4` unchanged, no spin, no wedge from a lost
+ECHO, wire format right; applied its diagnostics (credit and skipped ECHOs in the status line).
+
+Image `shim/out/enxerto-boot-ios26full-boot50-wlan-svc.img` (kernel 1120-1124): develop's Enxerto, the GPU
+baseline args of the `-enxdev` image with the 11 Wi-Fi args replaced by `sweetwlan=5` (**484 bytes**, 122 free;
+`sweetgpuboost=7` back). Test: the phone stays up 10+ minutes, the status line every minute with ECHOs answered,
+the service thread's CPU small in `top`. Not booted: needs the user's OK.
