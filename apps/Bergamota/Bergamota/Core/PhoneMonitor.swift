@@ -353,7 +353,7 @@ final class PhoneMonitor {
         defer { metricsInFlight = false }
         let ip = settings.phoneIP
         let remote = "/usr/local/bin/sweetmetrics" + (settings.metricsGPUInfo ? " --gpu-info" : "")
-        let r = await Shell.run(ssh, ["-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "root@\(ip)", remote], timeout: 6)
+        let r = await Shell.run(ssh, Shell.sshOptions + ["root@\(ip)", remote], timeout: 6)
         guard state == .ios else { return }      // the phone went away while we waited
         if r.launchError != nil || r.timedOut || (r.status != 0 && PhoneMetrics.extractJSON(r.stdout) == nil) {
             let err = r.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
