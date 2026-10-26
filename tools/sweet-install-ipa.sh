@@ -2,11 +2,15 @@
 # Sideload an IPA onto the phone over SSH as a system app.
 #   tools/sweet-install-ipa.sh App.ipa          install (or reinstall)
 #   tools/sweet-install-ipa.sh -u App.app       uninstall by bundle folder name
-# The app must be decrypted (no FairPlay: App Store downloads won't run),
-# support iOS 16 and contain an arm64 slice. Every Mach-O in the bundle is
-# re-signed ad-hoc keeping its own entitlements (our kernel accepts ad-hoc
-# signatures), copied to /Applications and registered with LaunchServices by
-# research/sweetnet/sweetuicache (tools/sweetnet/sweetuicache.m).
+# The app must be decrypted (no FairPlay: App Store downloads won't run) and
+# contain an arm64 or arm64e slice. arm64e code (iOS 26) gets its pointer-
+# authentication instructions rewritten to plain ARMv8.0 ones by Renegade's
+# pacstrip, as the system itself is (this CPU has no PAuth; the kernel's PAC
+# emulation, xnu patch 1019, would also run them, but at ~1 us per instruction).
+# Every Mach-O in the bundle is then re-signed ad-hoc keeping its own
+# entitlements (our kernel accepts ad-hoc signatures), copied to /Applications
+# and registered with LaunchServices by research/sweetnet/sweetuicache
+# (tools/sweetnet/sweetuicache.m).
 set -eu
 host=${SWEET_HOST:-root@192.168.7.2}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -26,12 +30,25 @@ app=$(ls -d "$tmp"/Payload/*.app | head -1)
 [ -d "$app" ] || { echo "no Payload/*.app in $ipa" >&2; exit 1; }
 name=$(basename "$app")
 
-# FairPlay-encrypted executables cannot run here.
-exe=$app/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
-if otool -l "$exe" | grep -A4 LC_ENCRYPTION_INFO | grep -q 'cryptid 1'; then
-	echo "$name is FairPlay-encrypted (App Store download): it will not run; use a decrypted IPA" >&2
-	exit 1
-fi
+# Every Mach-O of the bundle (executables, dylibs, frameworks, extensions).
+machos=$tmp/machos.txt
+find "$app" -type f | while read -r f; do
+	case $(od -An -tx1 -N4 "$f" | tr -d ' \n') in
+	cffaedfe|cafebabe|cafebabf) echo "$f" ;;
+	esac
+done > "$machos"
+
+# FairPlay-encrypted code can neither run here nor be rewritten (pacstrip would corrupt it).
+while read -r f; do
+	if otool -l "$f" | grep -A4 LC_ENCRYPTION_INFO | grep -q 'cryptid 1'; then
+		echo "$name: ${f#"$app"/} is FairPlay-encrypted (App Store download): it will not run; use a decrypted IPA" >&2
+		exit 1
+	fi
+done < "$machos"
+
+# arm64e: PAC instructions -> plain ARMv8.0 (same 4-byte rewrite as the system's; no-op for arm64 code).
+tr '\n' '\0' < "$machos" | xargs -0 python3 -I "$here/renegade/pacstrip.py" > "$tmp/pacstrip.txt"
+grep -v ': no PAC code$' "$tmp/pacstrip.txt" || true
 
 # Re-sign inside-out: nested bundles/dylibs first, the app last, each with its
 # own entitlements (if any).
