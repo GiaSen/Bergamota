@@ -1073,6 +1073,43 @@ fn cmd_root_ipsw(args: &[String]) -> Res<ExitCode> {
         let vol = Rc::new(renegade::hfs::Volume::open(Sparse::open(FileAt::open(refimg)?)?)?);
         let cur: Rc<RefCell<(String, Option<Vec<u8>>)>> = Rc::new(RefCell::new((String::new(), None)));
         let rep = report.clone();
+        let vol2 = vol.clone();
+        cfg.entries_tap = Some(Box::new(move |mine| {
+            use std::collections::HashMap;
+            let theirs = renegade::tree::from_volume(&*vol2, "").unwrap();
+            let t: HashMap<&str, &renegade::hfswrite::Entry> = theirs.iter().map(|e| (e.path.as_str(), e)).collect();
+            let m: HashMap<&str, &renegade::hfswrite::Entry> = mine.iter().map(|e| (e.path.as_str(), e)).collect();
+            let (mut only_ref, mut only_mine, mut meta, mut kind) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for (p, e) in &t {
+                match m.get(p) {
+                    None => only_ref.push(p.to_string()),
+                    Some(x) => {
+                        use renegade::hfswrite::Kind;
+                        let k = |e: &renegade::hfswrite::Entry| match &e.kind { Kind::Dir => "dir".to_string(), Kind::File { .. } => "file".to_string(), Kind::Symlink { target } => format!("symlink {target}") };
+                        if k(e) != k(x) {
+                            kind.push(format!("{p}: ref {} mine {}", k(e), k(x)));
+                        } else if (e.uid, e.gid, e.perm) != (x.uid, x.gid, x.perm) {
+                            meta.push(format!("{p}: ref {}:{} {:o} mine {}:{} {:o}", e.uid, e.gid, e.perm, x.uid, x.gid, x.perm));
+                        }
+                    }
+                }
+            }
+            for p in m.keys() {
+                if !t.contains_key(p) {
+                    only_mine.push(p.to_string());
+                }
+            }
+            only_ref.sort();
+            only_mine.sort();
+            meta.sort();
+            kind.sort();
+            eprintln!("TREE: {} entries mine, {} in the reference; {} only in the reference, {} only in mine, {} kind differences, {} owner/mode differences", mine.len(), theirs.len(), only_ref.len(), only_mine.len(), kind.len(), meta.len());
+            for (name, v) in [("ONLY-REF", &only_ref), ("ONLY-MINE", &only_mine), ("KIND", &kind), ("META", &meta)] {
+                for l in v.iter().take(40) {
+                    eprintln!("TREE {name} {l}");
+                }
+            }
+        }));
         let dump: Option<(String, String)> = opts.get("--dump").and_then(|d| d.split_once('=')).map(|(a, b)| (a.to_string(), b.to_string()));
         let show = opts.contains_key("--show") || flags.iter().any(|f| f == "--show");
         cfg.tap = Some(Box::new(move |path, off, chunk| {

@@ -40,13 +40,15 @@ pub struct Config {
     pub volume_size: Option<u64>,
     /// Debugging: keep only the entries at or under this path (and its folders); implies nothing else.
     pub only: Option<String>,
+    /// Called once with the final entries just before the image is written (tests compare the tree).
+    pub entries_tap: Option<Box<dyn FnOnce(&[Entry])>>,
     /// Called with (path, byte offset, chunk) for every chunk of every file written (tests compare with a reference).
     pub tap: Option<Box<dyn FnMut(&str, u64, &[u8])>>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { pems: Vec::new(), now: 0, verify_aea: false, macho: true, cache: Some(dsc::Options::default()), tweaks: true, quiet: false, tools: None, ssh_key: None, volume_size: None, only: None, tap: None }
+        Config { pems: Vec::new(), now: 0, verify_aea: false, macho: true, cache: Some(dsc::Options::default()), tweaks: true, quiet: false, tools: None, ssh_key: None, volume_size: None, only: None, entries_tap: None, tap: None }
     }
 }
 
@@ -316,6 +318,9 @@ pub fn build<W: Write + Seek>(ipsw: &Ipsw, cfg: &mut Config, out: W, ev: &mut dy
     let mut done = 0u64;
     let mut last_report = 0u64;
     let paths: HashMap<usize, String> = entries.iter().filter_map(|e| if let Kind::File { source, .. } = e.kind { Some((source, e.path.clone())) } else { None }).collect();
+    if let Some(t) = cfg.entries_tap.take() {
+        t(&entries);
+    }
     let mut tap = cfg.tap.take();
     let st = {
         let mut feed = |source: usize, sink: &mut dyn FnMut(&[u8]) -> Result<()>| -> Result<()> {
