@@ -11,9 +11,16 @@ Chrome or Edge on a desktop computer talks fastboot to the Poco F1 over **WebUSB
 
 - **Patch IPSW + flash** (the default): pick Apple's IPSW, patch it into a root image in the browser, flash it.
   The IPSW step checks the file against Renegade's profiles (`src/lib/profiles.ts`: ios26 = iOS 26.6.2 23G90
-  for iPhone12,1, ios18 = iOS 18.7.8 22H352 for iPhone11,8). The in-browser patcher is phase 3 (Renegade in
-  Rust compiled to WebAssembly); until it lands the Patch step points to `tools/renegade/renegade root` and the
-  second path.
+  for iPhone12,1, ios18 = iOS 18.7.8 22H352 for iPhone11,8). The patch step runs Renegade (Rust, compiled to
+  WebAssembly: `tools/renegade-wasm`, built into `src/patcher/renegade.wasm` by `npm run build:wasm`) in a Web
+  Worker: it reads the IPSW with `FileReaderSync` (never loaded whole), decrypts and reads the APFS images,
+  and writes the sparse `userdata` image into the browser's private storage (OPFS, about 18 GB; the step checks
+  `navigator.storage.estimate()` first). The image then goes through the same checks and flashing as the
+  second path. The only network request is `/api/fcs-key` (`worker/index.ts`): the IPSW's disk images are
+  AEA-encrypted for a private key Apple publishes on its CDN without CORS headers, so the Worker fetches that
+  one file (URL pattern allowlisted) for the page. The root gets an SSH server when the page has the tools
+  bundle (`public/tools/berga-tools.zip`, `scripts/fetch-tools.sh` downloads the newest `berga-tools-vN` release)
+  and the user pastes an SSH public key; without them the root builds but has no SSH.
 - **Flash an image**: an iOS root (`.simg` or `.img`, onto `userdata`), Enxerto's `boot.img` (onto `boot`) or a
   splash (onto `logo`).
 
@@ -47,12 +54,12 @@ npm install
 npm test          # node --test: sparse splitting round trips, end-to-end flash into a fake phone, allowlist
 npm run check     # svelte-check
 npm run dev       # Vite on http://localhost:5173 (dev only: window.__session drives the flow with test/helpers.ts FakePhone)
-npm run build     # -> dist/
+npm run build:wasm # tools/renegade-wasm -> src/patcher/renegade.wasm (needs rustup + the wasm32-unknown-unknown target)
+npm run build     # build:wasm, then Vite -> dist/ (the wasm build is also part of `npm run dev` and `deploy`)
 npx wrangler dev  # serve dist/ like production (headers, 404, /flash -> /flash/) on http://localhost:8787
 ```
 
-`public/_headers` sets the CSP (fonts and images only from this origin, `wasm-unsafe-eval` for the coming
-WASM patcher) and `Permissions-Policy: usb=(self)`.
+`public/_headers` sets the CSP (fonts and images only from this origin, `wasm-unsafe-eval` for the WASM patcher) and `Permissions-Policy: usb=(self)`.
 
 ## Deploy
 
