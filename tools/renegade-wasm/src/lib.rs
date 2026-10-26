@@ -196,6 +196,8 @@ pub extern "C" fn rr_result_len() -> usize {
 /// Opens the IPSW (host source 0) and describes it: JSON {device, version, build, images: [{name, path, encrypted, keyUrl}]}.
 #[unsafe(no_mangle)]
 pub extern "C" fn rr_open_ipsw() -> i32 {
+    // a panic aborts the module (panic = "abort"): say why first, through the log
+    std::panic::set_hook(Box::new(|info| event(1, &format!("internal error: {info}"), 0.0, 0.0)));
     let src: Src = Rc::new(HostSrc::new(0));
     match renegade::ipsw::Ipsw::open(src).and_then(|ipsw| {
         let mut images = Vec::new();
