@@ -1384,3 +1384,7 @@ working, ECHOs answered). Second attempt (2.4 GHz network): "no BSS" because the
 that AP and each scan replaced the whole cache. **1129** (`1129-beryllium-wlan-bss-cache-aging.patch`): the BSS cache
 keeps a network until three scans in a row miss it; image `shim/out/enxerto-boot-ios26full-boot54-wlan-wpa2-cache.img`
 (kernel 1129), built, not booted.
+Boot 53 then ended without a 2.4 GHz attempt: wifid stopped scanning after the "no BSS" result (the service stayed idle
+and healthy, ECHO 9/9 over 10 minutes), and at ~22:41Z launchd rebooted the phone "due to critical process crashes:
+SpringBoard" (SpringBoard on the new Turnip GPU driver, the GPU line's first boot with it; reported to that session).
+The EAPOL TID fix is still untested. Console: `research/ios26/logs-wlan/boot53-wlan-wpa2-tid-usb.txt` (main checkout).
