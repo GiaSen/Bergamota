@@ -22,6 +22,7 @@ pub mod apfs;
 pub mod aea;
 pub mod bundle;
 pub mod codesign;
+pub mod dsc;
 pub mod fixups;
 pub mod hfs;
 pub mod hfsedit;
@@ -34,6 +35,7 @@ pub mod macho;
 pub mod machostage;
 pub mod pacstrip;
 pub mod plist;
+pub mod rootbuild;
 pub mod sparse;
 pub mod tree;
 pub mod tweaks;
@@ -71,3 +73,11 @@ pub(crate) mod bytes {
         String::from_utf8_lossy(&b[..end]).into_owned()
     }
 }
+
+/// The browser build needs no random numbers (the crypto crates link a RNG they never call): a source that fails.
+#[cfg(target_family = "wasm")]
+fn no_random(_: &mut [u8]) -> std::result::Result<(), getrandom::Error> {
+    Err(getrandom::Error::UNSUPPORTED)
+}
+#[cfg(target_family = "wasm")]
+getrandom::register_custom_getrandom!(no_random);

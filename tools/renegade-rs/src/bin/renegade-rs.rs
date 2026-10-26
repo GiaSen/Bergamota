@@ -37,6 +37,8 @@ fn main() -> ExitCode {
         Some("plist") => cmd_plist(&args[1..]),
         Some("tweaks") => cmd_tweaks(&args[1..]),
         Some("ipsw") => cmd_ipsw(&args[1..]),
+        Some("apfs") => cmd_apfs(&args[1..]),
+        Some("root-ipsw") => cmd_root_ipsw(&args[1..]),
         Some("sign") => cmd_sign(&args[1..]),
         Some("resign-check") => cmd_resign_check(&args[1..]),
         _ => {
@@ -892,6 +894,145 @@ fn cmd_ipsw(args: &[String]) -> Res<ExitCode> {
             img.read_at(off, &mut buf[..n])?;
             o.write_all(&buf[..n])?;
             off += n as u64;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Opens an image of an IPSW (URL or file) as a raw APFS container, fetching the AEA key when needed.
+fn open_ipsw_image(src: &str, image: &str, pem_file: Option<&String>) -> Res<renegade::io::Src> {
+    let ipsw = renegade::ipsw::Ipsw::open(open_src(src)?)?;
+    let im = renegade::ipsw::Image::ALL.into_iter().find(|i| i.name() == image).ok_or("image must be os, sysos or appos")?;
+    let pem = match (pem_file, ipsw.key_url(im)?) {
+        (Some(f), _) => Some(fs::read_to_string(f)?),
+        (None, Some(u)) => Some(http_get(&u)?),
+        _ => None,
+    };
+    Ok(ipsw.open_image(im, pem.as_deref(), false)?)
+}
+
+/// apfs IPSW IMAGE [stats|ls [PATH]|volumes]: what the APFS reader sees in an image of the IPSW.
+fn cmd_apfs(args: &[String]) -> Res<ExitCode> {
+    let (pos, opts, _) = split(args, &["--pem", "--volume"]);
+    let [src, image, rest @ ..] = &pos[..] else { return Err("apfs IPSW os|sysos|appos [stats|volumes|find SUBSTR] [--volume N] [--pem FILE]".into()) };
+    let img = open_ipsw_image(src, image, opts.get("--pem"))?;
+    let c = renegade::apfs::Container::open(img)?;
+    let vols = c.volumes()?;
+    for v in &vols {
+        println!("volume {} {:?} role {:#x} sealed {} files {} dirs {} symlinks {} snapshots {}", v.index, v.name, v.role, v.sealed, v.num_files, v.num_directories, v.num_symlinks, v.num_snapshots);
+    }
+    let vi: usize = opts.get("--volume").map(|v| v.parse()).transpose()?.unwrap_or(0);
+    match rest.first().map(String::as_str) {
+        Some("stats") => {
+            let t = std::time::Instant::now();
+            let v = c.volume(vi)?;
+            println!("{:#?}", v.fsck_stats()?);
+            println!("{:.1}s", t.elapsed().as_secs_f64());
+        }
+        Some("find") => {
+            let needle = rest.get(1).ok_or("find SUBSTR")?;
+            let v = c.volume(vi)?;
+            v.walk(&mut |n| {
+                if n.path.contains(needle.as_str()) {
+                    println!("{} {:?} {} {:o} {}:{}", n.path, n.kind, n.size, n.mode, n.uid, n.gid);
+                }
+                Ok(())
+            })?;
+        }
+        _ => {}
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A write sink that keeps nothing (a progress counter with Seek, for runs that only check the stream).
+struct NullSeek {
+    pos: u64,
+    len: u64,
+}
+
+impl Write for NullSeek {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        self.pos += b.len() as u64;
+        self.len = self.len.max(self.pos);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl io::Seek for NullSeek {
+    fn seek(&mut self, to: io::SeekFrom) -> io::Result<u64> {
+        self.pos = match to {
+            io::SeekFrom::Start(o) => o,
+            io::SeekFrom::End(d) => (self.len as i64 + d) as u64,
+            io::SeekFrom::Current(d) => (self.pos as i64 + d) as u64,
+        };
+        Ok(self.pos)
+    }
+}
+
+/// root-ipsw IPSW OUT.simg|--null [--pem FILE] [--no-macho] [--no-cache] [--no-tweaks] [--compare REF.simg] [--now UNIX]
+fn cmd_root_ipsw(args: &[String]) -> Res<ExitCode> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let (pos, opts, flags) = split(args, &["--pem", "--compare", "--now", "--size"]);
+    let [src, out] = &pos[..] else { return Err("root-ipsw IPSW(file or URL) OUT.simg|null [--pem FILE] [--no-macho] [--no-cache] [--no-tweaks] [--compare REF.simg] [--now UNIX] [--size 24g]".into()) };
+    let ipsw = renegade::ipsw::Ipsw::open(open_src(src)?)?;
+    let mut cfg = renegade::rootbuild::Config { now: opts.get("--now").map(|n| n.parse()).transpose()?.unwrap_or(0), ..Default::default() };
+    cfg.volume_size = opts.get("--size").map(|s| parse_size(s)).transpose()?;
+    cfg.macho = !flags.iter().any(|f| f == "--no-macho");
+    cfg.tweaks = !flags.iter().any(|f| f == "--no-tweaks");
+    if flags.iter().any(|f| f == "--no-cache") {
+        cfg.cache = None;
+    }
+    if let Some(f) = opts.get("--pem") {
+        cfg.pem = Some(fs::read_to_string(f)?);
+    } else if let Some(u) = ipsw.key_url(renegade::ipsw::Image::Os)? {
+        cfg.pem = Some(http_get(&u)?);
+    }
+    // --compare: every file written is checked against the same path in a finished (Python-built) image
+    let report: Rc<RefCell<(u64, u64, BTreeMap<String, u64>)>> = Rc::new(RefCell::new((0, 0, BTreeMap::new())));
+    if let Some(refimg) = opts.get("--compare") {
+        let vol = Rc::new(renegade::hfs::Volume::open(Sparse::open(FileAt::open(refimg)?)?)?);
+        let cur: Rc<RefCell<(String, Option<Vec<u8>>)>> = Rc::new(RefCell::new((String::new(), None)));
+        let rep = report.clone();
+        cfg.tap = Some(Box::new(move |path, off, chunk| {
+            let mut c = cur.borrow_mut();
+            if c.0 != path || off == 0 {
+                c.0 = path.to_string();
+                c.1 = match vol.lookup(path, false) {
+                    Ok(Some(e)) if e.rt == FILE => vol.read_file(e).ok(),
+                    _ => None,
+                };
+                rep.borrow_mut().0 += 1;
+            }
+            let ok = c.1.as_ref().is_some_and(|r| r.get(off as usize..off as usize + chunk.len()) == Some(chunk));
+            if !ok {
+                let mut r = rep.borrow_mut();
+                let missing = c.1.is_none();
+                *r.2.entry(format!("{}{path}", if missing { "MISSING " } else { "DIFFERS " })).or_default() += 1;
+            }
+            rep.borrow_mut().1 += chunk.len() as u64;
+        }));
+    }
+    let t0 = std::time::Instant::now();
+    let mut ev = |e: renegade::rootbuild::Event| match e {
+        renegade::rootbuild::Event::Stage(s) => eprintln!("[{:>6.1}s] === {s}", t0.elapsed().as_secs_f64()),
+        renegade::rootbuild::Event::Log(l) => eprintln!("[{:>6.1}s] {l}", t0.elapsed().as_secs_f64()),
+        renegade::rootbuild::Event::Bytes(d, t) => eprintln!("[{:>6.1}s] {} / {} MiB", t0.elapsed().as_secs_f64(), d >> 20, t >> 20),
+    };
+    let sum = if out == "null" {
+        renegade::rootbuild::build(&ipsw, &mut cfg, NullSeek { pos: 0, len: 0 }, &mut ev)?.1
+    } else {
+        renegade::rootbuild::build(&ipsw, &mut cfg, BufWriter::new(File::create(out)?), &mut ev)?.1
+    };
+    eprintln!("{sum:?}");
+    let r = report.borrow();
+    if r.0 > 0 {
+        eprintln!("compared {} files, {} bytes; {} paths differ or are missing", r.0, r.1, r.2.len());
+        for (k, n) in r.2.iter().take(60) {
+            eprintln!("  {k} ({n} chunks)");
         }
     }
     Ok(ExitCode::SUCCESS)

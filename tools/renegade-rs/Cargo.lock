@@ -584,6 +584,7 @@ dependencies = [
  "aes",
  "aes-gcm",
  "ctr",
+ "getrandom",
  "hkdf",
  "hmac",
  "libc",

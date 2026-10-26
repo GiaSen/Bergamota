@@ -434,33 +434,12 @@ pub fn build<W: WriteAt>(entries: &[Entry], opts: &Options, out: &mut W, data: &
     let attr_start = cat_start + cat_blocks_est;
     let mut next_block = attr_start + attr_blocks;
 
-    // --- write file data, remember extents -------------------------------------------------------------------
+    // --- place file data (extents depend on sizes only; the bytes are written last, in image order) -------------
     let mut extent_of: HashMap<usize, (u64, u32, u32)> = HashMap::new(); // entry -> (len, start, count)
     let mut extent_of_group: HashMap<u64, (u64, u32, u32)> = HashMap::new();
     for &(i, len) in &data_files {
         let count = blocks_of(len);
         let start = if count > 0 { next_block } else { 0 };
-        let mut at = start as u64 * bs as u64;
-        let mut got = 0u64;
-        if let Kind::File { source, .. } = entries[i].kind {
-            data(source, &mut |b: &[u8]| {
-                if got + b.len() as u64 > len {
-                    return Err(bad(format!("{}: more data than its size", entries[i].path)));
-                }
-                out.write_at(at, b)?;
-                at += b.len() as u64;
-                got += b.len() as u64;
-                Ok(())
-            })?;
-        }
-        if got != len {
-            return Err(bad(format!("{}: got {got} bytes, expected {len}", entries[i].path)));
-        }
-        // zero the tail of the last block (the image may be a reused file)
-        let tail = (count as u64 * bs as u64) - len;
-        if tail > 0 {
-            out.write_at(start as u64 * bs as u64 + len, &vec![0; tail as usize])?;
-        }
         next_block += count;
         let ext = (len, start, count);
         match entries[i].link_group.filter(|g| groups.contains_key(g)) {
@@ -472,13 +451,14 @@ pub fn build<W: WriteAt>(entries: &[Entry], opts: &Options, out: &mut W, data: &
             }
         }
     }
+    let mut symlink_blocks: Vec<(u32, Vec<u8>)> = Vec::new();
     for &i in &order {
         if let Kind::Symlink { target } = &entries[i].kind {
             let len = target.len() as u64;
             let count = blocks_of(len);
             let mut blk = target.as_bytes().to_vec();
             blk.resize((count as u64 * bs as u64) as usize, 0);
-            out.write_at(next_block as u64 * bs as u64, &blk)?;
+            symlink_blocks.push((next_block, blk));
             extent_of.insert(i, (len, next_block, count));
             next_block += count;
         }
@@ -600,10 +580,6 @@ pub fn build<W: WriteAt>(entries: &[Entry], opts: &Options, out: &mut W, data: &
     }
     let (ext, _) = BTree::build(EXT_NODE, &[], 10, 0, 0x2, (ext_blocks as u64 * bs as u64 / EXT_NODE as u64) as u32)?;
     let (attr, _) = BTree::build(ATTR_NODE, &[], 266, 0, 0x6, (attr_blocks as u64 * bs as u64 / ATTR_NODE as u64) as u32)?;
-    out.write_at(ext_start as u64 * bs as u64, &ext.bytes())?;
-    out.write_at(cat_start as u64 * bs as u64, &cat.bytes())?;
-    out.write_at(attr_start as u64 * bs as u64, &attr.bytes())?;
-
     // --- allocation bitmap: block 0 (boot + header), metadata, data, the last block (alternate header) ------
     let mut bm = vec![0u8; (bitmap_blocks as u64 * bs as u64) as usize];
     let mut mark = |b: u32| bm[(b / 8) as usize] |= 0x80 >> (b % 8);
@@ -648,10 +624,48 @@ pub fn build<W: WriteAt>(entries: &[Entry], opts: &Options, out: &mut W, data: &
     // block 0: 1024 bytes of boot blocks (zero), the header, the rest of the block zero
     let mut b0 = vec![0u8; bs as usize];
     b0[1024..1536].copy_from_slice(&vh);
-    out.write_at(0, &b0)?;
     let size = total_blocks as u64 * bs as u64;
     let mut last = vec![0u8; bs as usize];
     last[bs as usize - 1024..bs as usize - 512].copy_from_slice(&vh);
+
+    // --- write everything in image order: block 0, bitmap, B-trees, file data, symlinks, the last block ------
+    out.write_at(0, &b0)?;
+    out.write_at(alloc_start as u64 * bs as u64, &bm)?;
+    drop(bm);
+    out.write_at(ext_start as u64 * bs as u64, &ext.bytes())?;
+    out.write_at(cat_start as u64 * bs as u64, &cat.bytes())?;
+    drop(cat);
+    out.write_at(attr_start as u64 * bs as u64, &attr.bytes())?;
+    for &(i, len) in &data_files {
+        let Kind::File { source, .. } = entries[i].kind else { continue };
+        let ext = match entries[i].link_group.filter(|g| groups.contains_key(g)) {
+            Some(g) => extent_of_group[&g],
+            None => extent_of[&i],
+        };
+        let start = ext.1;
+        let mut at = start as u64 * bs as u64;
+        let mut got = 0u64;
+        data(source, &mut |b: &[u8]| {
+            if got + b.len() as u64 > len {
+                return Err(bad(format!("{}: more data than its size", entries[i].path)));
+            }
+            out.write_at(at, b)?;
+            at += b.len() as u64;
+            got += b.len() as u64;
+            Ok(())
+        })?;
+        if got != len {
+            return Err(bad(format!("{}: got {got} bytes, expected {len}", entries[i].path)));
+        }
+        // zero the tail of the last block (the image may be a reused file)
+        let tail = (blocks_of(len) as u64 * bs as u64) - len;
+        if tail > 0 {
+            out.write_at(start as u64 * bs as u64 + len, &vec![0; tail as usize])?;
+        }
+    }
+    for (blk, bytes) in &symlink_blocks {
+        out.write_at(*blk as u64 * bs as u64, bytes)?;
+    }
     out.write_at(size - bs as u64, &last)?;
     st.total_blocks = total_blocks;
     st.free_blocks = total_blocks - used;

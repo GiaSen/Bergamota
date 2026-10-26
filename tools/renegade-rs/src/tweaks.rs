@@ -700,6 +700,9 @@ pub struct TreeFs<'a> {
     /// Sources below `base` are the caller's (the scanned files).
     pub base: usize,
     read_source: Box<dyn Fn(usize) -> Result<Vec<u8>> + 'a>,
+    /// Reads the first bytes of a scanned file without reading the whole of it (set by callers with big files).
+    #[allow(clippy::type_complexity)]
+    peek_source: Option<Box<dyn Fn(usize, usize) -> Result<Vec<u8>> + 'a>>,
     owners: BTreeMap<String, (u32, u32)>,
     now: u32,
     /// OwnerRecorder's rule: a chown to the user who owns the scanned files (the image is mounted noowners in
@@ -710,7 +713,7 @@ pub struct TreeFs<'a> {
 impl<'a> TreeFs<'a> {
     pub fn new(entries: Vec<crate::hfswrite::Entry>, base: usize, now: u32, read_source: impl Fn(usize) -> Result<Vec<u8>> + 'a) -> Self {
         let index = entries.iter().enumerate().map(|(i, e)| (e.path.clone(), i)).collect();
-        Self { entries, index, overlay: Vec::new(), base, read_source: Box::new(read_source), owners: BTreeMap::new(), now, skip_owner: None }
+        Self { entries, index, overlay: Vec::new(), base, read_source: Box::new(read_source), peek_source: None, owners: BTreeMap::new(), now, skip_owner: None }
     }
 
     fn reindex(&mut self) {
@@ -772,6 +775,22 @@ impl<'a> TreeFs<'a> {
         let dir = self.resolve(dir)?;
         let full = if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") };
         self.index.get(&full).map(|&i| self.entries[i].kind.clone())
+    }
+
+    /// A reader of the first `n` bytes of a scanned file (the data of an overlay file is in memory anyway).
+    pub fn set_peek(&mut self, f: impl Fn(usize, usize) -> Result<Vec<u8>> + 'a) {
+        self.peek_source = Some(Box::new(f));
+    }
+
+    /// The first `n` bytes (fewer for a shorter file) of a file entry.
+    pub fn head(&self, source: usize, n: usize) -> Result<Vec<u8>> {
+        if source >= self.base {
+            return Ok(self.overlay[source - self.base][..n.min(self.overlay[source - self.base].len())].to_vec());
+        }
+        match &self.peek_source {
+            Some(f) => f(source, n),
+            None => Ok((self.read_source)(source)?.into_iter().take(n).collect()),
+        }
     }
 
     /// The content of a file entry.
