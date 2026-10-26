@@ -2,17 +2,26 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> Chlorophyll on Turnip (Chlorophyll branch `turnip` 807c3a7, Bergamota branch `claude/chlorophyll-turnip-c432e2`), 2026-10-26: Turnip RUNS on the A630 <<<
-* **LATEST (2026-10-26 evening): Mesa 26.2.5 + `chl`, a Vulkan-native runtime written for Turnip, passes 27/27 checks on the phone.**
-  * Chlorophyll `turnip` d4dad63 / 842987c; details in `docs/TURNIP.md` section 3b.
-  * User asked for (1) the latest Mesa, relayed by the GPU session, and (2) "no Gallium, nothing Gallium-style, Turnip style from the ground up".
-  * Tree: `work-chlorophyll/mesa-turnip26`, built by `turnip/build-turnip.sh` with `patches/mesa-26.2/` (dropped/rewritten list in the doc). It produces `libchlorophyll.dylib`: Turnip + AIR frontend + `air/chl_vk.c`.
-  * `turnip/test/chl_test` on the phone (`/var/root/chl-test`): compute kernels, textures, views, resolves, clears and a triangle all pass. 200-draw bench through the Metal-shaped encoder: 5.0-7.5 us/draw (Gallium libbgair 9-17, production 100-200).
-  * Host checker `air_vk_check` (debug host build `mesa-turnip26/build-host`): 23/23 functions bridge, validate and serialize.
+### >>> Chlorophyll on Turnip (Chlorophyll branch `turnip` 6a27a3b, Bergamota branch `claude/chlorophyll-turnip-c432e2`), 2026-10-26: Turnip RUNS on the A630 <<<
+* **LATEST (2026-10-26 late): the Metal device (`src/bgmtl.m`) runs on chl, and every Metal probe passes on the phone.** Chlorophyll `turnip` 6a27a3b; details in `docs/TURNIP.md` section 3b, "Metal on chl".
+  * `bgmtl.m` is rewritten onto chl. Encoders record straight into chl command buffers; there is no BGWork and no bg_lock. The Gallium version is in git history only.
+  * Built by Chlorophyll `turnip/build-metal.sh`. It needs `GPU_METAL_WORK=~/git/iAndroid/work-chlorophyll` and `BERGAMOTA_GPU=<a Bergamota checkout>/gpu`; without `BERGAMOTA_GPU`, pacstrip silently does not run and the binaries die with SIGILL on the phone. Test copies are in `/var/root/metal-turnip`.
+  * Phone results:
+    * `bgmtl_probe` 12/12, `bgmtl_render_probe` 18/18.
+    * `bgmtl_layer_probe` 3664/3664 pixels.
+    * `bgmtl_xr2p_test`, `bgmtl_texpool_test` and `bgmtl_adddev` pass.
+    * CARenderer probe: scenes 0, 3, 4 and 7 match the CPU renderer (diff 0.12-0.22; Gallium gets 0.24 on scene 3 and 0.40 on scene 4). Scenes 5 and 6 blur correctly. Scenes 1 and 2 show the same vertical flip against the CPU reference as on Gallium.
+  * **Fixed: framebuffer fetch on Turnip.** ir3 serves the frontend's `load_output(fb_fetch_output)` only through a driver "fb read" descriptor, which Turnip lacks. So every `[[color(n)]]` read returned nothing: rounded clips drew as octagons, masks were off, backdrop materials went unblurred. The bridge now emits input-attachment loads. chl enables `VK_KHR_dynamic_rendering_local_read` and `VK_EXT_rasterization_order_attachment_access`. QuartzCore has 16 such shaders.
+  * Also fixed:
+    * frontend `param_glsl_type` for i8/i1 parameters;
+    * exact `ffma` becomes `fmad`;
+    * the command buffer is retired before it is marked done.
+  * Known, older than chl: the probes hang at exit, spinning a CPU, until `timeout` kills them (Gallium does the same).
   * **Not done yet:**
-    * IOSurface import in chl (drawables). Planned: a Turnip-side import of the stand-in's SURFACE_BO handle plus linear images with an explicit pitch.
-    * Moving `bgmtl.m` from `rwa_*` onto `chl_*` (encoders record straight into chl command buffers; no BGWork).
-    * Then backboardd on chl, which needs the user's OK for a system install.
+    * backboardd on chl. This needs the user's OK: it is a system install of libchlorophyll + inject, replacing libbgair.
+    * Per-draw dirty tracking in chl.
+    * Delete Gallium from the tree (T6).
+  * Earlier the same day: Mesa 26.2.5 + chl, 29/29 `chl_test` checks (`/var/root/chl-test`, IOSurface import included); 5.0-7.5 us/draw through the Metal-shaped encoder (Gallium 9-17, production 100-200). Tree `work-chlorophyll/mesa-turnip26`; host checker `air_vk_check` in `mesa-turnip26/build-host` (now also reads bare `.bc` dumps from `BGMTL_DUMP`).
 * Stand-in: `drmSyncobjQuery2` stub (Bergamota 147403f).
 * **User: "focus on converting the driver to run on turnip", then "drop Gallium completely and replace it with Turnip".** Full write-up: Chlorophyll `docs/TURNIP.md` (research, build, phone results, Turnip-only port plan T1-T7).
 * **Done:**
