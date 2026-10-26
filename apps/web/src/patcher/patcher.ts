@@ -10,7 +10,7 @@ export type PatchEvent = Extract<FromWorker, { type: "event" }>;
 export const NEEDED_BYTES = 22 * 2 ** 30;
 
 export function patcherSupported(): boolean {
-  return typeof Worker !== "undefined" && typeof WebAssembly !== "undefined" && !!navigator.storage?.getDirectory && typeof FileSystemFileHandle !== "undefined" && "createSyncAccessHandle" in FileSystemFileHandle.prototype;
+  return typeof Worker !== "undefined" && typeof WebAssembly !== "undefined" && typeof navigator.storage?.getDirectory === "function"; // createSyncAccessHandle exists only inside a worker
 }
 
 export async function storageRoom(): Promise<{ free: number; ok: boolean }> {
