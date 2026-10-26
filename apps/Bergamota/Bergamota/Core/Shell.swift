@@ -23,6 +23,11 @@ private final class DataBox: @unchecked Sendable {
 enum Shell {
     static let searchPaths = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
 
+    /// Options for every ssh/scp to the phone. Each root image has its own host key for the same IP (iOS 18's is in
+    /// ~/.ssh/known_hosts, iOS 26's in ~/.ssh/known_hosts_ios26); ssh accepts a key listed in any of these files.
+    static let sshOptions = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+                             "-o", "UserKnownHostsFile=~/.ssh/known_hosts ~/.ssh/known_hosts_ios26"]
+
     /// PATH used for every child process (GUI apps start with a minimal PATH).
     static var childPath: String {
         let inherited = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":").map(String.init)
