@@ -1273,3 +1273,15 @@ scan starts may see a shorter list.
 Image `shim/out/enxerto-boot-ios26full-boot51-wlan-settings.img` (kernel 1120-1125): boot 50's args with
 `sweet80211=3` instead of 2. Test (user): Settings › Wi-Fi lists the real nearby networks (lock icons on secured
 ones) and refreshes; `sweetwifi scan` over SSH lists them too. Not booted: needs the user's OK.
+
+**Boot 51-wlan-settings (2026-10-26 ~21:10Z, user OK, user present): MILESTONE, Settings › Wi-Fi lists the real
+nearby networks (user-confirmed: the names on the screen are the neighbours' networks the chip hears).** wifid powered
+the radio, read the capabilities, country and channel list as on boot 29; the service came up and ran its startup scan
+(9 networks). When the user opened Settings › Wi-Fi, wifid sent SCAN_REQ (type 10, 5528 bytes); the service ran a passive
+scan (scan id 0xa001, 26 channels, 9 networks), posted SCAN_DONE (event 10) and wifid read the results (type 11). Settings
+keeps rescanning while the page is open: scan ids 0xa002..0xa006 within a minute, 9-13 networks each, every one completed
+and reported. No panic; the service stayed up. Console: `research/ios26/logs-wlan/boot51-wlan-settings-usb.txt` (main
+checkout, not in git; the networks' names stay out of these docs).
+
+**WL1 and WL2 are done.** Next is WL3 (join an open network, IP traffic), the first step that transmits: decisions D1
+and D3 of docs/WIFI_IOS26_PHASE2.md (the user's OK to transmit; an open test network the user controls).
