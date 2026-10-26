@@ -1388,3 +1388,25 @@ Boot 53 then ended without a 2.4 GHz attempt: wifid stopped scanning after the "
 and healthy, ECHO 9/9 over 10 minutes), and at ~22:41Z launchd rebooted the phone "due to critical process crashes:
 SpringBoard" (SpringBoard on the new Turnip GPU driver, the GPU line's first boot with it; reported to that session).
 The EAPOL TID fix is still untested. Console: `research/ios26/logs-wlan/boot53-wlan-wpa2-tid-usb.txt` (main checkout).
+
+**MILESTONE, boot 54-wlan-wpa2-cache (2026-10-26 ~22:46Z, user OK, user present): the phone joins the user's WPA2-PSK
+network from Settings and is on the internet over the WCN3990.** Kernel 1129 (1126-1129). The 2.4 GHz AP (2412 MHz,
+-54 dBm, HT, WMM) was in the cache; the whole join took **251 ms**: VDEV_START, PEER_MAP, authentication and association
+acked (aid 18, PEER_ASSOC 11NG HT20 2x2), EAPOL message 2 out on TID 7 (TX completion ok), message 3 checked, message 4
+out, pairwise key (SEC_IND unicast), authorize, group key index 1 (SEC_IND group), link up. configd then got
+**192.168.1.189/24 by DHCP**, IPv6 SLAAC addresses from the router's advertisements, default route via 192.168.1.1 on en0
+(`ifconfig en0`: status active, type Wi-Fi); `netstat` shows established TLS connections from 192.168.1.189 to Apple
+servers. Traffic in the first 150 s: 6733 frames / 0.9 MB out, 12824 frames / 17 MB in, 0 TX failures, 31 RX drops
+(mostly our own broadcasts echoed by the AP), RSSI -54..-63. Console:
+`research/ios26/logs-wlan/boot54-wlan-wpa2-cache-usb.txt` (main checkout).
+
+One defect: Settings showed **"Unable to join ... channels in use by several other nearby networks"** over the working
+link (photo from the user). wifid joins with IO80211's **async** API (no GET 21 poll in the log), whose ASSOC_DONE
+handler reads a >= 460-byte status blob; the stand-in posted 4 bytes (`kev_post_msg` refuses more than one small mbuf,
+about 224 bytes), so IO80211 read its own 0xAA fill as the result. **1130** (`1130-sweet-kev-cluster-assoc-done.patch`):
+`kev_post_msg_internal` puts events up to one cluster (2 KiB) in a cluster mbuf; sweet_80211 posts a 460-byte zeroed
+ASSOC_DONE (result_valid 0 -> IO80211 reads GET 21 = 1); failed joins post it too (so a wrong password reports at once).
+Built; image `shim/out/enxerto-boot-ios26full-boot55-wlan-wpa2-assocdone.img` (kernel 1130), not booted.
+
+Earlier the same day (boots 52-53): the 5 GHz network of the same AP (-79 dBm) never acknowledged authentication;
+boot 53 ended in a SpringBoard crash reboot caused by the GPU line (its own note).
