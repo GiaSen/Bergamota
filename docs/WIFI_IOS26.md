@@ -1109,9 +1109,21 @@ Checked: a small harness ran CHAN_INFO PRE_COMPLETE / COMPLETE / short TLVs thro
 built with no new warnings; `1121` applies onto 1120 and reproduces the built source.
 
 **Images from develop from now on:** develop (with ios26) is merged into this branch (2252d2e, then local develop
-1122401 -> eb5ce4c). Image `shim/out/enxerto-boot-ios26full-boot48-wlan-radio.img` (sha256 `11b9d29c...`, kernel
-`4282ca2a...` = boot 47's kernel + 1121) is built on **develop's Enxerto** (the new boot screens) and the GPU
-baseline boot-args of `...-boot47-60hz-boost7b-enxdev.img` (606 bytes: 60 Hz, no `-v`/`keepsyms`,
+1122401 -> eb5ce4c). **1122** (`1122-beryllium-wlan-rf-clock.patch`, beryllium_wlan.c + sweet_rpmh.c): with **`sweetrfclk=1`** the
+WCN3990 reference clock is voted on right after the rails, as `ath10k_hw_power_on()` enables `cxo_ref_clk_pin`
+(beryllium `&wifi` clocks = `RPMH_RF_CLK2`): `sweet_rpmh_rfclk_enable("rfclka2")` sends clk-rpmh's VRM enable
+(value 1 at the cmd-db address + 4, active set, never voted off; only "rfclka2" is accepted). Off by default.
+Suggested by the GPU session after it checked boot 47's board data and rail votes (both fine): without the
+reference the synthesizer cannot lock, the firmware still visits every channel and hears nothing.
+
+Two images on the same kernel (1120 + 1121 + 1122, sha256 `20424c77...`), both on **develop's Enxerto**:
+* `shim/out/enxerto-boot-ios26full-boot48-wlan-radio.img` (sha256 `208cade2...`): the GPU baseline args of
+  `...-boot47-60hz-boost7b-enxdev.img` unchanged (606 bytes), no RF clock vote: boot 47 again + the counters.
+* `shim/out/enxerto-boot-ios26full-boot48r-wlan-rfclk.img` (sha256 `a88a0c80...`): the same with `sweetrfclk=1`
+  instead of `sweetgpuboost=7` (603 bytes; the GPU work moved to its own session).
+Run 48r first: beacons there = the RF clock was missing; else 48 vs 48r counters tell RF-deaf from filtered.
+The baseline args are those of `...-boot47-60hz-boost7b-enxdev.img` (60 Hz, no `-v`/`keepsyms`,
 `sweetgpufreq=gov sweetgpuboost=7`, `cpus=8 -noprogress`, every Wi-Fi arg incl. `sweetscan=1`); the recipe
-reproduces that `-enxdev` image byte for byte with the 1120 kernel, so only the kernel differs. Not booted: needs
-the user's OK.
+reproduces that `-enxdev` image byte for byte with the 1120 kernel, so only the kernel (and in 48r one arg)
+differs. The first boot 48 build (kernel 1121 alone, `11b9d29c...`) is superseded by the one above. Neither image
+is booted: each needs the user's OK.
