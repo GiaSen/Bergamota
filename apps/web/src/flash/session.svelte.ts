@@ -53,6 +53,7 @@ class Session {
   patchState = $state<"idle" | "running" | "done" | "error">("idle");
   patchError = $state<string | null>(null);
   patchStage = $state<string>("");
+  patchNote = $state("");
   patchBytes = $state({ done: 0, total: 0 });
   patchStartedAt = $state(0);
   sshKey = $state(safeGet("bergamota.sshKey"));
@@ -161,6 +162,7 @@ class Session {
     this.patchState = "running";
     this.patchError = null;
     this.patchStage = "open";
+    this.patchNote = "";
     this.patchBytes = { done: 0, total: 0 };
     this.patchStartedAt = performance.now();
     this.patchSummary = null;
@@ -175,7 +177,10 @@ class Session {
       p.onEvent = (e) => {
         if (e.kind === "stage") this.patchStage = e.text;
         else if (e.kind === "bytes") this.patchBytes = { done: e.done, total: e.total };
-        else this.addLog("note", e.text);
+        else {
+          this.patchNote = e.text;
+          this.addLog("note", e.text);
+        }
       };
       const info = await p.open(ipsw);
       this.patchInfo = info;

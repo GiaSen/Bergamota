@@ -47,6 +47,7 @@
     <div class="bar" role="progressbar" aria-label="Patch progress" aria-valuenow={Math.floor((at + frac) * 100 / PATCH_STAGES.length)} aria-valuemin={0} aria-valuemax={100}>
       <i style="width: {Math.min(100, ((Math.max(at, 0) + (session.patchStage === 'seal' ? frac : 0)) / PATCH_STAGES.length) * 100)}%"></i>
     </div>
+    <p class="muted note" aria-live="off">{session.patchNote}</p>
     <div class="meta"><span>{session.patchBytes.total ? `${fmtBytes(session.patchBytes.done)} of ${fmtBytes(session.patchBytes.total)}` : "working"}</span><span>{fmtDuration(elapsed)}</span></div>
     <div class="row"><button class="btn ghost" onclick={() => session.cancelPatch()}>Cancel</button></div>
   {:else if session.patchState === "done"}
@@ -76,5 +77,6 @@
   .live li.now { color: var(--ink); font-weight: 800; }
   .bar { height: 14px; background: #dddbd0; border-radius: 999px; overflow: hidden; margin: 22px 0 14px; }
   .bar i { display: block; height: 100%; background: var(--leaf); border-radius: 999px; transition: width 400ms cubic-bezier(0.2, 0.8, 0.2, 1); }
+  .note { margin: 0 0 10px; font: 400 13px var(--mono); overflow-wrap: anywhere; }
   .meta { display: flex; justify-content: space-between; font: 400 14px var(--mono); color: var(--ink-soft); font-variant-numeric: tabular-nums; }
 </style>
