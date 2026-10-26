@@ -19,7 +19,8 @@
  *
  * Build: gpu/freedreno-sweet/build.sh (arm64e dylib, install name libdrm.2.dylib so a Mesa linked against a
  * libdrm of the same name uses it; also libdrm_freedreno-free: Mesa's freedreno does not use libdrm_freedreno).
- * Status: compiles; never run. Mesa configuration: gpu/freedreno-sweet/README.md.
+ * Turnip (Vulkan) also runs over it: syncobjs are emulated on the kernel's fences and drmGetDevices2 names one device (below).
+ * Mesa configuration: gpu/freedreno-sweet/README.md.
  */
 #include <IOKit/IOKitLib.h>
 #include <errno.h>
@@ -357,10 +358,15 @@ sweet_call(uint32_t sel, void *data, size_t size)
 
 /* ---- libdrm API used by Mesa's freedreno msm backend ---- */
 
+static int sweet_submit(void *data, unsigned long size);
+
 EXPORT int
 drmCommandWriteRead(int fd, unsigned long idx, void *data, unsigned long size)
 {
 	(void)fd;
+	if (DRM_COMMAND_BASE + idx == SWEET_GPU_SEL_GEM_SUBMIT) {
+		return sweet_submit(data, size);
+	}
 	return sweet_call((uint32_t)(DRM_COMMAND_BASE + idx), data, size);
 }
 
@@ -454,12 +460,74 @@ drmGetCap(int fd, uint64_t cap, uint64_t *value)
 	return 0;
 }
 
+/*
+ * "Prime fds" for Turnip's dma-buf import (Chlorophyll on Turnip, chl_texture_from_iosurface): an IOSurface made a BO by
+ * SURFACE_BO, handed to Vulkan as VkImportMemoryFdInfoKHR. The fd is a dup of /dev/null registered here with the BO's handle
+ * and size; drmPrimeFDToHandle answers the handle, sweet_drm_prime_size the size (Turnip's msm_bo_init_dmabuf asks lseek
+ * otherwise, patches/mesa-26.2/turnip-ios.patch). Vulkan owns and closes the fd after the import.
+ */
+EXPORT int sweet_drm_surface_bo(int fd, struct sweet_gpu_surface_bo *io);
+#define PRIME_MAX 256
+static struct { int fd; uint32_t handle; uint64_t size; } g_prime[PRIME_MAX];
+static pthread_mutex_t g_prime_lock = PTHREAD_MUTEX_INITIALIZER;
+
+EXPORT int
+sweet_drm_surface_prime(int surface_id, struct sweet_gpu_surface_bo *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->surface_id = (uint32_t)surface_id;
+	int r = sweet_drm_surface_bo(-1, out);
+	if (r) {
+		errno = -r;
+		return -1;
+	}
+	int pfd = open("/dev/null", O_RDWR | O_CLOEXEC);
+	if (pfd < 0)
+		return -1;
+	pthread_mutex_lock(&g_prime_lock);
+	int slot = -1;
+	for (int i = 0; i < PRIME_MAX && slot < 0; i++)
+		if (g_prime[i].fd == pfd || g_prime[i].fd == 0)
+			slot = i;
+	if (slot < 0)
+		slot = pfd % PRIME_MAX;
+	g_prime[slot].fd = pfd;
+	g_prime[slot].handle = out->handle;
+	g_prime[slot].size = out->size;
+	pthread_mutex_unlock(&g_prime_lock);
+	return pfd;
+}
+
+EXPORT int64_t
+sweet_drm_prime_size(int prime_fd)
+{
+	int64_t size = -1;
+	pthread_mutex_lock(&g_prime_lock);
+	for (int i = 0; i < PRIME_MAX; i++)
+		if (g_prime[i].fd == prime_fd && prime_fd > 0) {
+			size = (int64_t)g_prime[i].size;
+			break;
+		}
+	pthread_mutex_unlock(&g_prime_lock);
+	return size;
+}
+
 EXPORT int
 drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 {
-	(void)fd; (void)prime_fd; (void)handle;
-	errno = ENOSYS;
-	return -1;
+	(void)fd;
+	int r = -1;
+	pthread_mutex_lock(&g_prime_lock);
+	for (int i = 0; i < PRIME_MAX; i++)
+		if (g_prime[i].fd == prime_fd && prime_fd > 0) {
+			*handle = g_prime[i].handle;
+			r = 0;
+			break;
+		}
+	pthread_mutex_unlock(&g_prime_lock);
+	if (r)
+		errno = EINVAL;
+	return r;
 }
 
 EXPORT int
@@ -470,14 +538,432 @@ drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
 	return -1;
 }
 
-EXPORT int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle) { (void)fd; (void)flags; (void)handle; return -ENOSYS; }
-EXPORT int drmSyncobjDestroy(int fd, uint32_t handle) { (void)fd; (void)handle; return -ENOSYS; }
-EXPORT int drmSyncobjWait(int fd, uint32_t *h, unsigned n, int64_t t, unsigned f, uint32_t *first) { (void)fd; (void)h; (void)n; (void)t; (void)f; (void)first; return -ENOSYS; }
-EXPORT int drmSyncobjSignal(int fd, const uint32_t *h, uint32_t n) { (void)fd; (void)h; (void)n; return -ENOSYS; }
-EXPORT int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd) { (void)fd; (void)handle; (void)sync_file_fd; return -ENOSYS; }
-EXPORT int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd) { (void)fd; (void)handle; (void)sync_file_fd; return -ENOSYS; }
-EXPORT int drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle) { (void)fd; (void)obj_fd; (void)handle; return -ENOSYS; }
-EXPORT int drmSyncobjReset(int fd, const uint32_t *h, uint32_t n) { (void)fd; (void)h; (void)n; return -ENOSYS; }
+/*
+ * ---- syncobjs, emulated on the kernel's fences (Turnip) ----
+ *
+ * Turnip's msm backend needs DRM syncobjs: binary sync objects that a submit signals (MSM_SUBMIT_SYNCOBJ_OUT) or waits for
+ * (MSM_SUBMIT_SYNCOBJ_IN), and that the CPU creates, resets, signals and waits on. The kernel has none, but it has one ring and
+ * one global fence sequence, so a syncobj is just a state here: unsignaled, signaled, or pending on fence F. A submit's out
+ * syncobjs become pending on its fence; its in syncobjs need nothing more than to be submitted already (the ring runs in order);
+ * a CPU wait on a pending syncobj is WAIT_FENCE. drmGetCap still reports no DRM_CAP_SYNCOBJ, so Gallium freedreno never takes
+ * this path (it uses syncobjs only for fence fds, which are not emulated); Turnip finds syncobjs by creating one.
+ */
+#define SOBJ_MAX 8192
+enum { SOBJ_FREE, SOBJ_UNSIGNALED, SOBJ_SIGNALED, SOBJ_PENDING };
+static struct { uint32_t state, fence; } g_sobj[SOBJ_MAX];     /* handle = index, 0 unused */
+static uint32_t g_sobj_next = 1;
+static pthread_mutex_t g_sobj_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_sobj_cv = PTHREAD_COND_INITIALIZER;      /* a syncobj got a fence or was signaled */
+
+#define MSM_SUBMIT_SYNCOBJ_IN   0x08000000u
+#define MSM_SUBMIT_SYNCOBJ_OUT  0x04000000u
+#define DRM_SYNCOBJ_CREATE_SIGNALED            (1u << 0)
+#define DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL        (1u << 0)
+#define DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT (1u << 1)
+
+struct msm_submit_syncobj { uint32_t handle, flags; uint64_t point; };
+
+static int
+sobj_valid(uint32_t h)
+{
+	return h > 0 && h < SOBJ_MAX && g_sobj[h].state != SOBJ_FREE;
+}
+
+static int
+sobj_err(int e)
+{
+	errno = e;
+	return -e;
+}
+
+static int64_t
+mono_ns(void)
+{
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return now.tv_sec * 1000000000ll + now.tv_nsec;
+}
+
+/* WAIT_FENCE on the global sequence until the absolute CLOCK_MONOTONIC deadline: 0, -ETIME or another -errno */
+static int
+fence_wait_abs(uint32_t fence, int64_t deadline)
+{
+	struct sweet_msm_wait_fence w;
+	memset(&w, 0, sizeof(w));
+	w.fence = fence;
+	w.queueid = 0;
+	int64_t left = deadline - mono_ns();
+	if (left < 0) {
+		left = 0;
+	}
+	/* sweet_call converts an absolute timeout to a relative one; hand it the absolute deadline */
+	int64_t abs = mono_ns() + left;
+	w.timeout.tv_sec = abs / 1000000000ll;
+	w.timeout.tv_nsec = abs % 1000000000ll;
+	int r = sweet_call(SWEET_GPU_SEL_WAIT_FENCE, &w, sizeof(w));
+	return r == -ETIMEDOUT ? -ETIME : r;
+}
+
+EXPORT int
+drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
+{
+	(void)fd;
+	pthread_mutex_lock(&g_sobj_lock);
+	for (uint32_t n = 0; n < SOBJ_MAX - 1; n++) {
+		uint32_t h = g_sobj_next;
+		g_sobj_next = g_sobj_next + 1 < SOBJ_MAX ? g_sobj_next + 1 : 1;
+		if (g_sobj[h].state == SOBJ_FREE) {
+			g_sobj[h].state = (flags & DRM_SYNCOBJ_CREATE_SIGNALED) ? SOBJ_SIGNALED : SOBJ_UNSIGNALED;
+			g_sobj[h].fence = 0;
+			*handle = h;
+			pthread_mutex_unlock(&g_sobj_lock);
+			return 0;
+		}
+	}
+	pthread_mutex_unlock(&g_sobj_lock);
+	return sobj_err(ENOMEM);
+}
+
+EXPORT int
+drmSyncobjDestroy(int fd, uint32_t handle)
+{
+	(void)fd;
+	pthread_mutex_lock(&g_sobj_lock);
+	int ok = sobj_valid(handle);
+	if (ok) {
+		g_sobj[handle].state = SOBJ_FREE;
+	}
+	pthread_mutex_unlock(&g_sobj_lock);
+	return ok ? 0 : sobj_err(EINVAL);
+}
+
+static int
+sobj_set(const uint32_t *h, uint32_t n, uint32_t state)
+{
+	pthread_mutex_lock(&g_sobj_lock);
+	for (uint32_t i = 0; i < n; i++) {
+		if (!sobj_valid(h[i])) {
+			pthread_mutex_unlock(&g_sobj_lock);
+			return sobj_err(EINVAL);
+		}
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		g_sobj[h[i]].state = state;
+		g_sobj[h[i]].fence = 0;
+	}
+	pthread_cond_broadcast(&g_sobj_cv);
+	pthread_mutex_unlock(&g_sobj_lock);
+	return 0;
+}
+
+EXPORT int
+drmSyncobjReset(int fd, const uint32_t *h, uint32_t n)
+{
+	(void)fd;
+	return sobj_set(h, n, SOBJ_UNSIGNALED);
+}
+
+EXPORT int
+drmSyncobjSignal(int fd, const uint32_t *h, uint32_t n)
+{
+	(void)fd;
+	return sobj_set(h, n, SOBJ_SIGNALED);
+}
+
+/* Wait until syncobj h is signaled (0), the deadline passes (-ETIME), or it is unsignaled with no fence and the caller does not
+ * wait for submission (-EINVAL). Called and returns with g_sobj_lock held. */
+static int
+sobj_wait_one(uint32_t h, int64_t deadline, uint32_t flags)
+{
+	for (;;) {
+		if (!sobj_valid(h)) {
+			return -EINVAL;
+		}
+		if (g_sobj[h].state == SOBJ_SIGNALED) {
+			return 0;
+		}
+		if (g_sobj[h].state == SOBJ_PENDING) {
+			uint32_t f = g_sobj[h].fence;
+			pthread_mutex_unlock(&g_sobj_lock);
+			int r = fence_wait_abs(f, deadline);
+			pthread_mutex_lock(&g_sobj_lock);
+			if (r) {
+				return r;
+			}
+			if (sobj_valid(h) && g_sobj[h].state == SOBJ_PENDING && g_sobj[h].fence == f) {
+				g_sobj[h].state = SOBJ_SIGNALED;
+			}
+			continue;
+		}
+		if (!(flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT)) {
+			return -EINVAL;
+		}
+		int64_t left = deadline - mono_ns();
+		if (left <= 0) {
+			return -ETIME;
+		}
+		struct timespec rel = { .tv_sec = left / 1000000000ll, .tv_nsec = left % 1000000000ll };
+		if (rel.tv_sec > 3600) {
+			rel.tv_sec = 3600;
+		}
+		pthread_cond_timedwait_relative_np(&g_sobj_cv, &g_sobj_lock, &rel);
+	}
+}
+
+/* Is h signaled now? A pending fence is polled (0 timeout). Called with g_sobj_lock held. */
+static int
+sobj_poll_one(uint32_t h)
+{
+	if (g_sobj[h].state == SOBJ_SIGNALED) {
+		return 1;
+	}
+	if (g_sobj[h].state != SOBJ_PENDING) {
+		return 0;
+	}
+	return sobj_wait_one(h, 0, 0) == 0;
+}
+
+EXPORT int
+drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles, int64_t timeout_nsec, unsigned flags, uint32_t *first_signaled)
+{
+	(void)fd;
+	int r = 0;
+
+	pthread_mutex_lock(&g_sobj_lock);
+	for (unsigned i = 0; i < num_handles; i++) {
+		if (!sobj_valid(handles[i])) {
+			pthread_mutex_unlock(&g_sobj_lock);
+			return sobj_err(EINVAL);
+		}
+	}
+	if (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL || num_handles == 1) {
+		for (unsigned i = 0; i < num_handles && r == 0; i++) {
+			r = sobj_wait_one(handles[i], timeout_nsec, flags);
+		}
+		if (r == 0 && first_signaled) {
+			*first_signaled = 0;
+		}
+	} else {
+		/* any: poll every 100 us (rare in Turnip: vkWaitForFences with waitAll = false) */
+		for (;;) {
+			int found = -1, all_unsubmitted = 1;
+			for (unsigned i = 0; i < num_handles && found < 0; i++) {
+				if (sobj_poll_one(handles[i])) {
+					found = (int)i;
+				}
+				if (g_sobj[handles[i]].state != SOBJ_UNSIGNALED) {
+					all_unsubmitted = 0;
+				}
+			}
+			if (found >= 0) {
+				if (first_signaled) {
+					*first_signaled = (uint32_t)found;
+				}
+				break;
+			}
+			if (all_unsubmitted && !(flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT)) {
+				r = -EINVAL;
+				break;
+			}
+			if (mono_ns() >= timeout_nsec) {
+				r = -ETIME;
+				break;
+			}
+			struct timespec rel = { 0, 100000 };
+			pthread_cond_timedwait_relative_np(&g_sobj_cv, &g_sobj_lock, &rel);
+		}
+	}
+	pthread_mutex_unlock(&g_sobj_lock);
+	return r ? sobj_err(-r) : 0;
+}
+
+/* Timelines, transfers and fds are not emulated (no DRM_CAP_SYNCOBJ_TIMELINE: Turnip emulates timelines on binary syncobjs). */
+EXPORT int drmSyncobjTimelineSignal(int fd, const uint32_t *h, uint64_t *p, uint32_t n) { (void)fd; (void)h; (void)p; (void)n; return sobj_err(ENOSYS); }
+EXPORT int drmSyncobjTimelineWait(int fd, uint32_t *h, uint64_t *p, unsigned n, int64_t t, unsigned f, uint32_t *first) { (void)fd; (void)h; (void)p; (void)n; (void)t; (void)f; (void)first; return sobj_err(ENOSYS); }
+EXPORT int drmSyncobjQuery(int fd, uint32_t *h, uint64_t *p, uint32_t n) { (void)fd; (void)h; (void)p; (void)n; return sobj_err(ENOSYS); }
+EXPORT int drmSyncobjQuery2(int fd, uint32_t *h, uint64_t *p, uint32_t n, uint32_t f) { (void)fd; (void)h; (void)p; (void)n; (void)f; return sobj_err(ENOSYS); }
+EXPORT int drmSyncobjTransfer(int fd, uint32_t dh, uint64_t dp, uint32_t sh, uint64_t sp, uint32_t f) { (void)fd; (void)dh; (void)dp; (void)sh; (void)sp; (void)f; return sobj_err(ENOSYS); }
+EXPORT int drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd) { (void)fd; (void)handle; (void)obj_fd; return sobj_err(ENOSYS); }
+EXPORT int drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle) { (void)fd; (void)obj_fd; (void)handle; return sobj_err(ENOSYS); }
+EXPORT int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd) { (void)fd; (void)handle; (void)sync_file_fd; return sobj_err(ENOSYS); }
+EXPORT int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd) { (void)fd; (void)handle; (void)sync_file_fd; return sobj_err(ENOSYS); }
+
+/*
+ * GEM_SUBMIT: the kernel takes no syncobjs (and at least one command), so they are taken off here. In syncobjs must already be
+ * signaled or pending (the ring is in order); out syncobjs become pending on the submit's fence. A submit with no command (Turnip
+ * signals semaphores that way) is not sent: its fence is the last submitted one.
+ */
+static int
+sweet_submit(void *data, unsigned long size)
+{
+	struct sweet_msm_gem_submit *req = data;
+	const struct msm_submit_syncobj *in = NULL, *out = NULL;
+	uint32_t nin = 0, nout = 0, stride = 0;
+	int r;
+
+	if (size < sizeof(*req)) {
+		return -EINVAL;
+	}
+	if (req->flags & (MSM_SUBMIT_SYNCOBJ_IN | MSM_SUBMIT_SYNCOBJ_OUT)) {
+		stride = req->syncobj_stride ? req->syncobj_stride : sizeof(struct msm_submit_syncobj);
+		if (req->flags & MSM_SUBMIT_SYNCOBJ_IN) {
+			in = (const void *)(uintptr_t)req->in_syncobjs;
+			nin = req->nr_in_syncobjs;
+		}
+		if (req->flags & MSM_SUBMIT_SYNCOBJ_OUT) {
+			out = (const void *)(uintptr_t)req->out_syncobjs;
+			nout = req->nr_out_syncobjs;
+		}
+	}
+	pthread_mutex_lock(&g_sobj_lock);
+	for (uint32_t i = 0; i < nin; i++) {
+		uint32_t h = ((const struct msm_submit_syncobj *)((const uint8_t *)in + i * stride))->handle;
+		if (!sobj_valid(h) || g_sobj[h].state == SOBJ_UNSIGNALED) {
+			pthread_mutex_unlock(&g_sobj_lock);
+			return -EINVAL;   /* what msm answers for a syncobj with no fence */
+		}
+	}
+	for (uint32_t i = 0; i < nout; i++) {
+		if (!sobj_valid(((const struct msm_submit_syncobj *)((const uint8_t *)out + i * stride))->handle)) {
+			pthread_mutex_unlock(&g_sobj_lock);
+			return -EINVAL;
+		}
+	}
+	pthread_mutex_unlock(&g_sobj_lock);
+
+	struct sweet_msm_gem_submit k = *req;
+	k.flags &= ~(MSM_SUBMIT_SYNCOBJ_IN | MSM_SUBMIT_SYNCOBJ_OUT);
+	k.in_syncobjs = k.out_syncobjs = 0;
+	k.nr_in_syncobjs = k.nr_out_syncobjs = k.syncobj_stride = 0;
+	if (k.nr_cmds == 0) {
+		struct sweet_gpu_info info;
+		memset(&info, 0, sizeof(info));
+		r = sweet_call(SWEET_GPU_SEL_INFO, &info, sizeof(info));
+		k.fence = info.last_fence;
+		k.fence_fd = -1;
+	} else {
+		r = sweet_call(SWEET_GPU_SEL_GEM_SUBMIT, &k, sizeof(k));
+	}
+	if (r) {
+		return r;
+	}
+	req->fence = k.fence;
+	req->fence_fd = k.fence_fd;
+	if (nout) {
+		pthread_mutex_lock(&g_sobj_lock);
+		for (uint32_t i = 0; i < nout; i++) {
+			uint32_t h = ((const struct msm_submit_syncobj *)((const uint8_t *)out + i * stride))->handle;
+			if (sobj_valid(h)) {
+				g_sobj[h].state = k.fence ? SOBJ_PENDING : SOBJ_SIGNALED;
+				g_sobj[h].fence = k.fence;
+			}
+		}
+		pthread_cond_broadcast(&g_sobj_cv);
+		pthread_mutex_unlock(&g_sobj_lock);
+	}
+	return 0;
+}
+
+/* ---- device enumeration (Vulkan's drmGetDevices2): one platform device whose render node is /dev/null ---- */
+
+#define DRM_NODE_PRIMARY 0
+#define DRM_NODE_RENDER  2
+#define DRM_NODE_MAX     3
+#define DRM_BUS_PLATFORM 2
+
+typedef struct { char fullname[512]; } drmPlatformBusInfo;
+typedef struct { char **compatible; } drmPlatformDeviceInfo;
+typedef struct _drmDevice {
+	char **nodes;
+	int available_nodes;
+	int bustype;
+	union { drmPlatformBusInfo *platform; void *any; } businfo;
+	union { drmPlatformDeviceInfo *platform; void *any; } deviceinfo;
+} drmDevice, *drmDevicePtr;
+
+static drmDevicePtr
+sweet_device(void)
+{
+	struct blob {
+		drmDevice dev;
+		char *nodes[DRM_NODE_MAX];
+		drmPlatformBusInfo bus;
+		drmPlatformDeviceInfo info;
+		char *compat[2];
+	} *b = calloc(1, sizeof(*b));
+	if (!b) {
+		return NULL;
+	}
+	b->nodes[DRM_NODE_PRIMARY] = "";              /* no primary node: stat() fails, no KMS */
+	b->nodes[1] = "";
+	b->nodes[DRM_NODE_RENDER] = "/dev/null";      /* every /dev/null fd is THE connection (is_ours) */
+	b->dev.nodes = b->nodes;
+	b->dev.available_nodes = 1 << DRM_NODE_RENDER;
+	b->dev.bustype = DRM_BUS_PLATFORM;
+	snprintf(b->bus.fullname, sizeof(b->bus.fullname), "/soc/gpu@5000000");
+	b->compat[0] = "qcom,adreno-630.2";
+	b->info.compatible = b->compat;
+	b->dev.businfo.platform = &b->bus;
+	b->dev.deviceinfo.platform = &b->info;
+	return &b->dev;
+}
+
+EXPORT int
+drmGetDevices2(uint32_t flags, drmDevicePtr devices[], int max_devices)
+{
+	(void)flags;
+	if (!connect_once()) {
+		return 0;
+	}
+	if (devices == NULL) {
+		return 1;
+	}
+	if (max_devices < 1) {
+		return 0;
+	}
+	devices[0] = sweet_device();
+	return devices[0] ? 1 : -ENOMEM;
+}
+
+EXPORT int
+drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device)
+{
+	(void)flags;
+	if (!is_ours(fd) && !connect_once()) {
+		return -ENODEV;
+	}
+	*device = sweet_device();
+	return *device ? 0 : -ENOMEM;
+}
+
+EXPORT int
+drmGetDevice(int fd, drmDevicePtr *device)
+{
+	return drmGetDevice2(fd, 0, device);
+}
+
+EXPORT void
+drmFreeDevice(drmDevicePtr *device)
+{
+	if (device && *device) {
+		free(*device);   /* one allocation (struct blob) */
+		*device = NULL;
+	}
+}
+
+EXPORT void
+drmFreeDevices(drmDevicePtr devices[], int count)
+{
+	for (int i = 0; devices && i < count; i++) {
+		drmFreeDevice(&devices[i]);
+	}
+}
+
+EXPORT int
+drmDevicesEqual(drmDevicePtr a, drmDevicePtr b)
+{
+	return a && b && a->bustype == b->bustype;
+}
 
 /* ---- mmap of a BO: offset = BO handle (GEM_INFO GET_OFFSET) ---- */
 
