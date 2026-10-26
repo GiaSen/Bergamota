@@ -1349,3 +1349,30 @@ Image `shim/out/enxerto-boot-ios26full-boot52-wlan-wpa2.img` (kernel 1127, boot 
 Wi-Fi, tap the home WPA2 network, enter the password; expected: it joins within a few seconds and gets an address by
 DHCP; then over SSH `ping` the gateway. The console shows each step (`SWEET WLAN sta:` and `SWEET 80211:` lines, the
 ASSOCIATE layout, the RSN element; never the key). Not booted: needs the user's OK.
+
+**Boot 52-wlan-wpa2 (2026-10-26 ~22:25Z, user OK, user present): FIRST TRANSMISSIONS, authenticated and associated to
+the user's WPA2 AP in 26 ms; the 4-way handshake did not complete; then the WLAN firmware asserted.** wifid's ASSOCIATE
+matched the decoded layout exactly (908 bytes, auth 1/8, key length 32 cipher 6 = PMK, a 22-byte RSN element CCMP/CCMP/PSK
+caps 0, flags2 4; BSSID zero), so the sync API and the capability bitmap are right. The service picked the strongest BSS
+of that SSID (2412 MHz, -60 dBm, HT, WMM), management TX went by WMI reference (service 76 present): VDEV_START ok, two
+HTT PEER_MAPs, authentication acked + response 0, association request acked + response 0 (aid 21, 12 rates, HT, WMM),
+PEER_ASSOC (flags 0x1007, 11NG HT20, 12 legacy + 16 HT rates, nss 2), VDEV_UP, PEER_ASSOC_CONF (0x6006) at 31 ms. EAPOL
+message 1 arrived (clear, 99 bytes) and the supplicant answered, but the AP sent message 1 three times and then a
+deauthentication (reason 2) at 3 s: **message 2 never reached it**. Result 30 reported to wifid. The teardown then sent
+VDEV_DOWN and the firmware asserted: `wlan_vdev.c:_wlan_vdev_down:3440` (MPSS fatal error; the service stopped, Wi-Fi gone
+until the next boot; the rest of iOS unaffected). Console: `research/ios26/logs-wlan/boot52-wlan-wpa2-usb.txt` (main
+checkout, not in git).
+
+Reading of the two failures (no TX completion was logged, so the first is the likeliest cause, not a certainty):
+* EAPOL went out as HTT ext TID 16 (`NON_QOS_MCAST_BCAST`). ath10k uses 16 only for non-QoS peers; to a WMM peer
+  mac80211's frames are QoS data and ath10k puts the TID in the descriptor (EAPOL priority 7). The frame most likely
+  sat in a queue the firmware never serves for this peer.
+* mac80211 flushes the TX queues before the driver's disassoc; VDEV_DOWN with frames still pending is what asserted.
+
+**1128** (`1128-beryllium-wlan-station-eapol-tid-drain.patch`, beryllium_wlan.c): TID 7 for EAPOL and 0 for data to a
+WMM peer (16 only for non-QoS peers); every EAPOL frame sent is logged (key info, msdu id, TID, CE4 index) and every TX
+completion before the link is up (status ok/discard/no-ack/postpone); the teardown waits for the TX queues to drain
+(PEER_FLUSH_TIDS after 0.8 s, VDEV_DOWN at the latest after 2 s); station HTT messages counted in the event tally.
+Built. Image `shim/out/enxerto-boot-ios26full-boot53-wlan-wpa2-tid.img` (kernel 1128, same args). Not booted: needs the
+user's OK. If message 2 still does not get through, the TX-completion lines tell whether the firmware sent it (status
+ok = the AP got it and rejected the MIC, i.e. a key derivation problem) or not.
