@@ -166,13 +166,15 @@ void charge_ui_init(void)
 	con_window(0, -1);	/* con_* log lines are recorded, not drawn */
 }
 
-/* The static picture of the logo partition's charging slot (ABL shows it before Enxerto runs): the scene and an empty
- * battery with the bolt, no numbers. */
+/* The static picture of the logo partition's charging slot (ABL shows it before Enxerto runs): the stage with the
+ * CHARGING pill and an empty bar, no numbers, no key hints (those are Enxerto's, not ABL's). */
 void charge_ui_splash(void)
 {
 	charge_ui_init();
-	band(HINT_Y, art_text_h(ART_MONO22));	/* the key hints are Enxerto's, not ABL's */
-	draw_battery(1, 0, 1);
+	con_rect(0, HINT_Y, FB_W, art_text_h(ART_MONO22), ID_INK);
+	pill(CHARGE_CHARGING, 0);
+	bar(0, 0);
+	art_text_centered(ART_MONO30, STATUS_Y, ID_PAPER, "Charging");
 }
 
 void charge_ui_update(const struct charge_view *v)

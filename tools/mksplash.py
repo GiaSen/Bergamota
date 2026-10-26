@@ -13,9 +13,10 @@ Slots in the stock image: 0 power-on logo (MI + mi.com, 161x321), 1 fastboot (10
   mksplash.py build  [--base backup/logo.img] [-o out/logo-bergamota.img] [--size 1080x2246]
   mksplash.py decode <logo.img> <outdir>        # slots -> PNG (+ slots.txt)
   mksplash.py verify <logo.img>                 # structure check
-Slots 0 (power-on), 1 (fastboot) and 2 (off-mode charging) are rebranded; every other slot (destroyed/verity
-warning, Google logos, blanks) is copied byte for byte. Stdlib only. The two screens are Enxerto's own renders
-(enxerto/out/preview/splash-*.ppm, drawn by enxerto/host_test with the tools/identity artwork).
+Rebranded: slots 0 (power-on), 1 (fastboot) and 2 (off-mode charging), Enxerto's own renders
+(enxerto/out/preview/splash-*.ppm, drawn by enxerto/host_test with the tools/identity artwork), and the Google logo
+slots 3/6/8, which get the Bergamota boot mark (tools/identity/mkbootmark.sh, same 458x154 size). Every other slot
+(destroyed/verity warning, blanks) is copied byte for byte. Stdlib only.
 """
 import argparse
 import os
@@ -23,7 +24,7 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bergamota_img import Canvas, write_png
+from bergamota_img import Canvas, read_png, write_png
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SIZE = 32 * 1024 * 1024
@@ -123,7 +124,23 @@ def compose_fastboot(w, h):
     return rendered("splash-fastboot", w, h)
 
 
-def build(base_path, out_path, size, preview_dir):
+GOOGLE_SLOTS = (3, 6, 8)
+
+
+def bootmark(path, w, h):
+    """The boot mark PNG as RGB, checked against the stock Google logo's size (ABL places the slot by its size)."""
+    if not os.path.exists(path):
+        raise SystemExit("%s missing: run tools/identity/mkbootmark.sh" % path)
+    bw, bh, px = read_png(path)
+    assert (bw, bh) == (w, h), "%s is %dx%d, the Google slot is %dx%d" % (path, bw, bh, w, h)
+    ch = len(px) // (bw * bh)
+    rgb = bytearray(bw * bh * 3)
+    for i in range(bw * bh):
+        rgb[i * 3:i * 3 + 3] = px[i * ch:i * ch + 3]
+    return rgb
+
+
+def build(base_path, out_path, size, preview_dir, mark_path=None):
     d = open(base_path, "rb").read()
     assert len(d) == SIZE, "base must be 32 MiB"
     slots = parse(d)
@@ -137,6 +154,10 @@ def build(base_path, out_path, size, preview_dir):
     new[0] = rgb_to_bmp(c0.w, c0.h, c0.px)
     new[1] = rgb_to_bmp(c1.w, c1.h, c1.px)
     new[2] = rgb_to_bmp(c2.w, c2.h, c2.px)
+    if mark_path:
+        for i in GOOGLE_SLOTS:
+            gw, gh = bmp_info(bmps[i])[:2]
+            new[i] = rgb_to_bmp(gw, abs(gh), bootmark(mark_path, gw, abs(gh)))
     def layout(tight):
         words, cur = [], HDR // BLK + 1
         for i, b in enumerate(new):
@@ -200,13 +221,15 @@ def main():
     b.add_argument("-o", "--out", default=os.path.join(HERE, "..", "out", "logo-bergamota.img"))
     b.add_argument("--size", default="1080x2246", help="power-on image size (panel is 1080x2246)")
     b.add_argument("--preview", help="also decode the result to PNGs in this directory")
+    b.add_argument("--bootmark", default=os.path.join(HERE, "identity", "out", "bootmark.png"),
+                   help="boot mark for the Google logo slots 3/6/8 ('' keeps Google's)")
     dd = sub.add_parser("decode"); dd.add_argument("img"); dd.add_argument("outdir")
     v = sub.add_parser("verify"); v.add_argument("img")
     a = ap.parse_args()
     if a.cmd == "build":
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
         w, h = map(int, a.size.split("x"))
-        build(a.base, a.out, (w, h), a.preview)
+        build(a.base, a.out, (w, h), a.preview, a.bootmark or None)
         verify(a.out)
     elif a.cmd == "decode":
         decode(a.img, a.outdir)
