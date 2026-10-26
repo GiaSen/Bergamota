@@ -1090,3 +1090,28 @@ cheapness:
    without it, and the firmware may not deliver management frames to a host whose HTT RX path is unconfigured.
 3. The **RF_CLK2** reference-clock vote (`cxo_ref_clk_pin`, RPMh "rfclka2") that ath10k makes at probe and this
    driver skips: Bluetooth works without it, but the WLAN RF may not.
+
+### 5.27 1121: the radio's own counters during the scan: built, NOT run
+
+`1121-beryllium-wlan-scan-radio-counters.patch` (no new gate: part of `sweetscan=1`), **diagnostics only, no new
+command to the chip**:
+* **CHAN_INFO** (WMI 0x4002, tag 38, 13 u32) parsed for every channel visit: freq, flags (COMPLETE / PRE_COMPLETE),
+  error, **noise floor**, rx_clear_count, cycle_count, **rx_frame_count**, my_bss_rx_cycle_count, tx_frame_cnt,
+  mac_clk; the first 64 logged (`scan: chan_info ...`), the COMPLETE ones summed and kept per channel.
+* Every WMI event id seen from the scan setup on is **tallied**; unknown ones are logged (first 32).
+* `scan summary radio:` (CHAN_INFO count, total rx/tx frames, HTT message count), `scan summary chan N MHz:` per
+  channel (rx_frames, noise floor, rx_clear, cycles) and `scan summary event 0x.... x N` at the end of the stage.
+Reading: rx_frames > 0 with a noise floor around -95..-100 dBm = the RF hears frames that the firmware does not
+pass up (-> the HTT RX setup / host filters); rx_frames 0 with a flat or absurd noise floor = the RF path itself
+(-> the RF_CLK2 vote, rails, antenna switch).
+
+Checked: a small harness ran CHAN_INFO PRE_COMPLETE / COMPLETE / short TLVs through the parser and the summary;
+built with no new warnings; `1121` applies onto 1120 and reproduces the built source.
+
+**Images from develop from now on:** develop (with ios26) is merged into this branch (2252d2e, then local develop
+1122401 -> eb5ce4c). Image `shim/out/enxerto-boot-ios26full-boot48-wlan-radio.img` (sha256 `11b9d29c...`, kernel
+`4282ca2a...` = boot 47's kernel + 1121) is built on **develop's Enxerto** (the new boot screens) and the GPU
+baseline boot-args of `...-boot47-60hz-boost7b-enxdev.img` (606 bytes: 60 Hz, no `-v`/`keepsyms`,
+`sweetgpufreq=gov sweetgpuboost=7`, `cpus=8 -noprogress`, every Wi-Fi arg incl. `sweetscan=1`); the recipe
+reproduces that `-enxdev` image byte for byte with the 1120 kernel, so only the kernel differs. Not booted: needs
+the user's OK.
