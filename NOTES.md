@@ -3,6 +3,17 @@
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> Chlorophyll on Turnip (Chlorophyll branch `turnip` 807c3a7, Bergamota branch `claude/chlorophyll-turnip-c432e2`), 2026-10-26: Turnip RUNS on the A630 <<<
+* **LATEST (2026-10-26 evening): Mesa 26.2.5 + `chl`, a Vulkan-native runtime written for Turnip, passes 27/27 checks on the phone.**
+  * Chlorophyll `turnip` d4dad63 / 842987c; details in `docs/TURNIP.md` section 3b.
+  * User asked for (1) the latest Mesa, relayed by the GPU session, and (2) "no Gallium, nothing Gallium-style, Turnip style from the ground up".
+  * Tree: `work-chlorophyll/mesa-turnip26`, built by `turnip/build-turnip.sh` with `patches/mesa-26.2/` (dropped/rewritten list in the doc). It produces `libchlorophyll.dylib`: Turnip + AIR frontend + `air/chl_vk.c`.
+  * `turnip/test/chl_test` on the phone (`/var/root/chl-test`): compute kernels, textures, views, resolves, clears and a triangle all pass. 200-draw bench through the Metal-shaped encoder: 5.0-7.5 us/draw (Gallium libbgair 9-17, production 100-200).
+  * Host checker `air_vk_check` (debug host build `mesa-turnip26/build-host`): 23/23 functions bridge, validate and serialize.
+  * **Not done yet:**
+    * IOSurface import in chl (drawables). Planned: a Turnip-side import of the stand-in's SURFACE_BO handle plus linear images with an explicit pitch.
+    * Moving `bgmtl.m` from `rwa_*` onto `chl_*` (encoders record straight into chl command buffers; no BGWork).
+    * Then backboardd on chl, which needs the user's OK for a system install.
+* Stand-in: `drmSyncobjQuery2` stub (Bergamota 147403f).
 * **User: "focus on converting the driver to run on turnip", then "drop Gallium completely and replace it with Turnip".** Full write-up: Chlorophyll `docs/TURNIP.md` (research, build, phone results, Turnip-only port plan T1-T7).
 * **Done:**
   * Mesa 25.0.7 Turnip built for iOS arm64e in a separate, Gallium-free tree `work-chlorophyll/mesa-turnip`, by Chlorophyll `turnip/build-turnip.sh` with `patches/turnip-ios.patch`. `mesa-air/build-ios` (the installed libbgair) is untouched.
