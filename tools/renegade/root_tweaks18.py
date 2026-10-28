@@ -363,12 +363,13 @@ def host_dropbearkey(out):
 
 def ssh(root):
     """Key-only SSH over the USB link (docs/SSH_OVER_USB.md): dropbear, dash
-    as /bin/sh, toybox, host keys, authorized_keys, launchd job. Needs the
-    binaries from tools/ssh/build.sh in research/ssh-build/out."""
+    as /bin/sh, toybox, host keys, authorized_keys, launchd job. Needs the iOS
+    binaries from tools/ssh/build.sh (research/ssh-build/out) or berga-tools
+    (renegade fetch-tools)."""
     out = os.path.normpath(SSH_OUT)
-    # macOS also needs the host builds (applet list, host keys); Linux needs only the iOS binaries (see toybox_applets)
-    need = [os.path.join(out, n) for n in (('dropbear', 'dash', 'toybox') if rplat.is_linux() else
-                                           ('dropbear', 'dash', 'toybox', 'dropbear-mac', 'toybox-mac'))]
+    # Only the iOS binaries are required, on macOS too: berga-tools ships no host builds. Without NAME-mac / NAME-linux the
+    # applet list is derived (toybox_applets) and the host keys are left to dropbear -R on the phone (host_dropbearkey).
+    need = [os.path.join(out, n) for n in ('dropbear', 'dash', 'toybox')]
     missing = [p for p in need if not os.path.isfile(p)]
     if missing:
         print('ssh: skipped, not built (run tools/ssh/build.sh):', ', '.join(os.path.basename(p) for p in missing))
@@ -445,7 +446,7 @@ def ssh(root):
                 print('ssh: host key kept', os.path.basename(kf))
                 continue
             if not keytool:
-                print('ssh: no dropbearkey for the host (Linux: apt install dropbear-bin): host key %s left to dropbear -R, '
+                print('ssh: no dropbearkey for the host (macOS: tools/ssh/build.sh; Linux: apt install dropbear-bin): host key %s left to dropbear -R, '
                       'which generates it on the phone at the first connection' % typ)
                 continue
             subprocess.run([tool, '-t', typ, '-f', kf], check=True, capture_output=True)
