@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board sweet|beryllium] [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board sweet|beryllium|dipper] [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE]
 """
 import hashlib, os, struct, sys
 
@@ -34,7 +34,7 @@ QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
 # Per-board differences; GIC, UFS, timer and the SoC window are the same on
-# SM7150 (sweet) and SDM845 (beryllium, Poco F1).
+# SM7150 (sweet) and SDM845 (beryllium, Poco F1; dipper, Mi 8).
 # Synthetic locally administered Bluetooth address (not the phone's): /chosen
 # mac-address-bluetooth0 and /arm-io/bluetooth local-mac-address, and what the
 # kernel writes into the WCN3990 with the QCA set-BD_ADDR vendor command.
@@ -71,6 +71,12 @@ BOARDS = {
         # Bluetooth driver: the node is beryllium only.
         bluetooth=True),
 }
+# Mi 8 (dipper, SDM845): the Poco F1's SoC, memory map and cont_splash (live DT, dtb/dipper/live.dtb) with a
+# 1080x2248 command-mode panel (Enxerto's display.c / ABL keep it refreshing from the framebuffer). 'xiaomi,beryllium'
+# stays in the list so the kernel's SDM845 drivers (sweet_board_beryllium(): USB, UFS, battery, charger, cpufreq,
+# RTC, ...) run; its Poco F1 touch drivers are kept off with the boot-arg sweettouch=0 until the ST FTS one exists.
+BOARDS['dipper'] = dict(BOARDS['beryllium'], fb_wh=(1080, 2248),
+                        compat=['xiaomi,dipper', 'xiaomi,beryllium', 'xiaomi,sweet', 'qcom,sdm845'])
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -165,8 +171,8 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
     fb_w, fb_h = b['fb_wh']
     if lowpool is not None:
         lp_base, lp_size = lowpool
-        if board != 'beryllium' or qemu:
-            raise SystemExit('--lowpool: Poco F1 only (--board beryllium, not --qemu)')
+        if board not in ('beryllium', 'dipper') or qemu:
+            raise SystemExit('--lowpool: SDM845 boards only (--board beryllium or dipper, not --qemu)')
         if lp_base < LOWPOOL_MIN or lp_base + lp_size > LOWPOOL_MAX or lp_base & 0x3fff or lp_size & 0x3fff:
             raise SystemExit(f'--lowpool {lp_base:#x}:{lp_size:#x}: must be 16K aligned inside {LOWPOOL_MIN:#x}..{LOWPOOL_MAX:#x}')
         if lp_base < phys_base + mem_size and phys_base < lp_base + lp_size:
