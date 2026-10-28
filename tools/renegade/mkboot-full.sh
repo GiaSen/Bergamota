@@ -5,6 +5,7 @@
 # defaults (ios26): research/ios26/kernel/kernel.development.sweet (xnu-12377), enxerto/out/beryllium-n104-2x.adt
 #           (tools/mkadt.py --identity n104ap --display-scale 2 --points 414x896), research/ios26/enxerto-boot-ios26full.img
 #           (ios18: xnu/out-0139/kernel.development.sweet, ../ios-beryllium/shim/out/beryllium-hi-3x.adt)
+# BOARD=dipper (Mi 8) builds Enxerto for that phone (default beryllium); pass its ADT (tools/mkadt.py --board dipper).
 # Test it with `fastboot boot OUT.img` (the phone must hold the image from tools/renegade/mkroot-full.sh
 # flashed to userdata: docs/IOS18_PORT.md section 12). Nothing is flashed or booted here.
 set -euo pipefail
@@ -29,7 +30,7 @@ if [ "${APPLE_LOGO:-1}" != 0 ]; then
 	python3 tools/mkapplelogo.py "${LOGO_SRC[@]}" || echo "warning: no Apple logo (Bergamota screen stays)" >&2
 fi
 python3 tools/mkpayload.py "$KERNEL" "$ADT" enxerto/out/payload-${NAME}full.bin --cmdline "$CMDLINE"
-BOARD=beryllium enxerto/build.sh "$PWD/enxerto/out/payload-${NAME}full.bin"
+BOARD=${BOARD:-beryllium} enxerto/build.sh "$PWD/enxerto/out/payload-${NAME}full.bin"
 cp enxerto/out/enxerto-boot.img "$OUT"
 python3 tools/unpack_bootv2.py "$OUT" enxerto/out/check-${NAME}full >/dev/null 2>&1 && cmp enxerto/out/check-${NAME}full/ramdisk enxerto/out/payload-${NAME}full.bin && echo "payload check: ramdisk == payload"
 ls -l "$OUT"
