@@ -1,8 +1,54 @@
 diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
-index 6ef2a78..080e1e2 100644
+index 6ef2a78..f131dae 100644
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -384,6 +384,14 @@ static const struct { const char *res; unsigned lo, hi; } rh_wcn_rails[] = {
+@@ -64,6 +64,12 @@ int sweet_rpmh_rfclk_enable(const char *res);
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+ static bool rh_be;
++/*
++ * cmd-db through the AOP locator (RH_DICT_PA: address, size), as sweet: also on the Mi 8 (dipper), whose firmware puts
++ * cmd-db elsewhere than the Poco F1's (live DT qcom,cmd-db@861e0000, reg = the locator 0xc3f000c) and whose
++ * removed_region@85fc0000 covers RH_BE_DB_PA: reading the Poco F1 address there faulted (boots ios26-3, -3b x2).
++ */
++static bool rh_loc;
+ static uint32_t rh_db_size;
+ static unsigned rh_ncpt;
+ static unsigned rh_lock;
+@@ -118,16 +124,17 @@ static int
+ rh_map(void)
+ {
+ 	rh_be = sweet_board_beryllium();
++	rh_loc = !rh_be || sweet_board_is("xiaomi,dipper");
+ 	if (!rh_rsc) {
+ 		rh_rsc = ml_io_map(rh_be ? RH_BE_RSC_PA : RH_RSC_PA, 0x100);
+ 	}
+ 	if (!rh_tcs) {
+ 		rh_tcs = ml_io_map(rh_be ? RH_BE_TCS_PA : RH_TCS_PA, RH_TCS_SIZE);
+ 	}
+-	if (!rh_dict && !rh_be) {
++	if (!rh_dict && rh_loc) {
+ 		rh_dict = ml_io_map(RH_DICT_PA, 8);
+ 	}
+-	if (!rh_rsc || !rh_tcs || (!rh_dict && !rh_be)) {
++	if (!rh_rsc || !rh_tcs || (!rh_dict && rh_loc)) {
+ 		printf("SWEET RPMH: RSC/locator mapping failed\n");
+ 		return ENOMEM;
+ 	}
+@@ -148,9 +155,9 @@ rh_map(void)
+ 		return ENODEV;
+ 	}
+ 	if (!rh_db) {
+-		uint32_t pa = rh_be ? RH_BE_DB_PA : rh_read(rh_dict, 0);
+-		uint32_t size = rh_be ? RH_BE_DB_SIZE : rh_read(rh_dict, 4);
+-		printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", rh_be ? 0u : RH_DICT_PA, pa, size);
++		uint32_t pa = rh_loc ? rh_read(rh_dict, 0) : RH_BE_DB_PA;
++		uint32_t size = rh_loc ? rh_read(rh_dict, 4) : RH_BE_DB_SIZE;
++		printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", rh_loc ? RH_DICT_PA : 0u, pa, size);
+ 		/* Firmware supplies the reserved RAM address; never scan physical RAM. */
+ 		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
+ 		    size < RH_DB_HEADER || size > RH_DB_MAX ||
+@@ -384,6 +391,14 @@ static const struct { const char *res; unsigned lo, hi; } rh_wcn_rails[] = {
  	{ "ldoa23", 3300, 3312 }, { "ldoa25", 3300, 3312 },
  };
  
@@ -17,7 +63,7 @@ index 6ef2a78..080e1e2 100644
  /*
   * WCN3990 reference clock (beryllium &wifi clocks = <&rpmhcc RPMH_RF_CLK2>, "cxo_ref_clk_pin"): clk-rpmh.c
   * DEFINE_CLK_RPMH_VRM(rf_clk2, _a, "rfclka2", 1) votes value 1 at the cmd-db address + CLK_RPMH_VRM_EN_OFFSET (4).
-@@ -452,8 +460,14 @@ sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable)
+@@ -452,8 +467,14 @@ sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable)
  		}
  	}
  	if (i == sizeof(rh_wcn_rails) / sizeof(rh_wcn_rails[0])) {
@@ -49,7 +95,7 @@ index 362a89b..335d346 100644
  		allowed = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 ||
  		    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index d713945..b4bdacd 100644
+index d713945..54ea2a0 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
 @@ -15,6 +15,17 @@
@@ -114,7 +160,7 @@ index d713945..b4bdacd 100644
  static const struct touch_board *tb = &touch_sweet;
  /* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
  #define GOODIX_PID_REG   0x4022u
-@@ -890,6 +924,185 @@ touch_ft8719(void)
+@@ -890,6 +924,198 @@ touch_ft8719(void)
  	return 0;
  }
  
@@ -245,13 +291,26 @@ index d713945..b4bdacd 100644
 +		touch_gpio(tb->sda, tb->mux, 0, 0, false, false);
 +		touch_gpio(tb->scl, tb->mux, 0, 0, false, false);
 +	}
++	/*
++	 * Every step below logs first and then waits 200 ms, so the UDP console (sent every 100 ms) has the line out
++	 * before the next, riskier step: boots ios26-3/-3b died here without a single line reaching the Mac.
++	 * Boot-arg sweettouchl28=0 skips the L28 vote.
++	 */
++	unsigned l28 = 1;
++	(void)PE_parse_boot_argn("sweettouchl28", &l28, sizeof(l28));
 +	dipper_bus_log("unpowered");
++	touch_wait(200);
 +	dipper_l28_log("before");
++	touch_wait(200);
 +	touch_gpio(DIPPER_TS_VDD, 0, 0, 0, true, true);   /* vdd: disp_vddio_vreg on */
 +	touch_wait(5);                                    /* its startup-delay-us 4000 */
-+	int pe = sweet_rpmh_vreg_set("ldoa28", 3300, true);
++	printf("SWEET TOUCH: vdd (GPIO %u) on; %s\n", DIPPER_TS_VDD,
++	    l28 ? "voting avdd L28 3300 mV (RPMh)" : "L28 vote skipped (sweettouchl28=0)");
++	touch_wait(200);
++	int pe = l28 ? sweet_rpmh_vreg_set("ldoa28", 3300, true) : -1;
 +	touch_wait(10);
-+	printf("SWEET TOUCH: vdd (GPIO %u) on, avdd L28 3300 mV RPMh vote err=%d\n", DIPPER_TS_VDD, pe);
++	printf("SWEET TOUCH: avdd L28 RPMh vote err=%d\n", pe);
++	touch_wait(200);
 +	dipper_l28_log("after");
 +	dipper_bus_log("powered");
 +	if (st.bitbang && (!bb_get(tb->sda) || !bb_get(tb->scl))) {
@@ -300,7 +359,7 @@ index d713945..b4bdacd 100644
  static int
  touch_nvt_params(void)
  {
-@@ -1085,7 +1298,7 @@ touch_thread(void *arg, wait_result_t result)
+@@ -1085,7 +1311,7 @@ touch_thread(void *arg, wait_result_t result)
  		if (!st.bitbang && (!touch_clocks() || !touch_se_init())) {
  			goto out;
  		}
@@ -309,7 +368,7 @@ index d713945..b4bdacd 100644
  			goto out;
  		}
  		goto selected;
-@@ -1135,6 +1348,7 @@ touch_thread(void *arg, wait_result_t result)
+@@ -1135,6 +1361,7 @@ touch_thread(void *arg, wait_result_t result)
  selected:
  	printf("SWEET TOUCH: selected %s, %ux%u, poll=%ums i2c-half=%uus irq-hint=%d\n",
  	    st.kind == TOUCH_NVT ? "NT36672A" : st.kind == TOUCH_FT8719 ? "Focaltech FT8719" :
@@ -317,7 +376,7 @@ index d713945..b4bdacd 100644
  	    st.kind == TOUCH_GOODIX ? "GT9896 Yellowstone" : "Focaltech 54:52",
  	    tb->w, tb->h, touch_poll_ms, bb_half_us, st.irq_hint);
  	unsigned errors = 0, ticks = 0;
-@@ -1143,7 +1357,8 @@ selected:
+@@ -1143,7 +1370,8 @@ selected:
  		/* sweet's IRQ lines idle high (low = report pending); NT36672A pulses high. */
  		bool irq_level = touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)) & 1u;
  		bool pending = st.kind == TOUCH_NVT ? irq_level : !irq_level;
@@ -327,7 +386,7 @@ index d713945..b4bdacd 100644
  			/* NT36672A pulses its IRQ: use the TLMM edge latch */
  			pending = touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->irq) + 0xcu) & 1u;
  			if (pending) {
-@@ -1155,10 +1370,10 @@ selected:
+@@ -1155,10 +1383,10 @@ selected:
  		 * Its report buffer keeps the last frame, so an unprompted read
  		 * replays old contacts as new touches (ghost taps).
  		 */
@@ -340,7 +399,7 @@ index d713945..b4bdacd 100644
  		/*
  		 * While a finger is down read on every IRQ edge (a new frame) and at
  		 * least every ~8 ms, so a missed edge cannot leave a stuck contact;
-@@ -1173,7 +1388,8 @@ selected:
+@@ -1173,7 +1401,8 @@ selected:
  			touch_trace_why = pending ? 'e' : 'a';
  			int err = st.kind == TOUCH_GOODIX ? touch_goodix() :
  			    st.kind == TOUCH_NVT ? touch_novatek() :
@@ -350,7 +409,7 @@ index d713945..b4bdacd 100644
  			if (err) {
  				/* At most one line a minute: bad frames are frequent and harmless */
  				static uint64_t last_log;
-@@ -1217,6 +1433,11 @@ sweet_touch_init(void)
+@@ -1217,6 +1446,11 @@ sweet_touch_init(void)
  		tb = &touch_beryllium;
  		st.irq_hint = 1; /* bit-banged reads are slow: only on IRQ edges or while touched */
  	}
