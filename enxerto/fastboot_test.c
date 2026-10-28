@@ -164,6 +164,13 @@ static void p_charger(void *ctx, int raw, char *buf, unsigned n)
 	buf[i] = 0;
 }
 
+static void p_display(void *ctx, struct fb *fb)
+{
+	(void)ctx;
+	fb_info(fb, "panel cmd mode: ctl0 pp0 (tear check on)");
+	fb_info(fb, "autorefresh 00000000 -> 80000001");
+}
+
 static const struct fb_transport transport = { .ctx = 0, .recv_cmd = t_recv_cmd, .send = t_send, .recv_data = t_recv_data, .send_data = t_send_data };
 static const struct fb_platform platform = {
 	.ctx = 0, .dl_buf = dlbuf, .dl_max = DLMAX, .idle = p_idle, .check_boot = p_check_boot, .boot = p_boot, .reboot = p_reboot,
@@ -1296,6 +1303,24 @@ int main(void)
 		for (int i = 0; i < n_resp; i++)
 			saw |= !strncmp(resp[i], "INFObergamota-charger: applied CDP", 34);
 		CHECK(saw);
+		cur_platform = &platform;
+	}
+
+	/* oem display: OKAY alone without a platform callback, the callback's INFO lines first with one */
+	reset_fake();
+	cmd("oem display");
+	fb = run_session(&r);
+	CHECK(n_resp == 1 && resp_is(0, "OKAY"));
+	{
+		static struct fb_platform pd;
+		pd = platform;
+		pd.display_info = p_display;
+		cur_platform = &pd;
+		reset_fake();
+		cmd("oem display");
+		fb = run_session(&r);
+		CHECK(n_resp == 3 && resp_is(0, "INFOpanel cmd mode: ctl0 pp0 (tear check on)") &&
+		      resp_is(1, "INFOautorefresh 00000000 -> 80000001") && resp_is(2, "OKAY"));
 		cur_platform = &platform;
 	}
 

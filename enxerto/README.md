@@ -9,6 +9,9 @@ The Bergamota Project's bootloader (*enxerto*, Portuguese for "graft": the piece
 
 ```sh
 BOARD=beryllium enxerto/build.sh [payload.bin]   # -> enxerto/out/enxerto-boot.img, bergamota-fastboot.img (what the Mac app boots with `fastboot boot`), charge-test.img, out/preview/*.ppm
+BOARD=dipper enxerto/build.sh [payload.bin]      # the Mi 8 (dtb/dipper/dtb); same outputs, same out/ directory
 ```
+
+**Mi 8 (`dipper`).** Same SoC, memory map and boot.img layout as the Poco F1; the boot.img header carries the phone's own Android 10 / 2020-09 version stamp. Its Samsung EA8074 is a **command-mode** panel: the MDP sends a frame only when kicked, so `display.c` turns on the ping-pong block's autorefresh (one frame per TE) and starts it once, before anything is drawn. It reads back which CTL and ping-pong ABL used and writes nothing when there is no command-mode CTL. `fastboot oem display` (Bergamota fastboot) reports what it found: CTL, ping-pong, autorefresh before/after, TE frame count over 100 ms, write-pointer samples and the source pipes with their address, stride, size and format. Early fast charging is compiled out on dipper (`CHARGER=1` turns it on) until its charger registers have been read back on the phone. Not yet run on the phone.
 
 `build.sh` also runs the host tests: it renders every screen to `out/preview/` and checks the fastboot state machine. Images built before the rename are called `shim/out/shim-boot-*.img`, and Bergamota still lists them.

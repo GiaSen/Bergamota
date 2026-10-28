@@ -7,7 +7,11 @@
 #include "sparse.h"
 
 #ifndef FB_PRODUCT
+#ifdef BOARD_DIPPER
+#define FB_PRODUCT	"dipper"
+#else
 #define FB_PRODUCT	"beryllium"
+#endif
 #endif
 #define FB_VERSION_BL	"bergamota-2"
 #define FB_SERIAL	"bergamota0001"
@@ -124,7 +128,7 @@ static const char *fb_var(struct fb *fb, unsigned i, const char **name, char *bu
 	case 8: *name = "bergamota"; return "1";
 	case 9: *name = "bergamota-flash"; return "1";	/* flash/erase/upload/oem hash exist (userdata, boot, logo) */
 	case 10: *name = "verify"; return fb->verify ? "on" : "off";
-	case 11: *name = "slot-count"; return "0";	/* the Poco F1 is not A/B */
+	case 11: *name = "slot-count"; return "0";	/* the Poco F1 is not A/B; on the Mi 8 only firmware partitions are */
 	case 12: *name = "usb-speed"; return fb->p->usb_speed ? fb->p->usb_speed(fb->p->ctx) : "unknown";
 	case 13:
 	case 14:
@@ -619,6 +623,10 @@ static void fb_oem(struct fb *fb, const char *a)
 	} else if (fb_eq(a, "gpt")) {
 		if (fb->p->gpt_info)
 			fb->p->gpt_info(fb->p->ctx, fb);
+		fb_resp(fb, "OKAY", "");
+	} else if (fb_eq(a, "display")) {
+		if (fb->p->display_info)
+			fb->p->display_info(fb->p->ctx, fb);
 		fb_resp(fb, "OKAY", "");
 	} else {
 		fb_resp(fb, "FAIL", "unknown oem command");

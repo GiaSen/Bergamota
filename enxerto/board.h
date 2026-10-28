@@ -1,10 +1,22 @@
 #pragma once
 /*
  * Board selection: build.sh passes -DBOARD_BERYLLIUM for the Poco F1
- * (xiaomi beryllium, SDM845); the default is sweet (SM7150).
+ * (xiaomi beryllium, SDM845) or -DBOARD_DIPPER for the Mi 8 (xiaomi dipper,
+ * SDM845); the default is sweet (SM7150).
  * Every value comes from the board's mainline/downstream device tree.
  */
-#if defined(BOARD_BERYLLIUM)
+#if defined(BOARD_DIPPER)
+#define BOARD_NAME		"dipper"
+/* live DT (dtb/dipper/live.dtb): reserved-memory cont_splash_region@9d400000 (as beryllium),
+ * panel ss_notch_fhd_ea8074 1080x2248 */
+#define FB_BASE			0x9d400000UL
+#define FB_W			1080
+#define FB_H			2248
+/* sdm845 qcom,msm-imem@146bf000, restart_reason@65c */
+#define IMEM_RESTART_REASON	0x146bf65cUL
+/* qcom,mdss-dsi-panel-type = dsi_cmd_mode: the MDP only sends a frame when kicked (display.c) */
+#define FB_CMD_MODE		1
+#elif defined(BOARD_BERYLLIUM)
 #define BOARD_NAME		"beryllium"
 /* reserved-memory cont_splash_mem@9d400000, simple-framebuffer 1080x2246 */
 #define FB_BASE			0x9d400000UL
