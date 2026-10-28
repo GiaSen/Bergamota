@@ -604,6 +604,17 @@ QUIET_REMOVE = ('com.apple.sirittsd',)
 # process unnests one 64 MB slice of the shared region (751 "triggered unnest" lines in 25 min), and the private
 # copies count against the footprint. Limits raised to at least QUIET_JETSAM_MB in com.apple.jetsamproperties.*.plist
 # (category -> labels); a label without an override gets one (gamepolicyd and deviceaccessd ran with the 6 MB default).
+# The com.apple.AudioUnit-Speech providers (audio component type 'ausp') are started as a group whenever speech voices
+# are enumerated and abort at once without audio hardware; removing sirittsd did not stop them (log dipper-ios26-6c:
+# 81 crashes each in 17.5 min, ReportCrash 184 s of CPU). Taken out of launchd's AppExtensions cache and renamed to
+# NAME.appex.quiet-off (rename back and drop the flag to undo).
+QUIET_EXT_OFF = (
+    'System/Library/ExtensionKit/Extensions/SiriAUSP.appex',
+    'System/Library/ExtensionKit/Extensions/MauiAUSP.appex',
+    'System/Library/ExtensionKit/Extensions/MacinTalkAUSP.appex',
+    'System/Library/ExtensionKit/Extensions/KonaSynthesizer.appex',
+    'System/Library/PrivateFrameworks/MacinTalk.framework/PlugIns/MacinTalkAUSP.appex',
+)
 QUIET_JETSAM_MB = 48
 QUIET_JETSAM = {
     'Daemon': ('com.apple.gamepolicyd', 'com.apple.deviceaccessd', 'com.apple.softposreaderd', 'com.apple.linkd',
@@ -646,8 +657,17 @@ def quiet(root):
         if j.get('Label') in QUIET_THROTTLE:
             j['ThrottleInterval'] = QUIET_THROTTLE[j['Label']]
             n += 1
+    exts = plist.get('AppExtensions', {})
+    ext_gone = [k for k in ('/' + p for p in QUIET_EXT_OFF) if exts.pop(k, None) is not None]
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'quiet: removed {len(gone)} job(s) {QUIET_REMOVE}, ThrottleInterval set on {n}')
+    renamed = 0
+    for p in QUIET_EXT_OFF:
+        src = os.path.join(root, p)
+        if os.path.isdir(src) and not os.path.exists(src + '.quiet-off'):
+            os.rename(src, src + '.quiet-off')
+            renamed += 1
+    print(f'quiet: removed {len(gone)} job(s) {QUIET_REMOVE}, ThrottleInterval set on {n}, '
+          f'{len(ext_gone)} speech extension(s) out of the AppExtensions cache, {renamed} renamed .quiet-off')
     quiet_jetsam(root)
 
 
