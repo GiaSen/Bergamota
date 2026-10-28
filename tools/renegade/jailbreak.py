@@ -729,6 +729,14 @@ def image_stage(root, owners_out):
     write_tar(st, buf, image=True)
     buf.seek(0)
     with tarfile.open(fileobj=buf, mode='r:') as tf:
+        # A re-run (`renegade update`, `--stages jb`) meets the files of the previous one, and a read-only one (etc/sudoers
+        # is 0440) cannot be opened for writing without root: like tar --unlink-first, remove an existing non-directory
+        # first. Every member is under private/var/jb (checked), so nothing else is ever removed.
+        for m in tf.getmembers():
+            dst = os.path.join(root, m.name)
+            if (not m.isdir() and m.name.startswith('private/var/jb/') and os.path.lexists(dst)
+                    and not os.path.isdir(dst)):
+                os.unlink(dst)
         tf.extractall(root, filter='fully_trusted')    # owners are not applied (no root): the map below does it
     if not os.path.islink(var) or os.readlink(var) != target:
         die('/var is no longer the symlink it was: aborting')
