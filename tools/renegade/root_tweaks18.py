@@ -589,8 +589,48 @@ QUIET_THROTTLE = {      # label -> ThrottleInterval seconds (default 10, replica
     'com.apple.icloud.findmydeviced': 60, 'com.apple.mobileactivationd': 60,
     'com.apple.spaceattributiond': 60, 'com.apple.fairplayd.H2': 60, 'com.apple.PerfPowerServices': 60,
     'com.apple.webinspectord': 60,
+    # iOS 26 on the Mi 8 (NOTES.md 2026-10-28, log dipper-ios26-6b, 25 min): bluetoothd 16 starts ("Bluetooth fatal
+    # error" without the sweetwlan transport), watchdogd 97 (KeepAlive, exits at once), wifip2pd 107 (no Wi-Fi),
+    # gamepolicyd 94 / deviceaccessd 93 (jetsam-killed at their limit, see QUIET_JETSAM), ReportMemoryException 17
+    'com.apple.bluetoothd': 300, 'com.apple.watchdogd': 300, 'com.apple.wifip2pd': 300,
+    'com.apple.gamepolicyd': 60, 'com.apple.deviceaccessd': 60, 'com.apple.ReportMemoryException': 60,
 }
-QUIET_REMOVE = ('com.apple.security.cryptexd',)     # libimage4 panics 'failed to get manifest properties' (no ADT /chosen/manifest-properties); fixed by tools/mkpayload.py add_img4_nodes (rebuild the boot image), so removing the job is no longer needed
+# sirittsd (an xpc.activity job) hosts the TTS audio units SiriAUSP/MacinTalkAUSP/MauiAUSP/KonaSynthesizer, which
+# abort at once on this port and are relaunched by it: ~135 crashes each in 25 min (Mi 8, log dipper-ios26-6b).
+# com.apple.security.cryptexd is no longer removed: its libimage4 panic ('failed to get manifest properties', no ADT
+# /chosen/manifest-properties) is fixed by tools/mkpayload.py add_img4_nodes.
+QUIET_REMOVE = ('com.apple.sirittsd',)
+# Daemons jetsam kills at their per-process limit on this port (SIGKILL, reason namespace 1 code 7): almost every
+# process unnests one 64 MB slice of the shared region (751 "triggered unnest" lines in 25 min), and the private
+# copies count against the footprint. Limits raised to at least QUIET_JETSAM_MB in com.apple.jetsamproperties.*.plist
+# (category -> labels); a label without an override gets one (gamepolicyd and deviceaccessd ran with the 6 MB default).
+QUIET_JETSAM_MB = 48
+QUIET_JETSAM = {
+    'Daemon': ('com.apple.gamepolicyd', 'com.apple.deviceaccessd', 'com.apple.softposreaderd', 'com.apple.linkd',
+               'com.apple.lsd', 'com.apple.lsd.system', 'com.apple.liveactivitiesd', 'com.apple.donotdisturbd',
+               'com.apple.nehelper', 'com.apple.WebBookmarks.webbookmarksd'),
+    'XPCService': ('com.apple.intents.intents-helper',),
+}
+
+
+def quiet_jetsam(root):
+    for path in sorted(glob.glob(os.path.join(root, 'System/Library/LaunchDaemons/com.apple.jetsamproperties.*.plist'))):
+        st = os.stat(path)
+        data = load(path)
+        props = data.get('Version4')
+        if not isinstance(props, dict):
+            print('quiet: no Version4 in', os.path.relpath(path, root), '(skipped)')
+            continue
+        n = 0
+        for cat, labels in QUIET_JETSAM.items():
+            over = props.setdefault(cat, {}).setdefault('Override', {})
+            for label in labels:
+                ent = over.setdefault(label, {})
+                for key in ('ActiveSoftMemoryLimit', 'InactiveHardMemoryLimit'):
+                    ent[key] = max(ent.get(key, 0), QUIET_JETSAM_MB)
+                n += 1
+        save(path, data, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+        print(f'quiet: {os.path.relpath(path, root)}: memory limits >= {QUIET_JETSAM_MB} MB for {n} label(s)')
 
 
 def quiet(root):
@@ -608,6 +648,7 @@ def quiet(root):
             n += 1
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
     print(f'quiet: removed {len(gone)} job(s) {QUIET_REMOVE}, ThrottleInterval set on {n}')
+    quiet_jetsam(root)
 
 
 REGISTER_LIST = 'usr/local/share/renegade/register-apps'
