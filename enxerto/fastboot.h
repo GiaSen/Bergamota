@@ -1,7 +1,7 @@
 #pragma once
 /*
  * Bergamota fastboot: the Android fastboot protocol subset (getvar, download, boot, flash, erase,
- * upload, oem hash/verify/gpt, reboot, reboot-bootloader, continue) as a transport-independent
+ * upload, oem hash/verify/gpt/display, reboot, reboot-bootloader, continue) as a transport-independent
  * state machine, so fastboot_test.c can drive it with a fake transport and a fake storage.
  *
  * Storage commands (flash/erase/oem hash/getvar partition-*) only ever accept the names userdata, boot
@@ -64,6 +64,8 @@ struct fb_platform {
 	void (*set_ufs_depth)(void *ctx, int n);
 	/* `oem gpt`: report what the GPT scan found through fb_info() */
 	void (*gpt_info)(void *ctx, struct fb *fb);
+	/* `oem display`: report the panel / MDP state (display.c) through fb_info(); may be NULL */
+	void (*display_info)(void *ctx, struct fb *fb);
 	/* getvar usb-speed: "high", "super", "full", ...; may be NULL */
 	const char *(*usb_speed)(void *ctx);
 	/* getvar bergamota-charger (raw=0) / bergamota-charger-raw (raw=1): at most 47 characters into buf; may be NULL */

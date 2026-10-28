@@ -2,8 +2,11 @@
 # Build Enxerto (the bootloader) and wrap it in an Android boot.img that ABL accepts.
 #   BOARD=sweet (default)  boot.img v2 mirroring the stock PixelOS header, DTB in the header
 #   BOARD=beryllium        boot.img v1, Image.gz + appended DTB like the Poco F1 ROM (SDM845 ABL)
+#   BOARD=dipper           the same for the Mi 8 (SDM845, command-mode panel: display.c); CHARGER defaults to 0
 # Usage: [BOARD=..] [DTB=..] ./build.sh [payload.bin]
 set -euo pipefail
+# DTB= may be relative to where build.sh is run from, or (as before) to enxerto/
+if [ -n "${DTB:-}" ] && [ -f "$DTB" ]; then DTB=$(cd "$(dirname "$DTB")" && pwd)/$(basename "$DTB"); fi
 cd "$(dirname "$0")"
 BOARD=${BOARD:-sweet}
 # Linux cross toolchain if present, else the bare-metal one (Homebrew aarch64-elf-gcc on macOS)
@@ -21,15 +24,29 @@ NM=${CROSS}nm
 # tables of pointers, which need ABS64 relocations (refused below).
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-tree-loop-distribute-patterns -fno-tree-switch-conversion -fno-jump-tables -Wall -Wextra"
 [ "${BOOTLOG:-0}" = 0 ] || CFLAGS="$CFLAGS -DBOOTUI_LOG=1"
-# CHARGER=0 compiles the early fast charging out (charger.c, README); default on. Runtime: boot.img cmdline
+# CHARGER=0 compiles the early fast charging out (charger.c, README); default on, except on dipper until its
+# PMI8998 charger registers have been read back on the phone. Runtime: boot.img cmdline
 # bergamota.charger=0 (off) / =keep (leave the programmed ICL/FCC in place at the kernel hand-off).
+[ "$BOARD" = dipper ] && CHARGER=${CHARGER:-0}
 [ "${CHARGER:-1}" != 0 ] || CFLAGS="$CFLAGS -DENXERTO_CHARGER=0"
 # BOOTPAUSE=<ms>: wait that long before jumping to xnu (debug photos of the log).
 [ -z "${BOOTPAUSE:-}" ] || CFLAGS="$CFLAGS -DBOOT_PAUSE_MS=${BOOTPAUSE}"
 case $BOARD in
 sweet)		DTB=${DTB:-../dtb/boot_unpacked/dtb} ;;
 beryllium)	DTB=${DTB:-../dtb/beryllium/dtb}; CFLAGS="$CFLAGS -DBOARD_BERYLLIUM" ;;
+dipper)		DTB=${DTB:-../dtb/dipper/dtb}; CFLAGS="$CFLAGS -DBOARD_DIPPER" ;;
 *)		echo "error: unknown BOARD=$BOARD" >&2; exit 1 ;;
+esac
+# boot.img header v1 version stamp: the phone's own ROM values (an image stamped newer than the ROM can make
+# keymaster upgrade its keys, and Android would then fail to decrypt its data on the next normal boot)
+case $BOARD in
+dipper)	OS_VERSION=10.0.0; OS_PATCH=2020-09 ;;	# backup/dipper/boot.img (Android 10)
+*)	OS_VERSION=16.0.0; OS_PATCH=2025-06 ;;
+esac
+HOSTDEF=
+case $BOARD in
+beryllium)	HOSTDEF=-DBOARD_BERYLLIUM ;;
+dipper)		HOSTDEF=-DBOARD_DIPPER ;;
 esac
 [ -f "$DTB" ] || { echo "error: $DTB missing (stock DTB of the phone, see README)" >&2; exit 1; }
 mkdir -p out
@@ -41,7 +58,7 @@ case ${BERGAMOTA:-} in
 1) CMDLINE="$CMDLINE bergamota.fastboot=1" ;;
 0) CMDLINE="$CMDLINE bergamota.fastboot=0" ;;
 esac
-SRCS="start.S enxerto.c console.c artdraw.c bootui.c fbui.c mmu.c fdt.c loader.c ufs.c inflate.c usb_dwc3.c usb_power.c fastboot.c sparse.c storage.c blake2b.c bergamota.c pmic.c charge.c charge_mode.c charger.c"
+SRCS="start.S enxerto.c console.c artdraw.c bootui.c fbui.c mmu.c fdt.c loader.c ufs.c inflate.c usb_dwc3.c usb_power.c fastboot.c sparse.c storage.c blake2b.c bergamota.c pmic.c charge.c charge_mode.c charger.c display.c"
 OBJS=""
 for f in $SRCS; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
@@ -64,13 +81,13 @@ if [ -n "${1:-}" ]; then
 else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
-if [ "$BOARD" = beryllium ]; then
-	# Same layout as the ROM's boot.img: header v1, Image.gz with the DTB
+if [ "$BOARD" != sweet ]; then
+	# Same layout as the ROM's boot.img (Poco F1 and Mi 8): header v1, Image.gz with the DTB
 	# appended (ABL gunzips the kernel and finds the DTB behind the stream).
 	gzip -9 -n -c out/Image | cat - "$DTB" > out/Image.gz-dtb
 	mkbootimg --header_version 1 --kernel out/Image.gz-dtb --ramdisk out/ramdisk.bin \
 		--base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
-		--tags_offset 0x100 --pagesize 4096 --os_version 16.0.0 --os_patch_level 2025-06 \
+		--tags_offset 0x100 --pagesize 4096 --os_version $OS_VERSION --os_patch_level $OS_PATCH \
 		--cmdline "$CMDLINE" -o out/enxerto-boot.img
 else
 	mkbootimg --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
@@ -82,22 +99,22 @@ fi
 # Charging-screen test image (docs/BERGAMOTA_CHARGE.md): no payload, cmdline forces charging mode, so
 # `fastboot boot out/charge-test.img` shows the off-mode charging screen on a phone that is just on.
 (cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk-empty.bin)
-if [ "$BOARD" = beryllium ]; then
+if [ "$BOARD" != sweet ]; then
 	mkbootimg --header_version 1 --kernel out/Image.gz-dtb --ramdisk out/ramdisk-empty.bin \
 		--base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
-		--tags_offset 0x100 --pagesize 4096 --os_version 16.0.0 --os_patch_level 2025-06 \
+		--tags_offset 0x100 --pagesize 4096 --os_version $OS_VERSION --os_patch_level $OS_PATCH \
 		--cmdline "console=null bergamota.charge=1" -o out/charge-test.img
 fi
 # Host render of the console layout and the boot screen (out/host.ppm, out/preview/*.ppm).
 mkdir -p out/preview
-cc -O1 -Wall $([ "$BOARD" = beryllium ] && echo -DBOARD_BERYLLIUM) $([ "${BOOTLOG:-0}" = 0 ] || echo -DBOOTUI_LOG=1) -o out/host_test console.c artdraw.c bootui.c fbui.c charge.c host_test.c && ./out/host_test
+cc -O1 -Wall $HOSTDEF $([ "${BOOTLOG:-0}" = 0 ] || echo -DBOOTUI_LOG=1) -o out/host_test console.c artdraw.c bootui.c fbui.c charge.c host_test.c && ./out/host_test
 # Host tests of the fastboot protocol, the sparse parser, GPT/allowlist storage and BLAKE2b (fake storage).
 cc -O1 -Wall -Wextra -o out/fastboot_test fastboot.c sparse.c storage.c blake2b.c fastboot_test.c && ./out/fastboot_test
 # The image Bergamota (the Mac app) boots from ABL with `fastboot boot`: fastboot forced on, empty ramdisk.
-if [ "$BOARD" = beryllium ]; then
+if [ "$BOARD" != sweet ]; then
 	mkbootimg --header_version 1 --kernel out/Image.gz-dtb --ramdisk out/ramdisk-empty.bin \
 		--base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
-		--tags_offset 0x100 --pagesize 4096 --os_version 16.0.0 --os_patch_level 2025-06 \
+		--tags_offset 0x100 --pagesize 4096 --os_version $OS_VERSION --os_patch_level $OS_PATCH \
 		--cmdline "console=null bergamota.fastboot=1" -o out/bergamota-fastboot.img
 	# same image under the name the Mac app looks for first (the flash-capable build)
 	cp out/bergamota-fastboot.img out/bergamota-fastboot-flash.img

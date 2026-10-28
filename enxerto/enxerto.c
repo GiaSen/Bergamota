@@ -15,6 +15,7 @@
 #include "bergamota.h"
 #include "charge_mode.h"
 #include "charger.h"
+#include "display.h"
 #include "usb_power.h"
 #include "ufs.h"
 #include "fdt.h"
@@ -377,6 +378,9 @@ static uint32_t to_us(uint64_t ticks)
 void enxerto_main(uint64_t dtb)
 {
 	struct mmu_info mi;
+
+	/* Command-mode panel (Mi 8): make the MDP refresh it from the framebuffer before anything is drawn (display.c). */
+	display_init();
 
 	/*
 	 * Fast charging from the very first moment (charger.c): ABL leaves the PMI8998 on its slow defaults.

@@ -20,6 +20,7 @@
 #include "cache.h"
 #include "charger.h"
 #include "console.h"
+#include "display.h"
 #include "fastboot.h"
 #include "fbui.h"
 #include "fdt.h"
@@ -755,6 +756,15 @@ static void p_gpt_info(void *ctx, struct fb *fb)
 	}
 }
 
+static void p_display_info(void *ctx, struct fb *fb)
+{
+	static char line[64];
+
+	(void)ctx;
+	for (unsigned i = 0; display_report(i, line, 61); i++)	/* 60 characters: what one INFO packet carries */
+		fb_info(fb, line);
+}
+
 __attribute__((optimize("no-tree-switch-conversion")))
 static const char *p_usb_speed(void *ctx)
 {
@@ -846,6 +856,7 @@ const char *bergamota_fastboot(uintptr_t dtb)
 	pl.part_selftest = p_part_selftest;
 	pl.set_ufs_depth = p_set_ufs_depth;
 	pl.gpt_info = p_gpt_info;
+	pl.display_info = p_display_info;
 	pl.usb_speed = p_usb_speed;
 	pl.charger = p_charger;
 	fb_init(&fb, &tr, &pl);
