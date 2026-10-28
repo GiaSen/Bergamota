@@ -81,7 +81,7 @@ index 6ef2a78..f131dae 100644
  	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
  		return EBUSY;
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index d713945..4f83d15 100644
+index d713945..58a71b7 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
 @@ -15,6 +15,17 @@
@@ -110,7 +110,7 @@ index d713945..4f83d15 100644
  extern void sweet_hid_touch(int finger, int down, int x, int y);
  extern void sweet_input_boost(void);    /* bsd/dev/sweet_cpufreq.c: GPU + CPU input boost (patch 0217) */
  void sweet_touch_init(void);
-@@ -47,6 +59,20 @@ void sweet_touch_init(void);
+@@ -47,6 +59,21 @@ void sweet_touch_init(void);
  #define TOUCH_FTS        2
  #define TOUCH_NVT        3
  #define TOUCH_FT8719     4
@@ -128,10 +128,11 @@ index d713945..4f83d15 100644
 +#define STFTS_TYPE_PALM  0x04u
 +#define STFTS_TYPE_HOVER 0x05u
 +#define DIPPER_TS_VDD    23u    /* disp_vddio_vreg enable (fixed 1.8 V, active high, startup-delay-us 4000) */
++#define DIPPER_SOUTH_PA  0x03d00000u /* DT TLMM + SOUTH (0x900000): GPIO 23 is a SOUTH pin, 31-34 are NORTH */
  /* FT8719 (Focaltech TDDI, EBBG Poco F1) */
  #define FT_ADDR          0x38u
  #define FT_ID_REG        0xa3u  /* chip id high: 0x87 */
-@@ -81,6 +107,12 @@ static const struct touch_board touch_beryllium = {
+@@ -81,6 +108,12 @@ static const struct touch_board touch_beryllium = {
  	"SE14", 0x00a98000u, 0x18738u, (0x0fu << 18) | (1u << 28), 0x18734u,
  	33, 34, 2, 31, 32, 1080, 2246, false,
  };
@@ -144,7 +145,39 @@ index d713945..4f83d15 100644
  static const struct touch_board *tb = &touch_sweet;
  /* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
  #define GOODIX_PID_REG   0x4022u
-@@ -890,6 +922,184 @@ touch_ft8719(void)
+@@ -168,19 +201,26 @@ touch_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
+ 	return false;
+ }
+ 
++/* base = the TLMM tile that holds the pin (st.gpio = NORTH) */
+ static void
+-touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++touch_gpio_at(vm_offset_t base, unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
+ {
+ 	uint32_t off = TOUCH_GPIO_CFG(pin);
+-	uint32_t cfg = touch_rd(st.gpio, off);
++	uint32_t cfg = touch_rd(base, off);
+ 	if (out) {
+ 		/* Set the desired latch before enabling output (reset is active low). */
+-		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
+-		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++		touch_wr(base, TOUCH_GPIO_IO(pin),
++		    (touch_rd(base, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
+ 	}
+ 	cfg &= ~0x3ffu;
+ 	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
+-	touch_wr(st.gpio, off, cfg);
++	touch_wr(base, off, cfg);
++}
++
++static void
++touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++{
++	touch_gpio_at(st.gpio, pin, mux, pull, drive, out, high);
+ }
+ 
+ static bool
+@@ -890,6 +930,197 @@ touch_ft8719(void)
  	return 0;
  }
  
@@ -229,6 +262,12 @@ index d713945..4f83d15 100644
 +	return err ? err : (bad ? EIO : 0);
 +}
 +
++/*
++ * TLMM SOUTH tile, for GPIO 23 only. Through st.gpio (NORTH) "GPIO 23" is an empty slot: it reads 0 and writing it
++ * reset the phone (boot ios26-5 x2, right after "bus unpowered").
++ */
++static vm_offset_t dipper_south;
++
 +static void
 +dipper_bus_log(const char *when)
 +{
@@ -236,7 +275,7 @@ index d713945..4f83d15 100644
 +	    bb_get(tb->sda), bb_get(tb->scl), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)) & 1u,
 +	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->sda)), touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->scl)),
 +	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->irq)), DIPPER_TS_VDD,
-+	    touch_rd(st.gpio, TOUCH_GPIO_CFG(DIPPER_TS_VDD)), touch_rd(st.gpio, TOUCH_GPIO_IO(DIPPER_TS_VDD)));
++	    touch_rd(dipper_south, TOUCH_GPIO_CFG(DIPPER_TS_VDD)), touch_rd(dipper_south, TOUCH_GPIO_IO(DIPPER_TS_VDD)));
 +}
 +
 +/*
@@ -249,6 +288,13 @@ index d713945..4f83d15 100644
 +	static const uint8_t ier[] = { 0xfa, 0x20, 0x00, 0x00, 0x29, 0x41 }; /* FTS_CMD_HW_REG_W ADDR_IER IER_ENABLE */
 +	static const uint8_t scan[] = { 0xa0, 0x00, 0x01 };                  /* FTS_CMD_SCAN_MODE ACTIVE, MULTI_TOUCH */
 +	uint8_t ev[STFTS_EVENT];
++	if (!dipper_south) {
++		dipper_south = ml_io_map(DIPPER_SOUTH_PA, TOUCH_GPIO_CFG(DIPPER_TS_VDD + 1));
++	}
++	if (!dipper_south) {
++		printf("SWEET TOUCH: TLMM SOUTH mapping failed\n");
++		return false;
++	}
 +	printf("SWEET TOUCH: TLMM rst%u=%#x/%#x irq%u=%#x/%#x sda=%#x scl=%#x\n",
 +	    tb->rst, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->rst)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->rst)),
 +	    tb->irq, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->irq)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)),
@@ -273,7 +319,7 @@ index d713945..4f83d15 100644
 +	(void)PE_parse_boot_argn("sweettouchl28", &l28, sizeof(l28));
 +	dipper_bus_log("unpowered");
 +	touch_wait(200);
-+	touch_gpio(DIPPER_TS_VDD, 0, 0, 0, true, true);   /* vdd: disp_vddio_vreg on */
++	touch_gpio_at(dipper_south, DIPPER_TS_VDD, 0, 0, 0, true, true); /* vdd: disp_vddio_vreg on */
 +	touch_wait(5);                                    /* its startup-delay-us 4000 */
 +	printf("SWEET TOUCH: vdd (GPIO %u) on; %s\n", DIPPER_TS_VDD,
 +	    l28 ? "voting avdd L28 3300 mV (RPMh)" : "L28 vote skipped (sweettouchl28=0)");
@@ -329,7 +375,7 @@ index d713945..4f83d15 100644
  static int
  touch_nvt_params(void)
  {
-@@ -1085,7 +1295,7 @@ touch_thread(void *arg, wait_result_t result)
+@@ -1085,7 +1316,7 @@ touch_thread(void *arg, wait_result_t result)
  		if (!st.bitbang && (!touch_clocks() || !touch_se_init())) {
  			goto out;
  		}
@@ -338,7 +384,7 @@ index d713945..4f83d15 100644
  			goto out;
  		}
  		goto selected;
-@@ -1135,6 +1345,7 @@ touch_thread(void *arg, wait_result_t result)
+@@ -1135,6 +1366,7 @@ touch_thread(void *arg, wait_result_t result)
  selected:
  	printf("SWEET TOUCH: selected %s, %ux%u, poll=%ums i2c-half=%uus irq-hint=%d\n",
  	    st.kind == TOUCH_NVT ? "NT36672A" : st.kind == TOUCH_FT8719 ? "Focaltech FT8719" :
@@ -346,7 +392,7 @@ index d713945..4f83d15 100644
  	    st.kind == TOUCH_GOODIX ? "GT9896 Yellowstone" : "Focaltech 54:52",
  	    tb->w, tb->h, touch_poll_ms, bb_half_us, st.irq_hint);
  	unsigned errors = 0, ticks = 0;
-@@ -1143,7 +1354,8 @@ selected:
+@@ -1143,7 +1375,8 @@ selected:
  		/* sweet's IRQ lines idle high (low = report pending); NT36672A pulses high. */
  		bool irq_level = touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)) & 1u;
  		bool pending = st.kind == TOUCH_NVT ? irq_level : !irq_level;
@@ -356,7 +402,7 @@ index d713945..4f83d15 100644
  			/* NT36672A pulses its IRQ: use the TLMM edge latch */
  			pending = touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->irq) + 0xcu) & 1u;
  			if (pending) {
-@@ -1155,10 +1367,10 @@ selected:
+@@ -1155,10 +1388,10 @@ selected:
  		 * Its report buffer keeps the last frame, so an unprompted read
  		 * replays old contacts as new touches (ghost taps).
  		 */
@@ -369,7 +415,7 @@ index d713945..4f83d15 100644
  		/*
  		 * While a finger is down read on every IRQ edge (a new frame) and at
  		 * least every ~8 ms, so a missed edge cannot leave a stuck contact;
-@@ -1173,7 +1385,8 @@ selected:
+@@ -1173,7 +1406,8 @@ selected:
  			touch_trace_why = pending ? 'e' : 'a';
  			int err = st.kind == TOUCH_GOODIX ? touch_goodix() :
  			    st.kind == TOUCH_NVT ? touch_novatek() :
@@ -379,7 +425,7 @@ index d713945..4f83d15 100644
  			if (err) {
  				/* At most one line a minute: bad frames are frequent and harmless */
  				static uint64_t last_log;
-@@ -1217,6 +1430,11 @@ sweet_touch_init(void)
+@@ -1217,6 +1451,11 @@ sweet_touch_init(void)
  		tb = &touch_beryllium;
  		st.irq_hint = 1; /* bit-banged reads are slow: only on IRQ edges or while touched */
  	}
