@@ -5,6 +5,12 @@
 # gives it 192.168.7.1/24 (the phone is 192.168.7.2), then prints the live
 # kernel console the phone streams to UDP port 5140 (and appends it to
 # LOGFILE if given). Needs sudo for the address.
+# macOS: every phone reboot re-enumerates the interface and drops the address;
+# a watcher re-adds it with `sudo -n` (never prompts), so one listener keeps
+# working across boots when sudoers lets this exact command run without a
+# password (visudo -f /etc/sudoers.d/bergamota-usbnet), e.g. for en0-en99:
+#   USER ALL=(root) NOPASSWD: /sbin/ifconfig en[0-9] inet 192.168.7.1 netmask 255.255.255.0 up
+#   USER ALL=(root) NOPASSWD: /sbin/ifconfig en[0-9][0-9] inet 192.168.7.1 netmask 255.255.255.0 up
 set -eu
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
@@ -17,12 +23,34 @@ mac=02:00:5e:77:ee:01
 echo "waiting for the phone's USB Ethernet ($mac)..." >&2
 if [ "$(uname)" = Darwin ]; then
 	# macOS: the CDC-ECM driver names it enN; ifconfig lists the host-side MAC as "ether"
+	phone_if() {
+		ifconfig -a | awk -v m="$mac" '/^[a-z]/{i=$1} $1=="ether" && tolower($2)==m {sub(":","",i); print i}'
+	}
 	ifname=
 	until [ -n "$ifname" ]; do
-		ifname=$(ifconfig -a | awk -v m="$mac" '/^[a-z]/{i=$1} $1=="ether" && tolower($2)==m {sub(":","",i); print i}')
+		ifname=$(phone_if)
 		[ -n "$ifname" ] || sleep 1
 	done
-	sudo ifconfig "$ifname" inet 192.168.7.1 netmask 255.255.255.0 up
+	sudo -n ifconfig "$ifname" inet 192.168.7.1 netmask 255.255.255.0 up 2>/dev/null ||
+		sudo ifconfig "$ifname" inet 192.168.7.1 netmask 255.255.255.0 up
+	keep_addr() {
+		warned=
+		while sleep 2; do
+			i=$(phone_if)
+			[ -n "$i" ] || continue
+			ifconfig "$i" | grep -q 'inet 192\.168\.7\.1 ' && continue
+			if sudo -n ifconfig "$i" inet 192.168.7.1 netmask 255.255.255.0 up 2>/dev/null; then
+				echo "$i: 192.168.7.1 re-added (the phone re-enumerated)" >&2
+				warned=
+			elif [ -z "$warned" ]; then
+				echo "$i lost 192.168.7.1 and sudo wants a password for it (see the sudoers lines at the top of $0)" >&2
+				warned=1
+			fi
+		done
+	}
+	keep_addr &
+	keeper=$!
+	trap 'kill "$keeper" 2>/dev/null' EXIT INT TERM
 else
 	until ip -o link | grep -qi "$mac"; do sleep 1; done
 	ifname=$(ip -o link | grep -i "$mac" | awk -F': ' '{print $2}' | cut -d@ -f1)
