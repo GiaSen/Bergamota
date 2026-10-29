@@ -1,0 +1,42 @@
+From 05235830e6ec6982e66cefc14869038ce22fbc5b Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giammasena@gmail.com>
+Date: Thu, 29 Oct 2026 23:57:30 +0100
+Subject: [PATCH] chl: free each prologue command buffer once its fence signals
+
+Texture uploads open a prologue command buffer every frame, and pro_reap
+released what it held but never the command buffer itself, with its Turnip
+command-stream BOs. backboardd ran out of the kernel's 4096 BO handles within
+minutes of UI use on the Mi 8 (GEM_NEW -> kIOReturnNoResources, then a refused
+pipeline and QuartzCore's abort). With the fix the live BO count stays flat
+(200-290) under sustained UI activity.
+---
+ air/chl_vk.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/air/chl_vk.c b/air/chl_vk.c
+index 36589da..f54b54b 100644
+--- a/air/chl_vk.c
++++ b/air/chl_vk.c
+@@ -74,7 +74,7 @@ say(char *why, size_t why_size, const char *fmt, ...)
+    X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler) \
+    X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
+    X(vkCreateComputePipelines) X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
+-   X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkResetCommandPool) X(vkAllocateCommandBuffers) \
++   X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkResetCommandPool) X(vkAllocateCommandBuffers) X(vkFreeCommandBuffers) \
+    X(vkBeginCommandBuffer) X(vkEndCommandBuffer) \
+    X(vkCmdPipelineBarrier) X(vkCmdBindPipeline) X(vkCmdPushDescriptorSetKHR) X(vkCmdPushConstants) X(vkCmdDispatch) \
+    X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCmdCopyImage) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) \
+@@ -510,6 +510,10 @@ pro_reap(struct chl_device *d, bool wait)
+          continue;
+       d->vk.vkDestroyFence(d->dev, d->pro_inflight[i].fence, NULL);
+       d->pro_inflight[i].fence = VK_NULL_HANDLE;
++      /* the prologue's command buffer too: each one holds Turnip command-stream BOs, and texture uploads open one every frame
++       * (backboardd ran out of the kernel's 4096 BO handles within minutes of UI use, Mi 8 2026-10-29) */
++      d->vk.vkFreeCommandBuffers(d->dev, d->pro_pool, 1, &d->pro_inflight[i].cb);
++      d->pro_inflight[i].cb = VK_NULL_HANDLE;
+       for (unsigned k = 0; k < d->pro_inflight[i].n_held; k++)
+          obj_release(d->pro_inflight[i].held[k]);
+       free(d->pro_inflight[i].held);
+-- 
+2.54.0 (Apple Git-157)
+
