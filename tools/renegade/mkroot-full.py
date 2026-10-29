@@ -416,6 +416,7 @@ def stage_tweaks(a, root):
         rt.launchd(root)
         if os.environ.get('SWEET_QUIET') == '1':       # root_tweaks18.quiet(): crash-looping daemons off/throttled
             rt.quiet(root)
+        rt.backboardd_env(root)    # CA_DISABLE_ASYNCHRONOUS: QuartzCore's AsynchronousNode assert (root_tweaks18.py)
         rt.containers(root)
         chowned[os.path.join(root, 'private/var/containers/Bundle')] = (33, 33)
         rt.event_timing(root)       # <ADT target>.{Default,Touch}.plist when the ADT claims another device (ios18: D22 from N841)

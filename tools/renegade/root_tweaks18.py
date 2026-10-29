@@ -1230,6 +1230,28 @@ BGL_FILES = ('bgl-launch', 'OpenGLES.framework/OpenGLES', 'libOSMesa.8.dylib', '
 BGL_DIR = 'usr/local/lib/bergamota-gl'
 BGL_LAUNCH = '/usr/local/lib/bergamota-gl/bgl-launch'
 BACKBOARDD_LABEL, BACKBOARDD_PATH = 'com.apple.backboardd', '/usr/libexec/backboardd'
+# QuartzCore 26's renderer aborts backboardd (the "soft reboot": backboardd and SpringBoard restart) in
+# CA::OGL::AsynchronousNode::retain_surface -> CA::OGL::Context::push_surface, "Assertion failed: (found !=
+# slist->end ())" (ogl-context.cpp:1186): an asynchronous node reuses a surface the context no longer lists. Same
+# symbolicated path in all five crashes on the Mi 8 (logs dipper-ios26-6/6a/6b/6c, NOTES.md 2026-10-29).
+# CA_DISABLE_ASYNCHRONOUS (a QuartzCore getenv switch) keeps the renderer off that path. bgl-launch passes the
+# environment through (setenv + execv). RENEGADE_NO_CAENV=1 leaves the job alone.
+BACKBOARDD_ENV = {'CA_DISABLE_ASYNCHRONOUS': '1'}
+
+
+def backboardd_env(root):
+    if os.environ.get('RENEGADE_NO_CAENV') == '1':
+        print('backboardd env: skipped (RENEGADE_NO_CAENV=1)')
+        return
+    path = os.path.join(root, 'System/Library/xpc/launchd.plist')
+    st = os.stat(path)
+    plist = load(path)
+    n = 0
+    for job in [j for j in plist['LaunchDaemons'].values() if j.get('Label') == BACKBOARDD_LABEL]:
+        job.setdefault('EnvironmentVariables', {}).update(BACKBOARDD_ENV)
+        n += 1
+    save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    print(f'backboardd env: {BACKBOARDD_ENV} on {n} job(s)')
 
 
 def find_bgl():
@@ -1389,6 +1411,7 @@ def base(root):
     launchd(root)
     if os.environ.get('SWEET_QUIET') == '1':
         quiet(root)
+    backboardd_env(root)
     containers(root)
     launchservices(root)
     event_timing(root)
@@ -1438,6 +1461,7 @@ def main():
     launchd(root)
     if os.environ.get('SWEET_QUIET') == '1':
         quiet(root)
+    backboardd_env(root)
     containers(root)
     launchservices(root)
     event_timing(root)
