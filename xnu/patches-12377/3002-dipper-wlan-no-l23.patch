@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index c9940e1..70598bf 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -3702,7 +3702,17 @@ wf_rails(void)
+ 	char log[96];
+ 	uint32_t lp = 0;
+ 	bool ok = true;
++	/*
++	 * Mi 8 (dipper): its icnss node has only vdd-3.3-ch0 (L25); L23 is the USB rail there (vdda33 of both QUSB2
++	 * PHYs and of the PD PHY), not a WCN3990 channel, so it is never voted.
++	 */
++	bool dipper = sweet_board_is("xiaomi,dipper");
+ 	for (unsigned k = 0; ok && k < sizeof(r) / sizeof(r[0]); k++) {
++		if (dipper && !strcmp(r[k].res, "ldoa23")) {
++			lp += (uint32_t)snprintf(log + lp, sizeof(log) - lp, " ldoa23=skipped");
++			lp = MIN(lp, (uint32_t)sizeof(log) - 1);
++			continue;
++		}
+ 		int err = sweet_rpmh_vreg_set(r[k].res, r[k].mv, true);
+ 		lp += (uint32_t)snprintf(log + lp, sizeof(log) - lp, " %s=%d", r[k].res, err);
+ 		lp = MIN(lp, (uint32_t)sizeof(log) - 1);
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index f131dae..e837194 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -460,6 +460,11 @@ sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable)
+ 	if (!sweet_board_beryllium() || !res) {
+ 		return EINVAL;
+ 	}
++	/* Mi 8: L23 feeds the USB PHYs (vdda33 of qusb@88e2000/88e3000 and the PD PHY), not the WCN3990 */
++	if (!strcmp(res, "ldoa23") && sweet_board_is("xiaomi,dipper")) {
++		printf("SWEET RPMH: ldoa23 refused on the Mi 8 (USB PHY rail)\n");
++		return EPERM;
++	}
+ 	for (i = 0; i < sizeof(rh_wcn_rails) / sizeof(rh_wcn_rails[0]); ++i) {
+ 		if (!strcmp(res, rh_wcn_rails[i].res) &&
+ 		    mv >= rh_wcn_rails[i].lo && mv <= rh_wcn_rails[i].hi) {
