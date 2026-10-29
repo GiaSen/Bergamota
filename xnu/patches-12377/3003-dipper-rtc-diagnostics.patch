@@ -1,0 +1,103 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 362a89b..cc2e5d3 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -411,26 +411,57 @@ sr_read32(unsigned addr, uint32_t *v)
+ 	return 0;
+ }
+ 
++/* Why the last sr_raw() failed and the RTC_CTRL it read, for sr_explain() (the Mi 8 never logged a SWEET RTC line). */
++static const char *sr_why = "not read yet";
++static int sr_ctrl = -1;
++
+ /* Raw RTC seconds, read twice over a byte-0 rollover. */
+ static int
+ sr_raw(uint32_t *raw)
+ {
+ 	uint8_t ctrl = 0, b0 = 0;
+-	if (!sweet_board_beryllium() || sweet_spmi_init() != 0 || sweet_spmi_read(0, SR_RTC_CTRL, &ctrl) != 0 ||
+-	    !(ctrl & SR_EN)) {
++	if (!sweet_board_beryllium() || sweet_spmi_init() != 0) {
++		sr_why = "SPMI not ready";
++		return -1;
++	}
++	if (sweet_spmi_read(0, SR_RTC_CTRL, &ctrl) != 0) {
++		sr_why = "RTC_CTRL read failed";
++		return -1;
++	}
++	sr_ctrl = ctrl;
++	if (!(ctrl & SR_EN)) {
++		sr_why = "RTC not enabled (RTC_CTRL bit 7 clear)";
+ 		return -1;
+ 	}
+ 	for (int t = 0; t < 2; t++) {
+ 		if (sr_read32(SR_RTC_READ, raw) != 0 || sweet_spmi_read(0, SR_RTC_READ, &b0) != 0) {
++			sr_why = "RTC_READ read failed";
+ 			return -1;
+ 		}
+ 		if (b0 == (uint8_t)*raw) {
+ 			return 0;
+ 		}
+ 	}
++	sr_why = "RTC_READ rolled over on both reads";
+ 	return -1;
+ }
+ 
++/* One line on why the RTC path gave up: the step, the RTC peripheral's APID and owner, RTC_CTRL. */
++static void
++sr_explain(const char *what)
++{
++	int apid = -1, owner = -1;
++	if (sp_ready) {
++		uint16_t a = sp_find_apid(SR_RTC_CTRL >> 8);
++		if (a != SP_NO_APID) {
++			apid = a;
++			owner = (int)(sp_rd(sp_cfg, 0x700u + 4u * a) & 7u);
++		}
++	}
++	printf("SWEET RTC: %s: %s (sid 0 peripheral 0x%x APID %d owner EE %d, RTC_CTRL %#x)\n", what, sr_why,
++	    SR_RTC_CTRL >> 8, apid, owner, sr_ctrl);
++}
++
+ /* The stored offset, or -1 when the alarm is armed (not ours) or unreadable. */
+ static int
+ sr_offset(uint32_t *off)
+@@ -446,9 +477,13 @@ sr_offset(uint32_t *off)
+ uint64_t
+ sweet_rtc_get(void)
+ {
+-	static bool told;
++	static bool told, told_fail;
+ 	uint32_t raw, off = 0;
+ 	if (sr_raw(&raw) != 0) {
++		if (!told_fail) {
++			told_fail = true;
++			sr_explain("no wall clock");
++		}
+ 		return 0;
+ 	}
+ 	bool have = sr_offset(&off) == 0;
+@@ -467,9 +502,21 @@ sweet_rtc_get(void)
+ void
+ sweet_rtc_set(uint64_t unix_secs)
+ {
++	static bool told;
+ 	uint32_t raw, off;
+-	if (unix_secs < SR_T_MIN || unix_secs >= SR_T_MAX || sr_raw(&raw) != 0 || unix_secs < raw ||
+-	    sr_offset(&off) != 0) {
++	if (unix_secs < SR_T_MIN || unix_secs >= SR_T_MAX) {
++		return;
++	}
++	bool have_raw = sr_raw(&raw) == 0;
++	if (!have_raw || unix_secs < raw || sr_offset(&off) != 0) {
++		if (!told) {
++			told = true;
++			if (have_raw) {
++				sr_why = unix_secs < raw ? "RTC already ahead of the time to keep" :
++				    "alarm armed or its data unreadable (offset not kept)";
++			}
++			sr_explain("time not kept");
++		}
+ 		return;
+ 	}
+ 	uint32_t want = (uint32_t)(unix_secs - raw);
