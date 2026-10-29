@@ -305,8 +305,11 @@ def main():
             rt.bglrender(mnt)
         # Metal Mercury, as in a full build (root_tweaks18.auto): the dylibs and bgmtl.arm go in before the first-boot job
         # picks the wallpaper, which follows the outcome. RENEGADE_NO_BGMTL=1 / RENEGADE_BGMTL=0 opts out.
+        # RENEGADE_CHL=1: Chlorophyll on Turnip as the system renderer (root_tweaks18.chlorophyll) instead.
         metal = False
-        if os.environ.get('RENEGADE_NO_BGMTL') != '1' and os.environ.get('RENEGADE_BGMTL') != '0':
+        if os.environ.get('RENEGADE_CHL') == '1':
+            metal = rt.chlorophyll(mnt)
+        elif os.environ.get('RENEGADE_NO_BGMTL') != '1' and os.environ.get('RENEGADE_BGMTL') != '0':
             metal = rt.bgmtl(mnt)
         rt.firstboot(mnt, appreg=feats['appreg'], jb=feats['jb'], wallpaper=feats['wallpaper'], metal=metal)
         if os.environ.get('RENEGADE_DISABLE_CRYPTEXD') == '1':

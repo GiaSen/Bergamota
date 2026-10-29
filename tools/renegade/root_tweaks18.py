@@ -980,6 +980,137 @@ def bgmtl(root):
     return True
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# chlorophyll (opt-in, RENEGADE_CHL=1; replaces bgmtl for that build): Chlorophyll on Turnip (gpu/metal turnip/build-metal.sh) as the iOS 26
+# system renderer. The Poco F1 had this install by hand on the phone (NOTES 2026-10-26: backboardd, SpringBoard, PosterBoard,
+# iconservicesagent, the Mercury and Photos posters), which every userdata reflash lost; here it is in the image.
+#   /usr/local/lib/bgmtl/{bgmtl-inject,libchlorophyll,libdrm.2}.dylib (pacstrip --sign) and /usr/local/bgi.dylib -> lib/bgmtl/bgmtl-inject.dylib.
+#   Every target gets ONE LC_LOAD_WEAK_DYLIB of /usr/local/bgi.dylib, so the boot-arg sweetdenypath=bgi.dylib (kernel 1016: lookups of a path
+#   ending in the suffix fail) starts all of them stock; the Poco F1 mixed two paths and one deny arg missed SpringBoard.
+#   SweetAdrenoUserClient is added to com.apple.security.iokit-user-client-class where the key exists, and to PosterBoard (app sandbox), as on
+#   the Poco F1; the posters keep their entitlements. Identifier and CS flags are kept. SpringBoard has 16 bytes of load-command slack:
+#   addlc.py --make-room drops its LC_SOURCE_VERSION and empty LC_DATA_IN_CODE. The originals go to /private/var/root/chlorophyll-orig/.
+#   Flags in /private/var/tmp: bgmtl.arm (allow-listed processes), bgmtl-bb.arm + bgmtl-bb.direct (backboardd without bgl-launch, iOS 26),
+#   bgmtl-bb.sync (synchronous commits, the Poco F1's proven mode); bgmtl.log world-writable (iconservicesagent runs as _iconservices).
+#   iconservicesagent's InactiveHard jetsam limit 15 -> 160 MB (Chlorophyll in-process is 45-105 MB after a render; NOTES boot 43).
+# Kill switches on the phone: /private/var/tmp/bgmtl.off (all but backboardd), bgmtl-bb.off (backboardd), bgmtl.off.<bundle id>.
+# Build output directory: RENEGADE_CHL_DIR (default research/chl-work/out-metal).
+CHL_DIR_DEFAULT = os.path.join(REPO, 'research/chl-work/out-metal')
+CHL_LINK = '/usr/local/bgi.dylib'
+CHL_ORIG = 'private/var/root/chlorophyll-orig'
+CHL_UC = 'SweetAdrenoUserClient'
+CHL_UC_KEY = 'com.apple.security.iokit-user-client-class'
+# (path in the root, add the user client class, create the key when missing)
+CHL_TARGETS = (
+    ('usr/libexec/backboardd', True, False),
+    ('System/Library/CoreServices/SpringBoard.app/SpringBoard', True, False),
+    ('Applications/PosterBoard.app/PosterBoard', True, True),
+    ('System/Library/CoreServices/iconservicesagent', True, False),
+    (MERCURY_BIN, False, False),
+    ('System/Library/ExtensionKit/Extensions/PhotosPosterProvider.appex/PhotosPosterProvider', False, False),
+)
+CHL_FLAGS = ('bgmtl.arm', 'bgmtl-bb.arm', 'bgmtl-bb.direct', 'bgmtl-bb.sync')
+CHL_JETSAM = (('Daemon', 'com.apple.iconservices.iconservicesagent', 160),)
+
+
+def chlorophyll_link(root, rel, add_uc, create_uc):
+    import subprocess, tempfile
+    sys.path.insert(0, HERE)
+    import pacstrip
+    binp = os.path.join(root, rel)
+    name = os.path.basename(rel)
+    if not os.path.exists(binp):
+        print('chlorophyll: no', rel, 'in the image: skipped')
+        return False
+    if macho_has_dylib(binp, CHL_LINK):
+        print('chlorophyll:', name, 'already links', CHL_LINK)
+        return True
+    mode = os.stat(binp).st_mode & 0o7777
+    orig = os.path.join(root, CHL_ORIG, name)
+    if not os.path.exists(orig):
+        install_file(binp, orig, mode)
+    tmpd = tempfile.mkdtemp(prefix='renegade-chl-')
+    try:
+        tmp = os.path.join(tmpd, name)
+        shutil.copyfile(binp, tmp)
+        os.chmod(tmp, 0o755)
+        ents, ident = entitlements_of(tmp) or {}, pacstrip.cs_identity(tmp)
+        want = dict(ents)
+        if add_uc and (CHL_UC_KEY in want or create_uc):
+            classes = list(want.get(CHL_UC_KEY, []))
+            if CHL_UC not in classes:
+                want[CHL_UC_KEY] = classes + [CHL_UC]
+        subprocess.run([sys.executable, '-I', ADDLC, '--weak', '--make-room', tmp, CHL_LINK], check=True)
+        rplat.adhoc_sign(tmp, ident[0], ident[2], plistlib.dumps(want) if want else None)
+        new = pacstrip.cs_identity(tmp)
+        if not new or new[:2] != ident[:2] or (ident[2] & ~new[2]) & ~pacstrip.CS_FLAG_IGNORED:
+            sys.exit('chlorophyll: identity or CS flags changed by the re-sign of %s: %s -> %s' % (name, ident, new))
+        if (entitlements_of(tmp) or {}) != want:
+            sys.exit('chlorophyll: entitlements of %s not as wanted after the re-sign: %s left alone' % (name, rel))
+        if not macho_has_dylib(tmp, CHL_LINK):
+            sys.exit('chlorophyll: LC_LOAD_WEAK_DYLIB missing after addlc.py')
+        install_file(tmp, binp, mode)
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+    print('chlorophyll: %s weak-links %s (re-signed ad hoc as %s, %d entitlements%s; original in /%s)' % (
+        name, CHL_LINK, ident[0], len(want), ', + ' + CHL_UC if want != ents else '', CHL_ORIG))
+    return True
+
+
+def chlorophyll_jetsam(root):
+    for path in sorted(glob.glob(os.path.join(root, 'System/Library/LaunchDaemons/com.apple.jetsamproperties.*.plist'))):
+        st = os.stat(path)
+        data = load(path)
+        props = data.get('Version4')
+        if not isinstance(props, dict):
+            continue
+        for cat, label, mb in CHL_JETSAM:
+            ent = props.setdefault(cat, {}).setdefault('Override', {}).setdefault(label, {})
+            ent['InactiveHardMemoryLimit'] = max(ent.get('InactiveHardMemoryLimit', 0), mb)
+            print('chlorophyll: %s: %s InactiveHard %d MB' % (os.path.relpath(path, root), label, ent['InactiveHardMemoryLimit']))
+        save(path, data, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+
+
+def chlorophyll(root):
+    import subprocess, tempfile
+    src = os.environ.get('RENEGADE_CHL_DIR') or CHL_DIR_DEFAULT
+    names = ('bgmtl-inject.dylib', 'libchlorophyll.dylib', 'libdrm.2.dylib')
+    if not all(os.path.exists(os.path.join(src, n)) for n in names):
+        print('chlorophyll: %s not built (gpu/metal/turnip/build-turnip.sh, then build-metal.sh): skipped' % src)
+        note_skip('chlorophyll', 'Chlorophyll dylibs not found in ' + src)
+        return False
+    for n in names:                                        # first: no binary may name a missing dylib
+        sd = tempfile.mkdtemp(prefix='renegade-chl-lib-')
+        try:
+            tmpl = os.path.join(sd, n)
+            shutil.copyfile(os.path.join(src, n), tmpl)
+            if n == 'bgmtl-inject.dylib':
+                # loaded through the CHL_LINK symlink: its @loader_path rpath worked on the Poco F1; the absolute one is a second chance
+                r = subprocess.run(['otool', '-l', tmpl], capture_output=True, text=True).stdout
+                if ' path %s (offset' % BGMTL_LIB_DIR not in r:      # an LC_RPATH entry, not the install name
+                    subprocess.run(['install_name_tool', '-add_rpath', BGMTL_LIB_DIR, tmpl], check=True, stderr=subprocess.DEVNULL)
+            subprocess.run([sys.executable, '-I', os.path.join(HERE, 'pacstrip.py'), '--sign', tmpl], check=True, stdout=subprocess.DEVNULL)
+            install_file(tmpl, os.path.join(root, BGMTL_LIB_DIR.lstrip('/'), n), 0o755)
+        finally:
+            shutil.rmtree(sd, ignore_errors=True)
+    link = os.path.join(root, CHL_LINK.lstrip('/'))
+    if os.path.lexists(link):
+        os.remove(link)
+    os.symlink('lib/bgmtl/bgmtl-inject.dylib', link)
+    os.lchown(link, 0, 0)
+    print('chlorophyll: dylibs installed in', BGMTL_LIB_DIR + ',', CHL_LINK, '-> lib/bgmtl/bgmtl-inject.dylib')
+    for rel, add_uc, create_uc in CHL_TARGETS:
+        chlorophyll_link(root, rel, add_uc, create_uc)
+    for f in CHL_FLAGS:
+        write_file(os.path.join(root, 'private/var/tmp', f), 'written by renegade chlorophyll\n')
+    logp = os.path.join(root, 'private/var/tmp/bgmtl.log')
+    if not os.path.exists(logp):
+        write_file(logp, '', 0o666)
+    print('chlorophyll: flags', ', '.join(CHL_FLAGS), 'in /private/var/tmp; bgmtl.log 0666')
+    chlorophyll_jetsam(root)
+    return True
+
+
 FIRSTBOOT_LABEL = 'org.bergamota.renegade-firstboot'
 FIRSTBOOT_SH = 'usr/local/libexec/renegade-firstboot.sh'
 FIRSTBOOT_DONE = 'private/var/db/.renegade-firstboot-done'
@@ -1436,8 +1567,11 @@ def auto(root):
         posterboard(root)
     # Metal Mercury ships by default (RENEGADE_NO_BGMTL=1 / RENEGADE_BGMTL=0 opts out). It goes in FIRST: the dylibs and bgmtl.arm are in the image
     # before the first-boot job can select the Mercury wallpaper, and so before PosterBoard ever launches Mercury. The wallpaper follows the outcome.
+    # RENEGADE_CHL=1: Chlorophyll on Turnip as the system renderer (chlorophyll()) instead of the Mercury-only bgmtl.
     metal = False
-    if os.environ.get('RENEGADE_NO_BGMTL') != '1' and os.environ.get('RENEGADE_BGMTL') != '0':
+    if os.environ.get('RENEGADE_CHL') == '1':
+        metal = chlorophyll(root)
+    elif os.environ.get('RENEGADE_NO_BGMTL') != '1' and os.environ.get('RENEGADE_BGMTL') != '0':
         metal = bgmtl(root)
     firstboot(root, appreg=enabled('appreg'), jb=enabled('jb'), wallpaper=enabled('wallpaper'), metal=metal)
     if enabled('bglrender'):
