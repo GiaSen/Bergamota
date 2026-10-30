@@ -1,0 +1,111 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 58a71b7..fe0f5d3 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -32,6 +32,7 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <kern/clock.h>
++#include <kern/cpu_number.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -44,6 +45,9 @@ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++extern processor_t cpu_to_processor(int cpu);
++extern processor_t thread_bind(processor_t processor);
+ extern void sweet_input_boost(void);    /* bsd/dev/sweet_cpufreq.c: GPU + CPU input boost (patch 0217) */
+ void sweet_touch_init(void);
+ 
+@@ -971,6 +975,7 @@ touch_stfts(void)
+ 		if (err || ev[0] == STFTS_EVT_NONE) {
+ 			break;
+ 		}
++		bool more = !(touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)) & 1u);    /* 3007: line high = FIFO empty, no empty read */
+ 		if (touch_trace) {
+ 			uint64_t ns;
+ 			absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+@@ -981,18 +986,27 @@ touch_stfts(void)
+ 		if (ev[0] == STFTS_EVT_ENTER || ev[0] == STFTS_EVT_MOTION || ev[0] == STFTS_EVT_LEAVE) {
+ 			if (id >= TOUCH_MAX) {
+ 				bad = true;
++				if (!more) {
++					break;
++				}
+ 				continue;
+ 			}
+ 			uint32_t bit = 1u << id;
+ 			if (ev[0] == STFTS_EVT_LEAVE || type == STFTS_TYPE_HOVER || type == STFTS_TYPE_PALM) {
+ 				changed |= (mask & bit) != 0;
+ 				mask &= ~bit;
++				if (!more) {
++					break;
++				}
+ 				continue;
+ 			}
+ 			unsigned px = ((unsigned)(ev[3] & 15u) << 8) | ev[2];
+ 			unsigned py = ((unsigned)ev[4] << 4) | (ev[3] >> 4);
+ 			if (px >= tb->w || py >= tb->h) {
+ 				bad = true;
++				if (!more) {
++					break;
++				}
+ 				continue;
+ 			}
+ 			mask |= bit;
+@@ -1004,6 +1018,9 @@ touch_stfts(void)
+ 			printf("SWEET TOUCH: FTS event %02x %02x %02x %02x %02x %02x %02x %02x\n",
+ 			    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
+ 		}
++		if (!more) {
++			break;
++		}
+ 	}
+ 	if (changed) {
+ 		touch_report(mask, x, y);
+@@ -1370,6 +1387,22 @@ selected:
+ 	    st.kind == TOUCH_GOODIX ? "GT9896 Yellowstone" : "Focaltech 54:52",
+ 	    tb->w, tb->h, touch_poll_ms, bb_half_us, st.irq_hint);
+ 	unsigned errors = 0, ticks = 0;
++	/*
++	 * 3007: a bit-banged read spins for a millisecond at kernel priority. The steering sends such a thread to an A75 first,
++	 * where it preempts the frame being rendered, every few milliseconds while a finger moves (synthetic touches skip all this).
++	 */
++	if (touch_on_dipper) {
++		int bind = 1;
++		(void)PE_parse_boot_argn("sweettouchbind", &bind, sizeof(bind));
++		for (unsigned i = 0; bind && i < 100 && !sweet_cpu_signal_is_enabled(3); i++) {
++			touch_wait(100);
++		}
++		if (bind && sweet_cpu_signal_is_enabled(3)) {
++			thread_bind(cpu_to_processor(3));       /* the last A55; takes effect at the next block */
++			thread_block(THREAD_CONTINUE_NULL);
++			printf("SWEET TOUCH: thread bound to cpu 3, now on cpu %d\n", cpu_number());
++		}
++	}
+ 	while (!st.dead) {
+ 		/* Optional IRQ hint still reads every 100ms, and always while down. */
+ 		/* sweet's IRQ lines idle high (low = report pending); NT36672A pulses high. */
+@@ -1399,7 +1432,8 @@ selected:
+ 		 * bit-banged transfer.
+ 		 */
+ 		static unsigned since_read;
+-		bool active_due = st.active && (!paced || touch_poll_ms >= 8 ||
++		/* 3007: the ST FTS's line is a level, nothing to miss: `pending` and `periodic` are enough */
++		bool active_due = st.active && st.kind != TOUCH_STFTS && (!paced || touch_poll_ms >= 8 ||
+ 		    ++since_read * touch_poll_ms >= 8);
+ 		if (!st.irq_hint || active_due || pending || periodic) {
+ 			since_read = 0;
+@@ -1466,6 +1500,9 @@ sweet_touch_init(void)
+ 	if (sweet_board_beryllium()) {
+ 		touch_poll_ms = 2;
+ 	}
++	if (touch_on_dipper) {
++		bb_half_us = 2;         /* 3007: at most 250 kHz, inside I2C fast mode; the reads spin for half the time. sweettouchbb=5 undoes it */
++	}
+ 	(void)PE_parse_boot_argn("sweettouchms", &touch_poll_ms, sizeof(touch_poll_ms));
+ 	if (touch_poll_ms < 1 || touch_poll_ms > 20) {
+ 		touch_poll_ms = 10;

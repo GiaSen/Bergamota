@@ -1,0 +1,152 @@
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+index fea5174..d2a8d4c 100644
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -60,6 +60,9 @@ static int sweet_fb_sysctl SYSCTL_HANDLER_ARGS
+  * the initial value. The framebuffer only reads it (a relaxed load per frame / vsync tick).
+  */
+ int sweet_fb_hud;
++/* 3006: copy mode shows a frame when the GPU has finished it (1) or only at a vsync tick (0, boot-arg sweetfb_gatepoll=0) */
++int sweet_fb_gatepoll = 1;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_gatepoll, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_gatepoll, 0, "show a frame when the GPU finishes it");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hud, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_hud, 0,
+     "Poco F1 on-screen performance HUD (0 off, 1 on); needs the copy scan-out path");
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 36230fe..6557b88 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -65,6 +65,7 @@ extern "C" void sweet_busy_init(void);          /* iokit/Kernel/arm/SweetBusy.cp
+ extern "C" int sweet_smmu_probe_sid(unsigned sid, unsigned level); /* bsd/dev/sweet_smmu.c, read only */
+ extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb */
+ extern "C" int sweet_fb_hud;
++extern "C" int sweet_fb_gatepoll;               /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_gatepoll (3006) */
+ extern "C" uint32_t sweet_gpu_fence_snapshot(void);     /* bsd/dev/sweet_a630.c (0229) */
+ extern "C" bool sweet_gpu_blit_window(uint64_t pa, uint64_t size);      /* bsd/dev/sweet_a630.c (0240) */
+ extern "C" uint32_t sweet_gpu_blit(uint64_t src_pa, uint32_t src_pitch, uint64_t dst_pa, uint32_t dst_pitch, uint32_t w, uint32_t h);
+@@ -263,6 +264,7 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static void swapFired(OSObject *owner, IOTimerEventSource *sender);
++	static void gateFired(OSObject *owner, IOTimerEventSource *sender);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -420,6 +422,13 @@ public:
+ 	 */
+ 	bool          fDirect, fEarly;
+ 	IOTimerEventSource *fSwapTimer;
++	/*
++	 * 3006, copy mode: a frame goes to the panel when the GPU has finished it, not at the next vsync tick. At the tick
++	 * the gate (0229) only saw the newest swap, whose GPU work was usually still running; that swap was then replaced
++	 * by the next one, and so on: backboardd rendered a steady 60 fps while about 10 frames a second were shown.
++	 */
++	IOTimerEventSource *fGateTimer;
++	bool          latchBlocks(uint64_t now);
+ 	uint8_t       fEarlyRec[SWEET_FB_SWAP_REC_SIZE];
+ 	void          quietConsole(void);
+ 	uint32_t      fZcCleanMode;     /* sweetfb_zcclean: 0 never, 1 always (0127 behaviour), 2 auto (patch 0212) */
+@@ -857,6 +866,14 @@ AppleCLCD::start(IOService *provider)
+ 			IOLog("SWEET FB: no swap timer: direct frames wait for the vsync tick\n");
+ 		}
+ 	}
++	if (!fEarly) {
++		PE_parse_boot_argn("sweetfb_gatepoll", &sweet_fb_gatepoll, sizeof(sweet_fb_gatepoll));
++		fGateTimer = IOTimerEventSource::timerEventSource(this, &AppleCLCD::gateFired);
++		if (fGateTimer == NULL || fWorkLoop->addEventSource(fGateTimer) != kIOReturnSuccess) {
++			OSSafeReleaseNULL(fGateTimer);
++			IOLog("SWEET FB: no gate timer: frames wait for the vsync tick\n");
++		}
++	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -1002,7 +1019,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		sender->setTimeoutUS(nextUS);
+ 		return;
+ 	}
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && fb->gpuGateOpen(mach_absolute_time());
++	/* 3006: with the previous frame not latched yet the gate timer takes this one, so this thread does not spin in waitLatch */
++	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && !fb->latchBlocks(now) && fb->gpuGateOpen(mach_absolute_time());
+ 	uint8_t *rec = NULL;
+ 	SweetSurface *taken[4] = {};
+ 	if (flush) {
+@@ -1073,6 +1091,57 @@ AppleCLCD::gpuGateOpen(uint64_t now)
+ 	return false;
+ }
+ 
++/*
++ * 3006: the previous frame has not latched, so the back buffer may still be on the panel. Only with the gate poll on, and
++ * only for a while: present()'s bounded waitLatch takes over if the latch never comes. Called with fLock held.
++ */
++bool
++AppleCLCD::latchBlocks(uint64_t now)
++{
++	if (fGateTimer == NULL || !sweet_fb_gatepoll || !fFlip || fLastFlush == 0 || latchedNow()) {
++		return false;
++	}
++	uint64_t cap;
++	nanoseconds_to_absolutetime(34 * NSEC_PER_MSEC, &cap);
++	return now - fPendAbs <= cap;
++}
++
++/* 3006: see fGateTimer. Same work loop as the vsync timer, so the two never run at once. */
++void
++AppleCLCD::gateFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	SweetSurface *taken[4] = {};
++
++	if (fb->fPowerOff || !sweet_fb_gatepoll) {
++		return;         /* the vsync tick takes it */
++	}
++	uint64_t now = mach_absolute_time();
++	IOLockLock(fb->fLock);
++	if (!fb->fDirty) {
++		IOLockUnlock(fb->fLock);
++		return;
++	}
++	if (fb->latchBlocks(now) || !fb->gpuGateOpen(now)) {
++		IOLockUnlock(fb->fLock);
++		sender->setTimeoutUS(1000);
++		return;
++	}
++	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++	if (rec == NULL) {
++		IOLockUnlock(fb->fLock);
++		return;         /* the vsync tick takes it */
++	}
++	memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++	fb->fDirty = false;
++	memcpy(taken, fb->fPendHold, sizeof(taken));
++	bzero(fb->fPendHold, sizeof(fb->fPendHold));
++	IOLockUnlock(fb->fLock);
++	fb->present(rec);
++	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++	sweet_hold_release(taken);      /* copied: CA may render into them again */
++}
++
+ void
+ AppleCLCD::swapFired(OSObject *owner, IOTimerEventSource *)
+ {
+@@ -1296,7 +1365,10 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	IOLockLock(fLock);
+ 	fSt.swaps++;
+ 	fPendFence = sweet_gpu_fence_snapshot();
+-	fPendAbs = mach_absolute_time();
++	/* 3006: the gate's cap counts from the oldest frame not yet shown; restarting it at every swap meant it never ran out */
++	if (!fDirty || !sweet_fb_gatepoll) {
++		fPendAbs = mach_absolute_time();
++	}
+ 	__atomic_store_n(&fSwapNewest, get32(rec, 0x50), __ATOMIC_RELEASE);
+ 	{
+ 		struct sweet_fb_trace_rec *tr = &sweet_fb_trace[get32(rec, 0x50) & (SWEET_FB_TRACE_N - 1)];
+@@ -1315,6 +1387,8 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	sweet_hold_release(dropped);
+ 	if (fEarly && !fPowerOff) {
+ 		fSwapTimer->setTimeoutUS(1);    /* scan it now: the MDP latches at its next vsync */
++	} else if (fGateTimer != NULL && sweet_fb_gatepoll && !fPowerOff) {
++		fGateTimer->setTimeoutUS(1000);
+ 	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
