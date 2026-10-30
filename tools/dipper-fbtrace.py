@@ -18,12 +18,14 @@ if len(rows) < 2:
 
 busy, shown, late = 0.0, 0, []
 swaps = 0
+bins = [0, 0, 0, 0]
 for a, b in zip(rows, rows[1:]):
     dt = (b[1] - a[1]) / 1000
     if dt > 50:
         continue
     busy += dt
     swaps += 1
+    bins[0 if dt <= 18 else 1 if dt <= 25 else 2 if dt <= 34 else 3] += 1
     if a[2]:
         shown += 1
         late.append((a[2] - a[1]) / 1000)
@@ -32,5 +34,6 @@ if not busy:
 late.sort()
 print(f"{swaps} swaps in {busy:.0f} ms of animation: rendered {swaps * 1000 / busy:.1f} fps, "
       f"shown {shown * 1000 / busy:.1f} fps ({100 * shown / swaps:.0f}% of the frames)")
+print(f"intervals: <=18 ms {bins[0]}, <=25 {bins[1]}, <=34 {bins[2]}, more {bins[3]}")
 if late:
     print(f"swap to scan-out: median {late[len(late) // 2]:.1f} ms, worst {late[-1]:.1f} ms")
