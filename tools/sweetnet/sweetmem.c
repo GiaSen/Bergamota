@@ -1,13 +1,14 @@
 /*
  * sweetmem: core clock, cache/DRAM latency and memory bandwidth, as seen from user space. Tells a slow L3 or DDR clock
  * (nobody votes for them unless the kernel does) from a slow CPU clock.
- * Usage: sweetmem [ROUNDS, default 3]. Only samples taken on an A75 count (clock probe before and after each), best of
- * several. Read-only, about a minute a round.
+ * Usage: sweetmem [ROUNDS, default 3] [q]. Only samples taken on an A75 count (clock probe before and after each), best of
+ * several. Read-only, about 3 minutes a round; q = fewer sizes and samples, under a minute.
  * Build: tools/sweetnet/build.sh (arm64e, then `renegade strip --sign`).
  */
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +16,7 @@
 #include <unistd.h>
 
 static mach_timebase_info_data_t tb;
+static int quick = 40;
 
 static double
 now_ns(void)
@@ -86,7 +88,7 @@ chase_ns(void **buf, size_t size)
 	}
 	/* The best of several short samples: an A55 in the middle or a preemption only ever makes a sample slower. */
 	double best = 1e9;
-	for (int s = 0; s < 40; s++) {
+	for (int s = 0; s < quick; s++) {
 		uint64_t loads = size >= (8u << 20) ? 400000 : 2000000, left = loads;
 		double g0 = to_a75(), t = now_ns();
 		while (left >= 16) {
@@ -149,10 +151,15 @@ bw_copy(void *d, const void *s, size_t size)
 int
 main(int argc, char **argv)
 {
-	static const size_t sizes[] = { 16u << 10, 64u << 10, 128u << 10, 512u << 10, 1024u << 10, 1536u << 10,
-		                        4u << 20, 16u << 20, 64u << 20 };
+	static const size_t all[] = { 16u << 10, 64u << 10, 128u << 10, 512u << 10, 1024u << 10, 1536u << 10,
+		                      4u << 20, 16u << 20, 64u << 20 };
+	static const size_t few[] = { 1024u << 10, 4u << 20, 16u << 20, 64u << 20 };
 	const size_t max = 64u << 20;
 	int rounds = argc > 1 ? atoi(argv[1]) : 3;
+	bool q = argc > 2;
+	if (q) {
+		quick = 8;
+	}
 	mach_timebase_info(&tb);
 	/* fixed priority 54, CoreAnimation's render thread: the kernel's steering (sweetamp_prio) prefers an A75 */
 	struct sched_param sp = { .sched_priority = 54 };
@@ -168,19 +175,22 @@ main(int argc, char **argv)
 	memset(b, 2, max);
 	for (int r = 0; r < rounds; r++) {
 		printf("round %d: A75 search %.2f GHz\n  latency:", r, to_a75());
-		for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+		const size_t *sizes = q ? few : all;
+		for (size_t i = 0; i < (q ? sizeof(few) / sizeof(few[0]) : sizeof(all) / sizeof(all[0])); i++) {
 			printf(" %zuK=%.1fns", sizes[i] >> 10, chase_ns(a, sizes[i]));
 			fflush(stdout);
 		}
 		printf("\n");
 		memset(a, 1, max);
 		double r64k = 0, r1m = 0, r64m = 0, c64k = 0, c1m = 0, c8m = 0, c64m = 0;
-#define BEST(var, expr) do { for (int s = 0; s < 12; s++) { double v, g0 = to_a75(); v = (expr); \
+#define BEST(var, expr) do { for (int s = 0; s < (q ? 2 : 12); s++) { double v, g0 = to_a75(); v = (expr); \
 		if (g0 >= 1.85 && core_ghz() >= 1.85 && v > var) { var = v; } } } while (0)
-		BEST(r64k, bw_read((uint64_t *)a, 64u << 10));
+		if (!q) {
+			BEST(r64k, bw_read((uint64_t *)a, 64u << 10));
+			BEST(c64k, bw_copy(b, a, 64u << 10));
+		}
 		BEST(r1m, bw_read((uint64_t *)a, 1u << 20));
 		BEST(r64m, bw_read((uint64_t *)a, max));
-		BEST(c64k, bw_copy(b, a, 64u << 10));
 		BEST(c1m, bw_copy(b, a, 1u << 20));
 		BEST(c8m, bw_copy(b, a, 8u << 20));
 		BEST(c64m, bw_copy(b, a, max));
