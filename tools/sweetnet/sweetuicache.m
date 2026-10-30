@@ -9,6 +9,9 @@
  * group containers, as MobileInstallation registers them: an app registered
  * without it has no extensions at all (no widgets: chronod "Ignoring restricted
  * or unknown extension", SpringBoard's "Waiting..." tiles).
+ * The app itself gets its entitlements and group containers the same way, and its data container when it
+ * has com.apple.private.security.container-required: without one Safari aborts at launch ("Safari received
+ * a nil container URL from LSApplicationRecord").
  */
 #import <Foundation/Foundation.h>
 #include <dlfcn.h>
@@ -53,6 +56,12 @@ static NSString *
 container_path(NSString *cls, NSString *ident)
 {
 	return [[[NSClassFromString(cls) containerWithIdentifier:ident createIfNecessary:YES existed:NULL error:NULL] url] path];
+}
+
+static NSDictionary *
+home_environment(NSString *c)
+{
+	return @{@"CFFIXED_USER_HOME": c, @"HOME": c, @"TMPDIR": [c stringByAppendingPathComponent:@"tmp"]};
 }
 
 static NSDictionary *
@@ -107,8 +116,7 @@ plugins_of(NSString *path, NSString *owner)
 			NSString *c = container_path(@"MCMPluginKitPluginDataContainer", pid);
 			if (c) {
 				d[@"Container"] = c;
-				d[@"EnvironmentVariables"] = @{@"CFFIXED_USER_HOME": c, @"HOME": c,
-				                               @"TMPDIR": [c stringByAppendingPathComponent:@"tmp"]};
+				d[@"EnvironmentVariables"] = home_environment(c);
 			}
 			plugins[pid] = d;
 		}
@@ -147,22 +155,35 @@ main(int argc, char **argv)
 		}
 		dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
 		NSDictionary *plugins = plugins_of(path, bid);
-		NSDictionary *dict = @{
+		NSDictionary *ents = entitlements_of([path stringByAppendingPathComponent:info[@"CFBundleExecutable"] ?: @""]) ?: @{};
+		NSMutableDictionary *dict = [@{
 			@"ApplicationType": @"System",
 			@"CFBundleIdentifier": bid,
 			@"CodeInfoIdentifier": bid,
 			@"CompatibilityState": @0,
+			@"Entitlements": ents,
+			@"GroupContainers": group_containers(ents),
 			@"IsDeletable": @NO,
 			@"Path": path,
 			@"SignerOrganization": @"Apple Inc.",
 			@"SignerIdentity": @"Apple iPhone OS Application Signing",
 			@"_LSBundlePlugins": plugins,
-		};
+		} mutableCopy];
+		id required = ents[@"com.apple.private.security.container-required"];
+		if ([required isKindOfClass:[NSString class]] || [required boolValue]) {
+			NSString *c = container_path(@"MCMAppDataContainer", [required isKindOfClass:[NSString class]] ? required : bid);
+			if (c) {
+				dict[@"Container"] = c;
+				dict[@"EnvironmentVariables"] = home_environment(c);
+				dict[@"IsContainerized"] = @YES;
+			}
+		}
 		BOOL ok = [w registerApplicationDictionary:dict];
 		if (!ok) {
 			ok = [w registerApplication:url];
 		}
-		printf("sweetuicache: register %s (%s, %lu extensions) -> %s\n", argv[1], bid.UTF8String, (unsigned long)plugins.count, ok ? "ok" : "FAILED");
+		printf("sweetuicache: register %s (%s, %lu extensions, container %s) -> %s\n", argv[1], bid.UTF8String, (unsigned long)plugins.count,
+		    dict[@"Container"] ? [dict[@"Container"] UTF8String] : "none", ok ? "ok" : "FAILED");
 		return ok ? 0 : 1;
 	}
 }
