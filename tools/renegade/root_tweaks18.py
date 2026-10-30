@@ -589,17 +589,21 @@ QUIET_THROTTLE = {      # label -> ThrottleInterval seconds (default 10, replica
     'com.apple.icloud.findmydeviced': 60, 'com.apple.mobileactivationd': 60,
     'com.apple.spaceattributiond': 60, 'com.apple.fairplayd.H2': 60, 'com.apple.PerfPowerServices': 60,
     'com.apple.webinspectord': 60,
-    # iOS 26 on the Mi 8 (NOTES.md 2026-10-28, log dipper-ios26-6b, 25 min): bluetoothd 16 starts ("Bluetooth fatal
-    # error" without the sweetwlan transport), watchdogd 97 (KeepAlive, exits at once), wifip2pd 107 (no Wi-Fi),
-    # gamepolicyd 94 / deviceaccessd 93 (jetsam-killed at their limit, see QUIET_JETSAM), ReportMemoryException 17
-    'com.apple.bluetoothd': 300, 'com.apple.watchdogd': 300, 'com.apple.wifip2pd': 300,
+    # iOS 26 on the Mi 8 (NOTES.md 2026-10-28, log dipper-ios26-6b, 25 min): watchdogd 97 starts (KeepAlive, exits at
+    # once), wifip2pd 107 (no Wi-Fi), gamepolicyd 94 / deviceaccessd 93 (jetsam-killed at their limit, see QUIET_JETSAM),
+    # ReportMemoryException 17
+    'com.apple.watchdogd': 300, 'com.apple.wifip2pd': 300,
     'com.apple.gamepolicyd': 60, 'com.apple.deviceaccessd': 60, 'com.apple.ReportMemoryException': 60,
 }
 # sirittsd (an xpc.activity job) hosts the TTS audio units SiriAUSP/MacinTalkAUSP/MauiAUSP/KonaSynthesizer, which
 # abort at once on this port and are relaunched by it: ~135 crashes each in 25 min (Mi 8, log dipper-ios26-6b).
 # com.apple.security.cryptexd is no longer removed: its libimage4 panic ('failed to get manifest properties', no ADT
 # /chosen/manifest-properties) is fixed by tools/mkpayload.py add_img4_nodes.
-QUIET_REMOVE = ('com.apple.sirittsd',)
+# bluetoothd only crashes on the Mi 8 ("Bluetooth fatal error" without the sweetwlan transport) and its Mach services stay
+# registered: an app holding a CBManager blocks its main thread for good in -[CBXpcConnection _sendBarrier] when it goes to the
+# background, and reopening it stops on a dimmed home screen. Without the job Settings shows Bluetooth greyed out. Take it out
+# of this list when Bluetooth is brought up on the Mi 8.
+QUIET_REMOVE = ('com.apple.sirittsd', 'com.apple.bluetoothd')
 # Daemons jetsam kills at their per-process limit on this port (SIGKILL, reason namespace 1 code 7): almost every
 # process unnests one 64 MB slice of the shared region (751 "triggered unnest" lines in 25 min), and the private
 # copies count against the footprint. Limits raised to at least QUIET_JETSAM_MB in com.apple.jetsamproperties.*.plist
