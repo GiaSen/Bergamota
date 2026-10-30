@@ -103,6 +103,10 @@ if [ "${IOS18:-1}" = 1 ]; then
 		"$here/sweetwifi.c" -o "$out18/sweetwifi"
 	codesign -s - -f --entitlements "$here/wifi.entitlements" "$out18/sweetwifi"
 	python3 -I "$pacstrip" --sign "$out18/sweetwifi"
+	# takes fairplayd.H2's job: answers FairPlay's Mach services with an error instead of leaving clients waiting
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetfpd.c" -o "$out18/sweetfpd"
+	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetfpd"
+	python3 -I "$pacstrip" --sign "$out18/sweetfpd"
 	# the unified log over SSH (no `log` tool on iOS)
 	b18 sweetlog sweetlog.m log.entitlements
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework CoreFoundation -framework IOKit \
