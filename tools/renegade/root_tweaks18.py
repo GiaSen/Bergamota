@@ -620,11 +620,14 @@ QUIET_EXT_OFF = (
     'System/Library/PrivateFrameworks/MacinTalk.framework/PlugIns/MacinTalkAUSP.appex',
 )
 QUIET_JETSAM_MB = 48
+# usernotificationsd alone: 96 kills in 16 min (2026-10-30), each with a ReportCrash run, about 11% of one core.
 QUIET_JETSAM = {
     'Daemon': ('com.apple.gamepolicyd', 'com.apple.deviceaccessd', 'com.apple.softposreaderd', 'com.apple.linkd',
                'com.apple.lsd', 'com.apple.lsd.system', 'com.apple.liveactivitiesd', 'com.apple.donotdisturbd',
-               'com.apple.nehelper', 'com.apple.WebBookmarks.webbookmarksd'),
-    'XPCService': ('com.apple.intents.intents-helper',),
+               'com.apple.nehelper', 'com.apple.WebBookmarks.webbookmarksd', 'com.apple.usernotificationsd',
+               'com.apple.localizationswitcherd', 'com.apple.aonsensed', 'com.apple.appplaceholdersyncd',
+               'com.apple.watchlistd', 'com.apple.driverkitd', 'com.apple.contextstored', 'com.apple.biomed'),
+    'XPCService': ('com.apple.intents.intents-helper', 'com.apple.extensionkitservice'),
 }
 
 
