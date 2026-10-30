@@ -1,0 +1,188 @@
+diff --git a/bsd/dev/sweet_charger.c b/bsd/dev/sweet_charger.c
+index b3303d3..1895568 100644
+--- a/bsd/dev/sweet_charger.c
++++ b/bsd/dev/sweet_charger.c
+@@ -174,6 +174,7 @@ static struct {
+ 	bool failed;                    /* gave up writing (refused / not taking effect) */
+ 	bool saved;
+ 	uint8_t o_icl, o_opt, o_load, o_fcc;    /* registers before our first write */
++	unsigned suspect;               /* 3013: ticks in a row reading unplugged or unsafe, while applied */
+ 	bool applied;
+ 	uint8_t applied_res;
+ 	uint8_t applied_icl_raw, applied_fcc_raw;
+@@ -559,23 +560,36 @@ sc_control(struct sc_snap *s)
+ 	cs.last_res = res;
+ 	cs.last_rp = rp;
+ 
+-	if (!plug) {
++	/*
++	 * 3013: on the Mi 8 single readings said unplugged, too hot or another Rp while nothing had happened, 9 times in 40 min,
++	 * and each cost about a minute back at 500 mA (AICL climbs again). An unplug or a fault has to be there on two ticks
++	 * in a row, 3 s apart; the charger's own limits act at once in the meantime.
++	 */
++	if (!plug || sc_unsafe(s)) {
+ 		cs.safe = 0;
++		if (cs.applied && cs.suspect < 1u) {
++			cs.suspect++;
++			cs.why = "suspect-reading";
++			return 0;
++		}
++	}
++	if (!plug) {
+ 		sc_restore(s, "unplug");
+ 		cs.why = "unplugged";
+ 		cs.bad = 0;
+ 		return 0;
+ 	}
+ 	if (sc_unsafe(s)) {
+-		cs.safe = 0;
+ 		sc_restore(s, "temperature-or-fault");
+ 		cs.why = "hold-temp-or-fault";
+ 		return 0;
+ 	}
++	cs.suspect = 0;
+ 	if (cs.safe < 255u) {
+ 		cs.safe++;
+ 	}
+-	if (cs.applied && (cs.applied_res != res || cs.applied_rp != rp)) {
++	/* 3013: a CDP or DCP limit does not depend on Rp, only a result whose limit changes is a reason to start over */
++	if (cs.applied && (cs.applied_res != res || (cs.applied_rp != rp && sc_icl_for(s) != cs.icl_sel))) {
+ 		sc_restore(s, "apsd-or-rp-changed");
+ 	}
+ 	if (cs.stable < 1 || cs.safe < 3) {
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index cc2e5d3..0b165bd 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -174,21 +174,36 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	}
+ 	unsigned off = 0x80u * apid;
+ 	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4);
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=0 */
+-	__asm__ volatile("dsb osh" ::: "memory");
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		uint32_t status = sp_rd(sp_obs, off + 0x08u);
+-		if (status & 1u) {
+-			if (status & 0x0eu) {
++	/* 3013: a read can come back with an error bit: try again before any caller takes it for a real state */
++	static unsigned sp_read_errs;
++	for (unsigned attempt = 0; attempt < 3; ++attempt) {
++		bool failed = false;
++		__asm__ volatile("dmb oshst" ::: "memory");
++		*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=0 */
++		__asm__ volatile("dsb osh" ::: "memory");
++		for (unsigned i = 0; i < 1000; ++i) {
++			uint32_t status = sp_rd(sp_obs, off + 0x08u);
++			if (status & 1u) {
++				if (status & 0x0eu) {
++					if (sp_read_errs++ < 16) {
++						printf("SWEET SPMI: read sid=%u addr=%#x status %#x, try %u\n", sid, addr, status, attempt);
++					}
++					failed = true;
++					break;
++				}
++				*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
+ 				sp_put(got);
+-				return -1;
++				return 0;
+ 			}
+-			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
++			delay(1);
++		}
++		if (!failed) {
++			break;          /* no answer at all: the timeout below */
++		}
++		if (attempt == 2) {
+ 			sp_put(got);
+-			return 0;
++			return -1;
+ 		}
+-		delay(1);
+ 	}
+ 	sp_poisoned[apid] = true;
+ 	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 56b6f9c..12b8f30 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -298,6 +298,38 @@ SweetBattery::estimatePercent(unsigned mv)
+ 	return 100;
+ }
+ 
++/*
++ * 3013: FG voltage and current move between two reads while charging (0.12 mV and 0.49 mA per bit), so equal
++ * words are rare: words within 64 counts are one sample. Only a torn read (a high byte from the next value) is
++ * further apart than that.
++ */
++static bool
++fg_read_word(unsigned sid, unsigned address, uint16_t *value)
++{
++	uint16_t previous = 0;
++	for (unsigned attempt = 0; attempt < 6; ++attempt) {
++		uint8_t lo, hi;
++		if (sweet_spmi_read(sid, address, &lo) || sweet_spmi_read(sid, address + 1, &hi)) {
++			return false;
++		}
++		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
++		int diff = (int16_t)(uint16_t)(next - previous);
++		if (attempt && diff >= -64 && diff <= 64) {
++			*value = next;
++			return true;
++		}
++		previous = next;
++	}
++	return false;
++}
++
++/* 3013: the last good measurement. A failed poll keeps it: 100% and full is for a boot with no measurement at all. */
++static struct {
++	bool have, external, charging, full, currentValid;
++	unsigned percent, mv;
++	int ma;
++} fg_last;
++
+ /*
+  * Poco F1: PMI8998 (SID 2) FG gen3 + SMB2 charger, read-only, as Linux
+  * qpnp-fg-gen3.c / smb-reg.h. The FG keeps its own calibrated monotonic
+@@ -318,12 +350,17 @@ SweetBattery::pollBeryllium(void)
+ 		}
+ 	}
+ 	valid = valid && msoc == msoc2 &&
+-	    readWord(0x41a0, &rawVoltage, sid) &&
++	    fg_read_word(sid, 0x41a0, &rawVoltage) &&
+ 	    !sweet_spmi_read(sid, 0x1310, &usb) &&
+ 	    !sweet_spmi_read(sid, 0x1006, &charger);
+ 	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 122070u) / 1000000u) : 0;
+ 	valid = valid && mv >= 2800 && mv <= 4600;
+ 	if (!valid) {
++		if (fg_last.have) {
++			publish(fg_last.percent, fg_last.mv, fg_last.ma, fg_last.external, fg_last.external, fg_last.charging,
++			    fg_last.full, true, fg_last.currentValid);
++			return;
++		}
+ 		publish(100, 4200, 0, true, true, false, true, false, false);
+ 		return;
+ 	}
+@@ -335,12 +372,20 @@ SweetBattery::pollBeryllium(void)
+ 	bool charging = external && state >= 1 && state <= 4;
+ 	bool full = external && state == 5;          /* TERMINATE_CHARGE */
+ 	int ma = 0;
+-	bool currentValid = readWord(0x41a2, &rawCurrent, sid);
++	bool currentValid = fg_read_word(sid, 0x41a2, &rawCurrent);
+ 	if (currentValid) {
+ 		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
+ 		/* FG: positive = discharging, 488.281 uA/bit; IOPMPowerSource: positive = charging, mA */
+ 		ma = (int)(-((int64_t)signedRaw * 488281) / 1000000);
+ 	}
++	fg_last.have = true;
++	fg_last.percent = full ? 100 : percent;
++	fg_last.mv = mv;
++	fg_last.ma = ma;
++	fg_last.external = external;
++	fg_last.charging = charging;
++	fg_last.full = full;
++	fg_last.currentValid = currentValid;
+ 	publish(full ? 100 : percent, mv, ma, external, external, charging, full, true, currentValid);
+ }
+ 
