@@ -1,0 +1,91 @@
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 8243af3..b696a46 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -378,7 +378,7 @@ static void cf_mem_setup(void);
+ static void cf_mem_step(uint64_t now);
+ 
+ /* 3008: A75 floor while the GPU sees frames (sysctl kern.sweet_cpu_anim_khz, 0 = off, 3009: on); called by the GPU governor */
+-static int cf_anim_khz = 2400000;
++static int cf_anim_khz = 2803200;
+ static uint64_t cf_anim_until;
+ 
+ void
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index fe0f5d3..6b3175c 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -31,6 +31,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <sys/sysctl.h>
+ #include <kern/clock.h>
+ #include <kern/cpu_number.h>
+ #include <kern/thread.h>
+@@ -1472,6 +1473,65 @@ out:
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * 3010: a finger for tests, sysctl kern.sweet_touch_drag = int32 { x1, y1, x2, y2, ms } in panel pixels. It takes the real finger's path
++ * from the report on (input boost, HID event, no user-space sender whose timers can be coalesced), one report every 8 ms.
++ */
++static int touch_drag_args[5];
++static int touch_drag_busy;
++static int touch_drag_chan;
++
++static void
++touch_drag_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	int x1 = touch_drag_args[0], y1 = touch_drag_args[1], x2 = touch_drag_args[2], y2 = touch_drag_args[3], ms = touch_drag_args[4];
++	int steps = ms / 8 > 1 ? ms / 8 : 1;
++	uint64_t period, next = mach_absolute_time();
++	nanoseconds_to_absolutetime(8 * NSEC_PER_MSEC, &period);
++	sweet_input_boost();
++	sweet_hid_touch(0, 1, x1, y1);
++	for (int i = 1; i <= steps; i++) {
++		next += period;
++		(void)assert_wait_deadline(&touch_drag_chan, THREAD_UNINT, next);
++		thread_block(THREAD_CONTINUE_NULL);
++		sweet_input_boost();
++		sweet_hid_touch(0, 1, x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps);
++	}
++	sweet_hid_touch(0, 0, x2, y2);
++	__atomic_store_n(&touch_drag_busy, 0, __ATOMIC_RELEASE);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static int
++sysctl_touch_drag SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int a[5];
++	thread_t thread;
++	if (!req->newptr) {
++		return 0;
++	}
++	if (req->newlen != sizeof(a) || st.active) {
++		return EINVAL;
++	}
++	int error = SYSCTL_IN(req, a, sizeof(a));
++	if (error) {
++		return error;
++	}
++	if (__atomic_exchange_n(&touch_drag_busy, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	memcpy(touch_drag_args, a, sizeof(a));
++	if (kernel_thread_start(touch_drag_thread, NULL, &thread) != KERN_SUCCESS) {
++		__atomic_store_n(&touch_drag_busy, 0, __ATOMIC_RELEASE);
++		return ENOMEM;
++	}
++	thread_deallocate(thread);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_touch_drag, CTLTYPE_OPAQUE | CTLFLAG_WR | CTLFLAG_LOCKED, 0, 0, sysctl_touch_drag, "S", "drag a test finger, panel pixels");
++
+ void
+ sweet_touch_init(void)
+ {

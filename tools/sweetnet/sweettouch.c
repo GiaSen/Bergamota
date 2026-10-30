@@ -6,6 +6,9 @@
  * Events go into the HID event system (IOHIDEventSystemClientDispatchEvent) like a digitizer's, with the
  * entitlement com.apple.private.hid.client.event-dispatch (touch.entitlements). iOS 18, arm64e + pacstrip.
  */
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach_time.h>
 #include <stdint.h>
@@ -83,8 +86,18 @@ int main(int argc, char **argv)
 		double x1 = atof(argv[2]), y1 = atof(argv[3]), x2 = atof(argv[4]), y2 = atof(argv[5]);
 		int ms = argc == 7 ? atoi(argv[6]) : 300, steps = ms / 8 > 2 ? ms / 8 : 2;
 		finger(x1, y1, true, kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch);
+		/*
+		 * A real-time thread on an absolute schedule: usleep() in a process started over SSH is coalesced by the kernel, and the
+		 * "8 ms" steps arrived in bursts about 100 ms apart, which looked like a UI that tracks a finger at 10 fps.
+		 */
+		mach_timebase_info_data_t tb;
+		mach_timebase_info(&tb);
+		uint64_t step = 8000000ull * tb.denom / tb.numer, next = mach_absolute_time();
+		thread_time_constraint_policy_data_t rt = { (uint32_t)step, (uint32_t)(step / 8), (uint32_t)(step / 2), 1 };
+		(void)thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&rt, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
 		for (int i = 1; i <= steps; i++) {
-			usleep(8000);
+			next += step;
+			mach_wait_until(next);
 			finger(x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps, true, kIOHIDDigitizerEventPosition);
 		}
 		finger(x2, y2, false, kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch);
