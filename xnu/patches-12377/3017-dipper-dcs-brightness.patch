@@ -1,0 +1,159 @@
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+index d2a8d4c..c9444b2 100644
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -63,6 +63,9 @@ int sweet_fb_hud;
+ /* 3006: copy mode shows a frame when the GPU has finished it (1) or only at a vsync tick (0, boot-arg sweetfb_gatepoll=0) */
+ int sweet_fb_gatepoll = 1;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_gatepoll, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_gatepoll, 0, "show a frame when the GPU finishes it");
++/* sysctl kern.sweet_fb_bl (3016): Mi 8 panel brightness by hand, 2..1023; 0 = the level iOS asks for */
++int sweet_fb_bl;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_bl, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_bl, 0, "Mi 8 panel brightness by hand");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hud, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_hud, 0,
+     "Poco F1 on-screen performance HUD (0 off, 1 on); needs the copy scan-out path");
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6557b88..d6c79d7 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -66,6 +66,7 @@ extern "C" int sweet_smmu_probe_sid(unsigned sid, unsigned level); /* bsd/dev/sw
+ extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb */
+ extern "C" int sweet_fb_hud;
+ extern "C" int sweet_fb_gatepoll;               /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_gatepoll (3006) */
++extern "C" int sweet_fb_bl;                     /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_bl (3016) */
+ extern "C" uint32_t sweet_gpu_fence_snapshot(void);     /* bsd/dev/sweet_a630.c (0229) */
+ extern "C" bool sweet_gpu_blit_window(uint64_t pa, uint64_t size);      /* bsd/dev/sweet_a630.c (0240) */
+ extern "C" uint32_t sweet_gpu_blit(uint64_t src_pa, uint32_t src_pitch, uint64_t dst_pa, uint32_t dst_pitch, uint32_t w, uint32_t h);
+@@ -504,6 +505,12 @@ public:
+ 	AppleARMBacklight *fBacklight;
+ 	void          blRequest(uint32_t level) { __atomic_store_n(&fBlReq, level | 0x80000000u, __ATOMIC_RELEASE); }
+ 	void          blackout(void);
++	/* 3016 Mi 8: no WLED, brightness is a DCS command to the EA8074, sent from the vsync timer without waiting for it */
++	vm_offset_t   fDsi;
++	bool          fDsiBusy;
++	uint32_t      fDsiWait, fDsiLevel, fDsiSent, fDsiFailed;
++	void          dsiInit(void);
++	void          dsiTick(void);
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -810,6 +817,7 @@ AppleCLCD::start(IOService *provider)
+ 		PE_parse_boot_argn("sweetfb_blfade", &blfade, sizeof(blfade));
+ 		if (blfade) {
+ 			blInit();
++			dsiInit();
+ 			int blsvc = 0;  /* 0249: off until CoreBrightness can take it (it crashed backboardd); sweetfb_blsvc=1 on */
+ 			PE_parse_boot_argn("sweetfb_blsvc", &blsvc, sizeof(blsvc));
+ 			if (blsvc && (fBacklight = OSTypeAlloc(AppleARMBacklight)) != NULL && fBacklight->init() && fBacklight->attach(this)) {
+@@ -1044,6 +1052,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (fb->fBlOK && fb->fBlPos != SWEET_FB_BL_STEPS && !dirty) {
+ 		(void)fb->blSet(true);     /* 0242: back on: the latest frame is up, light the panel in one step */
+ 	}
++	fb->dsiTick();
+ 	uint32_t req = __atomic_load_n(&fb->fBlReq, __ATOMIC_ACQUIRE);
+ 	if (fb->fBlOK && req != fb->fBlReqApplied && fb->fBlPos == SWEET_FB_BL_STEPS) {
+ 		/* 0243: iOS's brightness, on both WLED strings (the floor keeps the panel readable: 0 is iOS's "off", which is
+@@ -2633,6 +2642,103 @@ AppleCLCD::blInit(void)
+  * (fBlOK cleared, the original value written back as well as possible) when
+  * a write fails or does not read back: the caller blacks the screen out instead.
+  */
++/*
++ * 3016 Mi 8: the panel sets its own brightness (EA8074, DCS 0x51, 10 bits, most significant byte first: Linux
++ * mipi_dsi_dcs_set_display_brightness_ss; WLED MOD_EN reads 0). The command goes through the DSI host's FIFO, as
++ * dsi_ctrl_hw_cmn_kickoff_fifo_command does: no DMA buffer, nothing for the SMMU. The host sends it between two frames of
++ * the command-mode stream, so the vsync timer starts it and looks for "done" on a later tick and never spins here.
++ */
++#define SWEET_DSI0_PA           0x0ae94000u
++#define SWEET_DSI_SIZE          0x400u
++#define DSI_R_CTRL              0x004u
++#define DSI_R_STATUS            0x008u
++#define DSI_R_FIFO_STATUS       0x00cu
++#define DSI_R_DMA_CTRL          0x03cu
++#define DSI_R_DMA_LENGTH        0x04cu
++#define DSI_R_TRIG_CTRL         0x084u
++#define DSI_R_DMA_SW_TRIGGER    0x090u
++#define DSI_R_INT_CTRL          0x110u
++#define DSI_R_TPG_CTRL          0x15cu
++#define DSI_R_TPG_DMA_INIT      0x17cu
++#define DSI_R_TPG_FIFO_RESET    0x1ecu
++#define DSI_DMA_DONE            (1u << 0)
++#define DSI_INT_ERROR           (1u << 24)
++#define DSI_DMA_EMBEDDED        (1u << 28)
++#define DSI_DMA_LPM             (1u << 26)
++#define DSI_TPG_CUSTOM_FIFO     ((1u << 1) | (1u << 2) | (3u << 16))
++#define DSI_TRIG_SW             4u
++#define SWEET_DSI_BL_MIN        2u      /* qcom,mdss-dsi-bl-min-level */
++#define SWEET_DSI_BL_MAX        1023u
++#define SWEET_DSI_WAIT_TICKS    12u
++
++void
++AppleCLCD::dsiInit(void)
++{
++	if (!sweet_board_is("xiaomi,dipper") || (fDsi = ml_io_map(SWEET_DSI0_PA, SWEET_DSI_SIZE)) == 0) {
++		return;
++	}
++	IOLog("SWEET DSI: ctrl 0x%08x status 0x%08x fifo 0x%08x dma_ctrl 0x%08x trig 0x%08x int 0x%08x tpg 0x%08x\n",
++	    mdp_rd(fDsi, DSI_R_CTRL), mdp_rd(fDsi, DSI_R_STATUS), mdp_rd(fDsi, DSI_R_FIFO_STATUS), mdp_rd(fDsi, DSI_R_DMA_CTRL),
++	    mdp_rd(fDsi, DSI_R_TRIG_CTRL), mdp_rd(fDsi, DSI_R_INT_CTRL), mdp_rd(fDsi, DSI_R_TPG_CTRL));
++}
++
++void
++AppleCLCD::dsiTick(void)
++{
++	if (fDsi == 0) {
++		return;
++	}
++	if (fDsiBusy) {
++		uint32_t in = mdp_rd(fDsi, DSI_R_INT_CTRL);
++		if (!(in & DSI_DMA_DONE) && ++fDsiWait < SWEET_DSI_WAIT_TICKS) {
++			return;
++		}
++		if (in & DSI_DMA_DONE) {
++			mdp_wr(fDsi, DSI_R_INT_CTRL, (in | DSI_DMA_DONE) & ~DSI_INT_ERROR);
++		} else if (fDsiFailed++ < 8) {
++			IOLog("SWEET DSI: brightness %u not sent: ctrl 0x%08x status 0x%08x fifo 0x%08x dma_ctrl 0x%08x trig 0x%08x int 0x%08x tpg 0x%08x\n",
++			    fDsiLevel, mdp_rd(fDsi, DSI_R_CTRL), mdp_rd(fDsi, DSI_R_STATUS), mdp_rd(fDsi, DSI_R_FIFO_STATUS),
++			    mdp_rd(fDsi, DSI_R_DMA_CTRL), mdp_rd(fDsi, DSI_R_TRIG_CTRL), in, mdp_rd(fDsi, DSI_R_TPG_CTRL));
++		}
++		mdp_wr(fDsi, DSI_R_TPG_CTRL, 0);
++		mdp_wr(fDsi, DSI_R_TPG_FIFO_RESET, 1);
++		__asm__ volatile ("dsb osh" ::: "memory");
++		IODelay(1);
++		mdp_wr(fDsi, DSI_R_TPG_FIFO_RESET, 0);
++		fDsiBusy = false;
++	}
++	uint32_t want = (uint32_t)__atomic_load_n(&sweet_fb_bl, __ATOMIC_RELAXED);
++	if (want == 0) {
++		uint32_t req = __atomic_load_n(&fBlReq, __ATOMIC_ACQUIRE);
++		if (req == 0) {
++			return;         /* nobody asked yet: the level ABL left stays */
++		}
++		want = (req & 0xfffu) >> 2;
++	}
++	want = want < SWEET_DSI_BL_MIN ? SWEET_DSI_BL_MIN : (want > SWEET_DSI_BL_MAX ? SWEET_DSI_BL_MAX : want);
++	if (want == fDsiLevel) {
++		return;
++	}
++	uint32_t trig = mdp_rd(fDsi, DSI_R_TRIG_CTRL);
++	if ((trig & 7u) != DSI_TRIG_SW) {
++		mdp_wr(fDsi, DSI_R_TRIG_CTRL, (trig & ~7u) | DSI_TRIG_SW);
++	}
++	mdp_wr(fDsi, DSI_R_TPG_CTRL, DSI_TPG_CUSTOM_FIFO);
++	/* long DCS write 0x39, 3 bytes, last command: { WC low, WC high, DI, BIT(7) | BIT(6) }, then 0x51 hi lo and padding */
++	mdp_wr(fDsi, DSI_R_TPG_DMA_INIT, 0xc0390003u);
++	mdp_wr(fDsi, DSI_R_TPG_DMA_INIT, 0xff000051u | ((want >> 8) << 8) | ((want & 0xffu) << 16));
++	mdp_wr(fDsi, DSI_R_DMA_CTRL, (mdp_rd(fDsi, DSI_R_DMA_CTRL) & ~((1u << 31) | (1u << 30))) | DSI_DMA_LPM | DSI_DMA_EMBEDDED);
++	mdp_wr(fDsi, DSI_R_DMA_LENGTH, 8);
++	__asm__ volatile ("dsb osh" ::: "memory");
++	mdp_wr(fDsi, DSI_R_DMA_SW_TRIGGER, 1);
++	fDsiBusy = true;
++	fDsiWait = 0;
++	fDsiLevel = want;
++	if (fDsiSent++ < 8) {
++		IOLog("SWEET DSI: brightness %u\n", want);
++	}
++}
++
+ /* 0243: what iOS sets on the backlight service, logged (first 64 calls), and the brightness taken from it. */
+ IOReturn
+ AppleARMBacklight::setProperties(OSObject *properties)

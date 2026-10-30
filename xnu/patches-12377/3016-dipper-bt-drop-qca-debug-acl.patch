@@ -1,0 +1,16 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index f793386..52137b3 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -9256,7 +9256,10 @@ wl_xport_feed(uint8_t b)
+ 		wl.xs_st = 2;
+ 	}
+ 	if (wl.xs_st == 2 && wl.xs_have == wl.xs_total) {
+-		bt_hci_rx_packet(wl.xs_pkt, wl.xs_have);
++		/* 3016: QCA's own debug stream, ACL on handle 0x2edc (Linux hci_qca QCA_DEBUG_HANDLE -> hci_recv_diag): not for iOS */
++		if (wl.xs_type != 2 || (wl.xs_pkt[1] | (wl.xs_pkt[2] << 8)) != 0x2edc) {
++			bt_hci_rx_packet(wl.xs_pkt, wl.xs_have);
++		}
+ 		wl.xs_st = 0;
+ 	}
+ }
