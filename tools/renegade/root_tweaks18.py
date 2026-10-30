@@ -116,6 +116,9 @@ def merge_pref(root, name, values):
 # _LimitLoadFromDeviceTree condition; it idles at 0% here.
 NO_BASEBAND_JOBS = ('com.apple.CommCenter', 'com.apple.voicemail.vmd')
 COMMCENTER_NONCELL = '/System/Library/LaunchDaemons/com.apple.CommCenter-noncellular.plist'
+# fairplayd.H2 exits at once on this hardware while launchd keeps its names, so its clients wait for ever: tools/sweetnet/sweetfpd.c
+# takes the job and answers them with an error (locationd, then every CoreLocation client, hung behind it).
+FAIRPLAY_JOB = '/System/Library/LaunchDaemons/com.apple.fairplayd.H2.plist'
 
 
 def launchd(root):
@@ -139,7 +142,19 @@ def launchd(root):
         job = load(cc)
         job.pop('_LimitLoadFromDeviceTree', None)
         job.pop('_PanicOnCrash', None)
+        # The non-cellular CommCenter advertises the ARI service but never answers: libARI's registerClient waits
+        # forever, and locationd with it (ice::Client::start), then every CoreLocation client (News' main thread).
+        # With the name gone the client gets a connection error at once.
+        job.get('MachServices', {}).pop('com.apple.commcenter.ari.rt.xpc', None)
         jobs[COMMCENTER_NONCELL] = job
+    fpd = find_sweetnet('ios18/sweetfpd')
+    if fpd and FAIRPLAY_JOB in jobs:
+        install_file(fpd, os.path.join(root, 'usr/local/bin/sweetfpd'))
+        jobs[FAIRPLAY_JOB]['Program'] = '/usr/local/bin/sweetfpd'
+        print('launchd.plist: fairplayd.H2 runs /usr/local/bin/sweetfpd')
+    elif not fpd:
+        print('sweetfpd: not built (tools/sweetnet/build.sh): stock fairplayd.H2, its clients hang')
+        note_skip('sweetfpd', not_built())
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
     print(f'launchd.plist: {renamed} _PanicOnCrash renamed, removed (no baseband) {sorted(removed)}, '
           f'CommCenter: {"non-cellular job" if os.path.exists(cc) else "absent (no " + COMMCENTER_NONCELL + ")"}')
