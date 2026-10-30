@@ -1,0 +1,187 @@
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 2460e6d..303cd69 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -62,6 +62,8 @@
+  *                                      sweetgpuinputms= in sweet_a630.c.
+  *   sweetamp=0|1                       idle-core steering in the scheduler (default 1)
+  *   sweetamp_prio=<n>                  base_pri threshold (default 31)
++ *   sweetamp_yield=1                   an A55 about to take such a thread waits for an A75 that is awake or waking (patch 3005,
++ *                                      default off); sweetamp_wait_us=<n> caps the wait (default 200)
+  * Core-class steering (independent of the cpufreq mode): once all CPUs are up,
+  * osfmk/kern/sched_prim.c is told which CPUs are A75 (MPIDR Aff1 >= 4) and which A55;
+  * choose_processor() then gives user threads with base_pri >= sweetamp_prio an idle A75
+@@ -103,6 +105,9 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern uint64_t sweet_processor_idle_time(int cpu);
+ extern void sweet_amp_enable(uint64_t big, uint64_t little, int pri);
++extern int sweet_amp_yield;
++extern uint64_t sweet_amp_wait_abs;
++extern uint32_t sweet_amp_yield_waits, sweet_amp_yield_ok, sweet_amp_yield_timeouts;
+ extern kern_return_t thread_terminate(thread_t);
+ extern boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ extern void sweet_gpu_input_boost(uint64_t now);        /* bsd/dev/sweet_a630.c */
+@@ -498,6 +503,10 @@ cf_log_summary(unsigned id, struct cf_domain *d)
+ 		}
+ 	}
+ 	printf("%s\n", line);
++	if (id == 1 && sweet_amp_yield) {
++		printf("SWEET AMP: A55 waited for an A75 %u times: A75 took the thread %u, timed out %u\n",
++		    sweet_amp_yield_waits, sweet_amp_yield_ok, sweet_amp_yield_timeouts);
++	}
+ }
+ 
+ /* Core-class steering of the scheduler's idle-CPU choice (osfmk/kern/sched_prim.c). */
+@@ -519,6 +528,14 @@ cf_amp_setup(void)
+ 		return;
+ 	}
+ 	sweet_amp_enable(big, little, cf_amp_pri);
++	{
++		int yield = 0, wait_us = 200;
++		(void)PE_parse_boot_argn("sweetamp_yield", &yield, sizeof(yield));
++		(void)PE_parse_boot_argn("sweetamp_wait_us", &wait_us, sizeof(wait_us));
++		nanoseconds_to_absolutetime((uint64_t)wait_us * NSEC_PER_USEC, &sweet_amp_wait_abs);
++		sweet_amp_yield = yield;
++		printf("SWEET AMP: A55s leave A75-class threads to a waking A75: %s (sweetamp_yield), wait %d us\n", yield ? "on" : "off", wait_us);
++	}
+ 	cf_amp_big = big;
+ 	cf_amp_on = true;
+ 	printf("SWEET AMP: idle-core steering on: A75 mask 0x%llx, A55 mask 0x%llx, base_pri >= %d takes an A75 first\n",
+diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
+index 768efa7..11c6b94 100644
+--- a/osfmk/kern/sched_clutch.c
++++ b/osfmk/kern/sched_clutch.c
+@@ -3422,6 +3422,23 @@ sched_clutch_choose_thread(
+ 	return sched_clutch_processor_highest_thread(processor, prev_thread != NULL ? SCHED_CLUTCH_TRAVERSE_REMOVE_CONSIDER_CURRENT : SCHED_CLUTCH_TRAVERSE_REMOVE_HIERARCHY_ONLY);
+ }
+ 
++#if defined(__arm64__)
++#include <pexpert/arm64/board_config.h>
++#endif
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* The thread the shared run queue would hand out next, left on the queue (pset locked; patch 3005, sched_prim.c). */
++thread_t sweet_clutch_peek(processor_t processor);
++thread_t
++sweet_clutch_peek(processor_t processor)
++{
++	sched_clutch_root_t root_clutch = sched_clutch_processor_root_clutch(processor);
++	if (root_clutch->scr_thr_count == 0) {
++		return THREAD_NULL;
++	}
++	return sched_clutch_hierarchy_thread_highest(root_clutch, processor, NULL, SCHED_CLUTCH_TRAVERSE_CHECK_PREEMPT);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ static boolean_t
+ sched_clutch_processor_enqueue(
+ 	processor_t       processor,
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 47ccef6..50683d0 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -2426,6 +2426,12 @@ __enum_closed_decl(thread_select_outcome_t, int, {
+ 	IDLE_SMT_PRIMARY_NOSMT  = 16,
+ });
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern int sweet_amp_yield;
++static bool sweet_amp_big_is_coming(processor_set_t pset, processor_t processor);
++static void sweet_amp_wait_for_big(processor_set_t pset, processor_t processor);
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ /*
+  *	thread_select:
+  *
+@@ -2470,6 +2476,10 @@ thread_select(thread_t          thread,
+ 
+ 	pset_lock(pset);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	bool sweet_amp_waited = false;
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ 	do {
+ 		loop_count++;
+ 		select_outcome = IDLE_NONE;
+@@ -2818,6 +2828,14 @@ send_followup_ipi_before_idle:
+ 
+ 		processor->deadline = RT_DEADLINE_NONE;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (sweet_amp_yield && !sweet_amp_waited && sweet_amp_big_is_coming(pset, processor)) {
++			sweet_amp_waited = true;
++			sweet_amp_wait_for_big(pset, processor);
++			continue;       /* things changed while the lock was dropped */
++		}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ 		/* No RT threads, so let's look at the regular threads. */
+ 		if ((new_thread = SCHED(choose_thread)(processor, MINPRI, current_thread_can_keep_running ? thread : THREAD_NULL, *reason)) != THREAD_NULL) {
+ 			if (new_thread != thread) {
+@@ -4715,6 +4733,66 @@ sweet_amp_wanted_map(thread_t thread)
+ 	}
+ 	return os_atomic_load(&sweet_amp_little_mask, relaxed);
+ }
++
++/*
++ * Patch 3005 (boot-arg sweetamp_yield=1). The steering above picks an A75 when a thread wakes, but all eight cores share one
++ * run queue: the waker, often a kernel thread on an A55, blocks right after the wakeup and its A55 takes the thread from the
++ * queue while the chosen A75 is still leaving WFI. CoreAnimation's display thread ran on the A55s that way, every frame.
++ * So an A55 about to pick up work first looks at the thread on top of the queue: if it should run on an A75 and one is
++ * awake or waking for it, the A55 waits a moment (with the pset unlocked) for it to go. After sweet_amp_wait_abs it takes the
++ * thread as before, so no work can be left stranded (processor_idle() does not look at the queue again).
++ */
++int sweet_amp_yield;
++uint64_t sweet_amp_wait_abs;
++uint32_t sweet_amp_yield_waits, sweet_amp_yield_ok, sweet_amp_yield_timeouts;
++extern thread_t sweet_clutch_peek(processor_t processor);
++
++static bool
++sweet_amp_big_is_coming(processor_set_t pset, processor_t processor)
++{
++	uint64_t big = os_atomic_load(&sweet_amp_big_mask, acquire);
++	if (big == 0 || bit_test(big, processor->cpu_id)) {
++		return false;
++	}
++	thread_t top = sweet_clutch_peek(processor);
++	if (top == THREAD_NULL || top->bound_processor != PROCESSOR_NULL || sweet_amp_wanted_map(top) != big) {
++		return false;
++	}
++	uint64_t usable = big & pset->recommended_bitmask;
++	if (pset->cpu_state_map[PROCESSOR_DISPATCHING] & usable) {
++		return true;
++	}
++	uint64_t idle = pset->cpu_state_map[PROCESSOR_IDLE] & usable;
++	if (idle == 0) {
++		return false;
++	}
++	/* an A75 sits idle and nothing has called it (the one chosen at wakeup went to other work): as processor_setrun() does */
++	processor_t b = processor_array[lsb_first(idle)];
++	pset_update_processor_state(pset, b, PROCESSOR_DISPATCHING);
++	sched_ipi_type_t ipi = sched_ipi_action(b, top, SCHED_IPI_EVENT_PREEMPT);
++	sched_ipi_perform(b, ipi);
++	return true;
++}
++
++/* Called and returns with the pset locked; drops it while waiting. */
++static void
++sweet_amp_wait_for_big(processor_set_t pset, processor_t processor)
++{
++	uint64_t deadline = mach_absolute_time() + sweet_amp_wait_abs;
++	bool gone;
++	sweet_amp_yield_waits++;
++	do {
++		pset_unlock(pset);
++		delay(5);
++		pset_lock(pset);
++		gone = !sweet_amp_big_is_coming(pset, processor);
++	} while (!gone && mach_absolute_time() < deadline);
++	if (gone) {
++		sweet_amp_yield_ok++;
++	} else {
++		sweet_amp_yield_timeouts++;
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ #if CONFIG_SCHED_SMT
