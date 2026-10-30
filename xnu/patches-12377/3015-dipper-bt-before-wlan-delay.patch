@@ -1,0 +1,59 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index beca962..f793386 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -578,6 +578,7 @@ static struct {
+ 	unsigned stage, delay_s;
+ 	int sleep_chan;
+ 	thread_t bt_thread;             /* the BT stage next to the WLAN service (3011): sleeps on its own event */
++	unsigned bt_delay_s;            /* 3015: sweetwlan=5: Bluetooth starts this long after the root device */
+ 	volatile bool bt_rails_done;    /* 3011: its rail votes are over, RPMh is free for the service's */
+ 	bool started;
+ 	bool service;                   /* sweetwlan=5: the WLAN service (every Wi-Fi gate on, no hold, no teardown) */
+@@ -9539,10 +9540,25 @@ wl_bt_start(void)
+ static void
+ wl_thread(void *arg, wait_result_t wr)
+ {
++	unsigned wait_s = wl.delay_s;
++	bool bt_early;
++
+ 	(void)arg;
+ 	(void)wr;
+-	printf("SWEET WLAN: stage %u starts in %u s\n", wl.stage, wl.delay_s);
+-	wl_sleep(wl.delay_s * 1000u);
++	/*
++	 * 3015: Bluetooth does not wait for the Wi-Fi service's delay. bluetoothd starts about 16 s after power-on and aborts
++	 * while com.apple.uart.bluetooth is missing (reason=1201): six crashes per boot, and apps going to the background
++	 * block on it meanwhile. sweetbtdelay=S counts from the root device, like sweetwlandelay.
++	 */
++	bt_early = wl.stage == 5 && wl.bt_hci && wl.bt_delay_s < wait_s;
++	printf("SWEET WLAN: stage %u starts in %u s%s\n", wl.stage, wait_s, bt_early ? ", Bluetooth earlier" : "");
++	if (bt_early) {
++		wl_sleep(wl.bt_delay_s * 1000u);
++		wait_s -= wl.bt_delay_s;
++	} else {
++		wl_sleep(wait_s * 1000u);
++		wait_s = 0;
++	}
+ 	if (!wl_map()) {
+ 		printf("SWEET WLAN: MMIO mapping failed\n");
+ 		goto out;
+@@ -9556,6 +9572,9 @@ wl_thread(void *arg, wait_result_t wr)
+ 		if (wl.stage == 5 && wl.bt_hci) {
+ 			wl_bt_start();
+ 		}
++		if (wait_s) {
++			wl_sleep(wait_s * 1000u);
++		}
+ 		wl_mss();
+ 	}
+ out:
+@@ -9588,6 +9607,8 @@ beryllium_wlan_init(void)
+ 	wl.bt_setaddr = 1;              /* sweetbt=1: program the ADT local-mac-address with 0xfc14 */
+ 	wl.bt_log = 64;                 /* sweetbt=1: HCI packet trace lines */
+ 	(void)PE_parse_boot_argn("sweetbt", &wl.bt_hci, sizeof(wl.bt_hci));             /* 1: keep the controller, serve com.apple.uart.bluetooth */
++	wl.bt_delay_s = 5;
++	(void)PE_parse_boot_argn("sweetbtdelay", &wl.bt_delay_s, sizeof(wl.bt_delay_s));
+ 	(void)PE_parse_boot_argn("sweetbtsk", &wl.bt_sk, sizeof(wl.bt_sk));             /* 1: also register com.apple.uart.sk.bluetooth */
+ 	(void)PE_parse_boot_argn("sweetbtlog", &wl.bt_log, sizeof(wl.bt_log));
+ 	(void)PE_parse_boot_argn("sweetbtaddr", &wl.bt_setaddr, sizeof(wl.bt_setaddr));
