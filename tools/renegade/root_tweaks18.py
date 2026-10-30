@@ -991,7 +991,8 @@ def bgmtl(root):
 #   the Poco F1; the posters keep their entitlements. Identifier and CS flags are kept. SpringBoard has 16 bytes of load-command slack:
 #   addlc.py --make-room drops its LC_SOURCE_VERSION and empty LC_DATA_IN_CODE. The originals go to /private/var/root/chlorophyll-orig/.
 #   Flags in /private/var/tmp: bgmtl.arm (allow-listed processes), bgmtl-bb.arm + bgmtl-bb.direct (backboardd without bgl-launch, iOS 26),
-#   bgmtl-bb.sync (synchronous commits, the Poco F1's proven mode); bgmtl.log world-writable (iconservicesagent runs as _iconservices).
+#   no bgmtl-bb.sync (asynchronous commits: 30 -> 34 fps on the Mi 8 since the commit race is fixed, gpu/metal 4a581d8; an image built
+#   earlier gets the flag removed); bgmtl.log world-writable (iconservicesagent runs as _iconservices).
 #   iconservicesagent's InactiveHard jetsam limit 15 -> 160 MB (Chlorophyll in-process is 45-105 MB after a render; NOTES boot 43).
 # Kill switches on the phone: /private/var/tmp/bgmtl.off (all but backboardd), bgmtl-bb.off (backboardd), bgmtl.off.<bundle id>.
 # Build output directory: RENEGADE_CHL_DIR (default research/chl-work/out-metal).
@@ -1009,7 +1010,7 @@ CHL_TARGETS = (
     (MERCURY_BIN, False, False),
     ('System/Library/ExtensionKit/Extensions/PhotosPosterProvider.appex/PhotosPosterProvider', False, False),
 )
-CHL_FLAGS = ('bgmtl.arm', 'bgmtl-bb.arm', 'bgmtl-bb.direct', 'bgmtl-bb.sync')
+CHL_FLAGS = ('bgmtl.arm', 'bgmtl-bb.arm', 'bgmtl-bb.direct')
 CHL_JETSAM = (('Daemon', 'com.apple.iconservices.iconservicesagent', 160),)
 
 
@@ -1103,6 +1104,9 @@ def chlorophyll(root):
         chlorophyll_link(root, rel, add_uc, create_uc)
     for f in CHL_FLAGS:
         write_file(os.path.join(root, 'private/var/tmp', f), 'written by renegade chlorophyll\n')
+    stale = os.path.join(root, 'private/var/tmp/bgmtl-bb.sync')
+    if os.path.lexists(stale):
+        os.remove(stale)
     logp = os.path.join(root, 'private/var/tmp/bgmtl.log')
     if not os.path.exists(logp):
         write_file(logp, '', 0o666)

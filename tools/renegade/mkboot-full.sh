@@ -17,8 +17,9 @@ KERNEL=${1:-$DEF_KERNEL}
 ADT=${2:-$(tg adt)}
 OUT=${3:-$WORK/enxerto-boot-${NAME}full.img}
 # RAM-disk cmdline of docs/IOS18_PORT.md section 9 with rd=md0 -> rd=ufsroot0 ufsrw=1 rootrw=1.
+# serial=1, not 3: the input bit starts a kernel thread that burns one whole core at priority 95 (measured on the Mi 8, 2026-10-30).
 # ignition_level=1: dyld's libignition looks for the cache in /System/Library/Caches/com.apple.dyld only.
-CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_vsync=1 sweetfb_scale=1 sweetfb_flip=1 sweetusb=2 sweetbattery=1 sweetfb_hw=1 sweetarm64e=1 launchd_disable_all_timeouts=1"}
+CMDLINE=${CMDLINE:-"debug=0xc serial=1 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_vsync=1 sweetfb_scale=1 sweetfb_flip=1 sweetusb=2 sweetbattery=1 sweetfb_hw=1 sweetarm64e=1 launchd_disable_all_timeouts=1"}
 mkdir -p enxerto/out
 # Apple logo as Enxerto's last frame (docs: tools/mkapplelogo.py): read from the iOS root you built, never
 # committed. APPLE_LOGO=0 skips it (the Bergamota screen stays), APPLE_LOGO_PNG=file uses an extracted PNG.
