@@ -1,0 +1,17 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index cba1d1e..beca962 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -9359,7 +9359,11 @@ wl_xport_run(void)
+ 		if (idle < 200) {
+ 			delay(30);
+ 		} else {
+-			wl_sleep_us(bt_hci_connected() ? 300 : 2000);
++			/*
++			 * 3014: 300 us is about 2560 wakes/s, 6% of a core with nothing to do. A controller asleep (IBS) has to
++			 * send a wake byte before any data and waits for the ack, so 2 ms is only 2 ms of latency there.
++			 */
++			wl_sleep_us(bt_hci_connected() && !wl.ibs_asleep ? 300 : 2000);
+ 		}
+ 		if (wl_ms() - last_ms >= 10000) {
+ 			last_ms = wl_ms();
