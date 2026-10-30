@@ -599,11 +599,11 @@ QUIET_THROTTLE = {      # label -> ThrottleInterval seconds (default 10, replica
 # abort at once on this port and are relaunched by it: ~135 crashes each in 25 min (Mi 8, log dipper-ios26-6b).
 # com.apple.security.cryptexd is no longer removed: its libimage4 panic ('failed to get manifest properties', no ADT
 # /chosen/manifest-properties) is fixed by tools/mkpayload.py add_img4_nodes.
-# bluetoothd only crashes on the Mi 8 ("Bluetooth fatal error" without the sweetwlan transport) and its Mach services stay
-# registered: an app holding a CBManager blocks its main thread for good in -[CBXpcConnection _sendBarrier] when it goes to the
-# background, and reopening it stops on a dimmed home screen. Without the job Settings shows Bluetooth greyed out. Take it out
-# of this list when Bluetooth is brought up on the Mi 8.
-QUIET_REMOVE = ('com.apple.sirittsd', 'com.apple.bluetoothd')
+# bluetoothd stays: since xnu 3011 the Mi 8 runs it next to Wi-Fi (sweetwlan=5 sweetbt=1, RENEGADE_BT_FW=research/bt-dipper/fw).
+# On a kernel or boot-args without that BT stage it only crashes and its Mach services stay registered: an app holding a CBManager
+# then blocks its main thread for good in -[CBXpcConnection _sendBarrier] when it goes to the background, and reopening it stops
+# on a dimmed home screen. Such a boot needs this job out of launchd.plist.
+QUIET_REMOVE = ('com.apple.sirittsd',)
 # Daemons jetsam kills at their per-process limit on this port (SIGKILL, reason namespace 1 code 7): almost every
 # process unnests one 64 MB slice of the shared region (751 "triggered unnest" lines in 25 min), and the private
 # copies count against the footprint. Limits raised to at least QUIET_JETSAM_MB in com.apple.jetsamproperties.*.plist
