@@ -1,0 +1,110 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index 80d8b31..9ad9157 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -54,6 +54,7 @@
+ #include <sys/uio.h>
+ #include <sys/sysctl.h>
+ #include <stdarg.h>
++#include <sys/proc.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -265,6 +266,7 @@ enum { CC_AHB, CC_CX_GMU, CC_CXO, CC_CX_SNOC_DVM, CC_CX_APB, CC_CXO_AON, CC_GX_G
+ #define A6XX_CP_RB_WPTR         0x0807
+ #define A6XX_CP_SQE_CNTL        0x0808
+ #define A6XX_CP_HW_FAULT        0x0821
++#define A6XX_UCHE_CLIENT_PF     0x0e19  /* 3004: [2:0] which UCHE client faulted (Linux a6xx_uche_fault_block) */
+ #define A6XX_CP_INTERRUPT_STATUS 0x0823
+ #define A6XX_CP_PROTECT_STATUS  0x0824
+ #define A6XX_CP_STATUS_1        0x0825
+@@ -844,6 +846,7 @@ gpu_power_cx(void)
+ #define SMMU_CB_FSR             0x058
+ #define SMMU_CB_FAR             0x060
+ #define SMMU_CB_FSYNR0          0x068
++#define SMMU_CB_FSYNR1          0x06c   /* 3004: [7:0] the GPU-side master of the access (Linux a6xx_fault_block) */
+ #define SMMU_CB_TLBIALL         0x618
+ #define SMMU_CB_TLBSYNC         0x7f0
+ #define SMMU_CB_TLBSTATUS       0x7f4
+@@ -2722,6 +2725,57 @@ sweet_gpu_vm_flush(void)
+  * boot on hardware and is ignored). Logs it, clears it, and declares the GPU lost: the CP is wedged on the faulting
+  * access (the context terminates instead of stalling, but the CP does not recover) and nothing is reset here.
+  */
++/*
++ * 3004 (Mi 8 GPU faults): who made the faulting access, and whose submissions were in flight. All clients share one GPU
++ * address space and one ring, so the SMMU fault alone does not say which process's work read the bad address.
++ * a630_subs keeps the submitting process and first IB of the last SUBS_N submissions (sweet_gpu_submit); the master
++ * decode is Linux a6xx_fault_block / a6xx_uche_fault_block (FSYNR1[7:0], then UCHE_CLIENT_PF[2:0] for mids 2 and 3).
++ */
++#define SUBS_N                  64u
++static struct {
++	uint32_t seqno, dwords;
++	int pid;
++	uint64_t ib;
++	char name[20];
++} a630_subs[SUBS_N];
++
++static const char *
++gpu_fault_block(uint32_t mid, uint32_t pf, bool pf_valid)
++{
++	static const char *const uche[7] = { "VFD", "SP", "VSC", "VPC", "HLSQ", "PC", "LRZ" };
++
++	switch (mid) {
++	case 0: return "CP";
++	case 4: return "CCU";
++	case 6: return "CDP prefetch";
++	case 1: return "UCHE";
++	case 2: return !pf_valid ? "TP or VFD" : (pf & 7) == 0 ? "TP" : "TP|VFD";
++	case 3: return !pf_valid ? "a UCHE client" : (pf & 7) < 7 ? uche[pf & 7] : "UCHE client 7";
++	default: return "unknown";
++	}
++}
++
++static void
++gpu_fault_detail(vm_offset_t b)
++{
++	uint32_t fsynr1 = gpu_rd(b, SMMU_CB_FSYNR1), pf = 0;
++	bool gx = (gpu_rd(cc, GPUCC_GX_GDSCR) & GDSC_PWR_ON) && !(gpu_rd(cc, gpucc_cbcr[CC_GX_GFX3D].off) & CBCR_CLK_OFF);
++	uint32_t done = cp_memory ? *(volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE) : 0;
++
++	if (gx) {
++		pf = gpu_r(A6XX_UCHE_CLIENT_PF);
++	}
++	printf("SWEET GPU: fault master: FSYNR1 %#x mid %u UCHE_CLIENT_PF %#x%s -> %s\n", fsynr1, fsynr1 & 0xff, pf,
++	    gx ? "" : " (GX off, not read)", gpu_fault_block(fsynr1 & 0xff, pf, gx));
++	for (unsigned i = 0; i < SUBS_N; i++) {
++		if (a630_subs[i].seqno && (int32_t)(a630_subs[i].seqno - done) > 0) {
++			printf("SWEET GPU: in flight at the fault: submission %u by %s[%d], first IB %#llx (%u dwords)\n",
++			    a630_subs[i].seqno, a630_subs[i].name, a630_subs[i].pid, (unsigned long long)a630_subs[i].ib,
++			    a630_subs[i].dwords);
++		}
++	}
++}
++
+ bool
+ sweet_gpu_check_fault(void)
+ {
+@@ -2738,6 +2792,7 @@ sweet_gpu_check_fault(void)
+ 	}
+ 	printf("SWEET GPU: SMMU CB%u FAULT: FSR %#x FAR %#x%08x FSYNR0 %#x\n", CP_CB, fsr,
+ 	    gpu_rd(b, SMMU_CB_FAR + 4), gpu_rd(b, SMMU_CB_FAR), gpu_rd(b, SMMU_CB_FSYNR0));
++	gpu_fault_detail(b);
+ 	gpu_wr(b, SMMU_CB_FSR, fsr);
+ 	if (!a630_dev.lost) {
+ 		a630_dev.hangs++;
+@@ -3010,6 +3065,15 @@ sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned co
+ 	if (++a630_dev.seqno == 0) {
+ 		a630_dev.seqno = 1;
+ 	}
++	{
++		unsigned s = a630_dev.seqno % SUBS_N;
++
++		a630_subs[s].seqno = a630_dev.seqno;
++		a630_subs[s].pid = proc_selfpid();
++		a630_subs[s].ib = ib_iova[0];
++		a630_subs[s].dwords = ib_dwords[0];
++		proc_selfname(a630_subs[s].name, sizeof(a630_subs[s].name));
++	}
+ 	if (a630_stamps) {
+ 		ring_time(a630_dev.seqno, 0);
+ 	}
