@@ -641,7 +641,8 @@ QUIET_JETSAM = {
                'com.apple.lsd', 'com.apple.lsd.system', 'com.apple.liveactivitiesd', 'com.apple.donotdisturbd',
                'com.apple.nehelper', 'com.apple.WebBookmarks.webbookmarksd', 'com.apple.usernotificationsd',
                'com.apple.localizationswitcherd', 'com.apple.aonsensed', 'com.apple.appplaceholdersyncd',
-               'com.apple.watchlistd', 'com.apple.driverkitd', 'com.apple.contextstored', 'com.apple.biomed'),
+               'com.apple.watchlistd', 'com.apple.driverkitd', 'com.apple.contextstored', 'com.apple.biomed',
+               'com.apple.tccd', 'com.apple.managedappdistributiond'),
     'XPCService': ('com.apple.intents.intents-helper', 'com.apple.extensionkitservice'),
 }
 
