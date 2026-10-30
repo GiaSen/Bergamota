@@ -1,0 +1,338 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index 9ad9157..302d0ea 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -311,6 +311,7 @@ static uint32_t a630_idle_ms;           /* sweetgpuidle=MS: slumber after this l
+ static uint32_t a630_hwcg;              /* sweetgpuhwcg=1: hardware clock gating tables */
+ static uint32_t a630_ubwc;              /* sweetgpuubwc=1: program the UBWC/bank registers (hbb 15) */
+ static uint32_t a630_stamps;           /* sweetgpustamps=1: CP timestamps around every submission (diagnostic; adds a WFI) */
++extern void sweet_cpu_anim_note(uint64_t now);  /* bsd/dev/sweet_cpufreq.c (3008) */
+ static uint64_t gov_boost_until;        /* mach time until which the interactive boost floor holds */
+ static uint32_t a630_boost_level = 3;   /* sweetgpuboost=N: floor while a client submits frequently (0 = off) */
+ static uint32_t a630_hb_s;              /* sweetgpuhb=SECONDS: heartbeat line with GPU + USB clock state */
+@@ -3704,8 +3705,10 @@ gpu_gov_tick(uint64_t dt)
+ 	uint64_t now = mach_absolute_time(), hold;
+ 	nanoseconds_to_absolutetime(400 * NSEC_PER_MSEC, &hold);
+ 	unsigned cap = a630_level_max;
+-	if (a630_boost_level && gov_rate >= 4) {
++	/* 3008: 3, not 4: a scene at 30 fps fell below the rate, lost the floor and got slower still */
++	if (a630_boost_level && gov_rate >= 3) {
+ 		gov_boost_until = now + hold;
++		sweet_cpu_anim_note(now);
+ 	}
+ 	unsigned floor_lvl = (a630_boost_level && now < gov_boost_until) ? MIN(a630_boost_level, cap) : 1;
+ 	floor_lvl = MAX(floor_lvl, gpu_input_floor(now));
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 303cd69..ecb1b3e 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -113,6 +113,8 @@ extern boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ extern void sweet_gpu_input_boost(uint64_t now);        /* bsd/dev/sweet_a630.c */
+ void sweet_cpufreq_max(void);
+ void sweet_input_boost(void);
++void sweet_cpu_anim_note(uint64_t now);
++extern int sweet_rpmh_bus_vote(unsigned mbps);
+ 
+ #define CPUFREQ_ENABLE          0x000u
+ #define CPUFREQ_FREQ_LUT        0x110u
+@@ -372,6 +374,18 @@ cf_cluster_load(struct cf_domain *d, uint64_t wall)
+ 	return worst;
+ }
+ 
++/* 3008: A75 floor while the GPU sees frames (sysctl kern.sweet_cpu_anim_khz, 0 = off); called by the GPU governor */
++static int cf_anim_khz;
++static uint64_t cf_anim_until;
++
++void
++sweet_cpu_anim_note(uint64_t now)
++{
++	uint64_t hold;
++	nanoseconds_to_absolutetime(150 * NSEC_PER_MSEC, &hold);
++	cf_anim_until = now + hold;
++}
++
+ static void
+ cf_gov_step(unsigned id, struct cf_domain *d, uint64_t wall)
+ {
+@@ -438,6 +452,16 @@ cf_gov_step(unsigned id, struct cf_domain *d, uint64_t wall)
+ 	if (in_act && target < d->in_idx) {
+ 		target = d->in_idx;
+ 	}
++	/* 3008: while the GPU sees frames: a load governor would stretch each frame's CPU work towards its 80% target */
++	if (id == 1 && cf_anim_khz && mach_absolute_time() < cf_anim_until) {
++		uint32_t f = 0;
++		while (f < ceil_i && d->khz[f] < (uint32_t)cf_anim_khz) {
++			f++;
++		}
++		if (target < f) {
++			target = f;
++		}
++	}
+ 	uint32_t next = cur;
+ 	if (target > cur) {
+ 		next = target;
+@@ -748,6 +772,173 @@ cf_sysctl SYSCTL_HANDLER_ARGS
+ 	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
+ }
+ 
++SYSCTL_INT(_kern, OID_AUTO, sweet_cpu_anim_khz, CTLFLAG_RW | CTLFLAG_LOCKED, &cf_anim_khz, 0, "A75 floor while the GPU sees frames");
++
++/*
++ * 3008: the memory side of the CPU, all off unless asked for, each switchable while the system runs. Android's kernel does
++ * all three (live DT qcom,cpucc@0x17d41000 + qcom,l3-cpu*, qcom,llcc@1100000, qcom,cpubw + qcom,llccbw); this one did none:
++ * DRAM reads take 240-270 ns (110-130 expected), and 4 MB is as slow as 64 MB, so the 2.8 MB system cache does nothing.
++ */
++#define OSM_L3_PA               0x17d41000u
++#define LLCC_PA                 0x1100000u
++#define LLCC_SIZE               0x250000u
++#define LLCC_BCAST              0x200000u       /* qcom,llcc-broadcast-off */
++#define LLCC_COMMON_STATUS0     0x3000cu
++#define LLCC_ACT_CTRL(n)        (LLCC_BCAST + (n) * 0x1000u)
++#define LLCC_STATUS(n)          (LLCC_BCAST + 4u + (n) * 0x1000u)
++#define LLCC_ATTR0(n)           (LLCC_BCAST + 0x21000u + 8u * (n))
++#define LLCC_ATTR1(n)           (LLCC_BCAST + 0x21004u + 8u * (n))
++
++/* llcc-sdm845.c: the slices Android activates at probe */
++static const struct { uint32_t sid, kb, prio, bonus, res; } llcc_slices[] = {
++	{ 1, 2816, 1, 0xffc, 0x2 },     /* cpuss */
++	{ 13, 256, 2, 0x0, 0x1 },       /* mmuhwt */
++};
++static vm_offset_t llcc_base, l3_base;
++static int sweet_llcc_on, sweet_bus_mbps;
++static int sweet_mem_lock;
++
++static uint32_t
++mm_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++mm_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* llcc-slice.c llcc_update_act_ctrl: trigger, clear the trigger, wait for the opposite state to leave */
++static int
++llcc_act(uint32_t sid, uint32_t opcode, uint32_t gone)
++{
++	uint32_t v = (opcode << 1) | 1u;
++	mm_wr(llcc_base, LLCC_ACT_CTRL(sid), v);
++	mm_wr(llcc_base, LLCC_ACT_CTRL(sid), v & ~1u);
++	for (unsigned i = 0; i < 1000; i++) {
++		if (!(mm_rd(llcc_base, LLCC_STATUS(sid)) & gone)) {
++			return 0;
++		}
++		delay(1);
++	}
++	return ETIMEDOUT;
++}
++
++static int
++llcc_set(int on)
++{
++	if (llcc_base == 0) {
++		llcc_base = ml_io_map(LLCC_PA, LLCC_SIZE);
++	}
++	if (llcc_base == 0) {
++		return ENOMEM;
++	}
++	uint32_t banks = mm_rd(llcc_base, LLCC_COMMON_STATUS0) >> 28;
++	if (banks == 0 || banks > 4) {
++		printf("SWEET LLCC: %u banks, not touched\n", banks);
++		return ENODEV;
++	}
++	int error = 0;
++	for (unsigned i = 0; i < sizeof(llcc_slices) / sizeof(llcc_slices[0]); i++) {
++		uint32_t sid = llcc_slices[i].sid;
++		uint32_t a0 = mm_rd(llcc_base, LLCC_ATTR0(sid)), a1 = mm_rd(llcc_base, LLCC_ATTR1(sid)), st0 = mm_rd(llcc_base, LLCC_STATUS(sid));
++		int e;
++		if (on) {
++			/* probe_target_ways 0, fixed_size 0, cache_mode 0 for both */
++			mm_wr(llcc_base, LLCC_ATTR1(sid), (llcc_slices[i].prio << 4) | ((llcc_slices[i].kb * 1024u / banks / 64u) << 16));
++			mm_wr(llcc_base, LLCC_ATTR0(sid), (llcc_slices[i].res & 0xfffu) | (llcc_slices[i].bonus << 16));
++			e = llcc_act(sid, 1u, 2u);
++		} else {
++			e = llcc_act(sid, 2u, 1u);
++		}
++		printf("SWEET LLCC: slice %u %s: banks %u, before attr0 %#x attr1 %#x status %#x, now attr0 %#x attr1 %#x status %#x, err %d\n", sid,
++		    on ? "on" : "off", banks, a0, a1, st0, mm_rd(llcc_base, LLCC_ATTR0(sid)), mm_rd(llcc_base, LLCC_ATTR1(sid)), mm_rd(llcc_base, LLCC_STATUS(sid)), e);
++		if (e) {
++			error = e;
++		}
++	}
++	return error;
++}
++
++static int
++sysctl_sweet_llcc SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = sweet_llcc_on, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (__atomic_exchange_n(&sweet_mem_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	error = llcc_set(v != 0);
++	if (!error) {
++		sweet_llcc_on = v != 0;
++	}
++	__atomic_store_n(&sweet_mem_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_llcc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_llcc, "I", "CPU slices of the system cache");
++
++static int
++sysctl_sweet_bus SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = sweet_bus_mbps, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	error = sweet_rpmh_bus_vote((unsigned)v);
++	if (!error) {
++		sweet_bus_mbps = v;
++	}
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bus_mbps, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_bus, "I", "bus vote CPU -> DDR, MB/s (7216 = top)");
++
++/* L3 clock: the OSM's third domain, same layout as the CPU domains. Reads the state; a write selects a LUT row, -1 logs the table. */
++static int
++sysctl_sweet_l3 SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	if (l3_base == 0) {
++		l3_base = ml_io_map(OSM_L3_PA, CPUFREQ_WINDOW);
++	}
++	if (l3_base == 0) {
++		return ENOMEM;
++	}
++	int v = (int)mm_rd(l3_base, CPUFREQ_PERF_STATE), error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (v < 0) {
++		uint32_t prev = 0;
++		printf("SWEET L3: enable %#x state %u\n", mm_rd(l3_base, CPUFREQ_ENABLE), mm_rd(l3_base, CPUFREQ_PERF_STATE));
++		for (uint32_t i = 0; i < CPUFREQ_LUT_MAX; i++) {
++			uint32_t row = mm_rd(l3_base, CPUFREQ_FREQ_LUT + i * CPUFREQ_LUT_ROW);
++			uint32_t khz = (row >> 30) ? (row & 0xffu) * CPUFREQ_XO_KHZ : CPUFREQ_ALT_KHZ;
++			if (khz == prev) {
++				break;
++			}
++			prev = khz;
++			printf("SWEET L3: row %u %u kHz\n", i, khz);
++		}
++		return 0;
++	}
++	if ((uint32_t)v >= CPUFREQ_LUT_MAX) {
++		return EINVAL;
++	}
++	mm_wr(l3_base, CPUFREQ_PERF_STATE, (uint32_t)v);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_l3, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_l3, "I", "L3 clock LUT row");
++
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_cpufreq,
+     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, cf_sysctl, "A",
+     "Poco F1 cpufreq governor state per cluster (see bsd/dev/sweet_cpufreq.c)");
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index e837194..b91fcea 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -15,6 +15,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);
+ int sweet_rpmh_arc_vote(const char *res, bool max);
++int sweet_rpmh_bus_vote(unsigned mbps);
+ int sweet_rpmh_rfclk_enable(const char *res);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+@@ -59,6 +60,7 @@ int sweet_rpmh_rfclk_enable(const char *res);
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+ #define RH_ARC          3u
+ #define RH_VRM          4u
++#define RH_BCM          5u
+ #define RH_ARC_LEVELS   16u      /* RPMH_ARC_MAX_LEVELS */
+ #define RH_TIMEOUT_US   100000u
+ 
+@@ -215,7 +217,7 @@ rh_lookup_slave(const char *res, unsigned want, uint32_t *address, uint32_t *aux
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+ 			if (slave != want || (addr >> 16) != want || (addr & 15u) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid %s entry for %s\n", want == RH_ARC ? "ARC" : "VRM", res);
++				printf("SWEET RPMH: invalid %s entry for %s\n", want == RH_ARC ? "ARC" : want == RH_BCM ? "BCM" : "VRM", res);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
+@@ -544,6 +546,61 @@ out:
+  * dev_pm_genpd_set_performance_state(pd, INT_MAX) for proxy votes does; max=false
+  * votes hlvl 0 (off). Active set only, like the VRM votes above.
+  */
++/*
++ * 3008: bus clock vote, the path CPU -> memory as Linux's interconnect driver computes it (bcm-voter.c: peak * aux width /
++ * node bus width * 1000 / aux unit). Peak only, active set only, one vote standing until the next. Nothing in this kernel
++ * voted before (only the GMU's own table, vote 0), so these buses ran at what the bootloader left. mbps = 7216 is DDR's top.
++ */
++int
++sweet_rpmh_bus_vote(unsigned mbps)
++{
++	static const struct { const char *res; unsigned buswidth; } bcms[] = {
++		{ "MC0", 4 },   /* ebi */
++		{ "SH0", 16 },  /* qns_llcc */
++		{ "SH5", 32 },  /* qnm_apps */
++	};
++	if (!sweet_board_beryllium() || mbps == 0 || mbps > 20000) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t addrs[3], vals[3];
++	unsigned n = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	for (unsigned i = 0; !error && i < 3; i++) {
++		uint32_t address = 0, aux = 0, aux_len = 0;
++		if (rh_lookup_slave(bcms[i].res, RH_BCM, &address, &aux, &aux_len) != 0 || aux_len < 8) {
++			printf("SWEET RPMH: %s not usable (aux %u bytes), not voted\n", bcms[i].res, aux_len);
++			continue;
++		}
++		uint32_t unit = rh_db16(aux) | ((uint32_t)rh_db16(aux + 2) << 16), width = rh_db16(aux + 4);
++		if (unit == 0 || width == 0) {
++			continue;
++		}
++		uint64_t y = (uint64_t)mbps * 1000 * width / bcms[i].buswidth * 1000 / unit;
++		y = y > 0x3fffu ? 0x3fffu : (y == 0 ? 1 : y);
++		addrs[n] = address;
++		vals[n] = (1u << 30) | (1u << 29) | (uint32_t)y;        /* commit, valid, x = 0, y */
++		printf("SWEET RPMH: bus vote %s addr %#x unit %u width %u: %u MB/s -> y %llu\n", bcms[i].res, address, unit, width, mbps, y);
++		n++;
++	}
++	if (!error) {
++		error = n ? rh_cmds(addrs, vals, n) : ENODEV;
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: bus vote %u MB/s failed errno=%d\n", mbps, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ int
+ sweet_rpmh_arc_vote(const char *res, bool max)
+ {

@@ -43,6 +43,12 @@ if [ "${IOS18:-1}" = 1 ]; then
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetcpu.c" -o "$out18/sweetcpu"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetcpu"
 	python3 -I "$pacstrip" --sign "$out18/sweetcpu"
+	# sweetmem: core clock, cache/DRAM latency, memory bandwidth; sweetsys: read string/int sysctls, set int ones
+	for t in sweetmem sweetsys; do
+		xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/$t.c" -o "$out18/$t"
+		codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/$t"
+		python3 -I "$pacstrip" --sign "$out18/$t"
+	done
 	# sweetuicache: LaunchServices registration, run by the first-boot job (root_tweaks18.firstboot)
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -fobjc-arc \
 		-framework Foundation -framework Security "$here/sweetuicache.m" -o "$out18/sweetuicache"
