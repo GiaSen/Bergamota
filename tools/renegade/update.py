@@ -179,7 +179,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('image', help='root image: IMAGE.simg (full run) or IMAGE.img (resume after a failure)')
     for f_, what in (('appreg', 'first-boot LaunchServices registration of the staged apps'),
-                     ('posterboard', 'sweetfp.dylib + the LC_LOAD_DYLIB in PosterBoard'),
+                     ('posterboard', 'the PosterBoard shim + its LC_LOAD_DYLIB'),
                      ('bluetooth', 'bluetoothd env, BlueTool stub, hcitest'),
                      ('jb', 'jailbreak userland (Procursus rootless, Sileo, TrollStore)'),
                      ('wallpaper', 'default Gradient wallpaper and icon style at first boot'),

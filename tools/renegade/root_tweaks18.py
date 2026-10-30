@@ -729,7 +729,7 @@ def event_timing(root):
 # Renegade auto-fixes (2026-10-23): what was done by hand on the live phone, baked into the root.
 #
 #   appreg       staged_apps() + firstboot(): first-boot job registering the apps with LaunchServices (sweetuicache)
-#   posterboard  posterboard(): sweetfp.dylib linked into PosterBoard (NSURLFileProtectionKey on HFS+)
+#   posterboard  posterboard(): the target's shim (sweetfp.dylib, iOS 26: sweetpb26.dylib) linked into PosterBoard (HFS+ has no data protection)
 #   bluetooth    bluetooth(): BT_HCI_TRANSPORT in bluetoothd's job, BlueTool stub, hcitest
 #   jb           jailbreak_userland() + firstboot(): Procursus rootless, Sileo, TrollStore (jailbreak.py)
 #   wallpaper    firstboot(): the default lock poster (WALLPAPER_POSTER) + default (not tinted) icon style, once, as mobile
@@ -753,12 +753,14 @@ REPO = os.path.abspath(os.path.join(HERE, '..', '..'))
 # which needs a Metal device the ES-only render path does not have (the extension crash-loops, black screen), so it is NOT the default here.
 # Collections poster 7565 (the iOS 17 wallpaper) is not a descriptor of the provider (create fails with -2218). Override: RENEGADE_WALLPAPER_POSTER=provider:descriptor
 WALLPAPER_COLLECTIONS = 'com.apple.WallpaperKit.CollectionsPoster:5010'
-# The stock iOS 18 wallpaper is Mercury's "fluidity" poster (Metal): provider com.apple.MercuryPoster, descriptor fluidity.two as read back from
-# PosterBoard after the user picked "iOS 18" in Settings (other descriptors of the provider: fluidity.one, fluidity.dynamic). Without a Metal
-# device it is black, so it is only selected when the bgmtl feature installed the Metal device; otherwise WALLPAPER_COLLECTIONS.
-WALLPAPER_MERCURY = 'com.apple.MercuryPoster:fluidity.two'
+# The stock wallpaper is Mercury's poster (Metal). iOS 18: descriptor fluidity.two as read back from PosterBoard after the user picked "iOS 18" in
+# Settings (other descriptors of the provider: fluidity.one, fluidity.dynamic). Without a Metal device it is black, so it is only selected when the
+# bgmtl or chlorophyll feature installed the Metal device; otherwise WALLPAPER_COLLECTIONS. iOS 26 has no Mercury default even with the Metal device:
+# on Chlorophyll the space.* posters (space.dynamic is what PosterBoard picks by itself) are blown out to white and fluidity.* have jagged folds
+# (Mi 8, 2026-10-30); Collections 5010 draws clean through Core Animation and leaves the GPU alone.
+WALLPAPER_MERCURY = TARGET['mercury_poster']
 def wallpaper_poster(metal):
-    return os.environ.get('RENEGADE_WALLPAPER_POSTER') or (WALLPAPER_MERCURY if metal else WALLPAPER_COLLECTIONS)
+    return os.environ.get('RENEGADE_WALLPAPER_POSTER') or (WALLPAPER_MERCURY if metal and WALLPAPER_MERCURY else WALLPAPER_COLLECTIONS)
 WALLPAPER_POSTER = WALLPAPER_COLLECTIONS   # kept for readers of the old name: the poster used when there is no Metal device
 FEATURES = ('appreg', 'posterboard', 'bluetooth', 'jb', 'wallpaper', 'bglrender')
 SWEETNET_DIRS = [os.environ.get('RENEGADE_SWEETNET'),
@@ -783,9 +785,10 @@ def find_sweetnet(rel):
 
 
 UICACHE = None              # default: find_sweetnet('ios18/sweetuicache') (arm64e, pacstrip --sign)
-SWEETFP = None              # default: find_sweetnet('ios18/sweetfp.dylib')
+POSTER_SHIM = None          # default: find_sweetnet('ios18/' + the target's poster_shim)
 ADDLC = os.path.join(HERE, '..', 'sweetnet', 'addlc.py')
-SWEETFP_PATH = '/usr/local/lib/sweetfp.dylib'
+POSTER_SHIM_PATH = '/usr/local/lib/' + TARGET['poster_shim']
+POSTER_SHIMS_OTHER = [p for p in ('/usr/local/lib/sweetfp.dylib', '/usr/local/lib/sweetpb26.dylib') if p != POSTER_SHIM_PATH]
 POSTER_BIN = 'Applications/PosterBoard.app/PosterBoard'
 
 
@@ -866,27 +869,31 @@ def entitlements_of(path):
 def posterboard(root):
     """PosterBoard fix (live 2026-10-23): the HFS+ root has no data-protection classes, so PosterBoard's check of
     NSURLFileProtectionKey on its data store fails ("Failed to migrate to Version 61 from 59", no wallpaper store).
-    sweetfp.dylib (tools/sweetnet/sweetfp.m: arm64e, pacstrip --sign) keeps the class in an xattr; it is linked into
+    The target's shim fixes that: sweetfp.dylib (iOS 18, tools/sweetnet/sweetfp.m: keeps the class in an xattr) or
+    sweetpb26.dylib (iOS 26, sweetpb26.m: also APFS purgeable marking and StandBy's empty role; with sweetfp there the
+    store never holds a poster or a descriptor: -2218, black wallpaper). arm64e, pacstrip --sign. It is linked into
     /Applications/PosterBoard.app/PosterBoard as an extra LC_LOAD_DYLIB (tools/sweetnet/addlc.py: dyld ignores
-    DYLD_INSERT_LIBRARIES for platform binaries) and the binary is re-signed ad hoc, keeping its identifier, flags
-    and entitlements."""
+    DYLD_INSERT_LIBRARIES for platform binaries), replacing the other shim in an image that already links it, and the
+    binary is re-signed ad hoc, keeping its identifier, flags and entitlements."""
     import subprocess, tempfile
     sys.path.insert(0, HERE)
     import pacstrip
     binp = os.path.join(root, POSTER_BIN)
+    shim = os.path.basename(POSTER_SHIM_PATH)
     if not os.path.exists(binp):
         print('posterboard: no', POSTER_BIN, 'in the image: skipped')
         return
-    dylib = SWEETFP or find_sweetnet('ios18/sweetfp.dylib')
+    dylib = POSTER_SHIM or find_sweetnet('ios18/' + shim)
     if not dylib:
-        print('posterboard: sweetfp.dylib not built (tools/sweetnet/build.sh): skipped, PosterBoard left alone')
-        note_skip('posterboard sweetfp', not_built() + '; PosterBoard left alone')
+        print('posterboard: %s not built (tools/sweetnet/build.sh): skipped, PosterBoard left alone' % shim)
+        note_skip('posterboard ' + shim, not_built() + '; PosterBoard left alone')
         return
-    install_file(dylib, os.path.join(root, SWEETFP_PATH.lstrip('/')), 0o755)    # first: the binary must never name a missing dylib
-    print('posterboard:', SWEETFP_PATH, 'installed')
-    if macho_has_dylib(binp, SWEETFP_PATH):
-        print('posterboard: PosterBoard already links', SWEETFP_PATH)
+    install_file(dylib, os.path.join(root, POSTER_SHIM_PATH.lstrip('/')), 0o755)    # first: the binary must never name a missing dylib
+    print('posterboard:', POSTER_SHIM_PATH, 'installed')
+    if macho_has_dylib(binp, POSTER_SHIM_PATH):
+        print('posterboard: PosterBoard already links', POSTER_SHIM_PATH)
         return
+    other = next((p for p in POSTER_SHIMS_OTHER if macho_has_dylib(binp, p)), None)
     mode = os.stat(binp).st_mode & 0o7777
     tmpd = tempfile.mkdtemp(prefix='renegade-posterboard-')
     try:
@@ -894,23 +901,28 @@ def posterboard(root):
         shutil.copyfile(binp, tmp)
         os.chmod(tmp, 0o755)
         ents, ident = entitlements_of(tmp), pacstrip.cs_identity(tmp)
-        subprocess.run([sys.executable, '-I', ADDLC, tmp, SWEETFP_PATH], check=True)
+        if other:
+            subprocess.run(['install_name_tool', '-change', other, POSTER_SHIM_PATH, tmp], check=True, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run([sys.executable, '-I', ADDLC, tmp, POSTER_SHIM_PATH], check=True)
         pacstrip.sign(tmp)
         if entitlements_of(tmp) != ents or pacstrip.cs_identity(tmp)[:2] != ident[:2]:
             sys.exit('posterboard: entitlements or identifier changed by the re-sign: PosterBoard left alone')
-        if not macho_has_dylib(tmp, SWEETFP_PATH):
+        if not macho_has_dylib(tmp, POSTER_SHIM_PATH):
             sys.exit('posterboard: LC_LOAD_DYLIB missing after addlc.py')
         install_file(tmp, binp, mode)
     finally:
         shutil.rmtree(tmpd, ignore_errors=True)
-    print('posterboard: PosterBoard links', SWEETFP_PATH, '(re-signed ad hoc as %s, %d entitlements kept)' % (
+    if other and os.path.exists(os.path.join(root, other.lstrip('/'))):
+        os.remove(os.path.join(root, other.lstrip('/')))
+    print('posterboard: PosterBoard links', POSTER_SHIM_PATH, '(re-signed ad hoc as %s, %d entitlements kept)' % (
         ident[0], len(ents or {})))
 
 
 # ---------------------------------------------------------------------------------------------------------------
 # bgmtl (ON by default for this build, see the feature list above): the Bergamota Metal device for the stock iOS 18 wallpaper poster ONLY.
 # gpu/metal/inject (branch metal): bgmtl-inject.dylib + libbgair.dylib + libdrm.2.dylib (arm64e, pacstrip --sign) go to /usr/local/lib/bgmtl and
-# the dylib is linked into MercuryPosterExtension.appex's executable as an extra LC_LOAD_DYLIB (like sweetfp.dylib into PosterBoard), the binary
+# the dylib is linked into MercuryPosterExtension.appex's executable as an extra LC_LOAD_DYLIB (like the shim into PosterBoard), the binary
 # re-signed ad hoc keeping identifier and entitlements. The dylib is INERT until /private/var/tmp/bgmtl.arm exists, honours the kill switch
 # /private/var/tmp/bgmtl.off and carries its own dead-man (see gpu/metal/inject/bgmtl_inject.m); no other process is touched.
 # Build output directory: RENEGADE_BGMTL_DIR (default research/bgmtl). Undo: delete the three files and restore the extension binary.
@@ -1011,6 +1023,9 @@ CHL_TARGETS = (
     ('System/Library/ExtensionKit/Extensions/PhotosPosterProvider.appex/PhotosPosterProvider', False, False),
 )
 CHL_FLAGS = ('bgmtl.arm', 'bgmtl-bb.arm', 'bgmtl-bb.direct')
+# iconservicesagent stays linked but starts stock: on Chlorophyll it caches icons with their glass layers faint or gone (Photos, Notes, Safari,
+# Phone: NOTES 2026-10-30), on the stock renderer they are complete. Remove this file on the phone, and the icon cache, to try the GPU path again.
+CHL_OFF = ('bgmtl.off.com.apple.iconservicesagent',)
 CHL_JETSAM = (('Daemon', 'com.apple.iconservices.iconservicesagent', 160),)
 
 
@@ -1102,7 +1117,7 @@ def chlorophyll(root):
     print('chlorophyll: dylibs installed in', BGMTL_LIB_DIR + ',', CHL_LINK, '-> lib/bgmtl/bgmtl-inject.dylib')
     for rel, add_uc, create_uc in CHL_TARGETS:
         chlorophyll_link(root, rel, add_uc, create_uc)
-    for f in CHL_FLAGS:
+    for f in CHL_FLAGS + CHL_OFF:
         write_file(os.path.join(root, 'private/var/tmp', f), 'written by renegade chlorophyll\n')
     stale = os.path.join(root, 'private/var/tmp/bgmtl-bb.sync')
     if os.path.lexists(stale):
@@ -1110,7 +1125,7 @@ def chlorophyll(root):
     logp = os.path.join(root, 'private/var/tmp/bgmtl.log')
     if not os.path.exists(logp):
         write_file(logp, '', 0o666)
-    print('chlorophyll: flags', ', '.join(CHL_FLAGS), 'in /private/var/tmp; bgmtl.log 0666')
+    print('chlorophyll: flags', ', '.join(CHL_FLAGS + CHL_OFF), 'in /private/var/tmp; bgmtl.log 0666')
     chlorophyll_jetsam(root)
     return True
 
@@ -1120,7 +1135,8 @@ FIRSTBOOT_SH = 'usr/local/libexec/renegade-firstboot.sh'
 FIRSTBOOT_DONE = 'private/var/db/.renegade-firstboot-done'
 FIRSTBOOT_SCRIPT = r'''#!/bin/sh
 # Renegade first boot (root_tweaks18.firstboot), run by the launchd job org.bergamota.renegade-firstboot.
-#  1. APPREG: register /Applications apps listed in /usr/local/share/renegade/register-apps with LaunchServices:
+#  1. APPREG: register /Applications apps listed in /usr/local/share/renegade/register-apps, then every other app that
+#     bundles extensions, with LaunchServices:
 #       /usr/local/bin/sweetuicache /Applications/NAME.app      (one call per app, as root, like the live fix)
 #     LaunchServices answers only once lsd is up, so the first app is retried (5 s apart, 10 min at most).
 #  2. the jailbreak post-install (/var/jb/usr/share/renegade-jb/postinstall.sh) if the root has one
@@ -1168,6 +1184,13 @@ if [ $APPREG = 1 ] && [ -x $UIC ] && [ -s $LIST ]; then
 		fi
 		reg "$app" || bad="$bad $app"
 	done <$LIST
+	# the apps lsd seeded itself have no extensions in LaunchServices (no widgets) until they are registered this way too
+	for a in /Applications/*.app; do
+		app=${a##*/}
+		grep -q -x -F "$app" $LIST && continue
+		[ -n "$(ls -d "$a"/PlugIns/*.appex "$a"/Extensions/*.appex 2>/dev/null)" ] || continue
+		reg "$app" || bad="$bad $app"
+	done
 	for app in $bad; do      # one more round for the failures
 		reg "$app" || rc=1
 	done
@@ -1451,8 +1474,8 @@ def tool_gaps(feats):
     if feats.get('wallpaper') and 'wallpaper' not in gaps and not all(
             find_sweetnet('ios18/' + n) for n in ('sweetposterset', 'sweeticonstyle', 'sweetopen', 'SweetRun.app')):
         gaps['wallpaper'] = 'sweetposterset/sweeticonstyle/sweetopen/SweetRun.app ' + not_built()
-    if feats.get('posterboard') and not (SWEETFP or find_sweetnet('ios18/sweetfp.dylib')):
-        gaps['posterboard'] = 'sweetfp.dylib ' + not_built() + '; PosterBoard is left alone'
+    if feats.get('posterboard') and not (POSTER_SHIM or find_sweetnet('ios18/' + TARGET['poster_shim'])):
+        gaps['posterboard'] = TARGET['poster_shim'] + ' ' + not_built() + '; PosterBoard is left alone'
     if feats.get('bglrender') and not find_bgl():
         gaps['bglrender'] = ('payload: no prebuilt bergamota-gl (gpu/eagl/make-payload.sh needs a Mac; or a CI artifact in '
                              'research/bergamota-gl/ or $RENEGADE_BGL, or `renegade fetch-tools`)')
