@@ -1,6 +1,7 @@
 #!/bin/sh
 # Renegade first boot (root_tweaks18.firstboot), run by the launchd job org.bergamota.renegade-firstboot.
-#  1. APPREG: register /Applications apps listed in /usr/local/share/renegade/register-apps with LaunchServices:
+#  1. APPREG: register /Applications apps listed in /usr/local/share/renegade/register-apps, then every other app that
+#     bundles extensions, with LaunchServices:
 #       /usr/local/bin/sweetuicache /Applications/NAME.app      (one call per app, as root, like the live fix)
 #     LaunchServices answers only once lsd is up, so the first app is retried (5 s apart, 10 min at most).
 #  2. the jailbreak post-install (/var/jb/usr/share/renegade-jb/postinstall.sh) if the root has one
@@ -48,6 +49,13 @@ if [ $APPREG = 1 ] && [ -x $UIC ] && [ -s $LIST ]; then
 		fi
 		reg "$app" || bad="$bad $app"
 	done <$LIST
+	# the apps lsd seeded itself have no extensions in LaunchServices (no widgets) until they are registered this way too
+	for a in /Applications/*.app; do
+		app=${a##*/}
+		grep -q -x -F "$app" $LIST && continue
+		[ -n "$(ls -d "$a"/PlugIns/*.appex "$a"/Extensions/*.appex 2>/dev/null)" ] || continue
+		reg "$app" || bad="$bad $app"
+	done
 	for app in $bad; do      # one more round for the failures
 		reg "$app" || rc=1
 	done

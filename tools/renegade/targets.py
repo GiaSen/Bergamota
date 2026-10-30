@@ -18,14 +18,18 @@ TARGETS = {
         work='research/ios26',
         board='N104',        # EventTimingProfiles/<board>.*.plist shipped in the root
         adt_target='N104',   # ADT target-type the kernel reports (mkadt --identity n104ap)
-        adt='enxerto/out/beryllium-n104-2x.adt'),
+        adt='enxerto/out/beryllium-n104-2x.adt',
+        poster_shim='sweetpb26.dylib',                    # linked into PosterBoard (root_tweaks18.posterboard)
+        mercury_poster=None),                             # Mercury draws wrong here (root_tweaks18.WALLPAPER_MERCURY)
     'ios18': dict(
         device='iPhone11,8', version='18.7.8', build='22H352',
         dmgs=('094-31934-020.dmg.aea', '094-32062-020.dmg.aea', '094-32850-020.dmg'),
         work='research/ios18',
         board='N841',
         adt_target='D22',
-        adt='../ios-beryllium/shim/out/beryllium-hi-3x.adt'),
+        adt='../ios-beryllium/shim/out/beryllium-hi-3x.adt',
+        poster_shim='sweetfp.dylib',
+        mercury_poster='com.apple.MercuryPoster:fluidity.two'),
 }
 
 NAME = os.environ.get('RENEGADE_TARGET', 'ios26')

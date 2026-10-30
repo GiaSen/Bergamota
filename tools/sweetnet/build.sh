@@ -21,7 +21,7 @@ for t in ${TOOLS:-sweetnetcfg cscheck hcitest bluetool-stub sweetreboot sweetdur
 done
 # LaunchServices register tool for sideloaded apps (tools/sweet-install-ipa.sh)
 xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -fobjc-arc \
-	-framework Foundation "$here/sweetuicache.m" -o "$out/sweetuicache"
+	-framework Foundation -framework Security "$here/sweetuicache.m" -o "$out/sweetuicache"
 codesign -s - -f --entitlements "$here/uicache.entitlements" "$out/sweetuicache"
 
 # iOS 18 (Renegade): arm64e builds that the kernel without pointer authentication runs after
@@ -45,7 +45,7 @@ if [ "${IOS18:-1}" = 1 ]; then
 	python3 -I "$pacstrip" --sign "$out18/sweetcpu"
 	# sweetuicache: LaunchServices registration, run by the first-boot job (root_tweaks18.firstboot)
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -fobjc-arc \
-		-framework Foundation "$here/sweetuicache.m" -o "$out18/sweetuicache"
+		-framework Foundation -framework Security "$here/sweetuicache.m" -o "$out18/sweetuicache"
 	codesign -s - -f --entitlements "$here/uicache.entitlements" "$out18/sweetuicache"
 	python3 -I "$pacstrip" --sign "$out18/sweetuicache"
 	# sweetfp.dylib: NSURLFileProtectionKey shim, linked into PosterBoard (root_tweaks18.posterboard)
@@ -98,7 +98,7 @@ if [ "${IOS18:-1}" = 1 ]; then
 	codesign -s - -f --entitlements "$here/wifi.entitlements" "$out18/sweetwifi"
 	python3 -I "$pacstrip" --sign "$out18/sweetwifi"
 	# the unified log over SSH (no `log` tool on iOS)
-	b18 sweetlog sweetlog.m log.entitlements -framework OSLog
+	b18 sweetlog sweetlog.m log.entitlements
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework CoreFoundation -framework IOKit \
 		"$here/sweettouch.c" -o "$out18/sweettouch"
 	codesign -s - -f --entitlements "$here/touch.entitlements" "$out18/sweettouch"

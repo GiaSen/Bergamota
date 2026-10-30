@@ -38,7 +38,7 @@ import berga_tools  # noqa: E402
 SWEETNET = [
     ('bluetool-stub', 'macho'), ('cscheck', 'macho'), ('hcitest', 'macho'), ('sweetnetcfg', 'macho'),
     ('sweetreboot', 'macho'), ('sweetuicache', 'macho'),
-    ('ios18/sweetprefs', 'macho'), ('ios18/sweetuicache', 'macho'), ('ios18/sweetfp.dylib', 'macho'),
+    ('ios18/sweetprefs', 'macho'), ('ios18/sweetuicache', 'macho'), ('ios18/sweetfp.dylib', 'macho'), ('ios18/sweetpb26.dylib', 'macho'),
     ('ios18/sweetmetrics', 'macho'), ('ios18/sweetposterset', 'macho'), ('ios18/sweeticonstyle', 'macho'),
     ('ios18/sweetopen', 'macho'), ('ios18/sweetshot', 'macho'), ('ios18/sweettouch', 'macho'),
     ('ios18/sweetsample', 'macho'), ('ios18/sweetlog', 'macho'),

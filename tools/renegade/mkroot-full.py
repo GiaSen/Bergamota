@@ -780,7 +780,7 @@ def main():
     ap.add_argument('--keep-raw', action='store_true', help='simg stage: do not punch holes into the raw image')
     ap.add_argument('--jobs', type=int, default=os.cpu_count())
     for f_, what in (('appreg', 'first-boot LaunchServices registration of the staged apps (sweetuicache)'),
-                     ('posterboard', 'sweetfp.dylib + the LC_LOAD_DYLIB in PosterBoard'),
+                     ('posterboard', 'the PosterBoard shim + its LC_LOAD_DYLIB'),
                      ('bluetooth', 'bluetoothd env, BlueTool stub, hcitest'),
                      ('jb', 'jailbreak userland (Procursus rootless, Sileo, TrollStore)'),
                      ('wallpaper', 'default Gradient wallpaper and icon style at first boot'),
