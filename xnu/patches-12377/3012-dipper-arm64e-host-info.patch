@@ -1,0 +1,42 @@
+diff --git a/osfmk/kern/host.c b/osfmk/kern/host.c
+index 891abed..b31e4c1 100644
+--- a/osfmk/kern/host.c
++++ b/osfmk/kern/host.c
+@@ -200,6 +200,19 @@ host_processors(host_priv_t host_priv, processor_array_t * out_array, mach_msg_t
+ 
+ extern int sched_allow_NO_SMT_threads;
+ 
++/*
++ * sweetarm64e=1 runs an arm64e userland, and the CPU itself is plain arm64 (kern_exec.c). What userland asks here has to say
++ * arm64e: MobileGestalt's "arm64e" comes from this answer and is the required device capability of every Control Center module on
++ * iOS 26 (51 modules -> 0 loadable, and SpringBoard then deletes them from the saved layout). grade_binary() does not read this.
++ */
++extern bool sweet_arm64e_enabled(void);
++
++static cpu_subtype_t
++sweet_user_cpu_subtype(int slot)
++{
++	return sweet_arm64e_enabled() && slot_type(slot) == CPU_TYPE_ARM64 ? CPU_SUBTYPE_ARM64E : slot_subtype(slot);
++}
++
+ kern_return_t
+ host_info(host_t host, host_flavor_t flavor, host_info_t info, mach_msg_type_number_t * count)
+ {
+@@ -223,7 +236,7 @@ host_info(host_t host, host_flavor_t flavor, host_info_t info, mach_msg_type_num
+ 
+ 		basic_info->memory_size = machine_info.memory_size;
+ 		basic_info->cpu_type = slot_type(master_id);
+-		basic_info->cpu_subtype = slot_subtype(master_id);
++		basic_info->cpu_subtype = sweet_user_cpu_subtype(master_id);
+ 		basic_info->max_cpus = machine_info.max_cpus;
+ #if CONFIG_SCHED_SMT
+ 		if (sched_allow_NO_SMT_threads && current_task()->t_flags & TF_NO_SMT) {
+@@ -411,7 +424,7 @@ host_info(host_t host, host_flavor_t flavor, host_info_t info, mach_msg_type_num
+ #else
+ 		int master_id               = master_processor->cpu_id;
+ 		user_arch_info->cpu_type    = slot_type(master_id);
+-		user_arch_info->cpu_subtype = slot_subtype(master_id);
++		user_arch_info->cpu_subtype = sweet_user_cpu_subtype(master_id);
+ #endif
+ 
+ 
