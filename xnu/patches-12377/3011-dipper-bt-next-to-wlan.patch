@@ -1,0 +1,168 @@
+diff --git a/bsd/dev/beryllium_bt_hci.c b/bsd/dev/beryllium_bt_hci.c
+index f0d21f0..e6a377e 100644
+--- a/bsd/dev/beryllium_bt_hci.c
++++ b/bsd/dev/beryllium_bt_hci.c
+@@ -148,8 +148,13 @@ bt_hci_connected(void)
+  * parameters, which bcm_vsc.c's sub-opcode checker accepts (it returns true on an empty reply);
+  * a read that needs its parameters still fails in bluetoothd and shows up in the log. Every rewrite and every other non-zero status is logged (own budget), so the
+  * next missing command shows up even after the packet trace budget is spent.
++ *
++ * iOS 26 reads longer replies: AssertFail "ByteStream_NumReadBytesAvail(*pBs) >= 4" at bcm_vsc.c:1021 (0xfe3b, one second
++ * after each start) and :196 (0xfdf0 sub-opcode 0x11, BD_VSC_OLYMPIC_READ_ENHANCED_PROFILING_STATS, about 30 s after it)
++ * with 16 bytes, an abort each time (Mi 8, boot 24). The largest Command Complete passes every length check; the
++ * zeros read as empty counts.
+  */
+-#define BT_COMPAT_PAD   16u             /* parameter bytes in a rewritten Command Complete */
++#define BT_COMPAT_PAD   251u            /* parameter bytes in a rewritten Command Complete: 255 with the 4 of the header */
+ 
+ /* First parameter byte of the last few commands sent, by opcode (for rewritten replies). */
+ static struct { uint16_t op; uint8_t p0; } bt_last_cmd[8];
+@@ -239,7 +244,7 @@ static void
+ bt_pend_check(void)
+ {
+ 	uint64_t ns;
+-	uint8_t ev[7 + 16];
++	uint8_t ev[7 + BT_COMPAT_PAD];
+ 	unsigned i;
+ 
+ 	if (!bt.compat || !os_atomic_load(&bt_pend.on, acquire)) {
+@@ -252,7 +257,7 @@ bt_pend_check(void)
+ 	os_atomic_store(&bt_pend.on, false, relaxed);
+ 	ev[0] = 4;
+ 	ev[1] = 0x0e;
+-	ev[2] = 4 + 16;
++	ev[2] = 4 + BT_COMPAT_PAD;
+ 	ev[3] = 1;
+ 	ev[4] = (uint8_t)bt_pend.op;
+ 	ev[5] = (uint8_t)(bt_pend.op >> 8);
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 70598bf..cba1d1e 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -577,6 +577,8 @@ static struct {
+ 	uint8_t bdaddr[6];              /* wanted BD_ADDR, most significant byte first */
+ 	unsigned stage, delay_s;
+ 	int sleep_chan;
++	thread_t bt_thread;             /* the BT stage next to the WLAN service (3011): sleeps on its own event */
++	volatile bool bt_rails_done;    /* 3011: its rail votes are over, RPMh is free for the service's */
+ 	bool started;
+ 	bool service;                   /* sweetwlan=5: the WLAN service (every Wi-Fi gate on, no hold, no teardown) */
+ } wl;
+@@ -609,12 +611,19 @@ wl_wr(vm_offset_t base, uint32_t off, uint32_t val)
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ }
+ 
++/* The service wakes sleep_chan when work arrives: that must not cut the BT stage's power and firmware delays short. */
++static event_t
++wl_sleep_event(void)
++{
++	return current_thread() == wl.bt_thread ? (event_t)&wl.bt_thread : (event_t)&wl.sleep_chan;
++}
++
+ static void
+ wl_sleep(unsigned ms)
+ {
+ 	uint64_t deadline;
+ 	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+-	(void)assert_wait_deadline(&wl.sleep_chan, THREAD_UNINT, deadline);
++	(void)assert_wait_deadline(wl_sleep_event(), THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
+@@ -9282,7 +9291,7 @@ wl_sleep_us(unsigned us)
+ {
+ 	uint64_t deadline;
+ 	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
+-	(void)assert_wait_deadline(&wl.sleep_chan, THREAD_UNINT, deadline);
++	(void)assert_wait_deadline(wl_sleep_event(), THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
+@@ -9396,13 +9405,18 @@ wl_bt(void)
+ 	}
+ 	wl_baud_plan();
+ 	for (n = 0; n < sizeof(wl_bt_rails) / sizeof(wl_bt_rails[0]); n++) {
+-		err = sweet_rpmh_vreg_set(wl_bt_rails[n].res, wl_bt_rails[n].mv, true);
++		unsigned tries = 0;
++		/* EBUSY: the memory policy's bus votes share RPMh's lock */
++		while ((err = sweet_rpmh_vreg_set(wl_bt_rails[n].res, wl_bt_rails[n].mv, true)) == EBUSY && ++tries < 100) {
++			wl_sleep(1);
++		}
+ 		printf("SWEET WLAN: rail %s %u mV -> %d\n", wl_bt_rails[n].res, wl_bt_rails[n].mv, err);
+ 		if (err) {
+ 			goto out_restore;
+ 		}
+ 		wl_sleep(2);
+ 	}
++	wl.bt_rails_done = true;
+ 	wl_sleep(10);
+ 	/* qca_regulator_init(): 2400 baud power-off pulse, then 115200 baud power-on pulse */
+ 	if (!wl_baud(2400)) {
+@@ -9478,11 +9492,46 @@ out_restore:
+ 	wl_pins_restore();
+ out_clocks:
+ 	wl_clocks_off();
++	wl.bt_rails_done = true;        /* also when it stopped before the rails */
+ 	printf("SWEET WLAN: bluetooth stage done\n");
+ }
+ 
+ /* ---------------------------------------------------------------- thread */
+ 
++static void
++wl_bt_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	wl.bt_thread = current_thread();
++	wl_bt();
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/*
++ * 3011: sweetwlan=5 sweetbt=1, Bluetooth next to the WLAN service. The two share the chip's rails and nothing else: the BT
++ * stage has its UART (SE6, its clocks and pins) and fields of wl, the service has the modem and the copy engines.
++ * The service waits for the BT rail votes: RPMh answers EBUSY to a second caller, and its own rails would then fail.
++ */
++static void
++wl_bt_start(void)
++{
++	thread_t thread;
++	unsigned ms = 0;
++
++	if (kernel_thread_start(wl_bt_thread, NULL, &thread) != KERN_SUCCESS) {
++		printf("SWEET BT: kernel_thread_start failed: Wi-Fi only\n");
++		return;
++	}
++	thread_deallocate(thread);
++	while (!wl.bt_rails_done && ms < 5000) {
++		wl_sleep(10);
++		ms += 10;
++	}
++	printf("SWEET BT: running next to the WLAN service, rail votes over after %u ms\n", ms);
++}
++
+ static void
+ wl_thread(void *arg, wait_result_t wr)
+ {
+@@ -9500,6 +9549,9 @@ wl_thread(void *arg, wait_result_t wr)
+ 	} else if (wl.stage == 3) {
+ 		wl_inventory();
+ 	} else if (wl.stage == 4 || wl.stage == 5) {
++		if (wl.stage == 5 && wl.bt_hci) {
++			wl_bt_start();
++		}
+ 		wl_mss();
+ 	}
+ out:
+@@ -9535,8 +9587,8 @@ beryllium_wlan_init(void)
+ 	(void)PE_parse_boot_argn("sweetbtsk", &wl.bt_sk, sizeof(wl.bt_sk));             /* 1: also register com.apple.uart.sk.bluetooth */
+ 	(void)PE_parse_boot_argn("sweetbtlog", &wl.bt_log, sizeof(wl.bt_log));
+ 	(void)PE_parse_boot_argn("sweetbtaddr", &wl.bt_setaddr, sizeof(wl.bt_setaddr));
+-	if (wl.bt_hci && stage != 2) {
+-		printf("SWEET BT: sweetbt=1 needs sweetwlan=2 (the BT stage): ignored\n");
++	if (wl.bt_hci && stage != 2 && stage != 5) {
++		printf("SWEET BT: sweetbt=1 needs sweetwlan=2 or 5: ignored\n");
+ 		wl.bt_hci = 0;
+ 	}
+ 	wl.bt_nvmdelay = 10;            /* ms after the NVM; Linux: 0 (10 ms only between patch and NVM) */
