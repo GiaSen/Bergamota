@@ -8,9 +8,11 @@
 #      USE_KDK=1 to let dxb download the KDK (default: no KDK, see 0027-stage-coreentitlements-v2-stub.sh).
 # Compiler cache: sccache only (xnu's makedefs prefix KCC/KC++ with $(CCACHE)). BOUND_CHECKS=0: the
 # bounds-safety checks are off, as in the CI build. Output: $XNU_LOCAL_DIR/dxb/fakeroot/System/Library/Kernels/.
-# Needs about 8 GB free; run it in the background (it takes a while).
-# Toolchain: Xcode 26.x (DEVELOPER_DIR=...). The Xcode 27 SDK no longer ships Kernel.framework's private headers
-# (TrustCache/API.h, ...), so with Xcode 27 the build only gets as far as pmap_cs.h unless USE_KDK=1.
+# Needs about 8 GB free; run it in the background. On the M1 Air, 8 GB RAM: about 28 minutes from scratch, 18 s for --remake
+# after one .c edit (the first --remake after a full build takes about 2 minutes). sccache caches nothing here (0 hits).
+# Toolchain: Xcode 26.x (DEVELOPER_DIR=...), or Xcode 27 with tools/xnu-no-kdk-stubs standing in for the private headers
+# its SDK no longer ships (TrustCache/API.h, ...), copied into the empty KDK root below; USE_KDK=1 uses the real ones.
+# Packages: brew install cmake sccache gum xcodes bash ninja
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 REMAKE=0 JOBS=-j8
@@ -69,7 +71,10 @@ open('build.sh', 'w').write(s)
 PY
 if [ "${USE_KDK:-0}" != 1 ] && [ "$PSUB" = 26.0 ]; then
     rm -f patches/26.0/00_setup_coreentitlements.sh
-    mkdir -p "$W/no-kdk"
+    # headers Xcode 27's SDK lost: makedefs adds $(KDKROOT)/.../PrivateHeaders/platform to the include path
+    P="$W/no-kdk/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform"
+    mkdir -p "$P"
+    cp -R "$ROOT/tools/xnu-no-kdk-stubs/." "$P/"
     export KDKROOT="$W/no-kdk"
 fi
 export MACOS_VERSION KERNEL_CONFIG=${KERNEL_CONFIG:-DEVELOPMENT} MACHINE_CONFIG=SWEET
