@@ -1,0 +1,44 @@
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+index c9444b2..8c09ef2 100644
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -66,6 +66,8 @@ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_gatepoll, CTLFLAG_RW | CTLFLAG_LOCKED, &swe
+ /* sysctl kern.sweet_fb_bl (3016): Mi 8 panel brightness by hand, 2..1023; 0 = the level iOS asks for */
+ int sweet_fb_bl;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_bl, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_bl, 0, "Mi 8 panel brightness by hand");
++int sweet_fb_bl_now;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_bl_now, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_bl_now, 0, "Mi 8 panel brightness last sent");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hud, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_hud, 0,
+     "Poco F1 on-screen performance HUD (0 off, 1 on); needs the copy scan-out path");
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 69288cf..630e6a0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -66,7 +66,7 @@ extern "C" int sweet_smmu_probe_sid(unsigned sid, unsigned level); /* bsd/dev/sw
+ extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb */
+ extern "C" int sweet_fb_hud;
+ extern "C" int sweet_fb_gatepoll;               /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_gatepoll (3006) */
+-extern "C" int sweet_fb_bl;                     /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_bl (3016) */
++extern "C" int sweet_fb_bl, sweet_fb_bl_now;    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_bl, kern.sweet_fb_bl_now (3017, 3019) */
+ extern "C" uint32_t sweet_gpu_fence_snapshot(void);     /* bsd/dev/sweet_a630.c (0229) */
+ extern "C" bool sweet_gpu_blit_window(uint64_t pa, uint64_t size);      /* bsd/dev/sweet_a630.c (0240) */
+ extern "C" uint32_t sweet_gpu_blit(uint64_t src_pa, uint32_t src_pitch, uint64_t dst_pa, uint32_t dst_pitch, uint32_t w, uint32_t h);
+@@ -875,7 +875,8 @@ AppleCLCD::start(IOService *provider)
+ 		if (blfade) {
+ 			blInit();
+ 			dsiInit();
+-			int blsvc = 0;  /* 0249: off until CoreBrightness can take it (it crashed backboardd); sweetfb_blsvc=1 on */
++			/* 0249: off until CoreBrightness can take it (it crashed backboardd); sweetfb_blsvc=1 on. 3019: the Mi 8 has its panel data (3018) */
++			int blsvc = fDsi != 0;
+ 			PE_parse_boot_argn("sweetfb_blsvc", &blsvc, sizeof(blsvc));
+ 			if (blsvc && (fBacklight = OSTypeAlloc(AppleARMBacklight)) != NULL && fBacklight->init() && fBacklight->attach(this)) {
+ 				fBacklight->fFB = this;
+@@ -2794,6 +2795,7 @@ AppleCLCD::dsiTick(void)
+ 	fDsiBusy = true;
+ 	fDsiWait = 0;
+ 	fDsiLevel = want;
++	__atomic_store_n(&sweet_fb_bl_now, (int)want, __ATOMIC_RELAXED);
+ 	if (fDsiSent++ < 8) {
+ 		IOLog("SWEET DSI: brightness %u\n", want);
+ 	}
