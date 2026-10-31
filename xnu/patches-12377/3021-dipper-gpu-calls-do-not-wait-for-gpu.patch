@@ -1,0 +1,149 @@
+diff --git a/iokit/Kernel/arm/SweetAdreno.cpp b/iokit/Kernel/arm/SweetAdreno.cpp
+index 2fc64a8..354777a 100644
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -92,6 +92,7 @@ struct sweet_gem {
+ 	uint32_t                  lastFence;    /* last submission that referenced the BO */
+ 	uint32_t                  lastWrite;    /* last one that wrote it */
+ 	bool                      submitted;    /* SET_IOVA is refused after the first submit */
++	bool                      fixedIova;    /* the client chose the address (SET_IOVA) and may reuse it right after closing */
+ 	IOMemoryMap              *alias;        /* SBO_IN_WRITABLE_ALIAS: RW CPU mapping in fTask of the pages of md (patch 0214) */
+ 	IOMemoryMap              *aliasK;       /* wrapped alias: RW kernel mapping of the same pages, the VA BO_SYNC cleans through (0217) */
+ };
+@@ -234,6 +235,14 @@ SweetAdrenoUserClient::initWithTask(task_t owningTask, void *securityID, UInt32
+ 	if (!sweet_gpu_ready() || gClientsLock == NULL) {
+ 		return false;
+ 	}
++	/*
++	 * 3021: without these three, a client built into the kernel gets IOUserClient's default locking: map and unmap wait for
++	 * every externalMethod in progress, and new ones queue behind them. The completion thread sits in a fence wait most of
++	 * the time, so the render thread's map and unmap waited for the GPU, up to 1.2 s. This client has its own lock.
++	 */
++	setProperty(kIOUserClientDefaultLockingKey, kOSBooleanFalse);
++	setProperty(kIOUserClientDefaultLockingSetPropertiesKey, kOSBooleanFalse);
++	setProperty(kIOUserClientDefaultLockingSingleThreadExternalMethodKey, kOSBooleanFalse);
+ 	fTask = owningTask;
+ 	fPid = proc_selfpid();
+ 	IOLockLock(gClientsLock);
+@@ -379,23 +388,85 @@ SweetAdrenoUserClient::waitFence(uint32_t fence, uint64_t ns)
+ 	}
+ }
+ 
++/*
++ * 3021: BOs closed while their last submission is still on the ring. Turnip lists every BO of the device in every
++ * submission, so nearly every close saw an unfinished fence and its caller, often the render thread, waited for the GPU.
++ * Turnip closes only what the GPU no longer needs, but freeing pages the GPU can still write would corrupt the kernel:
++ * the pages and the GPU mapping stay here until the fence has passed, as Linux's msm keeps them until it retires the
++ * submission. Reaped at GEM_NEW, GEM_CLOSE and submit (lock held). A GPU recovery advances the fence past everything
++ * lost; a lost GPU never reaps, which leaks them as releaseGem always did.
++ */
++struct sweet_gem_zombie {
++	struct sweet_gem_zombie *next;
++	IOMemoryDescriptor      *md;
++	SweetSurface            *surface;
++	uint64_t                 iova, mapped, vaLen;
++	uint32_t                 fence;
++};
++static struct sweet_gem_zombie *gGemZombies;
++
++static void
++sweet_gem_reap(void)
++{
++	struct sweet_gem_zombie **p = &gGemZombies, *z;
++
++	if (!sweet_gpu_ready()) {
++		return;
++	}
++	while ((z = *p) != NULL) {
++		if (!sweet_gpu_fence_done(z->fence)) {
++			p = &z->next;
++			continue;
++		}
++		*p = z->next;
++		sweet_gpu_vm_unmap(z->iova, z->mapped);
++		sweet_gpu_iova_free(z->iova, z->vaLen);
++		OSSafeReleaseNULL(z->md);
++		if (z->surface != NULL) {
++			z->surface->release();
++		}
++		IOFreeData(z, sizeof(*z));
++	}
++}
++
+ /*
+  * Give a BO back (lock held). If the GPU might still use it (a submission that did not
+- * complete), the memory and its GPU mapping are deliberately leaked: freeing pages the GPU
++ * complete), it becomes a zombie (above). When that cannot be done, wait; and if the wait
++ * fails, the memory and its GPU mapping are deliberately leaked: freeing pages the GPU
+  * can still write would corrupt the kernel.
+  */
+ void
+ SweetAdrenoUserClient::releaseGem(struct sweet_gem *g)
+ {
+-	bool done = true;
++	bool done = true, zombie = false;
+ 
+ 	if (g->lastFence != 0 && !sweet_gpu_fence_done(g->lastFence)) {
+-		done = waitFence(g->lastFence, (uint64_t)CLOSE_PATIENCE_MS * NSEC_PER_MSEC);
++		struct sweet_gem_zombie *z = NULL;
++		if (!g->fixedIova && g->iova != IOVA_UNSET && sweet_gpu_ready()) {
++			z = (struct sweet_gem_zombie *)IOMallocZeroData(sizeof(*z));
++		}
++		if (z != NULL) {
++			z->md = g->md;
++			z->surface = g->surface;
++			z->iova = g->iova;
++			z->mapped = g->size + g->tail;
++			z->vaLen = g->vaLen;
++			z->fence = g->lastFence;
++			z->next = gGemZombies;
++			gGemZombies = z;
++			g->md = NULL;
++			g->surface = NULL;
++			zombie = true;
++		} else {
++			done = waitFence(g->lastFence, (uint64_t)CLOSE_PATIENCE_MS * NSEC_PER_MSEC);
++		}
+ 	}
+ 	if (!sweet_gpu_ready()) {
+ 		done = false;
+ 	}
+-	if (!done) {
++	if (zombie) {
++		/* the zombie owns the descriptor, the surface and the GPU mapping now */
++	} else if (!done) {
+ 		IOLog("SWEET GPU: BO iova %#llx size %llu still in use by the GPU; leaked\n", g->iova, g->size);
+ 		g->md->retain();
+ 		if (g->surface != NULL) {
+@@ -551,6 +622,7 @@ SweetAdrenoUserClient::gemNew(struct sweet_msm_gem_new *r)
+ 	sweet_gpu_cache_sync(kva, (size_t)size);
+ 
+ 	sweet_gpu_lock();
++	sweet_gem_reap();
+ 	IOReturn ret = kIOReturnNoResources;
+ 	if (!sweet_gpu_ready()) {
+ 		ret = kIOReturnNotReady;
+@@ -627,6 +699,7 @@ SweetAdrenoUserClient::gemInfo(struct sweet_msm_gem_info *r)
+ 					sweet_gpu_iova_free(old, oldLen);
+ 					g->iova = newIova;
+ 					g->vaLen = g->size;
++					g->fixedIova = true;
+ 				}
+ 			}
+ 			break;
+@@ -778,6 +851,7 @@ SweetAdrenoUserClient::submit(struct sweet_msm_gem_submit *r)
+ 			ibn[i] = c->size / 4;
+ 		}
+ 	}
++	sweet_gem_reap();
+ 	{
+ 		uint32_t fence = sweet_gpu_submit(ib, ibn, r->nr_cmds);
+ 		if (fence == 0) {
+@@ -1273,6 +1347,7 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 	case SWEET_GPU_SEL_GEM_CLOSE:
+ 		NEED(struct sweet_gem_close);
+ 		sweet_gpu_lock();
++		sweet_gem_reap();
+ 		{
+ 			struct sweet_gem *g = gem(r.close.handle);
+ 			if (g == NULL) {
