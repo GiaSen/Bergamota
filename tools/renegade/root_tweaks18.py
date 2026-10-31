@@ -1046,9 +1046,9 @@ CHL_TARGETS = (
     ('System/Library/ExtensionKit/Extensions/PhotosPosterProvider.appex/PhotosPosterProvider', False, False),
 )
 CHL_FLAGS = ('bgmtl.arm', 'bgmtl-bb.arm', 'bgmtl-bb.direct')
-# iconservicesagent stays linked but starts stock: on Chlorophyll it caches icons with their glass layers faint or gone (Photos, Notes, Safari,
-# Phone: NOTES 2026-10-30), on the stock renderer they are complete. Remove this file on the phone, and the icon cache, to try the GPU path again.
-CHL_OFF = ('bgmtl.off.com.apple.iconservicesagent',)
+# Processes that stay linked but start stock. None now: iconservicesagent's glass layers were lost on the way through IOSurfaces (NOTES 2026-10-31,
+# gpu/metal docs/FIXES.md), and on the stock renderer it could not draw SF Symbols at all.
+CHL_OFF = ()
 CHL_JETSAM = (('Daemon', 'com.apple.iconservices.iconservicesagent', 160),)
 
 
