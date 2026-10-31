@@ -8,10 +8,9 @@
   after each milestone and before stopping. Record commits, CI run IDs, exact
   build/boot results and unfinished work. Distinguish observations from guesses.
 - Commit completed changes. Build kernels on this Mac with
-  `tools/xnu-offline-build.py` (about a minute; see the KERNEL BUILDS bullet in
-  `NOTES.md`). Do not start `xnu.yml` runs without asking the user: GitHub
-  complained about the computing time. Only a change to generated files or a move
-  to another xnu needs one.
+  `tools/xnu-local-build.sh` (from scratch about 28 minutes, `--remake` 18 s; see
+  the KERNEL BUILDS bullet in `NOTES.md`). Do not start `xnu.yml` runs without
+  asking the user: GitHub complained about the computing time.
 - Device bring-up uses temporary `fastboot boot` images. Preserve the Android
   installation and partition backups. The user approved (2026-10-15) using
   internal UFS for iOS and said Android may be deleted: the iOS root goes
