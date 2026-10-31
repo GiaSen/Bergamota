@@ -1,0 +1,210 @@
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+index 8c09ef2..2d1c9a5 100644
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -66,6 +66,11 @@ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_gatepoll, CTLFLAG_RW | CTLFLAG_LOCKED, &swe
+ /* sysctl kern.sweet_fb_bl (3016): Mi 8 panel brightness by hand, 2..1023; 0 = the level iOS asks for */
+ int sweet_fb_bl;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_bl, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_bl, 0, "Mi 8 panel brightness by hand");
++/* sysctl kern.sweet_fb_keepolder (3020): show the newest frame the GPU has finished, not only the newest swap; 0 = as before */
++int sweet_fb_keepolder = 1;
++int sweet_fb_older_shown;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_keepolder, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_keepolder, 0, "keep the swap before the pending one");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_older_shown, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_older_shown, 0, "frames shown from the older slot");
+ int sweet_fb_bl_now;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_bl_now, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_bl_now, 0, "Mi 8 panel brightness last sent");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hud, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_hud, 0,
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 630e6a0..2e41d8e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -67,6 +67,7 @@ extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet
+ extern "C" int sweet_fb_hud;
+ extern "C" int sweet_fb_gatepoll;               /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_gatepoll (3006) */
+ extern "C" int sweet_fb_bl, sweet_fb_bl_now;    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_bl, kern.sweet_fb_bl_now (3017, 3019) */
++extern "C" int sweet_fb_keepolder, sweet_fb_older_shown; /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_keepolder, kern.sweet_fb_older_shown (3020) */
+ extern "C" uint32_t sweet_gpu_fence_snapshot(void);     /* bsd/dev/sweet_a630.c (0229) */
+ extern "C" bool sweet_gpu_blit_window(uint64_t pa, uint64_t size);      /* bsd/dev/sweet_a630.c (0240) */
+ extern "C" uint32_t sweet_gpu_blit(uint64_t src_pa, uint32_t src_pitch, uint64_t dst_pa, uint32_t dst_pitch, uint32_t w, uint32_t h);
+@@ -437,6 +438,17 @@ public:
+ 	uint32_t      fPendFence;       /* 0229: newest GPU fence submitted when the pending swap arrived */
+ 	uint64_t      fPendAbs;         /* 0229: when it arrived */
+ 	bool          gpuGateOpen(uint64_t now);
++	/*
++	 * 3020: a frame costing about a vsync of GPU time was replaced by the next swap just before its fence passed, and so was
++	 * the next one: 60 swaps/s rendered, a third of them shown. The swap before the pending one now stays here, holds and
++	 * all, and the newest frame the GPU has finished is what gets shown.
++	 */
++	uint8_t      *fOlder;
++	bool          fOlderValid, fTakeOlder;
++	uint32_t      fOlderFence;
++	SweetSurface *fOlderHold[4];
++	uint64_t      fPendNewAbs;      /* when the newest swap arrived; fPendAbs is the oldest not shown */
++	void          takeFrame(uint8_t *rec, SweetSurface **taken, SweetSurface **stale);
+ 	uint32_t      fSwapDepth;       /* sweetfb_swapdepth: 1 = SwapWait(N) waits until N latched, 2 (default) = until N-1 latched */
+ 	bool          fWatching;        /* a frame is queued: the swap timer polls for its latch every 500 us */
+ 	void          latchWatch(void);
+@@ -937,6 +949,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	if (!fEarly) {
+ 		PE_parse_boot_argn("sweetfb_gatepoll", &sweet_fb_gatepoll, sizeof(sweet_fb_gatepoll));
++		fOlder = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		fGateTimer = IOTimerEventSource::timerEventSource(this, &AppleCLCD::gateFired);
+ 		if (fGateTimer == NULL || fWorkLoop->addEventSource(fGateTimer) != kIOReturnSuccess) {
+ 			OSSafeReleaseNULL(fGateTimer);
+@@ -1091,21 +1104,22 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	/* 3006: with the previous frame not latched yet the gate timer takes this one, so this thread does not spin in waitLatch */
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0 && !fb->latchBlocks(now) && fb->gpuGateOpen(mach_absolute_time());
+ 	uint8_t *rec = NULL;
+-	SweetSurface *taken[4] = {};
++	SweetSurface *taken[4] = {}, *stale[4] = {};
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+-			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+-			fb->fDirty = false;
+-			memcpy(taken, fb->fPendHold, sizeof(taken));
+-			bzero(fb->fPendHold, sizeof(fb->fPendHold));
++			fb->takeFrame(rec, taken, stale);
+ 		}
+ 	}
+ 	bool dirty = fb->fDirty;        /* still unshown: not yet worth lighting the panel */
+ 	IOLockUnlock(fb->fLock);
++	sweet_hold_release(stale);
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		if (dirty && fb->fGateTimer != NULL && sweet_fb_gatepoll) {
++			fb->fGateTimer->setTimeoutUS(1000);     /* 3020: it showed the older frame, the newest still waits */
++		}
+ 	}
+ 	if (fb->fZc) {
+ 		fb->zcPoll();
+@@ -1147,9 +1161,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ bool
+ AppleCLCD::gpuGateOpen(uint64_t now)
+ {
++	fTakeOlder = false;
+ 	if (sweet_gpu_fence_passed(fPendFence)) {
+ 		return true;
+ 	}
++	if (fOlderValid && sweet_gpu_fence_passed(fOlderFence)) {
++		fTakeOlder = true;
++		return true;
++	}
+ 	uint64_t cap;
+ 	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &cap);
+ 	if (now - fPendAbs > cap) {
+@@ -1161,6 +1180,31 @@ AppleCLCD::gpuGateOpen(uint64_t now)
+ 	return false;
+ }
+ 
++/* 3020: what gpuGateOpen chose. Called with fLock held. stale: holds to release, the older frame the newest one overtook. */
++void
++AppleCLCD::takeFrame(uint8_t *rec, SweetSurface **taken, SweetSurface **stale)
++{
++	if (fTakeOlder) {
++		fTakeOlder = false;
++		memcpy(rec, fOlder, SWEET_FB_SWAP_REC_SIZE);
++		memcpy(taken, fOlderHold, sizeof(fOlderHold));
++		bzero(fOlderHold, sizeof(fOlderHold));
++		fOlderValid = false;
++		fPendAbs = fPendNewAbs;
++		sweet_fb_older_shown++;
++		return;         /* the newest is still pending, fDirty stays */
++	}
++	memcpy(rec, fPending, SWEET_FB_SWAP_REC_SIZE);
++	fDirty = false;
++	memcpy(taken, fPendHold, sizeof(fPendHold));
++	bzero(fPendHold, sizeof(fPendHold));
++	if (fOlderValid) {
++		memcpy(stale, fOlderHold, sizeof(fOlderHold));
++		bzero(fOlderHold, sizeof(fOlderHold));
++		fOlderValid = false;
++	}
++}
++
+ /*
+  * 3006: the previous frame has not latched, so the back buffer may still be on the panel. Only with the gate poll on, and
+  * only for a while: present()'s bounded waitLatch takes over if the latch never comes. Called with fLock held.
+@@ -1181,7 +1225,7 @@ void
+ AppleCLCD::gateFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+-	SweetSurface *taken[4] = {};
++	SweetSurface *taken[4] = {}, *stale[4] = {};
+ 
+ 	if (fb->fPowerOff || !sweet_fb_gatepoll) {
+ 		return;         /* the vsync tick takes it */
+@@ -1202,14 +1246,16 @@ AppleCLCD::gateFired(OSObject *owner, IOTimerEventSource *sender)
+ 		IOLockUnlock(fb->fLock);
+ 		return;         /* the vsync tick takes it */
+ 	}
+-	memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+-	fb->fDirty = false;
+-	memcpy(taken, fb->fPendHold, sizeof(taken));
+-	bzero(fb->fPendHold, sizeof(fb->fPendHold));
++	fb->takeFrame(rec, taken, stale);
++	bool dirty = fb->fDirty;
+ 	IOLockUnlock(fb->fLock);
++	sweet_hold_release(stale);
+ 	fb->present(rec);
+ 	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	sweet_hold_release(taken);      /* copied: CA may render into them again */
++	if (dirty) {
++		sender->setTimeoutUS(1000);     /* 3020: it showed the older frame, the newest still waits */
++	}
+ }
+ 
+ void
+@@ -1424,7 +1470,7 @@ sweet_hold_release(SweetSurface **set)
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+-	SweetSurface *held[4] = {}, *dropped[4];
++	SweetSurface *held[4] = {}, *dropped[4] = {};
+ 	uint32_t mask = get32(rec, 0x104);
+ 	for (uint32_t i = 0; i < 4 && i < SWEET_FB_LAYERS; i++) {
+ 		uint32_t sid = get32(rec, 0x54 + 4 * i);
+@@ -1434,10 +1480,27 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ 	IOLockLock(fLock);
+ 	fSt.swaps++;
++	bool keep = fDirty && !fEarly && sweet_fb_gatepoll && sweet_fb_keepolder && fGateTimer != NULL && fOlder != NULL;
++	if (keep) {
++		/* 3020: the frame the GPU may still be drawing moves down one; only a frame older still is lost */
++		if (fOlderValid) {
++			memcpy(dropped, fOlderHold, sizeof(dropped));
++			fSt.coalesced++;
++		}
++		memcpy(fOlder, fPending, SWEET_FB_SWAP_REC_SIZE);
++		memcpy(fOlderHold, fPendHold, sizeof(fOlderHold));
++		bzero(fPendHold, sizeof(fPendHold));
++		fOlderFence = fPendFence;
++		fOlderValid = true;
++	} else if (fDirty) {
++		fSt.coalesced++;        /* the previous swap never reached the panel */
++		memcpy(dropped, fPendHold, sizeof(dropped));     /* replaced before it was copied */
++	}
+ 	fPendFence = sweet_gpu_fence_snapshot();
++	fPendNewAbs = mach_absolute_time();
+ 	/* 3006: the gate's cap counts from the oldest frame not yet shown; restarting it at every swap meant it never ran out */
+ 	if (!fDirty || !sweet_fb_gatepoll) {
+-		fPendAbs = mach_absolute_time();
++		fPendAbs = fPendNewAbs;
+ 	}
+ 	__atomic_store_n(&fSwapNewest, get32(rec, 0x50), __ATOMIC_RELEASE);
+ 	{
+@@ -1446,12 +1509,8 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		tr->id = get32(rec, 0x50);
+ 		tr->swap = mach_absolute_time();
+ 	}
+-	if (fDirty) {
+-		fSt.coalesced++;        /* the previous swap never reached the panel */
+-	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+-	memcpy(dropped, fPendHold, sizeof(dropped));     /* replaced before it was copied */
+ 	memcpy(fPendHold, held, sizeof(held));
+ 	IOLockUnlock(fLock);
+ 	sweet_hold_release(dropped);
