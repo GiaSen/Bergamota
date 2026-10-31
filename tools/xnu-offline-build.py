@@ -11,7 +11,8 @@ OUT             the stripped kernel, for tools/dipper-mkboot.sh
 Every object in the artifact's compile_commands.json is compiled with this Mac's clang and the same flags, in place
 (artifact objects are excluded from the tree), then the log's link line and strip run. No CTF and no dSYM: nothing at boot
 needs them. Only stale objects are recompiled, so after an edit under BUILDTREE/xnu a rerun takes seconds.
-A source whose headers changed is not detected: delete its object, or pass FILTER strings to force sources that contain them.
+A source whose headers changed is not detected: pass FILTER strings to force sources that contain them (`xnu` = everything, about 1 minute).
+Generated files stay as in the artifact: a new .defs, syscall, config or exported header needs a CI run or that step by hand.
 New source files need their entry added to compile_commands.json and link.filelist by hand.
 """
 import concurrent.futures as cf, json, os, re, shlex, subprocess, sys
@@ -19,8 +20,7 @@ import concurrent.futures as cf, json, os, re, shlex, subprocess, sys
 CI_DXB = '/Users/runner/work/Bergamota/Bergamota/dxb'
 CI_SDK = re.compile(r'/Applications/Xcode[^ /]*\.app/Contents/Developer/Platforms/MacOSX\.platform/Developer/SDKs/MacOSX[0-9.]*\.sdk')
 CI_SDK_PLATFORM = re.compile(CI_SDK.pattern + r'/+System/Library/Frameworks/Kernel\.framework/Versions/A/PrivateHeaders/platform')
-# -fexperimental-bounds-safety: unknown to Xcode 27's driver; the CI build has BOUND_CHECKS=0, its annotations compile away
-DROP = {'-g', '-MD', '-MMD', '-MP', '-gline-tables-only', '-fexperimental-bounds-safety'}
+DROP = {'-g', '-MD', '-MMD', '-MP', '-gline-tables-only'}
 DROP_WITH_ARG = {'-MF', '-MT', '-MJ'}
 
 
@@ -51,6 +51,9 @@ class Build:
                 pass
             elif a in DROP_WITH_ARG:
                 skip = True
+            elif a == '-fexperimental-bounds-safety':
+                # the same feature under Xcode 27's name: 276 files (networking) carry bounds checks, as in a CI kernel
+                args.append('-fbounds-safety')
             else:
                 args.append(self.path(a))
         cc = self.clang + ('++' if os.path.basename(e['arguments'][0]) == 'clang++' else '')
