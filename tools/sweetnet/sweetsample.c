@@ -7,6 +7,8 @@
  *   COUNT THREAD-NAME FRAME...       FRAME = d:0xADDR (unslid shared-cache address, for dsctools/symb.py SLIDE=0)
  *                                    or IMAGE+0xOFF (an image outside the cache) or ?:0xADDR
  * First lines: '# ' header with the totals and the per-thread sample counts.
+ * SWEETSAMPLE_ALL=1: every thread, waiting ones too. SWEETSAMPLE_THREAD=PREFIX: only threads whose name starts with PREFIX,
+ * which keeps the tick rate near HZ on a process with many threads.
  * iOS 18, arm64e + pacstrip (tools/sweetnet/build.sh); entitlements: task_for_pid-allow (sample.entitlements).
  */
 #include <mach/mach.h>
@@ -137,6 +139,7 @@ main(int argc, char **argv)
 	double secs = argc > 2 ? atof(argv[2]) : 3;
 	int hz = argc > 3 ? atoi(argv[3]) : 500;
 	all_threads = getenv("SWEETSAMPLE_ALL") && getenv("SWEETSAMPLE_ALL")[0] == '1';
+	const char *only = getenv("SWEETSAMPLE_THREAD");
 	if (pid <= 0) { fprintf(stderr, "sweetsample: no process %s\n", argv[1]); return 1; }
 	task_t task;
 	kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
@@ -155,8 +158,18 @@ main(int argc, char **argv)
 		mach_msg_type_number_t nth;
 		if (task_threads(task, &th, &nth) != KERN_SUCCESS) break;
 		for (mach_msg_type_number_t i = 0; i < nth; i++) {
+			mach_msg_type_number_t c;
+			if (only) {
+				thread_extended_info_data_t oi;
+				c = THREAD_EXTENDED_INFO_COUNT;
+				if (thread_info(th[i], THREAD_EXTENDED_INFO, (thread_info_t)&oi, &c) != KERN_SUCCESS ||
+				    strncmp(oi.pth_name, only, strlen(only))) {
+					mach_port_deallocate(mach_task_self(), th[i]);
+					continue;
+				}
+			}
 			thread_basic_info_data_t bi;
-			mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+			c = THREAD_BASIC_INFO_COUNT;
 			/* SWEETSAMPLE_ALL=1: every thread, waiting ones too (where a hung process is blocked) */
 			if (thread_info(th[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &c) != KERN_SUCCESS ||
 			    (!all_threads && bi.run_state != TH_STATE_RUNNING)) {
