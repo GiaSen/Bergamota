@@ -1,0 +1,92 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d6c79d7..69288cf 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -256,6 +256,63 @@ OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+ 
+ class IOMobileFramebufferUserClient;
+ 
++/*
++ * 3018 Mi 8: what a real panel's device tree gives CoreBrightness, on the backlight service. Display.m reads both when the
++ * service arrives, and without the calibration its fallback uses the marketing table before loading it: backboardd SIGSEGV
++ * at 0 (-[CBDisplayModuleiOS initWithBacklight:queue:display:]), the "crash" that kept sweetfb_blsvc off since 0249.
++ * Values are IOFixed (16.16). The panel's peak is its dtsi's (qcom,mdss-dsi-panel-peak-brightness); the minimum is its
++ * bl-min-level's; currents only have to be consistent with the nits (OLED: nothing measures them).
++ */
++#define SWEET_DSI_PANEL_NITS    430
++#define SWEET_DSI_PANEL_MID     140
++#define SWEET_DSI_PANEL_MIN     2
++#define SWEET_DSI_MA_MAX        30
++#define SWEET_DSI_MA_MID        10
++
++static void
++sweet_dsi_fixed(OSDictionary *d, const char *key, uint32_t value)
++{
++	OSNumber *n = OSNumber::withNumber((unsigned long long)(value << 16), 32);
++	if (n != NULL) {
++		d->setObject(key, n);
++		n->release();
++	}
++}
++
++static void
++sweet_dsi_publish_panel(IOService *svc)
++{
++	/* slider position -> nits, evenly spaced, 2 + 428 * x^2.2 */
++	static const uint16_t nits[33] = {
++		2, 2, 3, 4, 6, 9, 13, 17, 22, 28, 35, 43, 51, 61, 71, 83, 95, 108, 123, 138, 154, 171, 190, 209, 229, 251, 273, 297, 321,
++		347, 373, 401, 430,
++	};
++	uint32_t table[33];
++	OSDictionary *cal = OSDictionary::withCapacity(10);
++
++	for (unsigned i = 0; i < 33; i++) {
++		table[i] = (uint32_t)nits[i] << 16;
++	}
++	OSData *t = OSData::withBytes(table, sizeof(table));
++	if (t != NULL) {
++		svc->setProperty("backlight-marketing-table", t);
++		t->release();
++	}
++	if (cal != NULL) {
++		sweet_dsi_fixed(cal, "current-for-max-backlight", SWEET_DSI_MA_MAX);
++		sweet_dsi_fixed(cal, "current-for-mid-backlight", SWEET_DSI_MA_MID);
++		sweet_dsi_fixed(cal, "hardware-max-current-limit", SWEET_DSI_MA_MAX);
++		sweet_dsi_fixed(cal, "lMaxProduct", SWEET_DSI_PANEL_NITS);
++		sweet_dsi_fixed(cal, "lMidProduct", SWEET_DSI_PANEL_MID);
++		sweet_dsi_fixed(cal, "lMinProduct", SWEET_DSI_PANEL_MIN);
++		sweet_dsi_fixed(cal, "lMaxPanel", SWEET_DSI_PANEL_NITS);
++		sweet_dsi_fixed(cal, "lMidPanel", SWEET_DSI_PANEL_MID);
++		sweet_dsi_fixed(cal, "lMinPanel", SWEET_DSI_PANEL_MIN);
++		svc->setProperty("backlight-calibration-parameters", cal);
++		cal->release();
++	}
++}
++
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+ 
+@@ -823,10 +880,13 @@ AppleCLCD::start(IOService *provider)
+ 			if (blsvc && (fBacklight = OSTypeAlloc(AppleARMBacklight)) != NULL && fBacklight->init() && fBacklight->attach(this)) {
+ 				fBacklight->fFB = this;
+ 				fBacklight->setProperty("backlight-control", true);
++				if (fDsi != 0) {
++					sweet_dsi_publish_panel(fBacklight);
++				}
+ 				OSDictionary *dp = OSDictionary::withCapacity(1), *br = OSDictionary::withCapacity(3);
+ 				if (dp && br) {
+ 					OSNumber *mn = OSNumber::withNumber(0ULL, 32), *mx = OSNumber::withNumber(4095ULL, 32),
+-					    *va = OSNumber::withNumber((unsigned long long)(fBlRaw[0] & 0xfff), 32);
++					    *va = OSNumber::withNumber(fDsi != 0 ? 2047ULL : (unsigned long long)(fBlRaw[0] & 0xfff), 32);
+ 					br->setObject("min", mn);
+ 					br->setObject("max", mx);
+ 					br->setObject("value", va);
+@@ -2767,7 +2827,7 @@ AppleARMBacklight::setProperties(OSObject *properties)
+ 	if (nits != NULL && fFB != NULL) {
+ 		static uint32_t peak;
+ 		if (peak == 0) {
+-			int v = 500;
++			int v = fFB->fDsi != 0 ? SWEET_DSI_PANEL_NITS : 500;
+ 			PE_parse_boot_argn("sweetfb_blnits", &v, sizeof(v));
+ 			peak = (v >= 50 && v <= 2000) ? (uint32_t)v : 500;
+ 		}
