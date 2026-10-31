@@ -680,6 +680,8 @@ def quiet(root):
         if j.get('Label') in QUIET_THROTTLE:
             j['ThrottleInterval'] = QUIET_THROTTLE[j['Label']]
             n += 1
+        elif j.get('Label') == 'com.apple.bluetoothd':
+            j.pop('ThrottleInterval', None)   # an earlier build's 300 s: it crashes until the BT stage is up, and would then wait 5 minutes
     exts = plist.get('AppExtensions', {})
     ext_gone = [k for k in ('/' + p for p in QUIET_EXT_OFF) if exts.pop(k, None) is not None]
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
@@ -1142,9 +1144,11 @@ def chlorophyll(root):
         chlorophyll_link(root, rel, add_uc, create_uc)
     for f in CHL_FLAGS + CHL_OFF:
         write_file(os.path.join(root, 'private/var/tmp', f), 'written by renegade chlorophyll\n')
-    stale = os.path.join(root, 'private/var/tmp/bgmtl-bb.sync')
-    if os.path.lexists(stale):
-        os.remove(stale)
+    # renegade update works on a finished image: what an earlier build left behind stays unless it is taken out
+    for f in ('bgmtl-bb.sync', 'bgmtl.off.com.apple.iconservicesagent'):
+        stale = os.path.join(root, 'private/var/tmp', f)
+        if os.path.lexists(stale):
+            os.remove(stale)
     logp = os.path.join(root, 'private/var/tmp/bgmtl.log')
     if not os.path.exists(logp):
         write_file(logp, '', 0o666)
