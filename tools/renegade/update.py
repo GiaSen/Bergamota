@@ -313,6 +313,7 @@ def main():
             metal = rt.bgmtl(mnt)
         rt.firstboot(mnt, appreg=feats['appreg'], jb=feats['jb'], wallpaper=feats['wallpaper'], metal=metal)
         rt.hide_apps(mnt)
+        rt.test_tools(mnt)
         if os.environ.get('RENEGADE_DISABLE_CRYPTEXD') == '1':
             rt.cryptexd(mnt)
         jb_table = {}
