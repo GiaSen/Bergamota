@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/sweet_charger.c b/bsd/dev/sweet_charger.c
+index 923b3b1..0976d01 100644
+--- a/bsd/dev/sweet_charger.c
++++ b/bsd/dev/sweet_charger.c
+@@ -496,6 +496,47 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_charger,
+     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sc_sysctl, "A",
+     "Poco F1 PMI8998 charger state, key=value string (see bsd/dev/sweet_charger.c)");
+ 
++/*
++ * 3025: sysctl kern.sweet_battery_now: the fuel gauge read at this moment, "mv=N ma=N", ma positive while the battery discharges.
++ * For measuring what a change costs in power; kern.sweet_charger's own line is about 30 s old. Words as SweetBattery::fg_read_word.
++ */
++static bool
++sc_fg_word(unsigned addr, uint16_t *value)
++{
++	uint16_t previous = 0;
++	for (unsigned attempt = 0; attempt < 6; ++attempt) {
++		uint8_t lo, hi;
++		if (sweet_spmi_read(SC_SID, addr, &lo) || sweet_spmi_read(SC_SID, addr + 1, &hi)) {
++			return false;
++		}
++		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
++		int diff = (int16_t)(uint16_t)(next - previous);
++		if (attempt && diff >= -64 && diff <= 64) {
++			*value = next;
++			return true;
++		}
++		previous = next;
++	}
++	return false;
++}
++
++static int
++sc_battery_now_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	char buf[48];
++	uint16_t v = 0, i = 0;
++	if (!sc_fg_word(0x41a0, &v) || !sc_fg_word(0x41a2, &i)) {
++		return EIO;
++	}
++	int ma = (int)(((int64_t)(int16_t)i * 488281) / 1000000);
++	snprintf(buf, sizeof(buf), "mv=%u ma=%d", (unsigned)(((uint64_t)v * 122070u) / 1000000u), ma);
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_battery_now,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sc_battery_now_sysctl, "A",
++    "Mi 8 fuel gauge now: millivolts, milliamps out of the battery");
++
+ /* ------------------------------------------------------------------ control */
+ 
+ static int

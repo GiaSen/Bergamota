@@ -1,0 +1,172 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index 66a7a0e..2526237 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -310,6 +310,17 @@ static int a630_mode;
+ /* Boot-args (all off/default unless given; docs/GPU_KERNEL.md "Power") */
+ static uint32_t a630_idle_ms;           /* sweetgpuidle=MS: slumber after this long without a submission (0 = never) */
+ static uint32_t a630_hwcg;              /* sweetgpuhwcg=1: hardware clock gating tables */
++/*
++ * 3026: with the display off, slumber after this long without a submission (kern.sweet_gpu_off_idle_ms; 0 = never). About 20 mA of 320 mA at the
++ * battery. Not with the display on: a wake repeats the whole GMU/CP bring-up, 90-240 ms, and the first frame after a pause would wait for it.
++ * Hence 30 s and not less: a phone locked and woken again soon does not pay that, and standby is about long pauses anyway.
++ */
++static int a630_off_idle_ms = 30000;
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_off_idle_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &a630_off_idle_ms, 0, "GPU slumber after this idle with the display off");
++static int a630_resume_us, a630_resume_max_us;
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_resume_us, CTLFLAG_RD | CTLFLAG_LOCKED, &a630_resume_us, 0, "the last wake from slumber took this long");
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_resume_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &a630_resume_max_us, 0, "the longest wake from slumber");
++extern int sweet_fb_display_off;
+ static uint32_t a630_ubwc;              /* sweetgpuubwc=1: program the UBWC/bank registers (hbb 15) */
+ static uint32_t a630_stamps;           /* sweetgpustamps=1: CP timestamps around every submission (diagnostic; adds a WFI) */
+ extern void sweet_cpu_anim_note(uint64_t now);  /* bsd/dev/sweet_cpufreq.c (3008) */
+@@ -3444,6 +3455,7 @@ static bool
+ gpu_resume(void)
+ {
+ 	bool ok = false;
++	uint64_t resume_start = mach_absolute_time();
+ 
+ 	if (a630_gov && a630_boost_level) {
+ 		uint64_t hold;
+@@ -3477,6 +3489,10 @@ gpu_resume(void)
+ 		a630_awake = true;
+ 		a630_resumes++;
+ 		a630_last_active = mach_absolute_time();
++		a630_resume_us = (int)(ns_since(resume_start) / 1000);
++		if (a630_resume_us > a630_resume_max_us) {
++			a630_resume_max_us = a630_resume_us;
++		}
+ 	}
+ 	a630_quiet = 0;
+ 	if (!ok) {
+@@ -3823,7 +3839,11 @@ a630_pm_thread(void *arg, wait_result_t wr)
+ 			gpu_input_tick(now);                            /* before the governor: its floor includes the input floor */
+ 			if (a630_awake) {
+ 				gpu_gov_tick(dt);                       /* measures always, acts only with sweetgpufreq=gov */
+-				if (a630_idle_ms && ns_since(a630_last_active) >= (uint64_t)a630_idle_ms * NSEC_PER_MSEC && gpu_cp_idle_now()) {
++				int off_idle = __atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED) ? a630_off_idle_ms : 0;
++				if (off_idle > 0 && ns_since(a630_last_active) >= (uint64_t)off_idle * NSEC_PER_MSEC && gpu_cp_idle_now()) {
++					(void)gpu_suspend(a630_suspends != 0);
++					gov_win_ns = gov_win_busy_ns = 0;
++				} else if (a630_idle_ms && ns_since(a630_last_active) >= (uint64_t)a630_idle_ms * NSEC_PER_MSEC && gpu_cp_idle_now()) {
+ 					bool first = a630_suspends == 0;
+ 					if (first) {
+ 						printf("SWEET GPU: idle for %u ms: slumber\n", a630_idle_ms);
+diff --git a/bsd/dev/sweet_charger.c b/bsd/dev/sweet_charger.c
+index 0976d01..73bdf89 100644
+--- a/bsd/dev/sweet_charger.c
++++ b/bsd/dev/sweet_charger.c
+@@ -533,6 +533,53 @@ sc_battery_now_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __u
+ 	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
+ }
+ 
++/*
++ * 3026: sysctl kern.sweet_usbin_off=SECONDS (1..120): USBIN suspended for that long, then back, the call returns then. The phone runs from the
++ * battery with the cable still in, so kern.sweet_battery_now is the whole system's current, with no charger loss to guess.
++ */
++extern void IOSleep(unsigned int milliseconds);
++static int sc_usbin_off_busy;
++
++static int
++sc_usbin_off_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int secs = 0, error = sysctl_handle_int(oidp, &secs, 0, req);
++	uint8_t was = 0, off;
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (secs < 1 || secs > 120) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&sc_usbin_off_busy, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	if (sweet_spmi_read(SC_SID, R_CMD_IL, &was) != 0) {
++		__atomic_store_n(&sc_usbin_off_busy, 0, __ATOMIC_RELEASE);
++		return EIO;
++	}
++	off = was | 1u;
++	if (sweet_spmi_write(SC_SID, R_CMD_IL, &off, 1) != 0) {
++		__atomic_store_n(&sc_usbin_off_busy, 0, __ATOMIC_RELEASE);
++		return EPERM;
++	}
++	printf("SWEET CHARGER: USBIN suspended for %d s (test)\n", secs);
++	IOSleep((unsigned)secs * 1000u);
++	was &= ~1u;
++	for (unsigned attempt = 0; attempt < 5; attempt++) {
++		if (sweet_spmi_write(SC_SID, R_CMD_IL, &was, 1) == 0) {
++			printf("SWEET CHARGER: USBIN back\n");
++			break;
++		}
++		IOSleep(100);
++	}
++	__atomic_store_n(&sc_usbin_off_busy, 0, __ATOMIC_RELEASE);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_usbin_off, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sc_usbin_off_sysctl, "I",
++    "Mi 8: run from the battery for this many seconds (test)");
++
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_battery_now,
+     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sc_battery_now_sysctl, "A",
+     "Mi 8 fuel gauge now: millivolts, milliamps out of the battery");
+@@ -626,6 +673,10 @@ sc_control(struct sc_snap *s)
+ 		cs.why = "hold-temp-or-fault";
+ 		return 0;
+ 	}
++	if (__atomic_load_n(&sc_usbin_off_busy, __ATOMIC_ACQUIRE)) {
++		cs.why = "usbin-off-test";
++		return 0;
++	}
+ 	cs.suspect = 0;
+ 	if (cs.safe < 255u) {
+ 		cs.safe++;
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 51690e7..9d3f3c5 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -806,13 +806,21 @@ static vm_offset_t llcc_base, l3_base;
+ static int sweet_llcc_on, sweet_bus_mbps;
+ static int sweet_mem_lock;
+ /* sweet_bus_mbps != 0 or a kern.sweet_l3 write: set by hand, the policy leaves that one alone */
+-static bool cf_mem_auto, cf_mem_high, cf_l3_manual;
++static bool cf_mem_auto, cf_l3_manual;
++static int cf_mem_state;        /* 3026: 0 idle, 1 high, 2 display off */
+ static uint64_t cf_mem_until;
+ #define MEM_DDR_HIGH            7216    /* top */
+ #define MEM_DDR_IDLE            4000    /* below the ~5000 ABL leaves */
+ #define MEM_L3_HIGH             12u     /* 1401.6 MHz: 1478.4 needs an MX vote first (qcom,mx-turbo-freq) */
+ #define MEM_L3_IDLE             7u      /* 940.8 MHz, what ABL leaves */
+ #define MEM_HOLD_S              2
++/*
++ * 3026: display off, nothing moving: about 60 mA of 320 mA at the battery. 1000 and row 0 are as far as it goes (600 gave nothing more), and
++ * putting the panel to sleep or stopping the timing engine on top gave nothing either, so the black frame stays.
++ */
++#define MEM_DDR_OFF             1000
++#define MEM_L3_OFF              0u
++extern int sweet_fb_display_off;
+ 
+ static uint32_t
+ mm_rd(vm_offset_t base, uint32_t off)
+@@ -975,16 +983,17 @@ cf_mem_step(uint64_t now)
+ 		cf_mem_until = now + hold;
+ 	}
+ 	bool high = now < cf_mem_until;
+-	if (high == cf_mem_high) {
++	int state = high ? 1 : __atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED) ? 2 : 0;
++	if (state == cf_mem_state) {
+ 		return;
+ 	}
+-	if (sweet_bus_mbps == 0 && sweet_rpmh_bus_vote(high ? MEM_DDR_HIGH : MEM_DDR_IDLE) != 0) {
++	if (sweet_bus_mbps == 0 && sweet_rpmh_bus_vote(state == 1 ? MEM_DDR_HIGH : state == 2 ? MEM_DDR_OFF : MEM_DDR_IDLE) != 0) {
+ 		return;
+ 	}
+ 	if (!cf_l3_manual && l3_base != 0) {
+-		mm_wr(l3_base, CPUFREQ_PERF_STATE, high ? MEM_L3_HIGH : MEM_L3_IDLE);
++		mm_wr(l3_base, CPUFREQ_PERF_STATE, state == 1 ? MEM_L3_HIGH : state == 2 ? MEM_L3_OFF : MEM_L3_IDLE);
+ 	}
+-	cf_mem_high = high;
++	cf_mem_state = state;
+ }
+ 
+ static void
