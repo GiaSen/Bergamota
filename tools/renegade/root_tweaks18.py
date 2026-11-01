@@ -1322,6 +1322,31 @@ exit 0
 '''
 
 
+# Apps that exist for what they carry, not to be opened: the wallpaper posters' hosts (their extensions are found without an icon),
+# SweetRun (the first-boot job opens it by name) and the Sileo an older build left under /var/jb. A real iPhone does not show the posters'
+# hosts either; here they had two extra home screen pages. SBAppTags hidden keeps them registered and launchable.
+HIDDEN_APPS = ('Applications/UnityPosterApp.app', 'Applications/WeatherPosterApp.app', 'Applications/KaleidoscopePosterApp.app',
+               'Applications/AegirProxyApp.app', 'Applications/EmojiPoster.app', 'Applications/GradientPoster.app',
+               'Applications/PridePosterApp.app', 'Applications/SweetRun.app', 'private/var/jb/Applications/Sileo.app')
+
+
+def hide_apps(root):
+    n = 0
+    for rel in HIDDEN_APPS:
+        path = os.path.join(root, rel, 'Info.plist')
+        if not os.path.exists(path):
+            continue
+        with open(path, 'rb') as f:
+            info = plistlib.load(f)
+        if 'hidden' in info.get('SBAppTags', []):
+            continue
+        info['SBAppTags'] = info.get('SBAppTags', []) + ['hidden']
+        with open(path, 'wb') as f:
+            plistlib.dump(info, f, fmt=plistlib.FMT_BINARY)
+        n += 1
+    print('hide_apps: %d more of %d helper apps hidden from the home screen' % (n, len(HIDDEN_APPS)))
+
+
 def mac_time_zone():
     """The zone name this Mac is set to ('Europe/Amsterdam'), or '' if it cannot be read."""
     try:
@@ -1662,6 +1687,7 @@ def auto(root):
     elif os.environ.get('RENEGADE_NO_BGMTL') != '1' and os.environ.get('RENEGADE_BGMTL') != '0':
         metal = bgmtl(root)
     firstboot(root, appreg=enabled('appreg'), jb=enabled('jb'), wallpaper=enabled('wallpaper'), metal=metal)
+    hide_apps(root)
     if enabled('bglrender'):
         bglrender(root)
     if os.environ.get('RENEGADE_DISABLE_CRYPTEXD') == '1':      # opt-in, off by default
