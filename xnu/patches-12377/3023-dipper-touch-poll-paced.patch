@@ -1,0 +1,90 @@
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+index 2d1c9a5..913d952 100644
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -71,6 +71,8 @@ int sweet_fb_keepolder = 1;
+ int sweet_fb_older_shown;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_keepolder, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_keepolder, 0, "keep the swap before the pending one");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_older_shown, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_older_shown, 0, "frames shown from the older slot");
++int sweet_fb_display_off;      /* 3023: iOS has asked for the display off (RequestPowerChange) */
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_display_off, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_display_off, 0, "display off, as iOS asked");
+ int sweet_fb_bl_now;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_bl_now, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_bl_now, 0, "Mi 8 panel brightness last sent");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hud, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_hud, 0,
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index b7ad5c8..9544e3d 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -411,6 +411,15 @@ static unsigned bb_half_us = 5u;
+ #define BB_HALF_US bb_half_us
+ /* Poll period of the touch thread in ms (IRQ latch check; reads only on edges or while down) */
+ static unsigned touch_poll_ms = 10u;
++/*
++ * 3023: looking at the IRQ line every 2 ms was the kernel's largest idle cost, 5.5% of a core with the screen off too: 500 wake-ups a
++ * second. The ST FTS holds its line low while events wait in its FIFO, so looking less often loses no event, only time. Screen off: 100 ms.
++ * Screen on, no finger for 2 s: 4 ms, half of the IC's scan period. A finger, or within those 2 s: touch_poll_ms as before.
++ */
++extern int sweet_fb_display_off;
++static int touch_idle_ms = 4, touch_off_ms = 100;
++SYSCTL_INT(_kern, OID_AUTO, sweet_touch_idle_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &touch_idle_ms, 0, "Mi 8 touch poll with the screen on and no finger");
++SYSCTL_INT(_kern, OID_AUTO, sweet_touch_off_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &touch_off_ms, 0, "Mi 8 touch poll with the screen off");
+ static void
+ bb_line(unsigned pin, bool high)
+ {
+@@ -1306,6 +1315,27 @@ touch_se_init(void)
+ 	return true;
+ }
+ 
++/* 3023: how long until the next look at the IRQ line */
++static unsigned
++touch_pace(void)
++{
++	static uint64_t last_finger, two_s;
++	uint64_t now = mach_absolute_time();
++	int ms;
++	if (st.kind != TOUCH_STFTS) {
++		return touch_poll_ms;
++	}
++	if (two_s == 0) {
++		nanoseconds_to_absolutetime(2ull * NSEC_PER_SEC, &two_s);
++	}
++	if (st.active) {
++		last_finger = now;
++		return touch_poll_ms;
++	}
++	ms = __atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED) ? touch_off_ms : now - last_finger < two_s ? (int)touch_poll_ms : touch_idle_ms;
++	return ms >= 1 && ms <= 1000 ? (unsigned)ms : touch_poll_ms;
++}
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -1466,7 +1496,7 @@ selected:
+ 				errors = 0;
+ 			}
+ 		}
+-		touch_wait(touch_poll_ms);
++		touch_wait(touch_pace());
+ 	}
+ 	touch_report(0, st.x, st.y);
+ out:
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2e41d8e..fe762bd 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -66,6 +66,7 @@ extern "C" int sweet_smmu_probe_sid(unsigned sid, unsigned level); /* bsd/dev/sw
+ extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb */
+ extern "C" int sweet_fb_hud;
+ extern "C" int sweet_fb_gatepoll;               /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_gatepoll (3006) */
++extern "C" int sweet_fb_display_off;            /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_display_off (3023) */
+ extern "C" int sweet_fb_bl, sweet_fb_bl_now;    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_bl, kern.sweet_fb_bl_now (3017, 3019) */
+ extern "C" int sweet_fb_keepolder, sweet_fb_older_shown; /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_keepolder, kern.sweet_fb_older_shown (3020) */
+ extern "C" uint32_t sweet_gpu_fence_snapshot(void);     /* bsd/dev/sweet_a630.c (0229) */
+@@ -3909,6 +3910,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
++				__atomic_store_n(&sweet_fb_display_off, off ? 1 : 0, __ATOMIC_RELAXED);
+ 				fFB->fEmptyBlackArmed = !off;   /* 0233: the first swap after the display comes on may be layerless: black */
+ 				fFB->fFadeStep = 0;
+ 				fFB->fBlackDone = false;
