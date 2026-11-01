@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index ea05e18..9ab2626 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -885,6 +885,16 @@ ud_bus_reset(const char *why)
+ 		ud_epcmd(ep, DEPCMD_CLEARSTALL, 0, 0, 0);
+ 	}
+ 	ud.tx_busy = false;
++	/*
++	 * 3028: what was queued is for a link that is gone. An unplug gives no disconnect event, so the queue fills up behind the stuck transfer, and
++	 * ud_if_output drops a frame on a full queue without kicking: after the replug nothing ever started the queue again. The phone took frames
++	 * and answered none until a reboot (rx 380 -> 671, tx 1733, txq 32 for the rest of the boot, 2026-11-01; the same as 2026-10-28).
++	 */
++	while (ud.txq_count > 0) {
++		mbuf_freem(ud.txq[ud.txq_head]);
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++		ud.txq_count--;
++	}
+ 	lck_mtx_unlock(ud.lock);
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) & 3u);
+ 	if (ud.xfer_active[1]) {        /* an IN data/status stage on ep0 */

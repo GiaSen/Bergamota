@@ -1,0 +1,121 @@
+diff --git a/bsd/dev/sweet_charger.c b/bsd/dev/sweet_charger.c
+index 73bdf89..cb764fd 100644
+--- a/bsd/dev/sweet_charger.c
++++ b/bsd/dev/sweet_charger.c
+@@ -755,6 +755,8 @@ sc_control(struct sc_snap *s)
+ 	return wrote;
+ }
+ 
++int sweet_charger_plugged = 1;  /* 3029: USB power in or not, about 3 s old; sweet_touch.c */
++
+ static void
+ sc_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -790,6 +792,9 @@ sc_thread(__unused void *arg, __unused wait_result_t wr)
+ 				sc_restore(&s, cs.why);
+ 			}
+ 		}
++		if (sc_have(&s, R_RT_STS)) {
++			__atomic_store_n(&sweet_charger_plugged, (s.rt_sts & 0x10u) != 0, __ATOMIC_RELAXED);
++		}
+ 		sc_started = true;
+ 		sc_publish(&s);
+ 		since_log += period;
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 6f64182..c3322e8 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -417,13 +417,14 @@ static unsigned touch_poll_ms = 10u;
+  * Screen on, no finger for 2 s: 4 ms, half of the IC's scan period. A finger, or within those 2 s: touch_poll_ms as before.
+  */
+ extern int sweet_fb_display_off;
++extern int sweet_charger_plugged;       /* bsd/dev/sweet_charger.c (3029) */
+ static int touch_idle_ms = 4, touch_off_ms = 100;
+ /*
+- * 3027: what the touch thread is doing, kern.sweet_touch_stats, one string: passes through its loop, IC reads, failed reads, events from the IC, the
++ * 3027: what the touch thread is doing, kern.sweet_touch_stats, one string: passes through its loop, IC reads, failed reads, events from the IC, fingers down, the
+  * all-ones and CONTROLLER_READY events a reset leaves, restarts of the IC, contacts down, the IRQ line now. kern.sweet_touch_restart=1 restarts the
+  * IC by hand, =2 only pulses its reset, which is what the watchdog below has to notice by itself.
+  */
+-static unsigned touch_loops, touch_reads, touch_read_errs, touch_events, touch_ones, touch_readies, touch_restarts;
++static unsigned touch_loops, touch_reads, touch_read_errs, touch_events, touch_downs, touch_ones, touch_readies, touch_restarts;
+ static int touch_restart_req;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_touch_restart, CTLFLAG_RW | CTLFLAG_LOCKED, &touch_restart_req, 0, "Mi 8 touch IC: 1 restart, 2 pulse reset only");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_touch_idle_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &touch_idle_ms, 0, "Mi 8 touch poll with the screen on and no finger");
+@@ -999,6 +1000,9 @@ touch_stfts(void)
+ 			break;
+ 		}
+ 		touch_events++;
++		if (ev[0] == STFTS_EVT_ENTER) {
++			touch_downs++;
++		}
+ 		/* a single all-ones read has been seen with the IC carrying on: three in a row are a reason, CONTROLLER_READY always is */
+ 		static unsigned ones_run;
+ 		ones_run = ev[0] == 0xffu ? ones_run + 1 : 0;
+@@ -1368,23 +1372,12 @@ touch_stfts_restart(const char *why)
+ 	touch_suspect = NULL;
+ }
+ 
+-/* 3027: display on: interrupts and scanning asked for again, what fts_521 does at resume. Costs one write; a dead IC answers with an error. */
+-static void
+-touch_stfts_rearm(void)
+-{
+-	int e1 = stfts_write(stfts_ier, sizeof(stfts_ier));
+-	int e2 = stfts_write(stfts_scan, sizeof(stfts_scan));
+-	if (e1 || e2) {
+-		touch_suspect = "no answer when the display came on";
+-	}
+-}
+-
+ static int
+ touch_stats_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+ {
+ 	char buf[160];
+-	snprintf(buf, sizeof(buf), "loops=%u reads=%u errs=%u events=%u ones=%u readies=%u restarts=%u active=%#x irq=%u", touch_loops, touch_reads,
+-	    touch_read_errs, touch_events, touch_ones, touch_readies, touch_restarts, st.active, st.gpio ? touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)) & 1u : 9u);
++	snprintf(buf, sizeof(buf), "loops=%u reads=%u errs=%u events=%u downs=%u ones=%u readies=%u restarts=%u active=%#x irq=%u", touch_loops, touch_reads,
++	    touch_read_errs, touch_events, touch_downs, touch_ones, touch_readies, touch_restarts, st.active, st.gpio ? touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)) & 1u : 9u);
+ 	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_touch_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, touch_stats_sysctl, "A", "Mi 8 touch thread counters");
+@@ -1579,12 +1572,14 @@ selected:
+ 			 */
+ 			static uint64_t last_restart, five_s;
+ 			static int was_off;
++			static bool was_plugged = true;
+ 			int off = __atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED);
+ 			int req = __atomic_exchange_n(&touch_restart_req, 0, __ATOMIC_RELAXED);
+ 			uint64_t now = mach_absolute_time();
+ 			if (five_s == 0) {
+ 				nanoseconds_to_absolutetime(5ull * NSEC_PER_SEC, &five_s);
+ 			}
++			bool plugged = sweet_charger_plugged != 0;
+ 			if (req == 2) {
+ 				printf("SWEET TOUCH: test: reset pulse only\n");
+ 				touch_gpio(tb->rst, 0, 0, 0, true, false);
+@@ -1599,7 +1594,24 @@ selected:
+ 				last_restart = now;
+ 				errors = 0;
+ 			} else if (was_off && !off) {
+-				touch_stfts_rearm();
++				/*
++				 * 3029: as fts_521's resume does: a reset, so the IC comes back with a fresh baseline. The display is just on, nobody is touching yet, and it
++				 * takes about 40 ms. A person with a dead touch screen can always press power twice.
++				 */
++				touch_stfts_restart("display on");
++				last_restart = now;
++				errors = 0;
++			} else if (plugged != was_plugged && st.active == 0 && now - last_restart >= five_s) {
++				/*
++				 * 3029: a charger changes the noise the IC sees and it recalibrates at that moment, with whatever is on the glass (43 05 21 at the replug). Touch was
++				 * dead after a wall charger and a replug, 2026-11-01. A guess at the cause; a fresh baseline with no finger down does no harm.
++				 */
++				touch_stfts_restart(plugged ? "charger plugged in" : "charger unplugged");
++				last_restart = now;
++				errors = 0;
++			}
++			if (st.active == 0) {
++				was_plugged = plugged;
+ 			}
+ 			was_off = off;
+ 		}
