@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/sweet_80211.c b/bsd/dev/sweet_80211.c
+index b23e481..5fdacd5 100644
+--- a/bsd/dev/sweet_80211.c
++++ b/bsd/dev/sweet_80211.c
+@@ -624,7 +624,7 @@ s8_get(struct sweet80211_req *req)
+ 		/*
+ 		 * 3030: wifid takes its auto-join threshold from RSSI_THRESHOLD here (__WiFiDeviceManagerGetAutoJoinThreshold). With this type unsupported it kept the
+ 		 * device's default, 7 dB, and every network was "Below minimum RSSI threshold": a saved network was never joined by itself. -80 as iOS's own bad-RSSI
+-		 * limit (WiFiUsagePoorLinkSession). IO80211: { version, min, max, threshold }, int32. Of min and max wifid only logs them, as far as I can find.
++		 * limit (WiFiUsagePoorLinkSession). IO80211: { version, min, max, threshold }, int32. Min is also what wifid reads as the RSSI once disassociated; its default there was -19.
+ 		 */
+ 		const int32_t d[4] = { 1, S8_RSSI_MIN, S8_RSSI_MAX, -80 };
+ 		return s8_reply(req, d, sizeof(d));
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index c3322e8..0feee5c 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -984,7 +984,7 @@ static const uint8_t stfts_scan[] = { 0xa0, 0x00, 0x01 };                  /* FT
+ static int
+ touch_stfts(void)
+ {
+-	static unsigned logged;
++	static unsigned logged, status_logged;
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+ 	uint32_t mask = st.active;
+ 	bool changed = false, bad = false;
+@@ -1053,8 +1053,9 @@ touch_stfts(void)
+ 			x[id] = (int)px;
+ 			y[id] = (int)py;
+ 			changed = true;
+-		} else if (logged < 32) {
+-			logged++;
++		} else if (logged < 32 && (ev[0] != 0x43u || status_logged++ < 8)) {
++			/* 3031: every restart leaves status events behind, and they used up the lines the unusual ones need */
++			logged += ev[0] != 0x43u;
+ 			printf("SWEET TOUCH: FTS event %02x %02x %02x %02x %02x %02x %02x %02x\n",
+ 			    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
+ 		}

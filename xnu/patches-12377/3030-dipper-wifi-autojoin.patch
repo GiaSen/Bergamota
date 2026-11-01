@@ -1,0 +1,112 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index e3c8d31..a383d34 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -4417,6 +4417,7 @@ static struct {
+ } scan;
+ /* the BSS cache's IEs (SCAN_MAX_BSS x SWEET_WLAN_IE_MAX) and the lock between the service thread and ioctls */
+ static uint8_t *scan_ie;
++static uint64_t sweet_wlan_scan_abs;
+ static LCK_GRP_DECLARE(scan_grp, "sweet_wlan_scan");
+ static LCK_MTX_DECLARE(scan_lock, &scan_grp);
+ static volatile bool scan_req;          /* sweet_80211 asked for a scan (WL2) */
+@@ -4656,6 +4657,7 @@ scan_age(void)
+ 		w++;
+ 	}
+ 	scan.nbss = w;
++	sweet_wlan_scan_abs = mach_absolute_time();
+ }
+ 
+ /* SCAN_EVENT (tag 36: type, reason, freq, req id, scan id, vdev) */
+@@ -7044,6 +7046,13 @@ sta_init(void)
+ 	sta.eapol_msdu = -1;
+ }
+ 
++/* 3030: when the BSS cache was last filled, for the age of its entries (sweet_80211.c) */
++uint64_t
++sweet_wlan_scan_time(void)
++{
++	return sweet_wlan_scan_abs;
++}
++
+ /*
+  * ---- WL2: scans on request from sweet_80211 (sweet80211=3) and the BSS cache of the last scan. Only the
+  * service thread touches the chip; a request sets a flag the service picks up when the previous scan is done.
+diff --git a/bsd/dev/sweet_80211.c b/bsd/dev/sweet_80211.c
+index eb1a44f..b23e481 100644
+--- a/bsd/dev/sweet_80211.c
++++ b/bsd/dev/sweet_80211.c
+@@ -34,6 +34,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <sys/sysctl.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/sockio.h>
+ #include <sys/kern_event.h>
+@@ -100,6 +101,9 @@ static_assert(sizeof(struct sweet80211_req) == 40, "apple80211req is 40 bytes");
+ #define IOC_HARDWARE_VERSION    44
+ #define IOC_COUNTRY_CODE        51
+ #define IOC_SCAN_REQ_MULTIPLE   86
++#define IOC_RSSI_BOUNDS         106
++#define S8_RSSI_MIN             (-90)
++#define S8_RSSI_MAX             (-19)
+ #define IOC_HW_SUPPORTED_CHANNELS 254  /* real index table: gaps at 0, 114, 353 */
+ #define IOC_MAX                 640
+ 
+@@ -260,7 +264,11 @@ struct s8_scan_result {
+ 	uint16_t flags;                 /* 136 */
+ 	uint16_t ie_len;                /* 138 */
+ 	uint8_t  ie[2048];              /* 140 */
++	uint8_t  pad2[2256 - 2188];
++	uint64_t timestamp;             /* 2256: 3030, nanoseconds of uptime when the BSS was seen */
++	uint8_t  pad3[8];
+ } __attribute__((packed));
++static_assert(__builtin_offsetof(struct s8_scan_result, timestamp) == 2256, "scan result layout");
+ static_assert(__builtin_offsetof(struct s8_scan_result, ssid_len) == 96, "scan result layout");
+ static_assert(__builtin_offsetof(struct s8_scan_result, ie_len) == 138, "scan result layout");
+ 
+@@ -351,6 +359,15 @@ s8_fill_result(const struct sweet_wlan_bss *b, struct s8_scan_result *r)
+ 	}
+ 	r->ie_len = MIN(b->ie_len, (uint16_t)sizeof(r->ie));
+ 	memcpy(r->ie, b->ie, r->ie_len);
++	/*
++	 * 3030: with no timestamp CoreWiFi took every network's age as the whole uptime ("age=107399ms") and threw the list away wherever it asks for recent
++	 * results: auto-join's passes that use the scan just made, so a saved network was "found nearby but not joined" (user 2026-11-01).
++	 */
++	uint64_t seen = sweet_wlan_scan_time(), ns;
++	absolutetime_to_nanoseconds(seen, &ns);
++	r->timestamp = ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - seen, &ns);
++	r->age = (uint32_t)(ns / NSEC_PER_MSEC);
+ }
+ 
+ /* sweet80211=3: network s8.scan_next of the WLAN service's last scan, or the current one (CURRENT_NETWORK) */
+@@ -603,6 +620,15 @@ s8_get(struct sweet80211_req *req)
+ 		}
+ 		return s8_reply(req, &d, sizeof(d));
+ 	}
++	case IOC_RSSI_BOUNDS: {
++		/*
++		 * 3030: wifid takes its auto-join threshold from RSSI_THRESHOLD here (__WiFiDeviceManagerGetAutoJoinThreshold). With this type unsupported it kept the
++		 * device's default, 7 dB, and every network was "Below minimum RSSI threshold": a saved network was never joined by itself. -80 as iOS's own bad-RSSI
++		 * limit (WiFiUsagePoorLinkSession). IO80211: { version, min, max, threshold }, int32. Of min and max wifid only logs them, as far as I can find.
++		 */
++		const int32_t d[4] = { 1, S8_RSSI_MIN, S8_RSSI_MAX, -80 };
++		return s8_reply(req, d, sizeof(d));
++	}
+ 	case IOC_SCAN_RESULT:
+ 		if (s8.stage == 3) {
+ 			return s8_real_result(req, false);
+diff --git a/bsd/dev/sweet_wlan.h b/bsd/dev/sweet_wlan.h
+index 8e0eaad..d731aca 100644
+--- a/bsd/dev/sweet_wlan.h
++++ b/bsd/dev/sweet_wlan.h
+@@ -25,6 +25,7 @@ struct sweet_wlan_bss {
+ };
+ 
+ /* beryllium_wlan.c: 0 = scan queued (or already running), ENXIO = the service is not up (yet) */
++uint64_t sweet_wlan_scan_time(void);    /* 3030: mach_absolute_time of the last completed scan */
+ int sweet_wlan_scan_request(void);
+ /* beryllium_wlan.c: network i of the last completed scan; ENOENT past the end */
+ int sweet_wlan_bss_get(unsigned i, struct sweet_wlan_bss *out);

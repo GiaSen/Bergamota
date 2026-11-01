@@ -1,0 +1,183 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 9544e3d..6f64182 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -418,6 +418,14 @@ static unsigned touch_poll_ms = 10u;
+  */
+ extern int sweet_fb_display_off;
+ static int touch_idle_ms = 4, touch_off_ms = 100;
++/*
++ * 3027: what the touch thread is doing, kern.sweet_touch_stats, one string: passes through its loop, IC reads, failed reads, events from the IC, the
++ * all-ones and CONTROLLER_READY events a reset leaves, restarts of the IC, contacts down, the IRQ line now. kern.sweet_touch_restart=1 restarts the
++ * IC by hand, =2 only pulses its reset, which is what the watchdog below has to notice by itself.
++ */
++static unsigned touch_loops, touch_reads, touch_read_errs, touch_events, touch_ones, touch_readies, touch_restarts;
++static int touch_restart_req;
++SYSCTL_INT(_kern, OID_AUTO, sweet_touch_restart, CTLFLAG_RW | CTLFLAG_LOCKED, &touch_restart_req, 0, "Mi 8 touch IC: 1 restart, 2 pulse reset only");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_touch_idle_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &touch_idle_ms, 0, "Mi 8 touch poll with the screen on and no finger");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_touch_off_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &touch_off_ms, 0, "Mi 8 touch poll with the screen off");
+ static void
+@@ -962,6 +970,10 @@ stfts_event(uint8_t *ev)
+ 	return touch_read(STFTS_ADDR, STFTS_FIFO_READ, false, ev, STFTS_EVENT);
+ }
+ 
++static const char *touch_suspect;       /* 3027: why the IC should be restarted, set by touch_stfts */
++static const uint8_t stfts_ier[] = { 0xfa, 0x20, 0x00, 0x00, 0x29, 0x41 }; /* FTS_CMD_HW_REG_W ADDR_IER IER_ENABLE */
++static const uint8_t stfts_scan[] = { 0xa0, 0x00, 0x01 };                  /* FTS_CMD_SCAN_MODE ACTIVE, MULTI_TOUCH */
++
+ /*
+  * ST FTS events (fts_521 fts_*_pointer_event_handler): [0] event id, [1] touch id (7:4) | touch type (3:0),
+  * X = [3](3:0) << 8 | [2], Y = [4] << 4 | [3](7:4), panel pixels. The FIFO is drained (at most its depth) and
+@@ -986,6 +998,19 @@ touch_stfts(void)
+ 		if (err || ev[0] == STFTS_EVT_NONE) {
+ 			break;
+ 		}
++		touch_events++;
++		/* a single all-ones read has been seen with the IC carrying on: three in a row are a reason, CONTROLLER_READY always is */
++		static unsigned ones_run;
++		ones_run = ev[0] == 0xffu ? ones_run + 1 : 0;
++		if (ev[0] == 0xffu) {
++			touch_ones++;
++			if (ones_run >= 3) {
++				touch_suspect = "all-ones events";
++			}
++		} else if (ev[0] == STFTS_EVT_READY) {
++			touch_readies++;
++			touch_suspect = "CONTROLLER_READY: the IC has reset";
++		}
+ 		bool more = !(touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)) & 1u);    /* 3007: line high = FIFO empty, no empty read */
+ 		if (touch_trace) {
+ 			uint64_t ns;
+@@ -1062,8 +1087,6 @@ dipper_bus_log(const char *when)
+ static bool
+ touch_dipper_start(void)
+ {
+-	static const uint8_t ier[] = { 0xfa, 0x20, 0x00, 0x00, 0x29, 0x41 }; /* FTS_CMD_HW_REG_W ADDR_IER IER_ENABLE */
+-	static const uint8_t scan[] = { 0xa0, 0x00, 0x01 };                  /* FTS_CMD_SCAN_MODE ACTIVE, MULTI_TOUCH */
+ 	uint8_t ev[STFTS_EVENT];
+ 	if (!dipper_south) {
+ 		dipper_south = ml_io_map(DIPPER_SOUTH_PA, TOUCH_GPIO_CFG(DIPPER_TS_VDD + 1));
+@@ -1131,8 +1154,8 @@ touch_dipper_start(void)
+ 		printf("SWEET TOUCH: no ST FTS at %#x (err=%d dead=%d); stopping\n", STFTS_ADDR, err, st.dead);
+ 		return false;
+ 	}
+-	int e1 = stfts_write(ier, sizeof(ier));
+-	int e2 = stfts_write(scan, sizeof(scan));
++	int e1 = stfts_write(stfts_ier, sizeof(stfts_ier));
++	int e2 = stfts_write(stfts_scan, sizeof(stfts_scan));
+ 	printf("SWEET TOUCH: ST FTS interrupts on err=%d, active multi-touch scan err=%d\n", e1, e2);
+ 	if (e1 || e2 || st.dead) {
+ 		return false;
+@@ -1315,6 +1338,57 @@ touch_se_init(void)
+ 	return true;
+ }
+ 
++/*
++ * 3027: the IC again, as touch_dipper_start leaves it: reset pulse (its own pin, not the panel's), CONTROLLER_READY, interrupts and scanning on. A reset IC
++ * neither scans nor interrupts, and the kernel only ever started it once: touch stayed dead until a reboot (user, 2026-11-01). Rails stay on.
++ */
++static void
++touch_stfts_restart(const char *why)
++{
++	uint8_t ev[STFTS_EVENT];
++	int err = ENXIO;
++	bool ready = false;
++	unsigned t;
++
++	touch_restarts++;
++	printf("SWEET TOUCH: restarting the IC (%s)\n", why);
++	touch_report(0, st.x, st.y);
++	touch_gpio(tb->rst, 0, 0, 0, true, false);
++	touch_wait(10);
++	touch_gpio(tb->rst, 0, 0, 0, true, true);
++	for (t = 0; t < 50 && !ready; ++t) {
++		touch_wait(20);
++		err = stfts_event(ev);
++		ready = !err && ev[0] == STFTS_EVT_READY;
++	}
++	int e1 = stfts_write(stfts_ier, sizeof(stfts_ier));
++	int e2 = stfts_write(stfts_scan, sizeof(stfts_scan));
++	printf("SWEET TOUCH: IC restart %u: %s after %u ms (read err=%d), interrupts err=%d, scan err=%d\n", touch_restarts,
++	    ready ? "ready" : "NOT ready", t * 20u, err, e1, e2);
++	touch_suspect = NULL;
++}
++
++/* 3027: display on: interrupts and scanning asked for again, what fts_521 does at resume. Costs one write; a dead IC answers with an error. */
++static void
++touch_stfts_rearm(void)
++{
++	int e1 = stfts_write(stfts_ier, sizeof(stfts_ier));
++	int e2 = stfts_write(stfts_scan, sizeof(stfts_scan));
++	if (e1 || e2) {
++		touch_suspect = "no answer when the display came on";
++	}
++}
++
++static int
++touch_stats_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	char buf[160];
++	snprintf(buf, sizeof(buf), "loops=%u reads=%u errs=%u events=%u ones=%u readies=%u restarts=%u active=%#x irq=%u", touch_loops, touch_reads,
++	    touch_read_errs, touch_events, touch_ones, touch_readies, touch_restarts, st.active, st.gpio ? touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)) & 1u : 9u);
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_touch_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, touch_stats_sysctl, "A", "Mi 8 touch thread counters");
++
+ /* 3023: how long until the next look at the IRQ line */
+ static unsigned
+ touch_pace(void)
+@@ -1467,14 +1541,17 @@ selected:
+ 		/* 3007: the ST FTS's line is a level, nothing to miss: `pending` and `periodic` are enough */
+ 		bool active_due = st.active && st.kind != TOUCH_STFTS && (!paced || touch_poll_ms >= 8 ||
+ 		    ++since_read * touch_poll_ms >= 8);
++		touch_loops++;
+ 		if (!st.irq_hint || active_due || pending || periodic) {
+ 			since_read = 0;
++			touch_reads++;
+ 			touch_trace_why = pending ? 'e' : 'a';
+ 			int err = st.kind == TOUCH_GOODIX ? touch_goodix() :
+ 			    st.kind == TOUCH_NVT ? touch_novatek() :
+ 			    st.kind == TOUCH_FT8719 ? touch_ft8719() :
+ 			    st.kind == TOUCH_STFTS ? touch_stfts() : touch_focaltech();
+ 			if (err) {
++				touch_read_errs++;
+ 				/* At most one line a minute: bad frames are frequent and harmless */
+ 				static uint64_t last_log;
+ 				static unsigned suppressed;
+@@ -1496,6 +1573,36 @@ selected:
+ 				errors = 0;
+ 			}
+ 		}
++		if (st.kind == TOUCH_STFTS) {
++			/*
++			 * 3027: the watchdog: a reset's own event, several failed reads in a row, or no answer at display on. At most one restart per 5 s.
++			 */
++			static uint64_t last_restart, five_s;
++			static int was_off;
++			int off = __atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED);
++			int req = __atomic_exchange_n(&touch_restart_req, 0, __ATOMIC_RELAXED);
++			uint64_t now = mach_absolute_time();
++			if (five_s == 0) {
++				nanoseconds_to_absolutetime(5ull * NSEC_PER_SEC, &five_s);
++			}
++			if (req == 2) {
++				printf("SWEET TOUCH: test: reset pulse only\n");
++				touch_gpio(tb->rst, 0, 0, 0, true, false);
++				touch_wait(10);
++				touch_gpio(tb->rst, 0, 0, 0, true, true);
++			} else if (req == 1) {
++				touch_stfts_restart("by hand");
++				last_restart = now;
++				errors = 0;
++			} else if (now - last_restart >= five_s && (errors >= 5 || touch_suspect)) {
++				touch_stfts_restart(errors >= 5 ? "reads keep failing" : touch_suspect);
++				last_restart = now;
++				errors = 0;
++			} else if (was_off && !off) {
++				touch_stfts_rearm();
++			}
++			was_off = off;
++		}
+ 		touch_wait(touch_pace());
+ 	}
+ 	touch_report(0, st.x, st.y);

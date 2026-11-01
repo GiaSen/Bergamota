@@ -158,3 +158,23 @@ Adreno 630) are in Chlorophyll's own repository: `gpu/metal/docs/FIXES.md`.
 - **Fix.** Display off: DDR vote 1000 and L3 row 0, about 50-60 mA; GPU slumber after 30 s (`kern.sweet_gpu_off_idle_ms`), about 20 mA. Result about 270-280 mA. A GPU wake costs 90-240 ms, hence the 30 s.
 - **What did not help.** Panel sleep plus a stopped timing engine (241 -> 240 mA), DDR below 1000, A75s off (15-25 mA, a `cpus=4` boot).
 - **Still there.** Wi-Fi and Bluetooth about 45 mA. About 200 mA unexplained, the USB link among it.
+
+## Saved Wi-Fi networks were never joined by themselves (3030, Mi 8, 2026-11-01)
+
+- **Symptom.** After every reboot Wi-Fi stayed off until the network was picked by hand, though it was saved and in range. wifid's log: `Join candidate ... is not allowed (Below minimum RSSI threshold)`, even at -58 dBm, then `Known network is found nearby but not joined`.
+- **Why.** Two gaps in the kernel's stand-in for the Wi-Fi driver. wifid takes its auto-join threshold from IOC 106 (`RSSI_THRESHOLD`); that returned EOPNOTSUPP, so the threshold stayed at the device's default of 7, above any real signal. And scan results had no timestamp, so CoreWiFi computed every network's age as the whole uptime and dropped the lists it reuses.
+- **Fix.** IOC 106 answers `{1, -90, -19, -80}`; the u64 at offset 2256 of a scan result holds nanoseconds of uptime when the scan finished, and `age` the milliseconds since.
+- **Check.** `ifconfig en0` has an address about 2 minutes after a boot with nobody touching the phone. `sweetlog 60 AUTO-JOIN` on the phone shows small `age=` values.
+
+## USB network dead after a replug (3028, Mi 8, 2026-11-01)
+
+- **Symptom.** After unplugging and replugging, the phone enumerated and took frames but sent none: 0 packets on the Mac, no ARP answer, no SSH, until a reboot. `SWEET USB: ... tx 1733 ... txbusy 0 txq 32` never changing.
+- **Why.** An unplug gives no disconnect event, so the TX queue filled behind the stuck transfer. A bus reset cleared `tx_busy` but not the queue, and `ud_if_output` drops on a full queue without starting it.
+- **Fix.** The queue is emptied at a bus reset.
+- **Check.** Unplug for a minute with traffic running, replug, SSH works. Not tested yet with a real cable.
+
+## Touch chip restarted when it may have lost its way (3027, 3029, 3031, Mi 8, 2026-11-01)
+
+- **Symptom.** Touch dead with buttons and UI working, after the first ever unplug, wall charger and replug. Cause not proven: the chip still sent status events.
+- **Fix.** Reset, CONTROLLER_READY, interrupts and scanning again (about 40 ms) when the display comes on, as fts_521's resume does, when a charger comes or goes, on CONTROLLER_READY, on 3 all-ones events or 5 failed reads in a row. It used to be started once, at boot.
+- **Check.** `kern.sweet_touch_restart=2` pulses reset only; `kern.sweet_touch_stats` shows `readies` and `restarts` rising within a second. If touch dies again, `downs` tells whether the chip still sees fingers.
