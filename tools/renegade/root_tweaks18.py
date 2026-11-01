@@ -1265,10 +1265,11 @@ echo $ok >/private/var/tmp/renegade-poster.rc
 EOS
 	chmod 644 $T/sweetrun.sh
 	t=0
-	until /usr/local/bin/sweetopen com.sweet.run; do      # works once SpringBoard is up
+	until /usr/local/bin/sweetopen com.sweet.run; do      # works once SpringBoard is up and the phone is unlocked
 		t=$((t+1))
-		[ $t -ge 120 ] && break
-		sleep 5
+		[ $t -ge 60 ] && break
+		# this job outlasts auto-lock, and SpringBoard refuses to launch an app on a locked phone (3)
+		sweettouch lock; sleep 2; sweettouch home; sleep 3; sweettouch swipe 187 800 187 200 300; sleep 5
 	done
 	t=0
 	while [ ! -e $T/renegade-poster.rc ] && [ $t -lt 240 ]; do
@@ -1291,6 +1292,20 @@ if [ -f $JBPI ] && [ ! -e /var/jb/.renegade-jb-done ]; then
 	[ -e /var/jb/.renegade-jb-done ] || rc=1
 fi
 if [ $rc = 0 ] || [ $n -ge 3 ]; then
+	# a dead-man that fired during this busy boot says little about the next one (it fires again if it has to). The agent's also means icons
+	# it could not draw without the GPU were cached blank, so it restarts on an empty cache. What else fell back stays on the CPU until a reboot.
+	V=/private/var/tmp
+	if [ -e $V/bgmtl.off.com.apple.iconservicesagent ]; then
+		rm -f $V/bgmtl.off.com.apple.iconservicesagent $V/bgmtl.state.com.apple.iconservicesagent
+		for p in $(ps -A -o pid,comm | grep -E '/iconservicesagent$' | sed -E 's/^ *([0-9]+).*/\1/'); do kill -9 $p; done
+		rm -f /private/var/containers/Shared/SystemGroup/systemgroup.com.apple.lsd.iconscache/Library/Caches/com.apple.IconsCache/*/*
+		echo "iconservicesagent's dead-man cleared, icon cache emptied"
+	fi
+	for f in $V/bgmtl-bb.off $V/bgmtl.off.*; do
+		[ -e "$f" ] || continue
+		rm -f "$f" $V/bgmtl-bb.state $V/bgmtl.state.*
+		echo "dead-man cleared: $f (back on the GPU at the next boot)"
+	done
 	touch $DONE
 	echo "== done (rc=$rc), first-boot job disabled"
 fi
