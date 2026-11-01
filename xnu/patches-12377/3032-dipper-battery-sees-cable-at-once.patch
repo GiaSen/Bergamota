@@ -1,0 +1,56 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 12b8f30..140f173 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -50,6 +50,8 @@ private:
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+ 	void poll(void);
++	unsigned fTicks;        /* 3032: seconds since the last full poll */
++	bool fPlugged;
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value, unsigned sid = 0);
+@@ -441,8 +443,31 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+-		self->poll();
+-		sender->setTimeoutMS(30000);
++		/*
++		 * 3032: the cable used to wait for the 30 s poll, then for powerd: iOS said so about a minute after plugging in (user, 2026-11-01). One byte a
++		 * second on the Mi 8 sees it at once. The charger's own state takes a few seconds more to settle, so the full poll runs again soon after.
++		 */
++		bool due = ++self->fTicks >= 30;
++		bool beryllium = sweet_board_beryllium();
++		if (beryllium) {
++			uint8_t usb = 0;
++			if (sweet_spmi_read(2, 0x1310, &usb) == 0) {
++				bool plugged = (usb & 0x10u) != 0;
++				if (plugged != self->fPlugged) {
++					self->fPlugged = plugged;
++					self->fTicks = 26;
++					due = true;
++					IOLog("SWEET BATTERY: cable %s\n", plugged ? "in" : "out");
++				}
++			}
++		}
++		if (due) {
++			if (self->fTicks >= 30) {
++				self->fTicks = 0;
++			}
++			self->poll();
++		}
++		sender->setTimeoutMS(beryllium ? 1000 : 30000);
+ 	}
+ }
+ 
+@@ -463,7 +488,7 @@ SweetBattery::start(IOService *provider)
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(sweet_board_beryllium() ? 1000 : 30000);
+ 		} else {
+ 			fReal = false;
+ 			poll();

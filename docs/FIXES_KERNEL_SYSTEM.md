@@ -171,10 +171,17 @@ Adreno 630) are in Chlorophyll's own repository: `gpu/metal/docs/FIXES.md`.
 - **Symptom.** After unplugging and replugging, the phone enumerated and took frames but sent none: 0 packets on the Mac, no ARP answer, no SSH, until a reboot. `SWEET USB: ... tx 1733 ... txbusy 0 txq 32` never changing.
 - **Why.** An unplug gives no disconnect event, so the TX queue filled behind the stuck transfer. A bus reset cleared `tx_busy` but not the queue, and `ud_if_output` drops on a full queue without starting it.
 - **Fix.** The queue is emptied at a bus reset.
-- **Check.** Unplug for a minute with traffic running, replug, SSH works. Not tested yet with a real cable.
+- **Check.** Unplug for a minute with traffic running, replug, SSH works. Confirmed by hand, three replugs.
 
 ## Touch chip restarted when it may have lost its way (3027, 3029, 3031, Mi 8, 2026-11-01)
 
 - **Symptom.** Touch dead with buttons and UI working, after the first ever unplug, wall charger and replug. Cause not proven: the chip still sent status events.
 - **Fix.** Reset, CONTROLLER_READY, interrupts and scanning again (about 40 ms) when the display comes on, as fts_521's resume does, when a charger comes or goes, on CONTROLLER_READY, on 3 all-ones events or 5 failed reads in a row. It used to be started once, at boot.
 - **Check.** `kern.sweet_touch_restart=2` pulses reset only; `kern.sweet_touch_stats` shows `readies` and `restarts` rising within a second. If touch dies again, `downs` tells whether the chip still sees fingers.
+
+## iOS heard about the cable late (3032, Mi 8, 2026-11-01)
+
+- **Symptom.** iOS reported a plugged cable about a minute after plugging in.
+- **Why.** `SweetBattery` publishes the power source state from a 30 s poll.
+- **Fix.** The plug bit (0x1310, one byte) is read every second; a change publishes at once, and the full poll runs again 4 s later for the charger state.
+- **Check.** `SWEET BATTERY: cable in` in the log within a second of plugging in, and the charging bolt follows.
