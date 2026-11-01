@@ -1,0 +1,238 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 52137b3..e3c8d31 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -60,6 +60,7 @@ int wl_host_read(const char *part, uint64_t off, void *dst, uint64_t len);
+ #include "sweet_wlan_frames.h"
+ #include "sweet_wpa.h"
+ #include <sys/random.h>
++extern void thread_set_thread_name(thread_t th, const char *name);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -9532,6 +9533,7 @@ wl_bt_start(void)
+ 		printf("SWEET BT: kernel_thread_start failed: Wi-Fi only\n");
+ 		return;
+ 	}
++	thread_set_thread_name(thread, "sweet bt");
+ 	thread_deallocate(thread);
+ 	while (!wl.bt_rails_done && ms < 5000) {
+ 		wl_sleep(10);
+@@ -9632,6 +9634,7 @@ beryllium_wlan_init(void)
+ 	wl.service = stage == 5;
+ 	wl.delay_s = delay_s;
+ 	if (kernel_thread_start(wl_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet wlan");
+ 		thread_deallocate(thread);
+ 	} else {
+ 		printf("SWEET WLAN: kernel_thread_start failed\n");
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index 302d0ea..66a7a0e 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -67,6 +67,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include "sweet_board.h"
++extern void thread_set_thread_name(thread_t th, const char *name);
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/vm/pmap.h, MACH_KERNEL_PRIVATE */
+@@ -3863,6 +3864,7 @@ sweet_gpu_pm_start(void)
+ 		return;
+ 	}
+ 	if (kernel_thread_start((thread_continue_t)a630_pm_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet gpu pm");
+ 		thread_deallocate(thread);
+ 		printf("SWEET GPU: PM thread: idle %u ms, %s, max level %u, hwcg %u, recover %u\n", a630_idle_ms, a630_gov ? "governor" : "fixed level",
+ 		    a630_level_max, a630_hwcg, a630_recover_max);
+@@ -4085,6 +4087,7 @@ sweet_a630_probe(void)
+ 	}
+ 	kern_return_t kr = kernel_thread_start((thread_continue_t)a630_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet gpu");
+ 		thread_deallocate(thread);
+ 	} else {
+ 		printf("SWEET GPU: kernel_thread_start failed %d\n", kr);
+diff --git a/bsd/dev/sweet_charger.c b/bsd/dev/sweet_charger.c
+index 1895568..923b3b1 100644
+--- a/bsd/dev/sweet_charger.c
++++ b/bsd/dev/sweet_charger.c
+@@ -79,6 +79,7 @@
+ #include <stdarg.h>
+ #include "sweet_board.h"
+ #include "sweet_spmi.h"
++extern void thread_set_thread_name(thread_t th, const char *name);
+ 
+ extern kern_return_t thread_terminate(thread_t);
+ void sweet_charger_start(void);
+@@ -736,6 +737,7 @@ sweet_charger_start(void)
+ 	}
+ 	sc_mode = mode;
+ 	if (kernel_thread_start((thread_continue_t)sc_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet charger");
+ 		thread_deallocate(thread);
+ 		printf("SWEET CHARGER: %s, first sample in %u s (ICL cap %u mA, FCC %u mA, float <= %u uV)\n",
+ 		    mode == 2 ? "control (sweetcharger=2)" : "read only (sweetcharger=1)", SC_START_DELAY_S,
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index b696a46..51690e7 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -101,6 +101,7 @@
+ #include <arm/cpu_topology.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_board.h"
++extern void thread_set_thread_name(thread_t th, const char *name);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern uint64_t sweet_processor_idle_time(int cpu);
+@@ -718,6 +719,7 @@ sweet_cpufreq_max(void)
+ 	cf_boost_pct = cf_percent_arg("sweetcpufreq_little_boost_max", 100);
+ start:
+ 	if (kernel_thread_start((thread_continue_t)cf_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet cpufreq");
+ 		thread_deallocate(thread);
+ 	} else {
+ 		printf("SWEET CPUFREQ: kernel_thread_start failed\n");
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 4faeee1..cf21ca5 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -15,6 +15,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_board.h"
++extern void thread_set_thread_name(thread_t th, const char *name);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -184,6 +185,7 @@ sweet_keys_init(void)
+ 	}
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet keys");
+ 		thread_deallocate(thread);
+ 	} else {
+ 		printf("SWEET KEYS: kernel_thread_start failed %d\n", kr);
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index b40eccd..cb9aa77 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -19,6 +19,7 @@
+ #include <kern/task.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
++extern void thread_set_thread_name(thread_t th, const char *name);
+ 
+ extern task_t proc_task(proc_t);
+ extern int hz;
+@@ -83,6 +84,7 @@ sweet_sample_start(void)
+ {
+ 	thread_t thread;
+ 	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet sample");
+ 		thread_deallocate(thread);
+ 	}
+ }
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 6b3175c..b7ad5c8 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -39,6 +39,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_board.h"
++extern void thread_set_thread_name(thread_t th, const char *name);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -1579,6 +1580,7 @@ sweet_touch_init(void)
+ 	}
+ 	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet touch");
+ 		thread_deallocate(thread);
+ 	} else {
+ 		printf("SWEET TOUCH: kernel_thread_start failed %d\n", kr);
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index a627530..63fc5ea 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@
+ #include <machine/atomic.h>
+ 
+ #include "sweet_board.h"
++extern void thread_set_thread_name(thread_t th, const char *name);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -1325,6 +1326,7 @@ sweet_log_start(void)
+ 	}
+ 	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		os_atomic_store(&sweet_log_running, true, release);
++		thread_set_thread_name(thread, "sweet log");
+ 		thread_deallocate(thread);
+ 	}
+ }
+@@ -1558,6 +1560,7 @@ sweet_ufs_syncer_start(void)
+ 		return;
+ 	}
+ 	if (kernel_thread_start(sweet_ufs_syncer_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet ufs sync");
+ 		thread_deallocate(thread);
+ 	}
+ }
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 3cb72e3..ea05e18 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -41,6 +41,7 @@
+ #include <sys/kern_event.h>
+ #include <net/route.h>
+ #include <libkern/OSAtomic.h>
++extern void thread_set_thread_name(thread_t th, const char *name);
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int sweet_smmu_map_sid(unsigned sid);
+@@ -769,6 +770,7 @@ ud_route_kick(void)
+ 		return;
+ 	}
+ 	if (kernel_thread_start(ud_route_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet usb route");
+ 		thread_deallocate(thread);
+ 	} else {
+ 		ud.route_thread = 0;
+@@ -1340,11 +1342,13 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	}
+ 	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet usb net");
+ 		thread_deallocate(thread);
+ 	}
+ 	int livelog = 1;
+ 	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
+ 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet usb log");
+ 		thread_deallocate(thread);
+ 	}
+ }
+diff --git a/iokit/Kernel/arm/SweetBusy.cpp b/iokit/Kernel/arm/SweetBusy.cpp
+index dddbef8..15a7797 100644
+--- a/iokit/Kernel/arm/SweetBusy.cpp
++++ b/iokit/Kernel/arm/SweetBusy.cpp
+@@ -11,6 +11,7 @@
+ #include <IOKit/IORegistryEntry.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
++extern "C" void thread_set_thread_name(thread_t th, const char *name);
+ 
+ static uint32_t sweet_busy_secs;
+ 
+@@ -46,6 +47,7 @@ sweet_busy_init(void)
+ 		return;
+ 	}
+ 	if (kernel_thread_start(sweet_busy_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet busy");
+ 		thread_deallocate(thread);
+ 	}
+ }
