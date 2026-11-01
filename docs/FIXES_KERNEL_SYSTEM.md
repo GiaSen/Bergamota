@@ -135,3 +135,18 @@ Adreno 630) are in Chlorophyll's own repository: `gpu/metal/docs/FIXES.md`.
   (CS_INVALID); SpringBoard went into a TCC crash loop.
 - **Fix (procedure).** Install to a temp file and `mv` it over the original. The scripts (`bgairpush.sh`, the inject
   deploy) do this.
+
+## Phantom button presses: key polling outside the SPMI lock (3024, Mi 8, 2026-11-01)
+
+- **Symptom.** With nobody near the phone, `SWEET KEYS: key=0 down=1 pon=0xf5` and the like, about one event every 30-50 s, 7 to 140 presses per boot, power and both volume keys. Each became a real HID event: the volume slider appeared on its own.
+- **Why.** `sweet_keys.c` polled the PMIC through the SPMI observer channels with no lock while `sweet_spmi.c` used them for the charger, battery and backlight. Linux serialises all of an EE's arbiter access; this did not. Reads came back with garbage data or status 0x9 (done and dropped).
+- **Fix.** Key polling takes `sp_lock` (`kern.sweet_keys_lock`), and a key changes only after 3 reads in a row, 20 ms apart.
+- **Check.** `kern.sweet_keys_glitches` and `kern.sweet_keys_read_errors` stay at 0 (2 and 1 in 180 s with the lock off, 0 and 0 in about 640 s with it on), and no `SWEET KEYS: key=` lines while nobody touches the phone. Real presses still need a person.
+
+## Touch polling paced by the screen (3023, Mi 8, 2026-11-01)
+
+- **Symptom.** `sweet touch` was the kernel's busiest thread at idle, 5.5% of a core with the screen off too: 500 wake-ups a second to read one GPIO. (Thread names come from 3022; `sweetcpu --kernel` shows them.)
+- **Why it is safe to slow down.** The ST FTS holds its line low while events wait in its FIFO, so looking less often loses nothing, only time.
+- **Fix.** 100 ms with the display off (`kern.sweet_touch_off_ms`, new `kern.sweet_fb_display_off`), 4 ms with the screen on and no finger for 2 s (`kern.sweet_touch_idle_ms`), 2 ms otherwise.
+- **Check.** Display off: touch 5.1% -> not listed, kernel_task 1.18 -> 0.74 s in 8 s. Screen on: 5.5% -> 3.0%. A real finger still needs a person; the tools' touches skip this loop.
+- **Not ours.** The 10 Hz redraw on the home screen is the Clock icon's second hand: no GPU work at all on page 2.
