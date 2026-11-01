@@ -45,7 +45,7 @@ screen (image versions v8-v14 in NOTES.md):
                   public key, host keys, launchd job (docs/SSH_OVER_USB.md);
                   skipped if the binaries are not built
 """
-import glob, os, plistlib, shutil, sys
+import glob, os, plistlib, re, shutil, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import renegade_platform as rplat
@@ -1173,10 +1173,18 @@ FIRSTBOOT_SCRIPT = r'''#!/bin/sh
 #     sweetposterset (retried: -2203 while PosterBoard's store has no lock role yet, or the service is not up) and
 #     sweeticonstyle. Marker /private/var/db/.renegade-poster-done
 #  4. disables itself: marker /private/var/db/.renegade-firstboot-done (after 3 incomplete runs too)
+#  Also: the time zone of the Mac that built the image, at the start and the end (iOS defaults to US/Pacific and, with no network or
+#  location, stays there). Settings can change it afterwards: this job does not run again.
 DONE=/private/var/db/.renegade-firstboot-done
 TRIES=/private/var/db/.renegade-firstboot-tries
 [ -e $DONE ] && exit 0
 PATH=/usr/local/bin:/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin:/usr/sbin:/sbin
+set_zone() {
+	[ -n '@ZONE@' ] || return 0
+	mkdir -p /var/db/timezone
+	ln -sf /var/db/timezone/zoneinfo/@ZONE@ /var/db/timezone/localtime
+}
+set_zone
 export PATH
 exec >>/private/var/log/renegade-firstboot.log 2>&1
 n=0
@@ -1309,8 +1317,18 @@ if [ $rc = 0 ] || [ $n -ge 3 ]; then
 	touch $DONE
 	echo "== done (rc=$rc), first-boot job disabled"
 fi
+set_zone
 exit 0
 '''
+
+
+def mac_time_zone():
+    """The zone name this Mac is set to ('Europe/Amsterdam'), or '' if it cannot be read."""
+    try:
+        t = os.readlink('/etc/localtime')
+    except OSError:
+        return ''
+    return t.split('zoneinfo/', 1)[1] if 'zoneinfo/' in t and re.fullmatch(r'[A-Za-z0-9_+/-]+', t.split('zoneinfo/', 1)[1]) else ''
 
 
 def firstboot(root, appreg=True, jb=True, wallpaper=True, metal=False):
@@ -1362,7 +1380,8 @@ def firstboot(root, appreg=True, jb=True, wallpaper=True, metal=False):
                     os.lchown(os.path.join(d, n), 0, 0)
             os.lchown(app, 0, 0)
             print('firstboot: sweetposterset, sweeticonstyle, sweetopen, /Applications/SweetRun.app installed')
-    write_file(os.path.join(root, FIRSTBOOT_SH), FIRSTBOOT_SCRIPT.replace('@APPREG@', '1' if appreg else '0')
+    print('firstboot: time zone', mac_time_zone() or '(left to iOS)')
+    write_file(os.path.join(root, FIRSTBOOT_SH), FIRSTBOOT_SCRIPT.replace('@ZONE@', mac_time_zone()).replace('@APPREG@', '1' if appreg else '0')
                .replace('@WALL@', '1' if wallpaper else '0')
                .replace('@WPROV@', wallpaper_poster(metal).split(':', 1)[0]).replace('@WDESC@', wallpaper_poster(metal).split(':', 1)[1])
                .replace('@WPROV2@', WALLPAPER_COLLECTIONS.split(':', 1)[0]).replace('@WDESC2@', WALLPAPER_COLLECTIONS.split(':', 1)[1]), 0o755)
