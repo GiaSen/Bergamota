@@ -150,3 +150,11 @@ Adreno 630) are in Chlorophyll's own repository: `gpu/metal/docs/FIXES.md`.
 - **Fix.** 100 ms with the display off (`kern.sweet_touch_off_ms`, new `kern.sweet_fb_display_off`), 4 ms with the screen on and no finger for 2 s (`kern.sweet_touch_idle_ms`), 2 ms otherwise.
 - **Check.** Display off: touch 5.1% -> not listed, kernel_task 1.18 -> 0.74 s in 8 s. Screen on: 5.5% -> 3.0%. A real finger still needs a person; the tools' touches skip this loop.
 - **Not ours.** The 10 Hz redraw on the home screen is the Clock icon's second hand: no GPU work at all on page 2.
+
+## Screen-off power: memory clocks and the GPU (3026, Mi 8, 2026-11-01)
+
+- **Symptom.** About 330 mA from the battery with the screen off and nothing running, about 1.25 W, 10 hours of standby. Nothing had measured it.
+- **How to measure.** `kern.sweet_battery_now` reads the fuel gauge; `kern.sweet_usbin_off=SECONDS` runs the phone from the battery for that long with the cable in, so the gauge reads the whole system. With USB power on, the gauge only shows what is left over after the system and the charger's losses.
+- **Fix.** Display off: DDR vote 1000 and L3 row 0, about 50-60 mA; GPU slumber after 30 s (`kern.sweet_gpu_off_idle_ms`), about 20 mA. Result about 270-280 mA. A GPU wake costs 90-240 ms, hence the 30 s.
+- **What did not help.** Panel sleep plus a stopped timing engine (241 -> 240 mA), DDR below 1000, A75s off (15-25 mA, a `cpus=4` boot).
+- **Still there.** Wi-Fi and Bluetooth about 45 mA. About 200 mA unexplained, the USB link among it.
