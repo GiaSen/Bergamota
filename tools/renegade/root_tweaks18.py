@@ -1347,6 +1347,18 @@ def hide_apps(root):
     print('hide_apps: %d more of %d helper apps hidden from the home screen' % (n, len(HIDDEN_APPS)))
 
 
+# Measuring tools, so a freshly flashed phone can be looked at at once (they went missing with every flash). Only where build.sh made them.
+TEST_TOOLS = ('sweetsys', 'sweetcpu', 'sweetsample', 'sweetmem', 'sweetgpu', 'sweetlog', 'sweetlogs', 'sweetcc')
+
+
+def test_tools(root):
+    found = [n for n in TEST_TOOLS if find_sweetnet('ios18/' + n)]
+    for n in found:
+        install_file(find_sweetnet('ios18/' + n), os.path.join(root, 'private/var/root', n))
+    print('test_tools: %d of %d in /var/root%s' % (len(found), len(TEST_TOOLS), '' if len(found) == len(TEST_TOOLS) else
+                                                     ' (missing: %s)' % ' '.join(n for n in TEST_TOOLS if n not in found)))
+
+
 def mac_time_zone():
     """The zone name this Mac is set to ('Europe/Amsterdam'), or '' if it cannot be read."""
     try:
@@ -1688,6 +1700,7 @@ def auto(root):
         metal = bgmtl(root)
     firstboot(root, appreg=enabled('appreg'), jb=enabled('jb'), wallpaper=enabled('wallpaper'), metal=metal)
     hide_apps(root)
+    test_tools(root)
     if enabled('bglrender'):
         bglrender(root)
     if os.environ.get('RENEGADE_DISABLE_CRYPTEXD') == '1':      # opt-in, off by default
