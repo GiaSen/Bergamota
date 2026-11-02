@@ -4,6 +4,7 @@
  *   sweetwifi [-i en0] info          power state, country code, current SSID/BSSID
  *   sweetwifi [-i en0] power on|off  APPLE80211_IOC_POWER through the framework
  *   sweetwifi [-i en0] scan          Apple80211Scan: SCAN_REQ, wait for SCAN_DONE, read results
+ *   sweetwifi [-i en0] disassoc      Apple80211Disassociate: leave the network (wifid usually joins it again)
  *
  * The same calls wifid makes, without wifid or the UI (useful while touch does not work):
  * they reach the kernel stand-in (bsd/dev/sweet_80211.c) as SIOCGA80211/SIOCSA80211 ioctls,
@@ -113,7 +114,7 @@ main(int argc, char **argv)
 		i = 3;
 	}
 	if (i >= argc) {
-		fprintf(stderr, "usage: sweetwifi [-i IF] info | power on|off | scan\n");
+		fprintf(stderr, "usage: sweetwifi [-i IF] info | power on|off | scan | disassoc\n");
 		return 2;
 	}
 	void *h = dlopen("/System/Library/PrivateFrameworks/IO80211.framework/IO80211", RTLD_NOW);
@@ -168,6 +169,10 @@ main(int argc, char **argv)
 		printf("Apple80211SetPower(%u) -> %d\n", on, err);
 	} else if (strcmp(cmd, "scan") == 0) {
 		err = do_scan(ref);
+	} else if (strcmp(cmd, "disassoc") == 0) {
+		int (*a_disassoc)(Apple80211Ref) = sym(h, "Apple80211Disassociate");
+		err = a_disassoc(ref);
+		printf("Apple80211Disassociate -> %d\n", err);
 	} else {
 		fprintf(stderr, "sweetwifi: unknown command %s\n", cmd);
 		err = 2;
