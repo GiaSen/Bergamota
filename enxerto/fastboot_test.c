@@ -155,7 +155,7 @@ static void p_reboot(void *ctx, int mode)
 
 static void p_charger(void *ctx, int raw, char *buf, unsigned n)
 {
-	const char *s = raw ? "st=02/00 apsd=04 je=1f aicl=1 w=3/0" : "applied CDP 1500/2000mA 4395mV FAST 37%";
+	const char *s = raw == 2 ? "3652mV +1063mA 37%" : raw ? "st=02/00 apsd=04 je=1f aicl=1 w=3/0" : "applied CDP 1500/2000mA 4395mV FAST 37%";
 	unsigned i = 0;
 
 	(void)ctx;
@@ -1295,10 +1295,11 @@ int main(void)
 		pc.charger = p_charger;
 		cur_platform = &pc;
 		reset_fake();
-		cmd("getvar:bergamota-charger"); cmd("getvar:bergamota-charger-raw"); cmd("getvar:all");
+		cmd("getvar:bergamota-charger"); cmd("getvar:bergamota-charger-raw"); cmd("getvar:bergamota-battery"); cmd("getvar:all");
 		fb = run_session(&r);
 		CHECK(resp_is(0, "OKAYapplied CDP 1500/2000mA 4395mV FAST 37%"));
 		CHECK(resp_is(1, "OKAYst=02/00 apsd=04 je=1f aicl=1 w=3/0"));
+		CHECK(resp_is(2, "OKAY3652mV +1063mA 37%"));
 		int saw = 0;
 		for (int i = 0; i < n_resp; i++)
 			saw |= !strncmp(resp[i], "INFObergamota-charger: applied CDP", 34);

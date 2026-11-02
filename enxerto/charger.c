@@ -566,6 +566,26 @@ void enxerto_charger_raw(char *buf, unsigned n)
 	sb_u(&b, cs.write_fails);
 }
 
+void enxerto_charger_battery(char *buf, unsigned n)
+{
+	struct sb b = { buf, 0, n };
+
+	buf[0] = 0;
+	if (!cs.ticked || !cs.b.valid) {
+		sb_str(&b, "unavailable");
+		return;
+	}
+	sb_u(&b, cs.b.mv);
+	sb_str(&b, "mV ");
+	if (cs.b.ma_valid) {
+		sb_str(&b, cs.b.ma < 0 ? "-" : "+");
+		sb_u(&b, (unsigned)(cs.b.ma < 0 ? -cs.b.ma : cs.b.ma));
+		sb_str(&b, "mA ");
+	}
+	sb_u(&b, cs.b.soc);
+	sb_str(&b, "%");
+}
+
 void enxerto_charger_line(char *buf, unsigned n)
 {
 	struct sb b = { buf, 0, n };
@@ -606,6 +626,7 @@ void enxerto_charger_tick(int force) { (void)force; }
 void enxerto_charger_handoff(void) { }
 void enxerto_charger_status(char *buf, unsigned n) { (void)n; buf[0] = 'o'; buf[1] = 'f'; buf[2] = 'f'; buf[3] = 0; }
 void enxerto_charger_raw(char *buf, unsigned n) { (void)n; buf[0] = 0; }
+void enxerto_charger_battery(char *buf, unsigned n) { (void)n; buf[0] = 0; }
 void enxerto_charger_line(char *buf, unsigned n) { (void)n; buf[0] = 0; }
 
 #endif
