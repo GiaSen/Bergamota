@@ -1046,6 +1046,10 @@ CHL_TARGETS = (
     ('System/Library/CoreServices/iconservicesagent', True, False),
     (MERCURY_BIN, False, False),
     ('System/Library/ExtensionKit/Extensions/PhotosPosterProvider.appex/PhotosPosterProvider', False, False),
+    # the posters that draw with Metal: without a device their gallery previews are the clock on black, or the extension dies (gpu/metal docs/FIXES.md)
+    ('Applications/UnityPosterApp.app/Extensions/Unity2025Poster.appex/Unity2025Poster', False, False),
+    ('Applications/AegirProxyApp.app/Extensions/AegirPoster.appex/AegirPoster', False, False),
+    ('Applications/KaleidoscopePosterApp.app/Extensions/KaleidoscopePoster.appex/KaleidoscopePoster', False, False),
 )
 CHL_FLAGS = ('bgmtl.arm', 'bgmtl-bb.arm', 'bgmtl-bb.direct')
 # Processes that stay linked but start stock. None now: iconservicesagent's glass layers were lost on the way through IOSurfaces (NOTES 2026-10-31,
