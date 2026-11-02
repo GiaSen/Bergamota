@@ -1,0 +1,130 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index 2526237..bb60b41 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -3698,11 +3698,47 @@ gpu_busy_collect(void)
+  * drawing frames) raises the floor to the boost level for 400 ms after the last such window; the load-based part
+  * (>= 80% up one level, >= 90% two, >= 95% to the cap; < 30% twice in a row one down) never goes below the floor.
+  */
++/*
++ * 3034: who keeps the GPU busy: each tick with work queued goes to the process that submitted the oldest unfinished submission.
++ * The ring is first come first served, so these are also the processes the compositor's frames wait behind. kern.sweet_gpu_by.
++ */
++#define BY_N                    16u
++static struct {
++	int pid;
++	char name[20];
++	uint64_t ns;
++} a630_by[BY_N];
++
++static void
++gpu_by_note(uint64_t dt)
++{
++	uint32_t next = *(volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE) + 1;
++	unsigned s = next % SUBS_N, low = 0;
++
++	if (a630_subs[s].seqno != next) {
++		return;
++	}
++	for (unsigned i = 0; i < BY_N; i++) {
++		if (a630_by[i].ns != 0 && a630_by[i].pid == a630_subs[s].pid) {
++			a630_by[i].ns += dt;
++			return;
++		}
++		if (a630_by[i].ns < a630_by[low].ns) {
++			low = i;
++		}
++	}
++	a630_by[low].pid = a630_subs[s].pid;
++	memcpy(a630_by[low].name, a630_subs[s].name, sizeof(a630_by[low].name));
++	a630_by[low].name[sizeof(a630_by[low].name) - 1] = 0;
++	a630_by[low].ns = dt;
++}
++
+ static void
+ gpu_gov_tick(uint64_t dt)
+ {
+ 	if (!sweet_gpu_fence_done(a630_dev.seqno)) {
+ 		gov_win_busy_ns += dt;
++		gpu_by_note(dt);
+ 	}
+ 	gov_win_ns += dt;
+ 	if (gov_win_ns < 100 * NSEC_PER_MSEC) {
+@@ -3802,6 +3838,24 @@ sweet_gpu_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_gpu_sysctl, "A",
+     "Adreno 630 metrics: key=value line (docs/GPU_KERNEL.md)");
+ 
++static int
++sweet_gpu_by_sysctl(struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	char buf[640];
++	int n = 0;
++
++	buf[0] = 0;
++	for (unsigned i = 0; i < BY_N; i++) {
++		if (a630_by[i].ns != 0) {
++			n += snprintf(buf + n, sizeof(buf) - n, "%s/%d=%llu ", a630_by[i].name, a630_by[i].pid, a630_by[i].ns / NSEC_PER_MSEC);
++		}
++	}
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu_by, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_gpu_by_sysctl, "A",
++    "GPU busy ms per process, name/pid=ms (3034)");
++
+ /*
+  * The same numbers as kern.sweet_gpu's level/mhz/busy_pct/freq/state, for the framebuffer's on-screen HUD (patch 0213):
+  * no formatting, no locks, plain reads of the governor's words. state: 0 off, 1 on, 2 slumber, 3 lost; gov: 1 governor.
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a0d8cfb..d330199 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1157,9 +1157,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+  */
+ /*
+  * 0229: the pending swap is taken only once the GPU work submitted before it has completed (it may be drawing that very
+- * framebuffer), or after a second (a stuck GPU must not stop the display). Called with fLock held.
+- * 3033: it was 50 ms, and a frame that took longer went to the panel half drawn, without its top layers: the wallpaper editor,
+- * whose frames can take over a second, flashed the gallery underneath, black and without its controls.
++ * framebuffer), or after 3 s (a stuck GPU must not stop the display). Called with fLock held.
++ * 3033: it was 50 ms, and a frame that took longer went to the panel half drawn, without its top layers: the wallpaper editor
++ * flashed the gallery underneath, black and without its controls.
++ * 3034: a second was not enough: the ring holds about a second of every process's work there, so frames still ran out. The
++ * limit now only covers a stuck GPU, and when it runs out the older frame goes first, having the better chance of being whole.
+  */
+ bool
+ AppleCLCD::gpuGateOpen(uint64_t now)
+@@ -1173,10 +1175,14 @@ AppleCLCD::gpuGateOpen(uint64_t now)
+ 		return true;
+ 	}
+ 	uint64_t cap;
+-	nanoseconds_to_absolutetime(1000 * NSEC_PER_MSEC, &cap);
++	nanoseconds_to_absolutetime(3000 * NSEC_PER_MSEC, &cap);
+ 	if (now - fPendAbs > cap) {
+ 		fSt.gpuHoldTimeouts++;
+-		fPendFence = 0;
++		if (fOlderValid) {
++			fTakeOlder = true;
++		} else {
++			fPendFence = 0;
++		}
+ 		return true;
+ 	}
+ 	fSt.gpuHolds++;
+@@ -1484,7 +1490,15 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	IOLockLock(fLock);
+ 	fSt.swaps++;
+ 	bool keep = fDirty && !fEarly && sweet_fb_gatepoll && sweet_fb_keepolder && fGateTimer != NULL && fOlder != NULL;
+-	if (keep) {
++	if (keep && fOlderValid && !sweet_gpu_fence_passed(fOlderFence)) {
++		/*
++		 * 3034: the older frame keeps its place until the GPU has finished it, and the frame after it is lost instead. Moving
++		 * every frame down meant that with more than one swap's worth of GPU work queued no frame was ever finished in time,
++		 * and only the gate's limit, showing a frame the GPU was still drawing, got anything to the panel.
++		 */
++		memcpy(dropped, fPendHold, sizeof(dropped));
++		fSt.coalesced++;
++	} else if (keep) {
+ 		/* 3020: the frame the GPU may still be drawing moves down one; only a frame older still is lost */
+ 		if (fOlderValid) {
+ 			memcpy(dropped, fOlderHold, sizeof(dropped));
