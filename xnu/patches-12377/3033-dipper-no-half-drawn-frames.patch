@@ -1,0 +1,33 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index fe762bd..a0d8cfb 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -476,7 +476,7 @@ public:
+ 		uint64_t zcAbs, zcMaxAbs;       /* zero-copy: cache clean + register programming */
+ 		uint64_t cleanAbs, cleans, cleanSkips;
+ 		uint64_t swapWaits, swapWaitAbs, swapWaitTimeouts;      /* SwapWait calls that had to wait, their time, those that gave up */
+-		uint64_t gpuHolds, gpuHoldTimeouts;                     /* 0229: pending swaps held for the GPU, held past 50 ms */
++		uint64_t gpuHolds, gpuHoldTimeouts;                     /* 0229: pending swaps held for the GPU, held past the limit */
+ 		uint64_t replaceWaits, replaceTimeouts;                 /* 0220: frames that waited for the previous one's latch / gave up */
+ 		uint64_t emptySwaps, emptyKept;                         /* 0233: swaps with no layer / of those, the ones that kept the frame */
+ 		uint64_t scanCopies, scanCopyAbs, scanCopyMaxAbs;       /* 0235: frames copied to a scan-out buffer, their time */
+@@ -1157,7 +1157,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+  */
+ /*
+  * 0229: the pending swap is taken only once the GPU work submitted before it has completed (it may be drawing that very
+- * framebuffer), or after 50 ms (a stuck GPU must not stop the display). Called with fLock held.
++ * framebuffer), or after a second (a stuck GPU must not stop the display). Called with fLock held.
++ * 3033: it was 50 ms, and a frame that took longer went to the panel half drawn, without its top layers: the wallpaper editor,
++ * whose frames can take over a second, flashed the gallery underneath, black and without its controls.
+  */
+ bool
+ AppleCLCD::gpuGateOpen(uint64_t now)
+@@ -1171,7 +1173,7 @@ AppleCLCD::gpuGateOpen(uint64_t now)
+ 		return true;
+ 	}
+ 	uint64_t cap;
+-	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &cap);
++	nanoseconds_to_absolutetime(1000 * NSEC_PER_MSEC, &cap);
+ 	if (now - fPendAbs > cap) {
+ 		fSt.gpuHoldTimeouts++;
+ 		fPendFence = 0;
