@@ -8,7 +8,7 @@
  *
  *   ICL by APSD result  DCP 2000 mA, CDP 1500 mA, QC2/QC3 1500 mA (no 9 V negotiation),
  *                       AICL off -> at most 1500 mA; SDP / float / OCP / unknown: hardware limit stays
- *   FCC                 2000 mA (CHARGER_FCC_MA)
+ *   FCC                 2000 mA, 1700 mA on the Mi 8 (CHARGER_FCC_MA)
  *   FV                  never raised; written (4395 mV) only when it reads 0 or above 4395 mV
  *   never touched       JEITA, termination, AICL, HVDCP, type-C, watchdog, OTG
  *   hold + give back    hot / cold / soft-limit / battery-OV / safety-timer bits, unplug, new APSD result
@@ -30,5 +30,7 @@ void enxerto_charger_handoff(void);
 void enxerto_charger_status(char *buf, unsigned n);
 /* "st=02/00 apsd=04 je=1f aicl=1 w=3/0" raw bits for debugging (getvar bergamota-charger-raw) */
 void enxerto_charger_raw(char *buf, unsigned n);
+/* "3652mV +1063mA 1%", what the fuel gauge reads, + = into the battery (getvar bergamota-battery) */
+void enxerto_charger_battery(char *buf, unsigned n);
 /* "charging 1500 mA CDP 37%" for the fastboot screen, "" when there is nothing to say */
 void enxerto_charger_line(char *buf, unsigned n);

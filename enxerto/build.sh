@@ -24,11 +24,11 @@ NM=${CROSS}nm
 # tables of pointers, which need ABS64 relocations (refused below).
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-tree-loop-distribute-patterns -fno-tree-switch-conversion -fno-jump-tables -Wall -Wextra"
 [ "${BOOTLOG:-0}" = 0 ] || CFLAGS="$CFLAGS -DBOOTUI_LOG=1"
-# CHARGER=0 compiles the early fast charging out (charger.c, README); default on, except on dipper until its
-# PMI8998 charger registers have been read back on the phone. Runtime: boot.img cmdline
+# CHARGER=0 compiles the early fast charging out (charger.c, README); default on. Runtime: boot.img cmdline
 # bergamota.charger=0 (off) / =keep (leave the programmed ICL/FCC in place at the kernel hand-off).
-[ "$BOARD" = dipper ] && CHARGER=${CHARGER:-0}
 [ "${CHARGER:-1}" != 0 ] || CFLAGS="$CFLAGS -DENXERTO_CHARGER=0"
+# 0.5 C of the Mi 8's 3400 mAh, as the kernel's sweetcharger_fcc=1700 (the code's 2000 mA is for 4000 mAh)
+[ "$BOARD" = dipper ] && CFLAGS="$CFLAGS -DCHARGER_FCC_MA=1700"
 # BOOTPAUSE=<ms>: wait that long before jumping to xnu (debug photos of the log).
 [ -z "${BOOTPAUSE:-}" ] || CFLAGS="$CFLAGS -DBOOT_PAUSE_MS=${BOOTPAUSE}"
 case $BOARD in

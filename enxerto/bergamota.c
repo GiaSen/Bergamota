@@ -385,7 +385,9 @@ static void p_charger(void *ctx, int raw, char *buf, unsigned n)
 {
 	(void)ctx;
 	enxerto_charger_tick(1);	/* a getvar answers with fresh registers */
-	if (raw)
+	if (raw == 2)
+		enxerto_charger_battery(buf, n);
+	else if (raw)
 		enxerto_charger_raw(buf, n);
 	else
 		enxerto_charger_status(buf, n);

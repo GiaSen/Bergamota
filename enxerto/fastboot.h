@@ -68,7 +68,7 @@ struct fb_platform {
 	void (*display_info)(void *ctx, struct fb *fb);
 	/* getvar usb-speed: "high", "super", "full", ...; may be NULL */
 	const char *(*usb_speed)(void *ctx);
-	/* getvar bergamota-charger (raw=0) / bergamota-charger-raw (raw=1): at most 47 characters into buf; may be NULL */
+	/* getvar bergamota-charger (raw=0) / bergamota-charger-raw (raw=1) / bergamota-battery (raw=2): at most 47 characters into buf; may be NULL */
 	void (*charger)(void *ctx, int raw, char *buf, unsigned n);
 };
 
