@@ -1410,3 +1410,16 @@ Built; image `shim/out/enxerto-boot-ios26full-boot55-wlan-wpa2-assocdone.img` (k
 
 Earlier the same day (boots 52-53): the 5 GHz network of the same AP (-79 dBm) never acknowledged authentication;
 boot 53 ended in a SpringBoard crash reboot caused by the GPU line (its own note).
+
+### 6.4 3035: station power save (2026-11-02, Mi 8)
+
+The radio listened all the time: the join sent STA_POWERSAVE_MODE 0 and nothing turned it on. Now, in ath10k's order (`ath10k_add_interface`, `ath10k_mac_vif_setup_ps`), all on vdev 0:
+
+* At VDEV_CREATE, in the scan setup sequence: STA_POWERSAVE_PARAM (0x9002, tag 109, `{vdev, param, value}`) RX_WAKE_POLICY (0) = WAKE (0), TX_WAKE_THRESHOLD (1) = ALWAYS (1), PSPOLL_COUNT (2) = NO_MAX (0); then STA_POWERSAVE_MODE (0x9001, tag 108, `{vdev, mode}`) 1, because ath10k says the firmware uses more power with it off on a vdev without a channel.
+* At VDEV_START: mode 0, as before.
+* At CONNECTED: INACTIVITY_TIME (3) = 100 ms, then mode 1. `kern.sweet_wlan_ps` and `sweetwlanps=` set the ms, live; 0 is off (ath10k: "Firmware doesn't like 0").
+
+Screen off, on the battery, 5 GHz: about 887 mW against about 1332 mW. Latency on an idle link about 75 ms against about 8 ms; no change in throughput. Numbers and the disproved band claim: NOTES.md.
+
+**Known bug, not from this:** any teardown on the Mi 8 asserts the firmware in `wlan_vdev.c:_wlan_vdev_down:3440`, with or without power save (`sweetwifi disassoc` reproduces it), and Wi-Fi stays gone until a reboot. So the leaving path cannot be tested yet: ath10k also forces mode 1 on a stopped vdev, which is not done here.
+

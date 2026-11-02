@@ -1,0 +1,129 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index a383d34..a728fad 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -43,6 +43,7 @@ int wl_host_read(const char *part, uint64_t off, void *dst, uint64_t len);
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <sys/sysctl.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -4581,7 +4582,25 @@ scan_step(void)
+ 		what = "vdev tx encap native wifi";
+ 		break;
+ 	}
+-	case 8: {                               /* START_SCAN, passive, ath10k defaults */
++	/*
++	 * 3035: power save as ath10k_add_interface sets it up: RX_WAKE_POLICY WAKE, TX_WAKE_THRESHOLD ALWAYS, PSPOLL_COUNT NO_MAX.
++	 * Then on: ath10k_mac_vif_setup_ps says the firmware uses more power with it off on a vdev without a channel.
++	 */
++	case 8:
++	case 9:
++	case 10: {
++		uint32_t v[3] = { 0, (uint32_t)scan.step - 8, scan.step == 9 ? 1u : 0u };
++		n = scan_cmd(c, 0x9002, 109, v, 12);
++		what = "sta power save param";
++		break;
++	}
++	case 11: {
++		uint32_t v[2] = { 0, 1 };
++		n = scan_cmd(c, 0x9001, 108, v, 8);
++		what = "sta power save on (no channel)";
++		break;
++	}
++	case 12: {                              /* START_SCAN, passive, ath10k defaults */
+ 		uint32_t s[25];
+ 		memset(s, 0, sizeof(s));
+ 		s[0] = 0xa000 | (scan.count & 0xfff);   /* scan_id (ATH10K_SCAN_ID 0 for the first) */
+@@ -4619,7 +4638,7 @@ scan_step(void)
+ 	if (!wce.wmi_credits || !wce_send(1, wce.wmi_eid, c, n)) {
+ 		return false;                   /* no credit yet: try again on the next poll */
+ 	}
+-	if (scan.step == 8) {
++	if (scan.step == 12) {
+ 		scan.count++;
+ 	}
+ 	if (scan.count <= 1) {
+@@ -4629,7 +4648,7 @@ scan_step(void)
+ 	scan.step++;
+ 	scan.step_ms = ms_now_ms();
+ 	wf.sent_ms = ms_now_ms();               /* each step gets its own 30 s */
+-	if (scan.step == 9) {
++	if (scan.step == 13) {
+ 		wf.state = WS_SCANNING;
+ 		wf.sent_ms = ms_now_ms();
+ 	}
+@@ -6346,6 +6365,36 @@ sta_peer_assoc(void)
+ 	}
+ }
+ 
++/*
++ * 3035: power save once the link is up (ath10k_mac_vif_setup_ps). With it off the radio listened all the time: 100-125 mA of
++ * about 325 mA with the screen off, on 5 GHz. kern.sweet_wlan_ps, sweetwlanps=: ms without traffic before the firmware sleeps
++ * ("firmware doesn't like 0" there, so 0 here is off); the join turns it off until the link is up (ST_START).
++ */
++static int sta_ps_ms = 100, sta_ps_set = -1;
++SYSCTL_INT(_kern, OID_AUTO, sweet_wlan_ps, CTLFLAG_RW | CTLFLAG_LOCKED, &sta_ps_ms, 0, "ms without Wi-Fi traffic before the radio sleeps, 0 = never");
++
++static void
++sta_ps_mode(uint32_t on, const char *what)
++{
++	uint8_t c[32];
++	uint32_t v[2] = { 0, on };
++	sta_wmi(c, scan_cmd(c, 0x9001, 108, v, 8), what);
++}
++
++static void
++sta_ps_apply(void)
++{
++	int ms = sta_ps_ms;
++	if (ms > 0) {
++		uint8_t c[32];
++		uint32_t v[3] = { 0, 3, (uint32_t)ms };         /* INACTIVITY_TIME */
++		sta_wmi(c, scan_cmd(c, 0x9002, 109, v, 12), "power save inactivity time");
++	}
++	sta_ps_mode(ms > 0, ms > 0 ? "power save on" : "power save off");
++	sta_ps_set = ms;
++	printf("SWEET WLAN sta: power save %s, %d ms\n", ms > 0 ? "on" : "off", ms);
++}
++
+ static void
+ sta_connected(void)
+ {
+@@ -6355,6 +6404,7 @@ sta_connected(void)
+ 	    sta.bssid[1], sta.bssid[2], sta.bssid[3], sta.bssid[4], sta.bssid[5], sta.aid, sta.rsn ? "WPA2-PSK" : "open",
+ 	    ms_now_ms() - sta.join_ms);
+ 	ipc_note(" sta CONNECTED %llu ms;", ms_now_ms() - sta.join_ms);
++	sta_ps_apply();
+ 	sweet80211_link(1, 0, false);           /* link state and events first: wifid reads them once GET 21 says 1 */
+ 	lck_mtx_lock(&sta_lock);
+ 	if (!sta.req_pending) {
+@@ -6496,6 +6546,9 @@ sta_step(void)
+ 		}
+ 		break;
+ 	case ST_CONNECTED:
++		if (sta_ps_ms != sta_ps_set) {
++			sta_ps_apply();
++		}
+ 		if (sta.key_pending[1] && sta.keys_step != 3) {
+ 			sta_install_key(false);         /* group rekey */
+ 			sta.keys_step = 3;
+@@ -7129,7 +7182,7 @@ svc_scan(void)
+ 	scan.foreign = 0;
+ 	scan.started = false;
+ 	scan.completed = false;
+-	scan.step = 8;                          /* START_SCAN only: the setup steps are done */
++	scan.step = 12;                         /* START_SCAN only: the setup steps are done */
+ 	wf.sent_ms = ms_now_ms();
+ }
+ 
+@@ -9610,6 +9663,7 @@ beryllium_wlan_init(void)
+ 		return;                 /* off by default: no log line, no mapping */
+ 	}
+ 	(void)PE_parse_boot_argn("sweetwlandelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("sweetwlanps", &sta_ps_ms, sizeof(sta_ps_ms));
+ 	/* Bluetooth firmware (stage 2): sweetbtfw=1 (default) downloads rampatch + NVM when the files exist */
+ 	wl.bt_fw = 1;
+ 	wl.bt_baud = 3000000;           /* 3200000 is the dtsi max-speed and also has an exact S6 rate */
