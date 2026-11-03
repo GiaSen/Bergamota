@@ -1,0 +1,646 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1b3074c..9e9ff71 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,7 @@ bsd/dev/sweet_fb.c			standard
+ bsd/dev/sweet_a630.c			standard
+ bsd/dev/sweet_a630_pas.c			standard
+ bsd/dev/beryllium_wlan.c		standard
++bsd/dev/dipper_audio.c		standard
+ bsd/dev/sweet_80211.c			standard
+ bsd/dev/sweet_wpa.c			standard
+ bsd/dev/sweet_wlan_frames.c		standard
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 8d98cc0..a28c669 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -1881,12 +1881,12 @@ ms_smem_unlock(void)
+  * Returns the data offset in SMEM, 0 on failure. This is the first write into shared SMEM.
+  */
+ static uint32_t
+-ms_smem_alloc(uint32_t item, uint32_t size)
++ms_smem_alloc_in(uint32_t host, uint32_t item, uint32_t size)
+ {
+ 	uint32_t off, psize, data = 0, free_u = 0, free_c = 0, pos = 0, have = 0;
+ 	enum { A_BAD, A_EXISTS, A_SMALL, A_NEW, A_FULL } res = A_BAD;
+-	if (!ms_smem_part(0, 1, &off, &psize)) {
+-		printf("SWEET MSS: no apps<->modem SMEM partition\n");
++	if (!ms_smem_part(0, host, &off, &psize)) {
++		printf("SWEET MSS: no apps<->host %u SMEM partition\n", host);
+ 		return 0;
+ 	}
+ 	if (!ms_smem_lock()) {
+@@ -1948,13 +1948,20 @@ out:
+ 		printf("SWEET MSS: SMEM partition out of memory\n");
+ 		break;
+ 	case A_BAD:
+-		printf("SWEET MSS: apps<->modem partition not sane (free %#x/%#x size %#x, walk ended at +%#x)\n",
+-		    free_u, free_c, psize, pos - off);
++		printf("SWEET MSS: apps<->host %u partition not sane (free %#x/%#x size %#x, walk ended at +%#x)\n",
++		    host, free_u, free_c, psize, pos - off);
+ 		break;
+ 	}
+ 	return data;
+ }
+ 
++/* the modem's partition (host 1), as before the audio DSP needed the same for host 2 */
++static uint32_t
++ms_smem_alloc(uint32_t item, uint32_t size)
++{
++	return ms_smem_alloc_in(1, item, size);
++}
++
+ /* qcom_smp2p_kick(): apcs ipc doorbell, sdm845 apss_shared +12, channel 14 for the modem */
+ static void
+ ms_smp2p_kick(void)
+@@ -9723,5 +9730,117 @@ beryllium_wlan_init(void)
+ 	}
+ }
+ 
++/*
++ * ---- shared with bsd/dev/dipper_audio.c (the audio DSP, 3040): SMEM, AOSS QMP, files of the modem partition. Same code
++ * as the modem path; SMEM offsets are relative to the SMEM base, hosts as in qcom_smem.c (1 modem, 2 lpass). The FAT reader
++ * has static buffers: the audio driver starts after the Wi-Fi bring-up (its own delay), and both take sweet_share_lock here.
++ */
++static LCK_GRP_DECLARE(sweet_share_grp, "sweet_share");
++static LCK_MTX_DECLARE(sweet_share_lock, &sweet_share_grp);
++static struct wl_fat sweet_share_fat;
++
++static bool
++sweet_share_map(void)
++{
++	if (!wl.smem) {
++		wl.smem = ml_io_map(WL_SMEM_PA, WL_SMEM_SIZE);
++	}
++	if (!wl.mutex) {
++		wl.mutex = ml_io_map(WL_MUTEX_PA, 0x4000);
++	}
++	if (!ms.qmp) {
++		ms.qmp = ml_io_map(MSS_QMP_PA, 0x1000);
++	}
++	if (!ms.ipc) {
++		ms.ipc = ml_io_map(MSS_APSS_SHARED_PA, 0x1000);
++	}
++	return wl.smem && wl.mutex && ms.qmp && ms.ipc;
++}
++
++uint32_t
++sweet_smem_rd(uint32_t off)
++{
++	return sweet_share_map() && off < WL_SMEM_SIZE ? smem_u32(off) : 0;
++}
++
++void
++sweet_smem_wr(uint32_t off, uint32_t val)
++{
++	if (sweet_share_map() && off < WL_SMEM_SIZE) {
++		wl_wr(wl.smem, off & ~3u, val);
++	}
++}
++
++/* data offset of an item in the apps<->host partition (0xfffe: the global one), 0 = none */
++uint32_t
++sweet_smem_item(uint32_t host, uint32_t item, uint32_t *size)
++{
++	uint32_t sz = 0, it = 0;
++	if (sweet_share_map()) {
++		it = host == 0xfffe ? ms_smem_item(0xfffe, 0xfffe, item, &sz) : ms_smem_item(0, host, item, &sz);
++	}
++	if (size) {
++		*size = sz;
++	}
++	return it;
++}
++
++uint32_t
++sweet_smem_alloc(uint32_t host, uint32_t item, uint32_t size)
++{
++	return sweet_share_map() ? ms_smem_alloc_in(host, item, size) : 0;
++}
++
++/* the APCS IPC doorbell (apss_shared +12): one bit per remote channel */
++void
++sweet_apcs_kick(unsigned bit)
++{
++	if (sweet_share_map()) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		wl_wr(ms.ipc, 12, 1u << bit);
++	}
++}
++
++/* one AOSS QMP message, opening the channel the first time (the modem path opens it the same way) */
++bool
++sweet_qmp_send(const char *msg)
++{
++	bool ok = false;
++	lck_mtx_lock(&sweet_share_lock);
++	if (sweet_share_map() && (ms.qmp_open || ms_qmp_open())) {
++		ok = ms_qmp_send(msg);
++	}
++	lck_mtx_unlock(&sweet_share_lock);
++	return ok;
++}
++
++/*
++ * A file of the modem partition's FAT16 (e.g. "image/adsp.mdt"): its first cluster and size, 0 or an errno. Mounted again
++ * for every call: the FAT lives in wl_fatbuf, which a mount of another partition (bluetooth) overwrites.
++ */
++int
++sweet_modem_file(const char *path, uint32_t *cluster, uint32_t *size)
++{
++	lck_mtx_lock(&sweet_share_lock);
++	int err = fat_mount(&sweet_share_fat, "modem");
++	if (!err) {
++		err = fat_open(&sweet_share_fat, path, cluster, size);
++	}
++	lck_mtx_unlock(&sweet_share_lock);
++	return err;
++}
++
++int
++sweet_modem_file_read(uint32_t cluster, uint64_t off, void *dst, uint64_t len)
++{
++	lck_mtx_lock(&sweet_share_lock);
++	int err = fat_mount(&sweet_share_fat, "modem");
++	if (!err) {
++		err = fat_read_chain(&sweet_share_fat, cluster, off, dst, len);
++	}
++	lck_mtx_unlock(&sweet_share_lock);
++	return err;
++}
++
+ #endif /* !WLAN_HOST_TEST */
+ #endif /* WLAN_HOST_TEST || ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+new file mode 100644
+index 0000000..3ef34c6
+--- /dev/null
++++ b/bsd/dev/dipper_audio.c
+@@ -0,0 +1,412 @@
++/*
++ * Mi 8 (dipper, SDM845) audio, patch 3040 onwards: the audio DSP (LPASS QDSP6, "adsp") first; the speaker path is
++ * DSP -> QUAT MI2S -> TI TAS2557 smart amp (I2C 0x4c on i2c@894000), the WCD9340 codec only serves the headset.
++ *
++ * OFF by default. Boot-arg sweetaudio=N runs the stages up to N; sweetaudiodelay=S waits S seconds after the root
++ * device is up first (default 150: after the Wi-Fi bring-up, which shares the modem partition's FAT reader).
++ *
++ *   1  read-only probe: image/adsp.mdt from the modem partition, its segments against the adsp_region carve-out, every
++ *      adsp.bNN present with the right size, the apps<->lpass SMEM partition and its SMP2P/GLINK items, SCM PAS
++ *      availability. Writes nothing.
++ *   2  boot: AOSS QMP load_state adsp on, RPMh cx vote, our SMP2P item (429, "master-kernel"), PAS id 1
++ *      INIT_IMAGE (the .mdt) + MEM_SETUP (the carve-out) + segments + AUTH_AND_RESET, then the DSP's SMP2P item
++ *      (443, "slave-kernel": bit 0 fatal, 1 ready, 2 handover, 3 stop ack) until ready. The DSP keeps running.
++ *
++ * Facts from the live DT (dtb/dipper/live.dtb): qcom,lpass@17300000 pil-tz-generic, qcom,pas-id 1, firmware "adsp",
++ * memory-region adsp_region@0x8c500000 0x1e00000 (no-map, in the low DDR bank the kernel does not manage),
++ * qcom,signal-aop, vdd_cx level 0x181, qcom,smem-id 423 (crash reason); smp2p-adsp remote pid 2, doorbell
++ * 0x1799000c bit 10, IRQ 158. Linux: qcom_q6v5_pas.c (sdm845 adsp: "cx" proxy, load_state "adsp"), qcom_mdt_loader.c,
++ * qcom_smp2p.c (sdm845.dtsi smp2p-lpass qcom,smem = <443>, <429>).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/kalloc.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
++#include "sweet_board.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
++extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
++extern void thread_set_thread_name(thread_t th, const char *name);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_log_sync(void);
++extern int sweet_rpmh_arc_vote(const char *res, bool max);
++/* bsd/dev/sweet_a630_pas.c */
++extern int sweet_scm_pas(uint32_t pas_id, uint32_t cmd, uint32_t arginfo, uint64_t arg1, uint64_t arg2);
++/* bsd/dev/beryllium_wlan.c */
++extern uint32_t sweet_smem_rd(uint32_t off);
++extern void sweet_smem_wr(uint32_t off, uint32_t val);
++extern uint32_t sweet_smem_item(uint32_t host, uint32_t item, uint32_t *size);
++extern uint32_t sweet_smem_alloc(uint32_t host, uint32_t item, uint32_t size);
++extern void sweet_apcs_kick(unsigned bit);
++extern bool sweet_qmp_send(const char *msg);
++extern int sweet_modem_file(const char *path, uint32_t *cluster, uint32_t *size);
++extern int sweet_modem_file_read(uint32_t cluster, uint64_t off, void *dst, uint64_t len);
++void dipper_audio_init(void);
++
++#define AU_PAS_ID               1u
++#define AU_REGION_PA            0x8c500000ull   /* adsp_region */
++#define AU_REGION_SIZE          0x1e00000u
++#define AU_HOST                 2u              /* qcom_smem host / smp2p remote pid of lpass */
++#define AU_SMP2P_IN             443u
++#define AU_SMP2P_OUT            429u
++#define AU_SMP2P_DOORBELL       10u
++#define AU_CRASH_ITEM           423u
++#define AU_GLINK_DESC           478u            /* SMEM_GLINK_NATIVE_XPRT_DESCRIPTOR, per edge partition */
++#define SMP2P_MAGIC             0x504d5324u     /* "$SMP" */
++#define SMP2P_MAX_ENTRY         16u
++#define SMP2P_ITEM_SIZE         (20u + SMP2P_MAX_ENTRY * 20u)
++#define SMP2P_FEATURE_SSR_ACK   1u
++#define MDT_MAX_PHDRS           32u
++#define PT_LOAD                 1u
++#define MDT_TYPE_MASK           (7u << 24)
++#define MDT_TYPE_HASH           (2u << 24)
++#define MDT_RELOCATABLE         (1u << 27)
++#define AU_CHUNK                (1u << 20)
++
++static struct {
++	unsigned stage, delay_s;
++	uint8_t *mdt;
++	uint32_t mdt_size;
++	unsigned phnum;
++	uint64_t lo, hi;                /* extent of the loadable segments */
++	bool relocate;
++	uint32_t smp2p_out;
++	vm_offset_t region;
++} au;
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static void
++au_sleep(unsigned ms)
++{
++	delay((uint64_t)ms * 1000);
++}
++
++/* ---- the .mdt: ELF32 header + program headers + hash segment, which is also the PAS metadata */
++static bool
++au_mdt_load(void)
++{
++	uint32_t cl = 0, size = 0;
++	int err = sweet_modem_file("image/adsp.mdt", &cl, &size);
++	if (err || size < 52 || size > 0x10000) {
++		printf("SWEET AUDIO: image/adsp.mdt: error %d, %u bytes\n", err, size);
++		return false;
++	}
++	au.mdt = kalloc_data(size, Z_WAITOK | Z_ZERO);
++	if (!au.mdt || sweet_modem_file_read(cl, 0, au.mdt, size)) {
++		printf("SWEET AUDIO: image/adsp.mdt: read failed\n");
++		return false;
++	}
++	au.mdt_size = size;
++	const uint8_t *e = au.mdt;
++	uint32_t phoff = le32(e + 28);
++	au.phnum = (unsigned)(e[44] | (e[45] << 8));
++	if (le32(e) != 0x464c457fu || e[4] != 1 || au.phnum == 0 || au.phnum > MDT_MAX_PHDRS || phoff + 32u * au.phnum > size) {
++		printf("SWEET AUDIO: image/adsp.mdt is not a Qualcomm ELF32 (magic %#x phnum %u)\n", le32(e), au.phnum);
++		return false;
++	}
++	au.lo = ~0ull;
++	au.hi = 0;
++	for (unsigned i = 0; i < au.phnum; i++) {
++		const uint8_t *p = e + phoff + 32 * i;
++		uint32_t type = le32(p), paddr = le32(p + 12), memsz = le32(p + 20), flags = le32(p + 24);
++		if (type != PT_LOAD || (flags & MDT_TYPE_MASK) == MDT_TYPE_HASH || memsz == 0) {
++			continue;
++		}
++		au.relocate |= !!(flags & MDT_RELOCATABLE);
++		au.lo = MIN(au.lo, paddr);
++		au.hi = MAX(au.hi, ((uint64_t)paddr + memsz + 0xfff) & ~0xfffull);
++	}
++	printf("SWEET AUDIO: adsp.mdt %u bytes, %u phdrs, %s image %#llx..%#llx (%llu KiB), carve-out %#llx+%#x: %s\n", size,
++	    au.phnum, au.relocate ? "relocatable" : "fixed", au.lo, au.hi, (au.hi - au.lo) >> 10, AU_REGION_PA, AU_REGION_SIZE,
++	    au.hi > au.lo && au.hi - au.lo <= AU_REGION_SIZE && (au.relocate || au.lo == AU_REGION_PA) ? "fits" : "DOES NOT FIT");
++	return au.hi > au.lo && au.hi - au.lo <= AU_REGION_SIZE && (au.relocate || au.lo == AU_REGION_PA);
++}
++
++/* each loadable segment's adsp.bNN, checked (copy == NULL) or copied into the mapped carve-out */
++static bool
++au_segments(vm_offset_t copy)
++{
++	const uint8_t *e = au.mdt;
++	uint32_t phoff = le32(e + 28);
++	uint8_t *buf = copy ? kalloc_data(AU_CHUNK, Z_WAITOK) : NULL;
++	bool ok = !copy || buf;
++	for (unsigned i = 0; ok && i < au.phnum; i++) {
++		const uint8_t *p = e + phoff + 32 * i;
++		uint32_t type = le32(p), paddr = le32(p + 12), filesz = le32(p + 16), memsz = le32(p + 20), flags = le32(p + 24);
++		if (type != PT_LOAD || (flags & MDT_TYPE_MASK) == MDT_TYPE_HASH || memsz == 0) {
++			continue;
++		}
++		uint64_t off = (uint64_t)paddr - (au.relocate ? au.lo : AU_REGION_PA);
++		char name[24];
++		snprintf(name, sizeof(name), "image/adsp.b%02u", i);
++		uint32_t cl = 0, size = 0;
++		if (filesz && (sweet_modem_file(name, &cl, &size) || size != filesz)) {
++			printf("SWEET AUDIO: %s: %u bytes, segment wants %u\n", name, size, filesz);
++			ok = false;
++			break;
++		}
++		if (off + memsz > AU_REGION_SIZE || filesz > memsz) {
++			printf("SWEET AUDIO: segment %u outside the carve-out\n", i);
++			ok = false;
++			break;
++		}
++		if (!copy) {
++			continue;
++		}
++		for (uint32_t o = 0; o < filesz; o += AU_CHUNK) {
++			uint32_t n = MIN(AU_CHUNK, filesz - o);
++			if (sweet_modem_file_read(cl, o, buf, n)) {
++				printf("SWEET AUDIO: %s: read failed at %u\n", name, o);
++				ok = false;
++				break;
++			}
++			for (uint32_t w = 0; w < n; w += 4) {
++				uint32_t v = 0;
++				for (uint32_t b = 0; b < 4 && w + b < n; b++) {
++					v |= (uint32_t)buf[w + b] << (8 * b);
++				}
++				*(volatile uint32_t *)(copy + off + o + w) = v;
++			}
++		}
++		for (uint32_t z = (filesz + 3) & ~3u; ok && z < memsz; z += 4) {    /* qcom_mdt_load: the rest of memsz zeroed */
++			*(volatile uint32_t *)(copy + off + z) = 0;
++		}
++		if (copy && ok) {
++			printf("SWEET AUDIO: segment %u: %u bytes (+%u zero) -> carve-out +%#llx\n", i, filesz, memsz - filesz, off);
++		}
++	}
++	if (buf) {
++		kfree_data(buf, AU_CHUNK);
++	}
++	return ok;
++}
++
++/* ---- SMP2P with the DSP (qcom_smp2p.c), in the apps<->lpass SMEM partition */
++static void
++au_smp2p_entry(uint32_t d, const char *name)
++{
++	uint32_t valid = sweet_smem_rd(d + 12) >> 16;
++	char b[16];
++	memset(b, 0, sizeof(b));
++	strlcpy(b, name, sizeof(b));
++	for (uint32_t c = 0; c < 16; c += 4) {
++		uint32_t w;
++		memcpy(&w, b + c, 4);
++		sweet_smem_wr(d + 20 + valid * 20 + c, w);
++	}
++	sweet_smem_wr(d + 20 + valid * 20 + 16, 0);
++	sweet_smem_wr(d + 12, SMP2P_MAX_ENTRY | ((valid + 1) << 16));
++}
++
++static bool
++au_smp2p_out(void)
++{
++	uint32_t d = sweet_smem_alloc(AU_HOST, AU_SMP2P_OUT, SMP2P_ITEM_SIZE);
++	if (!d) {
++		return false;
++	}
++	for (uint32_t k = 0; k < SMP2P_ITEM_SIZE; k += 4) {
++		sweet_smem_wr(d + k, 0);
++	}
++	sweet_smem_wr(d + 0, SMP2P_MAGIC);
++	sweet_smem_wr(d + 4, SMP2P_FEATURE_SSR_ACK << 8);
++	sweet_smem_wr(d + 8, 0u | (AU_HOST << 16));            /* local pid 0, remote pid 2 */
++	sweet_smem_wr(d + 12, SMP2P_MAX_ENTRY);
++	sweet_smem_wr(d + 4, (SMP2P_FEATURE_SSR_ACK << 8) | 1u);
++	sweet_apcs_kick(AU_SMP2P_DOORBELL);
++	au_smp2p_entry(d, "master-kernel");
++	sweet_apcs_kick(AU_SMP2P_DOORBELL);
++	au.smp2p_out = d;
++	printf("SWEET AUDIO: smp2p item %u at +%#x: version 1, pid 0->2, entry master-kernel, doorbell bit %u\n", AU_SMP2P_OUT, d,
++	    AU_SMP2P_DOORBELL);
++	return true;
++}
++
++/* the DSP's "slave-kernel" bits, false while its item or entry does not exist */
++static bool
++au_smp2p_in(uint32_t *bits)
++{
++	uint32_t sz = 0, it = sweet_smem_item(AU_HOST, AU_SMP2P_IN, &sz);
++	if (!it || sz < 20 || sweet_smem_rd(it) != SMP2P_MAGIC) {
++		return false;
++	}
++	uint32_t valid = MIN(sweet_smem_rd(it + 12) >> 16, SMP2P_MAX_ENTRY);
++	for (uint32_t k = 0; k < valid && 20 + (k + 1) * 20 <= sz; k++) {
++		char name[17];
++		for (uint32_t c = 0; c < 16; c += 4) {
++			uint32_t w = sweet_smem_rd(it + 20 + k * 20 + c);
++			memcpy(name + c, &w, 4);
++		}
++		name[16] = 0;
++		if (strcmp(name, "slave-kernel") == 0) {
++			*bits = sweet_smem_rd(it + 20 + k * 20 + 16);
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++au_crash_reason(void)
++{
++	uint32_t sz = 0, it = sweet_smem_item(0xfffe, AU_CRASH_ITEM, &sz);
++	if (!it || !sz) {
++		printf("SWEET AUDIO: no crash reason in SMEM (item %u)\n", AU_CRASH_ITEM);
++		return;
++	}
++	char msg[129];
++	uint32_t n = MIN(sz, 128u);
++	for (uint32_t k = 0; k < n; k += 4) {
++		uint32_t w = sweet_smem_rd(it + k);
++		memcpy(msg + k, &w, MIN(4u, n - k));
++	}
++	msg[n] = 0;
++	printf("SWEET AUDIO: DSP crash reason: \"%s\"\n", msg);
++}
++
++/* ---- stage 1 */
++static bool
++au_probe(void)
++{
++	bool ok = au_mdt_load() && au_segments(0);
++	uint32_t sz = 0;
++	uint32_t in = sweet_smem_item(AU_HOST, AU_SMP2P_IN, &sz), bits = 0;
++	printf("SWEET AUDIO: SMEM apps<->lpass: smp2p in %u at +%#x (%u bytes)%s, out %u at +%#x, glink descriptor %u at +%#x\n",
++	    AU_SMP2P_IN, in, sz, au_smp2p_in(&bits) ? "" : " (no slave-kernel)", AU_SMP2P_OUT,
++	    sweet_smem_item(AU_HOST, AU_SMP2P_OUT, NULL), AU_GLINK_DESC, sweet_smem_item(AU_HOST, AU_GLINK_DESC, NULL));
++	printf("SWEET AUDIO: probe %s\n", ok ? "OK: firmware complete and fits" : "FAILED");
++	sweet_log_sync();
++	return ok;
++}
++
++/* ---- stage 2 */
++static bool
++au_boot(void)
++{
++	if (!sweet_qmp_send("{class: image, res: load_state, name: adsp, val: on}")) {
++		printf("SWEET AUDIO: QMP load_state not consumed\n");
++		return false;
++	}
++	if (sweet_rpmh_arc_vote("cx.lvl", true) != 0) {     /* kept: the modem holds the same apps vote while Wi-Fi runs */
++		printf("SWEET AUDIO: cx vote failed\n");
++		return false;
++	}
++	if (!au_smp2p_out()) {
++		return false;
++	}
++	/* metadata in contiguous write-combined memory (dma_alloc_coherent in Linux), as for the GPU's zap shader */
++	vm_offset_t kva;
++	vm_size_t msize = round_page(au.mdt_size);
++	if (kmem_alloc_contig(kernel_map, &kva, msize, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET AUDIO: metadata allocation failed\n");
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	for (unsigned i = 1; pn && i < msize / PAGE_SIZE; i++) {
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(kva + i * PAGE_SIZE)) != pn + i) {
++			pn = 0;
++		}
++	}
++	if (!pn) {
++		printf("SWEET AUDIO: metadata not physically contiguous\n");
++		return false;
++	}
++	memcpy((void *)kva, au.mdt, au.mdt_size);
++	sweet_dma_sync_va((const void *)kva, msize);
++	for (unsigned i = 0; i < msize / PAGE_SIZE; i++) {
++		pmap_set_cache_attributes(pn + i, VM_WIMG_WCOMB);
++	}
++	sweet_dma_sync_va((const void *)kva, msize);
++	uint64_t size = au.hi - au.lo;
++	if (sweet_scm_pas(AU_PAS_ID, 1, 0x82, ptoa_64(pn), 0) != 0) {             /* INIT_IMAGE, SCM_ARGS(2, VAL, RW) */
++		return false;
++	}
++	bool started = false;
++	if (sweet_scm_pas(AU_PAS_ID, 2, 3, AU_REGION_PA, size) == 0 &&            /* MEM_SETUP */
++	    (au.region = ml_io_map((vm_offset_t)AU_REGION_PA, AU_REGION_SIZE)) != 0 && au_segments(au.region)) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		started = sweet_scm_pas(AU_PAS_ID, 5, 1, 0, 0) == 0;                 /* AUTH_AND_RESET */
++	}
++	if (!started) {
++		(void)sweet_scm_pas(AU_PAS_ID, 6, 1, 0, 0);                         /* SHUTDOWN */
++		return false;
++	}
++	printf("SWEET AUDIO: DSP authenticated and started\n");
++	sweet_log_sync();
++	uint32_t bits = 0, last = ~0u;
++	for (unsigned t = 0; t < 10000; t += 10) {
++		bool have = au_smp2p_in(&bits);
++		if (have && bits != last) {
++			printf("SWEET AUDIO: +%u ms: slave-kernel %#x (fatal %u ready %u handover %u stop-ack %u)\n", t, bits, bits & 1,
++			    (bits >> 1) & 1, (bits >> 2) & 1, (bits >> 3) & 1);
++			last = bits;
++		}
++		if (have && (bits & 1)) {
++			au_crash_reason();
++			return false;
++		}
++		if (have && (bits & 2)) {
++			uint32_t gl = sweet_smem_item(AU_HOST, AU_GLINK_DESC, NULL);
++			printf("SWEET AUDIO: DSP READY after %u ms; glink descriptor %u %s\n", t, AU_GLINK_DESC,
++			    gl ? "present" : "not there yet");
++			sweet_log_sync();
++			return true;
++		}
++		au_sleep(10);
++	}
++	printf("SWEET AUDIO: no ready from the DSP in 10 s (slave-kernel %s %#x)\n", last == ~0u ? "never seen," : "last", bits);
++	au_crash_reason();
++	return false;
++}
++
++static void
++au_thread(void *arg, wait_result_t w)
++{
++	(void)arg;
++	(void)w;
++	printf("SWEET AUDIO: stage %u in %u s\n", au.stage, au.delay_s);
++	au_sleep(au.delay_s * 1000);
++	if (au_probe() && au.stage >= 2) {
++		(void)au_boot();
++	}
++	sweet_log_sync();
++	(void)thread_terminate(current_thread());
++}
++
++void
++dipper_audio_init(void)
++{
++	unsigned stage = 0, delay_s = 150;
++	(void)PE_parse_boot_argn("sweetaudio", &stage, sizeof(stage));
++	(void)PE_parse_boot_argn("sweetaudiodelay", &delay_s, sizeof(delay_s));
++	if (!stage) {
++		return;
++	}
++	if (!sweet_board_is("xiaomi,dipper")) {
++		printf("SWEET AUDIO: sweetaudio=%u is for the Mi 8 (dipper): ignored\n", stage);
++		return;
++	}
++	au.stage = stage;
++	au.delay_s = delay_s;
++	thread_t th;
++	if (kernel_thread_start(au_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_set_thread_name(th, "sweet audio");
++		thread_deallocate(th);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_a630_pas.c b/bsd/dev/sweet_a630_pas.c
+index 97c4c2d..19c1713 100644
+--- a/bsd/dev/sweet_a630_pas.c
++++ b/bsd/dev/sweet_a630_pas.c
+@@ -332,6 +332,30 @@ out:
+ 	return ok;
+ }
+ 
++/*
++ * 3040: one PAS call for another peripheral (the audio DSP is pas id 1; bsd/dev/dipper_audio.c). cmd 1 INIT_IMAGE,
++ * 2 MEM_SETUP, 5 AUTH_AND_RESET, 6 SHUTDOWN; arginfo as SCM_ARGS. 0 = done with status and result 0, 1 = an error
++ * from TrustZone, -1 = the call did not complete (interrupted or busy for good: make no further calls).
++ */
++int
++sweet_scm_pas(uint32_t pas_id, uint32_t cmd, uint32_t arginfo, uint64_t arg1, uint64_t arg2)
++{
++	struct scm_regs r;
++	const struct scm_regs initial = {
++		{ SCM_64 | SCM_SIP | 0x0200u | cmd, arginfo, pas_id, arg1, arg2, 0, 0 }
++	};
++	__asm__ volatile ("dsb sy" ::: "memory");
++	bool done = scm_invoke(&initial, false, &r);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("SWEET PAS: id %u cmd %u args %#llx/%#llx: completed=%u status=%d result=%d\n", pas_id, cmd, arg1, arg2, done,
++	    (int32_t)r.a[0], (int32_t)r.a[1]);
++	sweet_log_sync();
++	if (!done) {
++		return -1;
++	}
++	return (int32_t)r.a[0] == 0 && (int32_t)r.a[1] == 0 ? 0 : 1;
++}
++
+ /* SHUTDOWN after a successful or partial load; true when quiesced (or never started). */
+ bool
+ sweet_a630_zap_shutdown(void)
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 63fc5ea..d812017 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -72,6 +72,7 @@ extern void sweet_keys_init(void);
+ extern void sweet_reboot_init(void);
+ extern void sweet_touch_init(void);
+ extern void beryllium_wlan_init(void);
++extern void dipper_audio_init(void);
+ extern void sweet80211_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_cpufreq_max(void);
+@@ -1159,6 +1160,7 @@ sweet_ufs_init(void)
+ 	sweet_a630_probe();	/* sweetgpu=N, beryllium only, off by default */
+ 	beryllium_wlan_init();      /* boot-arg sweetwlan=N, off by default */
+ 	sweet80211_init();          /* boot-arg sweet80211=N (iOS 26 Wi-Fi stand-in), off by default */
++	dipper_audio_init();        /* boot-arg sweetaudio=N (Mi 8 audio DSP, 3040), off by default */
+ 	return 0;
+ }
+ 
