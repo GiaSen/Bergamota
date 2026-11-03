@@ -98,6 +98,8 @@ if [ "${IOS18:-1}" = 1 ]; then
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetsample.c" -o "$out18/sweetsample"
 	codesign -s - -f --entitlements "$here/sample.entitlements" "$out18/sweetsample"
 	python3 -I "$pacstrip" --sign "$out18/sweetsample"
+	# which service a thread stuck in mach_msg waits on (receive-right owner, launchd name)
+	b18 sweetportwho sweetportwho.m sample.entitlements
 	# Wi-Fi over SSH (iOS 26 stand-in, docs/WIFI_IOS26.md): Apple80211 info/power/scan without wifid or the UI
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework CoreFoundation \
 		"$here/sweetwifi.c" -o "$out18/sweetwifi"
@@ -109,6 +111,8 @@ if [ "${IOS18:-1}" = 1 ]; then
 	python3 -I "$pacstrip" --sign "$out18/sweetfpd"
 	# the unified log over SSH (no `log` tool on iOS)
 	b18 sweetlog sweetlog.m log.entitlements
+	# open a URL over SSH as a tapped link would (Safari for http/https, Settings for prefs:)
+	b18 sweeturl sweeturl.m url.entitlements
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework CoreFoundation -framework IOKit \
 		"$here/sweettouch.c" -o "$out18/sweettouch"
 	codesign -s - -f --entitlements "$here/touch.entitlements" "$out18/sweettouch"
