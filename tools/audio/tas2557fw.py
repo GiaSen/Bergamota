@@ -2,9 +2,15 @@
 """TI TAS2557 firmware (the Mi 8's /vendor/firmware/tas2557_uCDSP_*.bin): list it, or flatten one program +
 configuration into the register writes the amp needs, as TI's driver (tas2557-core.c) plays them.
 
-  tas2557fw.py FW.bin                              programs, configurations, PLLs, calibrations
-  tas2557fw.py FW.bin --flat PROGRAM CONFIG OUT    the writes for that pair, as 'book page reg value' lines (and
-                                                   'delay_us N'), in the order tas2557_set_program() sends them
+  tas2557fw.py FW.bin                                   programs, configurations, PLLs, calibrations
+  tas2557fw.py FW.bin --script id OUT                   reset, chip id (B0P0R3) and safe guard (R37, 0x5a)
+  tas2557fw.py FW.bin --script load OUT PROGRAM CONFIG  tas2557_set_program(): resets, defaults, program, PLL, coefficients
+  tas2557fw.py FW.bin --script on OUT GAIN              tas2557_enable(true): startup, unmute, DAC gain (0..15)
+  tas2557fw.py FW.bin --script off OUT                  tas2557_enable(false): the shutdown sequence
+  tas2557fw.py FW.bin --script status OUT               reads: flags, power, gain, mute, id
+
+A script is what kern.sweet_audio_i2c plays (bsd/dev/dipper_audio.c; tools/sweetnet/sweeti2c on the phone): 01 addr n
+data (write), 02 addr reg n (read), 03 level (reset pin), 04 ms (2 bytes), 05 addr reg mask value (read-modify-write).
 
 The firmware is Xiaomi's/TI's and stays out of git; this only reads it.
 
@@ -107,24 +113,167 @@ def parse(b):
     return h, plls, progs, cfgs, cals
 
 
-def commands(blk):
-    """tas2557_load_block: 4-byte commands [book? page reg value]; see the driver for the burst form"""
-    d = blk['data']
-    i, out = 0, []
-    n = len(d) // 4
-    while i < n:
-        w = d[4 * i:4 * i + 4]
-        if w[2] == 0x85:        # burst: w[0] book, w[1] page, w[3] first reg; count in the next word's ... (see load_block)
-            out.append(('burst?', w.hex()))
-        out.append(tuple(w))
-        i += 1
-    return out
+ADDR = 0x4c
+# tas2557-core.c tables, as (book, page, reg, value) or ('us', N)
+DEFAULT = [(0, 0, 21, 0x05), (0, 0, 45, 0x21), (0, 0, 46, 0x21), (0, 0, 37, 0x5a)]
+IRQ_CONFIG = [(0, 1, 106, 0x71), (0, 1, 108, 0x11), (0, 1, 109, 0x11), (0, 1, 110, 0x11), (0, 1, 111, 0x01),
+              (0, 1, 64, 0x07), (0, 1, 114, 0x80)]
+STARTUP = [(0, 1, 77, 0x15), (0, 1, 61, 0x01), (0, 1, 62, 0x01), (0, 0, 5, 0xa0), (0, 0, 5, 0xa3), (0, 0, 4, 0xf8),
+           ('us', 2000), (0, 0, 44, 0x2b)]
+UNMUTE = [(0, 0, 7, 0x00), (100, 0, 7, 0x00)]
+SHUTDOWN = [(0, 0, 44, 0x00), (100, 0, 7, 0x01), ('us', 10000), (0, 0, 7, 0x03), (0, 0, 4, 0x60), ('us', 2000),
+            (0, 0, 5, 0x00), (0, 0, 4, 0x00), (0, 1, 61, 0x00), (0, 1, 62, 0x00), (0, 1, 77, 0x00)]
+
+
+class Script:
+    """the ops, with TI's book/page switching (tas2557_change_book_page): page 0 reg 127 = book, reg 0 = page"""
+
+    def __init__(self):
+        self.b = bytearray()
+        self.book = self.page = None
+        self.notes = []
+
+    def bp(self, book, page):
+        if self.book != book:
+            self.raw_write(0, [0])
+            self.raw_write(127, [book])
+            self.book, self.page = book, 0
+            if page:
+                self.raw_write(0, [page])
+                self.page = page
+        elif self.page != page:
+            self.raw_write(0, [page])
+            self.page = page
+
+    def raw_write(self, reg, data):
+        assert len(data) < 255
+        self.b += bytes([1, ADDR, 1 + len(data), reg]) + bytes(data)
+
+    def write(self, book, page, reg, data):
+        self.bp(book, page)
+        self.raw_write(reg, data if isinstance(data, (list, bytes, bytearray)) else [data])
+
+    def read(self, book, page, reg, n=1, what=''):
+        self.bp(book, page)
+        self.b += bytes([2, ADDR, reg, n])
+        self.notes.append(f'{what or f"B{book}P{page}R{reg}"} ({n})')
+
+    def update(self, book, page, reg, mask, value):
+        self.bp(book, page)
+        self.b += bytes([5, ADDR, reg, mask, value])
+
+    def reset_pin(self, level):
+        self.b += bytes([3, 1 if level else 0])
+
+    def sleep_ms(self, ms):
+        ms = max(1, int(ms))
+        self.b += bytes([4, ms & 0xff, ms >> 8])
+
+    def table(self, rows):
+        for r in rows:
+            if r[0] == 'us':
+                self.sleep_ms((r[1] + 999) // 1000)
+            else:
+                self.write(*r)
+
+    def hw_reset(self):
+        """tas2557_hw_reset: low 5 ms, high 2 ms; the book/page cache is gone"""
+        self.reset_pin(0)
+        self.sleep_ms(5)
+        self.reset_pin(1)
+        self.sleep_ms(2)
+        self.book = self.page = None
+
+    def block(self, blk, label):
+        """tas2557_load_block: 4-byte commands book page reg value; reg 0x81 = sleep (book << 8 | page) ms;
+        reg 0x85 = burst of (book << 8 | page) bytes to the register in the next command, data from its 4th byte"""
+        d = blk['data']
+        if blk['chk'] and blk['chk'][0]:
+            self.write(0, 0, 33, 1)                     # TAS2557_CRC_RESET_REG
+        n, i = len(d) // 4, 0
+        while i < n:
+            w = d[4 * i:4 * i + 4]
+            i += 1
+            if w[2] <= 0x7f:
+                self.write(w[0], w[1], w[2], w[3])
+            elif w[2] == 0x81:
+                self.sleep_ms((w[0] << 8) | w[1])
+            elif w[2] == 0x85:
+                length = (w[0] << 8) | w[1]
+                nxt = d[4 * i:]
+                book, page, reg = nxt[0], nxt[1], nxt[2]
+                data = nxt[3:3 + length] if length > 1 else nxt[3:4]
+                for k in range(0, len(data), 240):      # one I2C write each, the register auto-increments
+                    self.write(book, page, reg + k, data[k:k + 240])
+                i += 1 + (((length - 2) // 4) + 1 if length >= 2 else 0)
+            else:
+                raise ValueError(f'{label}: unknown command {w.hex()}')
+        if blk['chk'] and blk['chk'][0]:
+            self.read(0, 0, 32, 1, f'{label} PRAM checksum, firmware says {blk["chk"][1]:#04x}')
+
+
+def script(kind, fw, args):
+    h, plls, progs, cfgs, cals = fw
+    s = Script()
+    if kind == 'id':
+        s.hw_reset()
+        s.write(0, 0, 1, 1)                             # TAS2557_SW_RESET_REG
+        s.book = s.page = None
+        s.sleep_ms(1)
+        s.read(0, 0, 3, 1, 'PGID (0xa0 = PG2.1, 0x80 = PG1.0)')
+        s.read(0, 0, 37, 1, 'safe guard (0x5a after defaults only)')
+    elif kind == 'load':
+        prog, cfg = int(args[0]), int(args[1])
+        p, c = progs[prog], cfgs[cfg]
+        assert c['program'] == prog, f'configuration {cfg} is for program {c["program"]}'
+        s.hw_reset()
+        s.write(0, 0, 1, 1)
+        s.book = s.page = None
+        s.sleep_ms(1)
+        s.table(DEFAULT)                                # tas2557_load_default
+        s.table(IRQ_CONFIG)                             # load_platdata: configIRQ (ti,irq-gpio is set)
+        s.update(0, 1, 1, 0x18, 0 << 3)                 # set_bit_rate(16): ASI1_DAC_FORMAT
+        s.update(0, 1, 1, 0x01, 0x01)                   # DOUT tri-state for extra BCLKs
+        for blk in p['data']['blocks']:
+            if blk['type'] == 0x01:                     # PGM_DEV_A
+                s.block(blk, f'program {prog}')
+        s.read(0, 0, 6, 1, 'SPK_CTRL after the program (DAC gain in bits 6:3)')
+        s.block(plls[c['pll']]['block'], f'PLL {c["pll"]}')
+        for t in (0x04, 0x03):                          # CFG_PRE_DEV_A, then CFG_COEFF_DEV_A
+            for blk in c['data']['blocks']:
+                if blk['type'] == t:
+                    s.block(blk, f'config {cfg} {BLOCK_NAMES[t]}')
+        s.read(0, 0, 37, 1, 'safe guard (0x5a)')
+    elif kind == 'on':
+        gain = int(args[0])
+        assert 0 <= gain <= 15
+        s.read(0, 0, 104, 1, 'FLAGS_1 (cleared by the read)')
+        s.read(0, 0, 108, 1, 'FLAGS_2')
+        s.table(STARTUP)
+        s.update(0, 0, 6, 0x78, gain << 3)              # tas2557_set_DAC_gain
+        s.table(UNMUTE)
+        s.read(0, 0, 4, 2, 'POWER_CTRL1/2')
+        s.read(0, 0, 6, 1, 'SPK_CTRL')
+    elif kind == 'off':
+        s.table(SHUTDOWN)
+        s.read(0, 0, 4, 2, 'POWER_CTRL1/2')
+    elif kind == 'status':
+        s.read(0, 0, 3, 1, 'PGID')
+        s.read(0, 0, 4, 2, 'POWER_CTRL1/2')
+        s.read(0, 0, 6, 2, 'SPK_CTRL, MUTE')
+        s.read(0, 0, 37, 1, 'safe guard')
+        s.read(0, 0, 104, 1, 'FLAGS_1')
+        s.read(0, 0, 108, 1, 'FLAGS_2')
+        s.read(0, 1, 1, 1, 'ASI1_DAC_FORMAT')
+    else:
+        raise SystemExit(f'unknown script {kind}')
+    return s
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('fw')
-    ap.add_argument('--flat', nargs=3, metavar=('PROGRAM', 'CONFIG', 'OUT'))
+    ap.add_argument('--script', nargs='+', metavar=('KIND OUT', 'ARG'))
     a = ap.parse_args()
     b = open(a.fw, 'rb').read()
     h, plls, progs, cfgs, cals = parse(b)
@@ -142,8 +291,11 @@ def main():
         print(f"config {i}: '{c['name']}' program {c['program']} PLL {c['pll']} {c['rate']} Hz{extra}: {bl}")
     for i, c in enumerate(cals):
         print(f"calibration {i}: '{c['name']}' program {c['program']} config {c['config']}")
-    if a.flat:
-        sys.exit('--flat: not written yet')
+    if a.script:
+        kind, out, args = a.script[0], a.script[1], a.script[2:]
+        sc = script(kind, (h, plls, progs, cfgs, cals), args)
+        open(out, 'wb').write(sc.b)
+        print(f'{out}: {len(sc.b)} bytes; reads, in order: ' + '; '.join(sc.notes))
 
 
 if __name__ == '__main__':

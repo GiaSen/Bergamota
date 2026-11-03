@@ -109,6 +109,14 @@ if [ "${IOS18:-1}" = 1 ]; then
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetapr.c" -o "$out18/sweetapr"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetapr"
 	python3 -I "$pacstrip" --sign "$out18/sweetapr"
+	# and its speaker amp: an I2C script in, the bytes read out (kern.sweet_audio_i2c; scripts from tools/audio/tas2557fw.py)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweeti2c.c" -o "$out18/sweeti2c"
+	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweeti2c"
+	python3 -I "$pacstrip" --sign "$out18/sweeti2c"
+	# and PCM for it: a file into the low-bank window the DSP reads (kern.sweet_audio_pool; PCM from tools/audio/mkpcm.py)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetpool.c" -o "$out18/sweetpool"
+	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetpool"
+	python3 -I "$pacstrip" --sign "$out18/sweetpool"
 	# Wi-Fi over SSH (iOS 26 stand-in, docs/WIFI_IOS26.md): Apple80211 info/power/scan without wifid or the UI
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework CoreFoundation \
 		"$here/sweetwifi.c" -o "$out18/sweetwifi"
