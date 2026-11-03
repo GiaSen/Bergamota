@@ -5,7 +5,7 @@
 #   matrix routing, run, writes. Opcodes and structures: techpack/audio/include/dsp/apr_audio-v2.h (downstream).
 #
 #   dipper-speaker.sh port-on | port-off | amp-load | amp-on GAINSCRIPT | amp-off | smmu | stream-on |
-#                     write BYTES [OFFSET] | stream-off | status
+#                     write BYTES [OFFSET] | stream-off | tone | status
 # Tools in /var/root: sweetapr, sweeti2c, sweetsys; amp scripts in /var/root/amp.
 set -u
 A=/var/root/sweetapr
@@ -79,6 +79,22 @@ stream-off)
 	$A --port $PORT 7 0x10bcd $PORT 2000                     # ASM_STREAM_CMD_CLOSE
 	# the ADM COPP stays open: its close wants src port 0x1006 and dest port = the COPP id (not yet in sweetapr)
 	$A 7 0x10d94 $((SESSION << 8)) 2000 w:$handle            # ASM_CMD_SHARED_MEM_UNMAP_REGIONS
+	;;
+tone)
+	# the first listening test: 2 s of tone440.pcm (mkpcm.py --freq 440 --seconds 2 --dbfs -30), amp ROM mode at DAC
+	# gain 2 of 15 (no speaker protection in ROM mode: stay low), everything off again afterwards
+	sync
+	$0 port-on >/dev/null
+	$I $AMP/id.bin
+	$I $AMP/load-rom.bin
+	$I $AMP/on-g2.bin
+	$0 stream-on >/dev/null || { $I $AMP/off.bin; $0 port-off >/dev/null; exit 1; }
+	/var/root/sweetpool $AMP/tone440.pcm
+	$0 write 384000 0
+	$I $AMP/status.bin
+	$I $AMP/off.bin
+	$0 stream-off >/dev/null
+	$0 port-off >/dev/null
 	;;
 status)
 	$SYS kern.sweet_audio_pins
