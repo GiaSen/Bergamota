@@ -1,0 +1,70 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index fed4daf..8d98cc0 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -4600,7 +4600,13 @@ scan_step(void)
+ 		what = "sta power save on (no channel)";
+ 		break;
+ 	}
+-	case 12: {                              /* START_SCAN, passive, ath10k defaults */
++	case 12: {                              /* 3037: PDEV_SET_PARAM idle_ps_config (44) = 1, as ath10k_start */
++		uint32_t p[3] = { 0, 44, 1 };
++		n = scan_cmd(c, 0x4003, 82, p, 12);
++		what = "pdev idle power save on";
++		break;
++	}
++	case 13: {                              /* START_SCAN, passive, ath10k defaults */
+ 		uint32_t s[25];
+ 		memset(s, 0, sizeof(s));
+ 		s[0] = 0xa000 | (scan.count & 0xfff);   /* scan_id (ATH10K_SCAN_ID 0 for the first) */
+@@ -4638,7 +4644,7 @@ scan_step(void)
+ 	if (!wce.wmi_credits || !wce_send(1, wce.wmi_eid, c, n)) {
+ 		return false;                   /* no credit yet: try again on the next poll */
+ 	}
+-	if (scan.step == 12) {
++	if (scan.step == 13) {
+ 		scan.count++;
+ 	}
+ 	if (scan.count <= 1) {
+@@ -4648,7 +4654,7 @@ scan_step(void)
+ 	scan.step++;
+ 	scan.step_ms = ms_now_ms();
+ 	wf.sent_ms = ms_now_ms();               /* each step gets its own 30 s */
+-	if (scan.step == 13) {
++	if (scan.step == 14) {
+ 		wf.state = WS_SCANNING;
+ 		wf.sent_ms = ms_now_ms();
+ 	}
+@@ -7195,7 +7201,7 @@ svc_scan(void)
+ 	scan.foreign = 0;
+ 	scan.started = false;
+ 	scan.completed = false;
+-	scan.step = 12;                         /* START_SCAN only: the setup steps are done */
++	scan.step = 13;                         /* START_SCAN only: the setup steps are done */
+ 	wf.sent_ms = ms_now_ms();
+ }
+ 
+diff --git a/bsd/dev/sweet_80211.c b/bsd/dev/sweet_80211.c
+index 5fdacd5..3bf79a0 100644
+--- a/bsd/dev/sweet_80211.c
++++ b/bsd/dev/sweet_80211.c
+@@ -480,6 +480,9 @@ s8_associate(struct sweet80211_req *req)
+ 	if (s8.stage != 3) {
+ 		return ENXIO;                           /* nothing to join with a null backend */
+ 	}
++	if (!s8.power) {
++		return ENXIO;                           /* 3037: as a scan */
++	}
+ 	if (req->data == 0 || req->len < 0x200 || req->len > 4096) {
+ 		printf("SWEET 80211: ASSOCIATE with %u bytes: refused\n", req->len);
+ 		return EINVAL;
+@@ -669,6 +672,9 @@ s8_set(struct sweet80211_req *req)
+ 		if (on != s8.power) {
+ 			s8.power = on;
+ 			printf("SWEET 80211: radio %s\n", on ? "on" : "off");
++			if (!on && s8.stage == 3) {
++				(void)sweet_wlan_leave();       /* 3037: the switch in Settings: off stayed joined, with the link up */
++			}
+ 			s8_post_event(M_POWER_CHANGED, NULL, 0);
+ 		}
+ 		return 0;
