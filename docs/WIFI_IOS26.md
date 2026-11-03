@@ -1430,3 +1430,8 @@ Every teardown on the Mi 8 asserted the firmware in `wlan_vdev.c:_wlan_vdev_down
 power save off -> deauthentication (unless the AP kicked us) -> wait for it and the TX queues (PEER_FLUSH_TIDS after 0.8 s, on at the latest after 2 s) -> PEER_DELETE -> wait for PEER_UNMAP (at most 1 s) -> VDEV_DOWN -> VDEV_STOP -> wait for VDEV_STOPPED (at most 2 s) -> power save on (no channel).
 
 The same patch fixes those waits: `sta_step` took the time in the state before handling the leave, so the first pass saw the old state's time and all of them ran out, and the deauthentication was discarded (status 1, the AP was never told). `sweetwifi disassoc` forces a leave; wifid joins again in 8-12 s. Numbers: NOTES.md.
+
+### 6.6 3037: the Settings switch leaves the network (2026-11-03, Mi 8)
+
+IOC_POWER only set a flag, so with Wi-Fi off in Settings the phone stayed joined, link up. Off now calls `sweet_wlan_leave` (a shutdown too: wifid powers the radio off then), and ASSOCIATE with the radio off is refused like a scan. The chip and its firmware stay running: Wi-Fi off draws more than connected (about 250 mA against 205 mA, screen off), and stopping the firmware is not done. The startup sequence also sets PDEV_SET_PARAM `idle_ps_config` (44) = 1, as `ath10k_start` does: about 20 mA of that state.
+
