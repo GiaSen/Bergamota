@@ -100,6 +100,11 @@ if [ "${IOS18:-1}" = 1 ]; then
 	python3 -I "$pacstrip" --sign "$out18/sweetsample"
 	# which service a thread stuck in mach_msg waits on (receive-right owner, launchd name)
 	b18 sweetportwho sweetportwho.m sample.entitlements
+	# silence through an AudioQueue: does the audio server's output device run, and at what rate
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework AudioToolbox -framework CoreFoundation \
+		"$here/sweetaq.c" -o "$out18/sweetaq"
+	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetaq"
+	python3 -I "$pacstrip" --sign "$out18/sweetaq"
 	# Wi-Fi over SSH (iOS 26 stand-in, docs/WIFI_IOS26.md): Apple80211 info/power/scan without wifid or the UI
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework CoreFoundation \
 		"$here/sweetwifi.c" -o "$out18/sweetwifi"

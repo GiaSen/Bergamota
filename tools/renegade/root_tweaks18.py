@@ -24,7 +24,8 @@ screen (image versions v8-v14 in NOTES.md):
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
                   on every boot
-  audio           VirtualAudio HAL plug-in disabled (mediaserverd crash)
+  audio           VirtualAudio HAL plug-in disabled (mediaserverd crash); iOS 26: kept, it routes to
+                  the HAL's null device, so audio queues start and YouTube plays (needs xnu 3039)
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
   SpringBoard     BKNoWatchdogs (one slow CPU path, no scene-create watchdog
@@ -588,10 +589,22 @@ def activation(root):
     print('data ark', d)
 
 
+# iOS 26: without VirtualAudio no audio queue has a device (kAudioQueueErr_InvalidDevice), and the MSE audio renderer turns
+# that into a decode error (YouTube). With it, the HAL's null device becomes the route and VirtualAudioDevice_Default is
+# built on it; its IO thread needs xnu 3039 (realtime computation clamped) or every queue fails to start.
+
+
 def audio(root):
-    src = os.path.join(root, 'Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin')
+    hal = os.path.join(root, 'Library/Audio/Plug-Ins/HAL')
+    src = os.path.join(hal, 'VirtualAudio.plugin')
     dst_dir = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled')
-    if os.path.exists(src):
+    if int(VERSION.split('.')[0]) >= 26:
+        parked = os.path.join(dst_dir, 'VirtualAudio.plugin')
+        if os.path.exists(parked) and not os.path.exists(src):
+            os.makedirs(hal, exist_ok=True)
+            shutil.move(parked, hal)
+            print('VirtualAudio.plugin enabled again')
+    elif os.path.exists(src):
         os.makedirs(dst_dir, exist_ok=True)
         shutil.move(src, dst_dir)
         print('VirtualAudio.plugin disabled')
