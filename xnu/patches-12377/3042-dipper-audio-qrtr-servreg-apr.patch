@@ -1,0 +1,772 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index a28c669..759ef60 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -3507,13 +3507,18 @@ pdm_serves(unsigned d, const char *name)
+ 	return false;
+ }
+ 
+-/* qcom_pdm_get_domain_list() / qcom_pdm_pfr(); the response TLVs in servreg_get_domain_list_resp_ei order */
+-static void
+-pdm_rx(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len)
++/*
++ * qcom_pdm_get_domain_list() / qcom_pdm_pfr(); the response TLVs in servreg_get_domain_list_resp_ei order. The answer
++ * to one request in r (512 bytes): its length, 0 = none. Shared by the modem's QRTR link (pdm_rx) and the audio DSP's
++ * (sweet_pdm_answer, bsd/dev/dipper_audio.c, 3042).
++ */
++#define PDM_ANSWER_MAX          512u    /* r is a parameter now: sizeof(r) would be the pointer's (3042's first build) */
++static uint32_t
++pdm_answer(const uint8_t *p, uint32_t len, uint8_t r[PDM_ANSWER_MAX])
+ {
+ 	if (len < 7 || p[0] != 0) {
+ 		printf("SWEET IPC: pd-mapper: %u-byte message of type %u ignored\n", len, len ? p[0] : 0);
+-		return;
++		return 0;
+ 	}
+ 	uint16_t txn, msg, mlen;
+ 	memcpy(&txn, p + 1, 2);
+@@ -3532,12 +3537,10 @@ pdm_rx(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len)
+ 	if (s2) {
+ 		memcpy(reason, s2, MIN((uint32_t)l2, PDM_NAME_MAX));
+ 	}
+-	uint8_t r[512];
+ 	uint32_t n = 7;
+ 	r[0] = 2;                       /* QMI_RESPONSE */
+ 	memcpy(r + 1, &txn, 2);
+ 	memcpy(r + 3, &msg, 2);
+-	ipc.pdm_reqs++;
+ 	switch (msg) {
+ 	case PDM_GET_DOMAIN_LIST: {     /* service name (TLV 1), optional offset (TLV 0x10) */
+ 		bool ok = true;
+@@ -3568,7 +3571,7 @@ pdm_rx(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len)
+ 			found = true;
+ 			uint32_t i = ndom++;
+ 			uint32_t nl = (uint32_t)strlen(pdm_domains[d].domain);
+-			if (i < offset || i >= PDM_LIST_MAX || list_at + 1 + nl + 9 > sizeof(r)) {
++			if (i < offset || i >= PDM_LIST_MAX || list_at + 1 + nl + 9 > PDM_ANSWER_MAX) {
+ 				continue;
+ 			}
+ 			r[list_at] = (uint8_t)nl;   /* nested QMI_STRING: u8 length, no NUL */
+@@ -3615,12 +3618,23 @@ pdm_rx(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len)
+ 	default:
+ 		printf("SWEET IPC: pd-mapper: unknown request %#x (%u bytes)\n", msg, len);
+ 		ipc_note(" pdm-unknown %#x;", msg);
+-		return;
++		return 0;
+ 	}
+ 	uint16_t body = (uint16_t)(n - 7);
+ 	memcpy(r + 5, &body, 2);
+-	(void)ipc_qrtr_send(Q_DATA, QRTR_PDM_PORT, node, port, r, n);
+-	sweet_log_sync();
++	return n;
++}
++
++static void
++pdm_rx(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len)
++{
++	uint8_t r[PDM_ANSWER_MAX];
++	uint32_t n = pdm_answer(p, len, r);
++	ipc.pdm_reqs++;
++	if (n) {
++		(void)ipc_qrtr_send(Q_DATA, QRTR_PDM_PORT, node, port, r, n);
++		sweet_log_sync();
++	}
+ }
+ 
+ /*
+@@ -9814,6 +9828,13 @@ sweet_qmp_send(const char *msg)
+ 	return ok;
+ }
+ 
++/* the service locator's (pd-mapper's) answer to one QMI request from any remote: length in r[512], 0 = none */
++uint32_t
++sweet_pdm_answer(const uint8_t *req, uint32_t len, uint8_t *r)
++{
++	return pdm_answer(req, len, r);
++}
++
+ /*
+  * A file of the modem partition's FAT16 (e.g. "image/adsp.mdt"): its first cluster and size, 0 or an errno. Mounted again
+  * for every call: the FAT lives in wl_fatbuf, which a mount of another partition (bluetooth) overwrites.
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 3294f2c..8933efc 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -11,9 +11,10 @@
+  *   2  boot: AOSS QMP load_state adsp on, RPMh cx vote, our SMP2P item (429, "master-kernel"), PAS id 1
+  *      INIT_IMAGE (the .mdt) + MEM_SETUP (the carve-out) + segments + AUTH_AND_RESET, then the DSP's SMP2P item
+  *      (443, "slave-kernel": bit 0 fatal, 1 ready, 2 handover, 3 stop ack) until ready. The DSP keeps running.
+- *   3  GLINK on the "lpass" SMEM edge (descriptor 478, our FIFO 479, the DSP's 480, doorbell bit 8), the DSP's channel
+- *      "apr_audio_svc" opened both ways, then one APR command to the DSP core (AVCS_CMD_ADSP_EVENT_GET_STATE): its
+- *      answer says whether the audio framework is up. Polled, no interrupts (qcom_glink_smem.c, qcom_glink_native.c,
++ *   3  GLINK on the "lpass" SMEM edge (descriptor 478, our FIFO 479, the DSP's 480, doorbell bit 8), the DSP's channels
++ *      "apr_audio_svc" and "IPCRTR" opened both ways; QRTR on IPCRTR answers the DSP's HELLO and offers the service
++ *      locator (pd-mapper, QMI 0x40, answers from beryllium_wlan.c's sdm845 table, 3042); then one APR command to the
++ *      DSP core (AVCS_CMD_ADSP_EVENT_GET_STATE): its answer says whether the audio framework is up. Polled, no interrupts (qcom_glink_smem.c, qcom_glink_native.c,
+  *      apr.c, q6core.c; the modem's GLINK in beryllium_wlan.c is the model, with host 2 and one APR channel).
+  *
+  * Facts from the live DT (dtb/dipper/live.dtb): qcom,lpass@17300000 pil-tz-generic, qcom,pas-id 1, firmware "adsp",
+@@ -81,7 +82,6 @@ void dipper_audio_init(void);
+ #define GL_TX_SIZE              0x4000u
+ #define GL_DOORBELL             8u              /* glink-smem-native-xprt-adsp qcom,irq-mask = <0x100> */
+ #define GL_FEATURE_REUSE        1u
+-#define GL_LCID                 1u              /* our id for apr_audio_svc */
+ #define GL_INTENTS              5u
+ #define GL_INTENT_SIZE          4096u
+ #define GL_MAX_LI               16u
+@@ -90,7 +90,8 @@ void dipper_audio_init(void);
+ #define APR_DOMAIN_APPS         5u
+ #define APR_DOMAIN_ADSP         4u
+ #define APR_SVC_ADSP_CORE       3u
+-#define APR_HDR_FIELD_SEQ_CMD   0x0180u         /* APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD, APR_HDR_LEN(32), APR_PKT_VER) */
++#define APR_HDR_SIZE            20u             /* sizeof(struct apr_hdr), packed */
++#define APR_HDR_FIELD_SEQ_CMD   0x0150u         /* APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD, APR_HDR_LEN(20) = 5 words, APR_PKT_VER) */
+ #define APR_BASIC_RSP_RESULT    0x000110e8u
+ #define AVCS_GET_STATE          0x0001290cu     /* AVCS_CMD_ADSP_EVENT_GET_STATE */
+ #define AVCS_GET_STATE_RSP      0x0001290du
+@@ -304,10 +305,12 @@ au_crash_reason(void)
+ 	printf("SWEET AUDIO: DSP crash reason: \"%s\"\n", msg);
+ }
+ 
+-/* ---- GLINK on the lpass edge: descriptor words tx tail @0, tx head @4, rx tail @8, rx head @12 */
+-static struct {
+-	uint32_t desc, tx, tx_len, rx, rx_len, features, rcid, next_liid;
+-	bool version_acked, open_acked, bad;
++/* ---- GLINK on the lpass edge: descriptor words tx tail @0, tx head @4, rx tail @8, rx head @12; two channels */
++enum { CH_APR, CH_QRTR, CH_APR2, CH_N };
++static const char *const gl_names[CH_N] = { "apr_audio_svc", "IPCRTR", "apr_apps2" };
++struct gl_ch {
++	uint32_t rcid;                  /* the DSP's id for the channel, 0 = not offered yet */
++	bool open_acked;
+ 	struct {
+ 		uint32_t id, size, off;
+ 		uint8_t *buf;
+@@ -317,11 +320,20 @@ static struct {
+ 		uint32_t id, size;
+ 		bool valid, used;
+ 	} ri[GL_MAX_RI];
++};
++static struct {
++	uint32_t desc, tx, tx_len, rx, rx_len, features, next_liid;
++	bool version_acked, bad;
++	struct gl_ch ch[CH_N];
+ 	unsigned opens_seen, rx_pkts;
+ 	uint32_t apr_opcode, apr_status;        /* the last APR answer */
+ 	bool apr_answered;
++	uint32_t qnode;                         /* the DSP's QRTR node, from its packets */
++	unsigned pdm_reqs, servers;
+ } gl;
+ 
++static void qr_rx(const uint8_t *p, uint32_t len);
++
+ static uint32_t
+ gl_rx_avail(void)
+ {
+@@ -425,24 +437,32 @@ gl_tx_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
+ 	return gl_tx(m, 8, NULL, 0);
+ }
+ 
++/* our channel ids are the index + 1 */
++static uint16_t
++gl_lcid(unsigned c)
++{
++	return (uint16_t)(c + 1);
++}
++
+ static bool
+-gl_add_intent(uint32_t size)
++gl_add_intent(unsigned c, uint32_t size)
+ {
++	struct gl_ch *ch = &gl.ch[c];
+ 	for (unsigned k = 0; k < GL_MAX_LI; k++) {
+-		if (gl.li[k].buf) {
++		if (ch->li[k].buf) {
+ 			continue;
+ 		}
+-		if (!(gl.li[k].buf = kalloc_data(size, Z_WAITOK | Z_ZERO))) {
++		if (!(ch->li[k].buf = kalloc_data(size, Z_WAITOK | Z_ZERO))) {
+ 			return false;
+ 		}
+-		gl.li[k].id = ++gl.next_liid;
+-		gl.li[k].size = size;
+-		gl.li[k].off = 0;
++		ch->li[k].id = ++gl.next_liid;
++		ch->li[k].size = size;
++		ch->li[k].off = 0;
+ 		struct {
+ 			uint16_t cmd, lcid;
+ 			uint32_t count, size, id;
+-		} __attribute__((packed)) c = { G_INTENT, GL_LCID, 1, size, gl.li[k].id };
+-		return gl_tx(&c, (uint32_t)sizeof(c), NULL, 0);
++		} __attribute__((packed)) m = { G_INTENT, gl_lcid(c), 1, size, ch->li[k].id };
++		return gl_tx(&m, (uint32_t)sizeof(m), NULL, 0);
+ 	}
+ 	return false;
+ }
+@@ -451,7 +471,7 @@ gl_add_intent(uint32_t size)
+ static void
+ gl_apr_rx(const uint8_t *p, uint32_t n)
+ {
+-	if (n < 32) {
++	if (n < APR_HDR_SIZE) {
+ 		printf("SWEET AUDIO: APR packet of %u bytes ignored\n", n);
+ 		return;
+ 	}
+@@ -463,11 +483,24 @@ gl_apr_rx(const uint8_t *p, uint32_t n)
+ 	memcpy(&dport, p + 10, 2);
+ 	memcpy(&token, p + 12, 4);
+ 	memcpy(&opcode, p + 16, 4);
+-	if (n >= 36) {
+-		memcpy(&w0, p + 32, 4);
++	uint32_t hlen = ((field >> 4) & 0xfu) * 4u;    /* APR_HDR_LEN in words: where the payload starts */
++	if (hlen < APR_HDR_SIZE) {
++		hlen = APR_HDR_SIZE;
++	}
++	if (n >= hlen + 4) {
++		memcpy(&w0, p + hlen, 4);
+ 	}
+-	if (n >= 40) {
+-		memcpy(&w1, p + 36, 4);
++	if (n >= hlen + 8) {
++		memcpy(&w1, p + hlen + 4, 4);
++	}
++	static unsigned dumped;
++	if (dumped++ < 2) {
++		char hex[3 * 64 + 1];
++		uint32_t m = MIN(n, 64u), o = 0;
++		for (uint32_t i = 0; i < m; i++) {
++			o += (uint32_t)snprintf(hex + o, sizeof(hex) - o, "%02x%s", p[i], (i & 3) == 3 ? " " : "");
++		}
++		printf("SWEET AUDIO: APR raw (%u bytes, header field %#x = %u-byte header): %s\n", n, field, hlen, hex);
+ 	}
+ 	printf("SWEET AUDIO: APR from svc %u domain %u port %u to svc %u domain %u port %u: opcode %#x token %u, %u bytes, "
+ 	    "payload %#x %#x\n", p[4], p[5], sport, p[8], p[9], dport, opcode, token, size, w0, w1);
+@@ -476,6 +509,17 @@ gl_apr_rx(const uint8_t *p, uint32_t n)
+ 	gl.apr_answered = true;
+ }
+ 
++static int
++gl_by_rcid(uint32_t rcid)
++{
++	for (unsigned c = 0; c < CH_N; c++) {
++		if (gl.ch[c].rcid && gl.ch[c].rcid == rcid) {
++			return (int)c;
++		}
++	}
++	return -1;
++}
++
+ static void
+ gl_poll(void)
+ {
+@@ -504,7 +548,6 @@ gl_poll(void)
+ 			break;
+ 		case G_VERSION_ACK:
+ 			gl_rx_advance(8);
+-			printf("SWEET AUDIO: glink version-ack %u features %#x\n", p1, p2);
+ 			if (p1 == 1 && p2 != gl.features) {
+ 				gl.features &= p2;
+ 				(void)gl_tx_cmd(G_VERSION, 1, gl.features);
+@@ -523,13 +566,17 @@ gl_poll(void)
+ 			gl_rx_advance(8 + extra);
+ 			gl.opens_seen++;
+ 			printf("SWEET AUDIO: glink: the DSP opens \"%s\" (its id %u)\n", name, p1);
+-			if (strcmp(name, "apr_audio_svc") == 0 && !gl.rcid) {
++			for (unsigned c = 0; c < CH_N; c++) {
++				if (strcmp(name, gl_names[c]) || gl.ch[c].rcid) {
++					continue;
++				}
+ 				struct {
+ 					uint16_t cmd, lcid;
+ 					uint32_t len;
+ 					char name[16];
+-				} __attribute__((packed)) req = { G_OPEN, GL_LCID, 14, "apr_audio_svc" };
+-				gl.rcid = p1;
++				} __attribute__((packed)) req = { G_OPEN, gl_lcid(c), (uint32_t)strlen(gl_names[c]) + 1, { 0 } };
++				strlcpy(req.name, gl_names[c], sizeof(req.name));
++				gl.ch[c].rcid = p1;
+ 				(void)gl_tx_cmd(G_OPEN_ACK, p1, 0);
+ 				(void)gl_tx(&req, (uint32_t)sizeof(req), NULL, 0);
+ 			}
+@@ -537,11 +584,13 @@ gl_poll(void)
+ 		}
+ 		case G_OPEN_ACK:
+ 			gl_rx_advance(8);
+-			if (p1 == GL_LCID && !gl.open_acked) {
+-				gl.open_acked = true;
+-				printf("SWEET AUDIO: glink apr_audio_svc open both ways; %u x %u-byte intents\n", GL_INTENTS, GL_INTENT_SIZE);
+-				for (unsigned k = 0; k < GL_INTENTS; k++) {
+-					(void)gl_add_intent(GL_INTENT_SIZE);
++			for (unsigned c = 0; c < CH_N; c++) {
++				if (p1 == gl_lcid(c) && !gl.ch[c].open_acked) {
++					gl.ch[c].open_acked = true;
++					printf("SWEET AUDIO: glink %s open both ways; %u x %u-byte intents\n", gl_names[c], GL_INTENTS, GL_INTENT_SIZE);
++					for (unsigned k = 0; k < GL_INTENTS; k++) {
++						(void)gl_add_intent(c, GL_INTENT_SIZE);
++					}
+ 				}
+ 			}
+ 			break;
+@@ -555,15 +604,17 @@ gl_poll(void)
+ 			if (p2 > 64 || avail < msglen) {
+ 				return;
+ 			}
+-			for (uint32_t k = 0; k < p2; k++) {
++			int c = gl_by_rcid(p1);
++			for (uint32_t k = 0; c >= 0 && k < p2; k++) {
+ 				uint32_t pair[2];
+ 				gl_rx_peek(8 + 8 * k, pair, 8);
+ 				for (unsigned j = 0; j < GL_MAX_RI; j++) {
+-					if (!gl.ri[j].valid) {
+-						gl.ri[j].id = pair[1];
+-						gl.ri[j].size = pair[0];
+-						gl.ri[j].valid = true;
+-						gl.ri[j].used = false;
++					struct gl_ch *ch = &gl.ch[c];
++					if (!ch->ri[j].valid) {
++						ch->ri[j].id = pair[1];
++						ch->ri[j].size = pair[0];
++						ch->ri[j].valid = true;
++						ch->ri[j].used = false;
+ 						break;
+ 					}
+ 				}
+@@ -572,21 +623,27 @@ gl_poll(void)
+ 			break;
+ 		}
+ 		case G_RX_DONE:
+-		case G_RX_DONE_W_REUSE:
++		case G_RX_DONE_W_REUSE: {
+ 			gl_rx_advance(8);
+-			for (unsigned j = 0; j < GL_MAX_RI; j++) {
+-				if (gl.ri[j].valid && gl.ri[j].id == p2) {
+-					gl.ri[j].used = false;
++			int c = gl_by_rcid(p1);
++			for (unsigned j = 0; c >= 0 && j < GL_MAX_RI; j++) {
++				struct gl_ch *ch = &gl.ch[c];
++				if (ch->ri[j].valid && ch->ri[j].id == p2) {
++					ch->ri[j].used = false;
+ 					if (cmd == G_RX_DONE) {
+-						gl.ri[j].valid = false;
++						ch->ri[j].valid = false;
+ 					}
+ 				}
+ 			}
+ 			break;
+-		case G_RX_INTENT_REQ:
++		}
++		case G_RX_INTENT_REQ: {
+ 			gl_rx_advance(8);
+-			(void)gl_tx_cmd(G_RX_INTENT_REQ_ACK, GL_LCID, p2 <= 0x10000u && gl_add_intent(MAX(p2, 1u)));
++			int c = gl_by_rcid(p1);
++			bool ok = c >= 0 && p2 <= 0x10000u && gl_add_intent((unsigned)c, MAX(p2, 1u));
++			(void)gl_tx_cmd(G_RX_INTENT_REQ_ACK, c >= 0 ? gl_lcid((unsigned)c) : 0, ok);
+ 			break;
++		}
+ 		case G_RX_INTENT_REQ_ACK:
+ 		case G_CLOSE_ACK:
+ 		case G_SIGNALS:
+@@ -607,31 +664,41 @@ gl_poll(void)
+ 			if (chunk > avail - 16) {
+ 				return;
+ 			}
+-			unsigned k;
+-			for (k = 0; k < GL_MAX_LI && !(gl.li[k].buf && gl.li[k].id == p2); k++) {
++			int c = gl_by_rcid(p1);
++			struct gl_ch *ch = c >= 0 ? &gl.ch[c] : NULL;
++			unsigned k = GL_MAX_LI;
++			for (unsigned x = 0; ch && x < GL_MAX_LI; x++) {
++				if (ch->li[x].buf && ch->li[x].id == p2) {
++					k = x;
++				}
+ 			}
+-			bool ok = p1 == gl.rcid && k < GL_MAX_LI && gl.li[k].size - gl.li[k].off >= chunk && !gl.li[k].bad;
++			bool ok = k < GL_MAX_LI && ch->li[k].size - ch->li[k].off >= chunk && !ch->li[k].bad;
+ 			if (ok) {
+-				gl_rx_peek(16, gl.li[k].buf + gl.li[k].off, chunk);
+-				gl.li[k].off += chunk;
++				gl_rx_peek(16, ch->li[k].buf + ch->li[k].off, chunk);
++				ch->li[k].off += chunk;
+ 			} else {
+ 				printf("SWEET AUDIO: glink data for id %u intent %u (%u bytes) dropped\n", p1, p2, chunk);
+ 				if (k < GL_MAX_LI) {
+-					gl.li[k].bad = true;
++					ch->li[k].bad = true;
+ 				}
+ 			}
+ 			gl_rx_advance((16 + chunk + 7u) & ~7u);
+ 			if (k < GL_MAX_LI && left == 0) {
+-				if (!gl.li[k].bad) {
++				if (!ch->li[k].bad) {
+ 					gl.rx_pkts++;
+-					gl_apr_rx(gl.li[k].buf, gl.li[k].off);
++					if (c == CH_APR || c == CH_APR2) {
++						printf("SWEET AUDIO: APR packet on %s\n", gl_names[c]);
++						gl_apr_rx(ch->li[k].buf, ch->li[k].off);
++					} else {
++						qr_rx(ch->li[k].buf, ch->li[k].off);
++					}
+ 				}
+-				gl.li[k].bad = false;
+-				gl.li[k].off = 0;
++				ch->li[k].bad = false;
++				ch->li[k].off = 0;
+ 				struct {
+ 					uint16_t cmd, lcid;
+ 					uint32_t liid;
+-				} __attribute__((packed)) done = { G_RX_DONE_W_REUSE, GL_LCID, gl.li[k].id };
++				} __attribute__((packed)) done = { G_RX_DONE_W_REUSE, gl_lcid((unsigned)c), ch->li[k].id };
+ 				(void)gl_tx(&done, (uint32_t)sizeof(done), NULL, 0);
+ 			}
+ 			break;
+@@ -644,31 +711,266 @@ gl_poll(void)
+ 	}
+ }
+ 
+-/* one packet into the smallest free remote intent that fits */
++/* one packet on channel c into the smallest free intent of the DSP that fits */
+ static bool
+-gl_send(const void *data, uint32_t len)
++gl_send(unsigned c, const void *data, uint32_t len)
+ {
++	struct gl_ch *ch = &gl.ch[c];
+ 	unsigned best = GL_MAX_RI;
+ 	for (unsigned j = 0; j < GL_MAX_RI; j++) {
+-		if (gl.ri[j].valid && !gl.ri[j].used && gl.ri[j].size >= len && (best == GL_MAX_RI || gl.ri[j].size < gl.ri[best].size)) {
++		if (ch->ri[j].valid && !ch->ri[j].used && ch->ri[j].size >= len && (best == GL_MAX_RI || ch->ri[j].size < ch->ri[best].size)) {
+ 			best = j;
+ 		}
+ 	}
+-	if (best == GL_MAX_RI || len > GL_TX_MAX) {
++	if (!ch->open_acked || best == GL_MAX_RI || len > GL_TX_MAX) {
+ 		return false;
+ 	}
+-	gl.ri[best].used = true;
++	ch->ri[best].used = true;
+ 	struct {
+ 		uint16_t cmd, lcid;
+ 		uint32_t iid, chunk, left;
+-	} __attribute__((packed)) h = { G_TX_DATA, GL_LCID, gl.ri[best].id, len, 0 };
++	} __attribute__((packed)) h = { G_TX_DATA, gl_lcid(c), ch->ri[best].id, len, 0 };
+ 	if (!gl_tx(&h, (uint32_t)sizeof(h), data, len)) {
+-		gl.ri[best].used = false;
++		ch->ri[best].used = false;
+ 		return false;
+ 	}
+ 	return true;
+ }
+ 
++/* ---- QRTR on IPCRTR (af_qrtr.c, ns.c): our node 1 answers HELLO and offers the service locator (pd-mapper) */
++#define QR_NODE_LOCAL           1u
++#define QR_PORT_CTRL            0xfffffffeu
++#define QR_PDM_PORT             0x4002u
++#define QR_PDM_SERVICE          0x40u
++#define QR_PDM_INSTANCE         0x101u          /* qmi_add_server: version 0x101 | instance 0 << 8 */
++enum { Q_DATA = 1, Q_HELLO = 2, Q_BYE = 3, Q_NEW_SERVER = 4, Q_DEL_SERVER = 5, Q_DEL_CLIENT = 6, Q_RESUME_TX = 7,
++       Q_NEW_LOOKUP = 10, Q_DEL_LOOKUP = 11 };
++extern uint32_t sweet_pdm_answer(const uint8_t *req, uint32_t len, uint8_t *r);
++/* the DSP's service notifier (QMI SERVREG_NOTIFIER 0x42, pdr_internal.h): our listener for the audio PD */
++#define QR_NOTIF_SERVICE        0x42u
++#define QR_NOTIF_PORT           0x4010u         /* our client socket */
++#define SERVREG_REGISTER_LISTENER 0x20u
++#define SERVREG_STATE_UPDATED   0x22u
++#define SERVREG_SET_ACK         0x23u
++static const char au_pd_path[] = "msm/adsp/audio_pd";
++static struct {
++	uint32_t node, port;            /* the notifier, from its NEW_SERVER */
++	uint16_t txn;
++	bool asked, answered;
++	uint32_t state;
++} nf;
++
++static const char *
++nf_state(uint32_t st)
++{
++	switch (st) {
++	case 0x0fffffffu: return "DOWN";
++	case 0x1fffffffu: return "UP";
++	case 0x2fffffffu: return "EARLY_DOWN";
++	case 0x7fffffffu: return "UNINIT";
++	default: return "?";
++	}
++}
++
++static bool qr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *pl, uint32_t size);
++
++/* pdr_register_listener(): enable (TLV 1, u8 1) + service path (TLV 2, the string without NUL) */
++static void
++nf_register(void)
++{
++	uint8_t q[7 + 4 + 3 + sizeof(au_pd_path)];
++	uint16_t plen = (uint16_t)(sizeof(au_pd_path) - 1), one = 1, mlen, msg = SERVREG_REGISTER_LISTENER;
++	uint32_t n = 7;
++	q[0] = 0;                               /* QMI_REQUEST */
++	nf.txn++;
++	memcpy(q + 1, &nf.txn, 2);
++	memcpy(q + 3, &msg, 2);
++	q[n] = 1;
++	memcpy(q + n + 1, &one, 2);
++	q[n + 3] = 1;
++	n += 4;
++	q[n] = 2;
++	memcpy(q + n + 1, &plen, 2);
++	memcpy(q + n + 3, au_pd_path, plen);
++	n += 3 + plen;
++	mlen = (uint16_t)(n - 7);
++	memcpy(q + 5, &mlen, 2);
++	nf.asked = qr_send(1, QR_NOTIF_PORT, nf.node, nf.port, q, n);
++	printf("SWEET AUDIO: servreg: register listener for %s at %u:%#x %s\n", au_pd_path, nf.node, nf.port,
++	    nf.asked ? "sent" : "NOT SENT");
++}
++
++/* a TLV's value in a QMI message body, NULL when absent */
++static const uint8_t *
++nf_tlv(const uint8_t *t, uint32_t len, uint8_t type, uint16_t *vlen)
++{
++	for (uint32_t o = 0; o + 3 <= len;) {
++		uint16_t l;
++		memcpy(&l, t + o + 1, 2);
++		if (o + 3 + l > len) {
++			return NULL;
++		}
++		if (t[o] == type) {
++			*vlen = l;
++			return t + o + 3;
++		}
++		o += 3 + l;
++	}
++	return NULL;
++}
++
++/* the notifier's answer (type 2) or state indication (type 4) */
++static void
++nf_rx(uint32_t snode, uint32_t sport, const uint8_t *p, uint32_t len)
++{
++	if (len < 7) {
++		return;
++	}
++	uint16_t txn, msg, mlen, vl = 0;
++	memcpy(&txn, p + 1, 2);
++	memcpy(&msg, p + 3, 2);
++	memcpy(&mlen, p + 5, 2);
++	const uint8_t *t = p + 7, *v;
++	uint32_t tl = MIN((uint32_t)mlen, len - 7);
++	if (p[0] == 2 && msg == SERVREG_REGISTER_LISTENER) {
++		uint16_t res = 0xffff, err = 0xffff;
++		if ((v = nf_tlv(t, tl, 2, &vl)) && vl >= 4) {
++			memcpy(&res, v, 2);
++			memcpy(&err, v + 2, 2);
++		}
++		uint32_t st = 0;
++		bool have = (v = nf_tlv(t, tl, 0x10, &vl)) && vl >= 4;
++		if (have) {
++			memcpy(&st, v, 4);
++			nf.state = st;
++		}
++		nf.answered = true;
++		printf("SWEET AUDIO: servreg: listener registered: result %u error %u, %s state %#x (%s)\n", res, err, au_pd_path,
++		    st, have ? nf_state(st) : "not given");
++	} else if (p[0] == 4 && msg == SERVREG_STATE_UPDATED) {
++		uint32_t st = 0;
++		uint16_t tid = 0;
++		if ((v = nf_tlv(t, tl, 1, &vl)) && vl >= 4) {
++			memcpy(&st, v, 4);
++		}
++		if ((v = nf_tlv(t, tl, 3, &vl)) && vl >= 2) {
++			memcpy(&tid, v, 2);
++		}
++		nf.state = st;
++		printf("SWEET AUDIO: servreg: %s is now %#x (%s), transaction %u -> ack\n", au_pd_path, st, nf_state(st), tid);
++		/* pdr_send_indack_msg(): SERVREG_SET_ACK with the path (TLV 1) and the transaction (TLV 2) */
++		uint8_t q[7 + 3 + sizeof(au_pd_path) + 5];
++		uint16_t plen = (uint16_t)(sizeof(au_pd_path) - 1), two = 2, m = SERVREG_SET_ACK, ml;
++		uint32_t n = 7;
++		q[0] = 0;
++		nf.txn++;
++		memcpy(q + 1, &nf.txn, 2);
++		memcpy(q + 3, &m, 2);
++		q[n] = 1;
++		memcpy(q + n + 1, &plen, 2);
++		memcpy(q + n + 3, au_pd_path, plen);
++		n += 3 + plen;
++		q[n] = 2;
++		memcpy(q + n + 1, &two, 2);
++		memcpy(q + n + 3, &tid, 2);
++		n += 5;
++		ml = (uint16_t)(n - 7);
++		memcpy(q + 5, &ml, 2);
++		(void)qr_send(1, QR_NOTIF_PORT, snode, sport, q, n);
++	} else {
++		printf("SWEET AUDIO: servreg: QMI type %u message %#x (%u bytes)\n", p[0], msg, len);
++	}
++}
++
++static bool
++qr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *pl, uint32_t size)
++{
++	static uint8_t pkt[32 + 600];
++	uint32_t h[8] = { 1, type, QR_NODE_LOCAL, src_port, 0, size, dst_node, dst_port };
++	uint32_t padded = (size + 3u) & ~3u;
++	if (padded > sizeof(pkt) - 32) {
++		return false;
++	}
++	memcpy(pkt, h, 32);
++	memcpy(pkt + 32, pl, size);
++	bzero(pkt + 32 + size, padded - size);
++	return gl_send(CH_QRTR, pkt, 32 + padded);
++}
++
++static void
++qr_rx(const uint8_t *p, uint32_t len)
++{
++	uint32_t h[8];
++	if (len < 32 || p[0] != 1) {
++		printf("SWEET AUDIO: qrtr: version %u packet of %u bytes ignored\n", len ? p[0] : 0, len);
++		return;
++	}
++	memcpy(h, p, 32);
++	uint32_t type = h[1], snode = h[2], sport = h[3], confirm = h[4], size = h[5], dport = h[7];
++	if (32 + size > len) {
++		return;
++	}
++	const uint8_t *pl = p + 32;
++	gl.qnode = snode;
++	switch (type) {
++	case Q_HELLO: {
++		uint32_t hello[5] = { Q_HELLO, 0, 0, 0, 0 };
++		uint32_t srv[5] = { Q_NEW_SERVER, QR_PDM_SERVICE, QR_PDM_INSTANCE, QR_NODE_LOCAL, QR_PDM_PORT };
++		bool a = qr_send(Q_HELLO, QR_PORT_CTRL, snode, QR_PORT_CTRL, hello, sizeof(hello));
++		bool b = qr_send(Q_NEW_SERVER, QR_PORT_CTRL, snode, QR_PORT_CTRL, srv, sizeof(srv));
++		printf("SWEET AUDIO: qrtr: hello from node %u -> hello %s, service locator 0x40 at %u:%#x %s\n", snode,
++		    a ? "sent" : "NOT SENT", QR_NODE_LOCAL, QR_PDM_PORT, b ? "announced" : "NOT ANNOUNCED");
++		break;
++	}
++	case Q_NEW_SERVER:
++	case Q_DEL_SERVER:
++		if (size >= 20) {
++			uint32_t v[5];
++			memcpy(v, pl, 20);
++			gl.servers++;
++			printf("SWEET AUDIO: qrtr: the DSP %s service %u (%#x) version %u instance %u at %u:%#x\n",
++			    type == Q_NEW_SERVER ? "offers" : "removes", v[1], v[1], v[2] & 0xff, v[2] >> 8, v[3], v[4]);
++			if (type == Q_NEW_SERVER && v[1] == QR_NOTIF_SERVICE && (v[2] >> 8) == 74 && !nf.asked) {
++				nf.node = v[3];
++				nf.port = v[4];
++				nf_register();
++			}
++		}
++		break;
++	case Q_NEW_LOOKUP:
++		if (size >= 20) {
++			uint32_t v[5];
++			memcpy(v, pl, 20);
++			printf("SWEET AUDIO: qrtr: the DSP looks up service %#x instance %#x\n", v[1], v[2]);
++		}
++		break;
++	case Q_DATA:
++		if (dport == QR_PDM_PORT) {
++			uint8_t r[512];
++			uint32_t n = sweet_pdm_answer(pl, size, r);
++			gl.pdm_reqs++;
++			if (n) {
++				(void)qr_send(Q_DATA, QR_PDM_PORT, snode, sport, r, n);
++			}
++		} else if (dport == QR_NOTIF_PORT) {
++			nf_rx(snode, sport, pl, size);
++		} else {
++			printf("SWEET AUDIO: qrtr: %u bytes from %u:%#x to port %#x (no server)\n", size, snode, sport, dport);
++		}
++		if (confirm) {
++			uint32_t r[5] = { Q_RESUME_TX, QR_NODE_LOCAL, dport, 0, 0 };
++			(void)qr_send(Q_RESUME_TX, dport, snode, sport, r, sizeof(r));
++		}
++		break;
++	case Q_RESUME_TX:
++	case Q_DEL_CLIENT:
++		break;
++	default:
++		printf("SWEET AUDIO: qrtr: control %u from %u:%#x (%u bytes)\n", type, snode, sport, size);
++		break;
++	}
++}
++
+ static bool
+ gl_up(void)
+ {
+@@ -693,7 +995,7 @@ gl_up(void)
+ 	return v;
+ }
+ 
+-/* stage 3: the channel, then AVCS_CMD_ADSP_EVENT_GET_STATE to the core service */
++/* stage 3: both channels, the service locator for the DSP, then AVCS_CMD_ADSP_EVENT_GET_STATE to the core service */
+ static bool
+ au_apr(void)
+ {
+@@ -703,21 +1005,27 @@ au_apr(void)
+ 	unsigned t;
+ 	for (t = 0; t < 10000 && !gl.bad; t += 5) {
+ 		gl_poll();
+-		if (gl.open_acked) {
+-			unsigned j;
+-			for (j = 0; j < GL_MAX_RI && !gl.ri[j].valid; j++) {
+-			}
+-			if (j < GL_MAX_RI) {
+-				break;
+-			}
++		bool have_ri = false;
++		for (unsigned j = 0; j < GL_MAX_RI; j++) {
++			have_ri |= gl.ch[CH_APR].ri[j].valid;
++		}
++		if (gl.ch[CH_APR].open_acked && have_ri && gl.ch[CH_QRTR].open_acked) {
++			break;
+ 		}
+ 		au_sleep(5);
+ 	}
+-	if (!gl.open_acked) {
++	if (!gl.ch[CH_APR].open_acked) {
+ 		printf("SWEET AUDIO: apr_audio_svc not open after %u ms (version-acked %u, %u channels offered, rx FIFO %s)\n", t,
+ 		    gl.version_acked, gl.opens_seen, gl.rx ? "seen" : "never seen");
+ 		return false;
+ 	}
++	/* let QRTR and the locator run first: the audio PD may start only after the DSP asked for its domains */
++	for (unsigned w = 0; w < 5000 && !gl.bad; w += 5) {
++		gl_poll();
++		au_sleep(5);
++	}
++	printf("SWEET AUDIO: after 5 s of QRTR: node %u, %u locator requests answered, %u services offered by the DSP; "
++	    "audio PD %s\n", gl.qnode, gl.pdm_reqs, gl.servers, nf.answered || nf.state ? nf_state(nf.state) : "state unknown");
+ 	struct {
+ 		uint16_t field, size;
+ 		uint8_t src_svc, src_domain;
+@@ -725,13 +1033,17 @@ au_apr(void)
+ 		uint8_t dest_svc, dest_domain;
+ 		uint16_t dest_port;
+ 		uint32_t token, opcode;
+-	} __attribute__((packed)) q = { APR_HDR_FIELD_SEQ_CMD, 32, APR_SVC_ADSP_CORE, APR_DOMAIN_APPS, 0, APR_SVC_ADSP_CORE,
+-	    APR_DOMAIN_ADSP, 0, 1, AVCS_GET_STATE };
++	} __attribute__((packed)) q = { APR_HDR_FIELD_SEQ_CMD, APR_HDR_SIZE, APR_SVC_ADSP_CORE, APR_DOMAIN_APPS, 0,
++	    APR_SVC_ADSP_CORE, APR_DOMAIN_ADSP, 0, 1, AVCS_GET_STATE };
++	_Static_assert(sizeof(q) == APR_HDR_SIZE, "apr_hdr is 20 bytes");
+ 	/* q6core_is_adsp_ready(): ask until it says ready; the services may come up seconds after the DSP itself */
++	/* both APR channels the DSP offers, alternately: the answer may come back on either */
++	printf("SWEET AUDIO: apr_apps2 %s\n", gl.ch[CH_APR2].open_acked ? "open both ways too" : "not open");
+ 	for (unsigned tries = 0; tries < 30; tries++) {
++		unsigned c = (tries & 1) && gl.ch[CH_APR2].open_acked ? CH_APR2 : CH_APR;
+ 		gl.apr_answered = false;
+-		if (!gl_send(&q, sizeof(q))) {
+-			printf("SWEET AUDIO: APR send failed (no free intent from the DSP)\n");
++		if (!gl_send(c, &q, sizeof(q))) {
++			printf("SWEET AUDIO: APR send on %s failed (no free intent from the DSP)\n", gl_names[c]);
+ 			return false;
+ 		}
+ 		for (unsigned w = 0; w < 1000 && !gl.apr_answered && !gl.bad; w += 5) {
+@@ -752,7 +1064,8 @@ au_apr(void)
+ 		au_sleep(100);
+ 	}
+ 	if (!gl.apr_opcode) {
+-		printf("SWEET AUDIO: no APR answer at all in 30 s (%u packets from the DSP)\n", gl.rx_pkts);
++		printf("SWEET AUDIO: no APR answer at all in 30 s (%u packets from the DSP, %u locator requests, %u services)\n",
++		    gl.rx_pkts, gl.pdm_reqs, gl.servers);
+ 	} else {
+ 		printf("SWEET AUDIO: the DSP answered but never said ready (last opcode %#x status %#x)\n", gl.apr_opcode, gl.apr_status);
+ 	}
