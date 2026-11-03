@@ -1,0 +1,600 @@
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 8933efc..3a00a39 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -16,6 +16,9 @@
+  *      locator (pd-mapper, QMI 0x40, answers from beryllium_wlan.c's sdm845 table, 3042); then one APR command to the
+  *      DSP core (AVCS_CMD_ADSP_EVENT_GET_STATE): its answer says whether the audio framework is up. Polled, no interrupts (qcom_glink_smem.c, qcom_glink_native.c,
+  *      apr.c, q6core.c; the modem's GLINK in beryllium_wlan.c is the model, with host 2 and one APR channel).
++ *   4  AFE (q6afe.c): the QUAT MI2S pins to qua_mi2s, the LPASS bit clock (AFE_PARAM_ID_CLOCK_SET, 1.536 MHz), the
++ *      QUAT_MI2S_RX port's I2S config (16-bit stereo 48 kHz on SD0, WS internal) and DEVICE_START with nothing routed
++ *      (the DSP sends zeros); the pads are sampled before, while and after it runs; then stopped, clock off, pins back.
+  *
+  * Facts from the live DT (dtb/dipper/live.dtb): qcom,lpass@17300000 pil-tz-generic, qcom,pas-id 1, firmware "adsp",
+  * memory-region adsp_region@0x8c500000 0x1e00000 (no-map, in the low DDR bank the kernel does not manage),
+@@ -27,7 +30,9 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <sys/sysctl.h>
+ #include <kern/clock.h>
++#include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <kern/kalloc.h>
+ #include <machine/machine_routines.h>
+@@ -91,13 +96,42 @@ void dipper_audio_init(void);
+ #define APR_DOMAIN_ADSP         4u
+ #define APR_SVC_ADSP_CORE       3u
+ #define APR_HDR_SIZE            20u             /* sizeof(struct apr_hdr), packed */
+-#define APR_HDR_FIELD_SEQ_CMD   0x0150u         /* APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD, APR_HDR_LEN(20) = 5 words, APR_PKT_VER) */
++#define APR_HDR_FIELD_SEQ_CMD   0x0250u         /* APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD 2 << 8, APR_HDR_LEN(20) = 5 words << 4, APR_PKT_VER 0); 0x150 (type 1, a response) worked for the core only */
+ #define APR_BASIC_RSP_RESULT    0x000110e8u
+ #define AVCS_GET_STATE          0x0001290cu     /* AVCS_CMD_ADSP_EVENT_GET_STATE */
+ #define AVCS_GET_STATE_RSP      0x0001290du
++#define AVCS_GET_FWK_VERSION    0x0001292cu
++#define AVCS_GET_FWK_VERSION_RSP 0x0001292du
+ enum { G_VERSION = 0, G_VERSION_ACK = 1, G_OPEN = 2, G_CLOSE = 3, G_OPEN_ACK = 4, G_INTENT = 5, G_RX_DONE = 6,
+        G_RX_INTENT_REQ = 7, G_RX_INTENT_REQ_ACK = 8, G_TX_DATA = 9, G_CLOSE_ACK = 11, G_TX_DATA_CONT = 12,
+        G_READ_NOTIF = 13, G_RX_DONE_W_REUSE = 14, G_SIGNALS = 15 };
++/* AFE (q6afe.c): the QUAT MI2S RX port feeds the TAS2557; dipper DT: rx-lines 1 = SD0 (gpio60), all MI2S masters */
++#define APR_SVC_AFE             4u
++#define AFE_PORT_CMD_DEVICE_START 0x000100e5u
++#define AFE_PORT_CMD_DEVICE_STOP 0x000100e6u
++#define AFE_PORT_CMD_SET_PARAM_V2 0x000100efu
++#define AFE_SVC_CMD_SET_PARAM   0x000100f3u
++#define AFE_MODULE_AUDIO_DEV_INTERFACE 0x0001020cu
++#define AFE_PARAM_ID_I2S_CONFIG 0x0001020du
++#define AFE_MODULE_CLOCK_SET    0x0001028fu
++#define AFE_PARAM_ID_CLOCK_SET  0x00010290u
++#define AFE_PORT_QUAT_MI2S_RX   0x1006u
++#define AFE_CLK_QUAD_MI2S_IBIT  0x106u          /* Q6AFE_LPASS_CLK_ID_QUAD_MI2S_IBIT */
++#define AFE_CLK_TOKEN           1024u
++#define AU_RATE                 48000u
++#define AU_BCLK                 (AU_RATE * 16u * 2u)    /* 16-bit stereo frames: 1.536 MHz, MI2S_BCLK_RATE */
++#define AU_TLMM_NORTH_PA        0x03900000u     /* TLMM + NORTH: gpio58-61 (QUAT MI2S) are NORTH pins */
++#define AU_MI2S_PIN0            58u
++#define AU_MI2S_FUNC            1u              /* qua_mi2s */
++#define TLMM_FUNC_PULL_DRV_MASK 0x1ffu          /* pull [1:0], func [5:2], drive [8:6] */
++struct au_apr_hdr {
++	uint16_t field, size;
++	uint8_t src_svc, src_domain;
++	uint16_t src_port;
++	uint8_t dest_svc, dest_domain;
++	uint16_t dest_port;
++	uint32_t token, opcode;
++} __attribute__((packed));
+ 
+ static struct {
+ 	unsigned stage, delay_s;
+@@ -306,8 +340,10 @@ au_crash_reason(void)
+ }
+ 
+ /* ---- GLINK on the lpass edge: descriptor words tx tail @0, tx head @4, rx tail @8, rx head @12; two channels */
+-enum { CH_APR, CH_QRTR, CH_APR2, CH_N };
+-static const char *const gl_names[CH_N] = { "apr_audio_svc", "IPCRTR", "apr_apps2" };
++enum { CH_APR, CH_QRTR, CH_APR2, CH_RPC, CH_SSR, CH_LOOP, CH_N };
++/* the last three only opened and logged: does the audio PD wait on one of them (3043) */
++static const char *const gl_names[CH_N] = { "apr_audio_svc", "IPCRTR", "apr_apps2", "fastrpcglink-apps-dsp", "glink_ssr",
++	                                    "LOOPBACK_CTL_LPASS" };
+ struct gl_ch {
+ 	uint32_t rcid;                  /* the DSP's id for the channel, 0 = not offered yet */
+ 	bool open_acked;
+@@ -327,6 +363,11 @@ static struct {
+ 	struct gl_ch ch[CH_N];
+ 	unsigned opens_seen, rx_pkts;
+ 	uint32_t apr_opcode, apr_status;        /* the last APR answer */
++	uint32_t apr_rsp_of;                    /* APR_BASIC_RSP_RESULT: the command it answers */
++	uint8_t apr_pl[256];                    /* the last answer's payload, after its header */
++	uint32_t apr_pl_len;
++	uint32_t last_riid;                     /* the DSP's intent our last packet went into */
++	bool last_ri_done;                      /* and whether the DSP has handed it back (RX_DONE) */
+ 	bool apr_answered;
+ 	uint32_t qnode;                         /* the DSP's QRTR node, from its packets */
+ 	unsigned pdm_reqs, servers;
+@@ -334,6 +375,15 @@ static struct {
+ 
+ static void qr_rx(const uint8_t *p, uint32_t len);
+ 
++/* every APR packet from the DSP, for kern.sweet_audio_apr */
++#define AU_CAP_N                16u
++#define AU_CAP_SIZE             256u
++static struct {
++	unsigned head, tail;
++	uint16_t len[AU_CAP_N];
++	uint8_t pkt[AU_CAP_N][AU_CAP_SIZE];
++} au_cap;
++
+ static uint32_t
+ gl_rx_avail(void)
+ {
+@@ -494,7 +544,7 @@ gl_apr_rx(const uint8_t *p, uint32_t n)
+ 		memcpy(&w1, p + hlen + 4, 4);
+ 	}
+ 	static unsigned dumped;
+-	if (dumped++ < 2) {
++	if (dumped++ < 6) {
+ 		char hex[3 * 64 + 1];
+ 		uint32_t m = MIN(n, 64u), o = 0;
+ 		for (uint32_t i = 0; i < m; i++) {
+@@ -506,7 +556,14 @@ gl_apr_rx(const uint8_t *p, uint32_t n)
+ 	    "payload %#x %#x\n", p[4], p[5], sport, p[8], p[9], dport, opcode, token, size, w0, w1);
+ 	gl.apr_opcode = opcode;
+ 	gl.apr_status = opcode == APR_BASIC_RSP_RESULT ? w1 : w0;
++	gl.apr_rsp_of = opcode == APR_BASIC_RSP_RESULT ? w0 : 0;
++	gl.apr_pl_len = n > hlen ? MIN(n - hlen, (uint32_t)sizeof(gl.apr_pl)) : 0;
++	memcpy(gl.apr_pl, p + hlen, gl.apr_pl_len);
+ 	gl.apr_answered = true;
++	/* kern.sweet_audio_apr hands these out; the oldest is overwritten when nobody reads */
++	unsigned slot = au_cap.head++ % AU_CAP_N;
++	au_cap.len[slot] = (uint16_t)MIN(n, (uint32_t)AU_CAP_SIZE);
++	memcpy(au_cap.pkt[slot], p, au_cap.len[slot]);
+ }
+ 
+ static int
+@@ -573,12 +630,13 @@ gl_poll(void)
+ 				struct {
+ 					uint16_t cmd, lcid;
+ 					uint32_t len;
+-					char name[16];
++					char name[32];
+ 				} __attribute__((packed)) req = { G_OPEN, gl_lcid(c), (uint32_t)strlen(gl_names[c]) + 1, { 0 } };
+ 				strlcpy(req.name, gl_names[c], sizeof(req.name));
+ 				gl.ch[c].rcid = p1;
+ 				(void)gl_tx_cmd(G_OPEN_ACK, p1, 0);
+-				(void)gl_tx(&req, (uint32_t)sizeof(req), NULL, 0);
++				/* the name padded to 8 bytes only (gl_tx pads): the DSP reads the next command right after it */
++				(void)gl_tx(&req, 8u + req.len, NULL, 0);
+ 			}
+ 			break;
+ 		}
+@@ -630,6 +688,7 @@ gl_poll(void)
+ 				struct gl_ch *ch = &gl.ch[c];
+ 				if (ch->ri[j].valid && ch->ri[j].id == p2) {
+ 					ch->ri[j].used = false;
++					gl.last_ri_done |= c == CH_APR && p2 == gl.last_riid;
+ 					if (cmd == G_RX_DONE) {
+ 						ch->ri[j].valid = false;
+ 					}
+@@ -689,8 +748,19 @@ gl_poll(void)
+ 					if (c == CH_APR || c == CH_APR2) {
+ 						printf("SWEET AUDIO: APR packet on %s\n", gl_names[c]);
+ 						gl_apr_rx(ch->li[k].buf, ch->li[k].off);
+-					} else {
++					} else if (c == CH_QRTR) {
+ 						qr_rx(ch->li[k].buf, ch->li[k].off);
++					} else {
++						static unsigned other_dumps;
++						if (other_dumps++ < 24) {
++							char hex[3 * 48 + 1];
++							uint32_t m = MIN(ch->li[k].off, 48u), o = 0;
++							for (uint32_t i = 0; i < m; i++) {
++								o += (uint32_t)snprintf(hex + o, sizeof(hex) - o, "%02x%s", ch->li[k].buf[i],
++								    (i & 3) == 3 ? " " : "");
++							}
++							printf("SWEET AUDIO: %s: %u bytes from the DSP: %s\n", gl_names[c], ch->li[k].off, hex);
++						}
+ 					}
+ 				}
+ 				ch->li[k].bad = false;
+@@ -726,6 +796,8 @@ gl_send(unsigned c, const void *data, uint32_t len)
+ 		return false;
+ 	}
+ 	ch->ri[best].used = true;
++	gl.last_riid = ch->ri[best].id;
++	gl.last_ri_done = false;
+ 	struct {
+ 		uint16_t cmd, lcid;
+ 		uint32_t iid, chunk, left;
+@@ -1026,14 +1098,7 @@ au_apr(void)
+ 	}
+ 	printf("SWEET AUDIO: after 5 s of QRTR: node %u, %u locator requests answered, %u services offered by the DSP; "
+ 	    "audio PD %s\n", gl.qnode, gl.pdm_reqs, gl.servers, nf.answered || nf.state ? nf_state(nf.state) : "state unknown");
+-	struct {
+-		uint16_t field, size;
+-		uint8_t src_svc, src_domain;
+-		uint16_t src_port;
+-		uint8_t dest_svc, dest_domain;
+-		uint16_t dest_port;
+-		uint32_t token, opcode;
+-	} __attribute__((packed)) q = { APR_HDR_FIELD_SEQ_CMD, APR_HDR_SIZE, APR_SVC_ADSP_CORE, APR_DOMAIN_APPS, 0,
++	struct au_apr_hdr q = { APR_HDR_FIELD_SEQ_CMD, APR_HDR_SIZE, APR_SVC_ADSP_CORE, APR_DOMAIN_APPS, 0,
+ 	    APR_SVC_ADSP_CORE, APR_DOMAIN_ADSP, 0, 1, AVCS_GET_STATE };
+ 	_Static_assert(sizeof(q) == APR_HDR_SIZE, "apr_hdr is 20 bytes");
+ 	/* q6core_is_adsp_ready(): ask until it says ready; the services may come up seconds after the DSP itself */
+@@ -1072,6 +1137,256 @@ au_apr(void)
+ 	return false;
+ }
+ 
++/* ---- stage 4: AFE */
++
++/*
++ * One APR command (header + payload) to svc on the DSP, then wait up to ms for its answer: the packet with opcode want
++ * (status 0; payload in gl.apr_pl), or APR_BASIC_RSP_RESULT for this command (its status). -1: nothing came.
++ */
++static int
++apr_request(unsigned svc, uint32_t token, uint32_t opcode, const void *pl, uint32_t len, uint32_t want, unsigned ms)
++{
++	uint8_t pkt[APR_HDR_SIZE + 128];
++	if (len > sizeof(pkt) - APR_HDR_SIZE) {
++		return -1;
++	}
++	struct au_apr_hdr h = { APR_HDR_FIELD_SEQ_CMD, (uint16_t)(APR_HDR_SIZE + len), (uint8_t)svc, APR_DOMAIN_APPS, 0,
++	    (uint8_t)svc, APR_DOMAIN_ADSP, 0, token, opcode };
++	memcpy(pkt, &h, APR_HDR_SIZE);
++	if (len) {
++		memcpy(pkt + APR_HDR_SIZE, pl, len);
++	}
++	gl.apr_answered = false;
++	gl.apr_rsp_of = 0;
++	if (!gl_send(CH_APR, pkt, APR_HDR_SIZE + len)) {
++		printf("SWEET AUDIO: APR %#x not sent (no free intent from the DSP)\n", opcode);
++		return -1;
++	}
++	for (unsigned w = 0; w < ms && !gl.bad; w += 2) {
++		au_sleep(2);
++		gl_poll();
++		if (gl.apr_answered && gl.apr_opcode == APR_BASIC_RSP_RESULT && gl.apr_rsp_of == opcode) {
++			return (int)gl.apr_status;
++		}
++		if (gl.apr_answered && want != APR_BASIC_RSP_RESULT && gl.apr_opcode == want) {
++			return 0;
++		}
++	}
++	printf("SWEET AUDIO: APR %#x to svc %u: no answer in %u ms (the DSP %s the packet's intent %u)\n", opcode, svc, ms,
++	    gl.last_ri_done ? "handed back" : "never handed back", gl.last_riid);
++	return -1;
++}
++
++static int
++apr_cmd(unsigned svc, uint32_t token, uint32_t opcode, const void *pl, uint32_t len)
++{
++	return apr_request(svc, token, opcode, pl, len, APR_BASIC_RSP_RESULT, 3000);
++}
++
++/* AVCS_CMD_GET_FWK_VERSION (q6core.c): the AVS build and the static services it runs, with their API versions */
++static void
++au_fwk_version(void)
++{
++	if (apr_request(APR_SVC_ADSP_CORE, 2, AVCS_GET_FWK_VERSION, NULL, 0, AVCS_GET_FWK_VERSION_RSP, 2000) != 0 ||
++	    gl.apr_opcode != AVCS_GET_FWK_VERSION_RSP || gl.apr_pl_len < 20) {
++		printf("SWEET AUDIO: AVCS framework version: no answer (last opcode %#x status %#x)\n", gl.apr_opcode, gl.apr_status);
++		return;
++	}
++	uint32_t v[5];
++	memcpy(v, gl.apr_pl, sizeof(v));
++	char out[200];
++	uint32_t o = 0;
++	for (uint32_t i = 0; i < v[4] && 20 + 8 * i + 8 <= gl.apr_pl_len && o < sizeof(out) - 24; i++) {
++		uint32_t s[2];
++		memcpy(s, gl.apr_pl + 20 + 8 * i, 8);
++		o += (uint32_t)snprintf(out + o, sizeof(out) - o, " %#x:v%u", s[0], s[1]);
++	}
++	printf("SWEET AUDIO: AVS build %u.%u.%u.%u, %u services (id:api):%s\n", v[0], v[1], v[2], v[3], v[4], out);
++}
++
++/* AFE_SVC_CMD_SET_PARAM (q6afe_set_param): one in-band parameter for the AFE service, e.g. a clock */
++static int
++afe_svc_param(uint32_t module, uint32_t param, const void *data, uint16_t size)
++{
++	struct {
++		uint32_t payload_size, addr_lsw, addr_msw, mem_map_handle;
++		uint32_t module_id, param_id;
++		uint16_t param_size, reserved;
++		uint8_t data[64];
++	} __attribute__((packed)) p = { 12u + size, 0, 0, 0, module, param, size, 0, { 0 } };
++	if (size > sizeof(p.data)) {
++		return -1;
++	}
++	memcpy(p.data, data, size);
++	return apr_cmd(APR_SVC_AFE, AFE_CLK_TOKEN, AFE_SVC_CMD_SET_PARAM, &p, 28u + size);
++}
++
++/* AFE_PORT_CMD_SET_PARAM_V2 (q6afe_port_set_param_v2): one in-band parameter for a port */
++static int
++afe_port_param(uint16_t port, uint32_t module, uint32_t param, const void *data, uint16_t size)
++{
++	struct {
++		uint16_t port_id, payload_size;
++		uint32_t addr_lsw, addr_msw, mem_map_handle;
++		uint32_t module_id, param_id;
++		uint16_t param_size, reserved;
++		uint8_t data[64];
++	} __attribute__((packed)) p = { port, (uint16_t)(12u + size), 0, 0, 0, module, param, size, 0, { 0 } };
++	if (size > sizeof(p.data)) {
++		return -1;
++	}
++	memcpy(p.data, data, size);
++	return apr_cmd(APR_SVC_AFE, port, AFE_PORT_CMD_SET_PARAM_V2, &p, 28u + size);
++}
++
++static int
++afe_port_cmd(uint16_t port, uint32_t opcode)
++{
++	struct { uint16_t port_id, reserved; } __attribute__((packed)) p = { port, 0 };
++	return apr_cmd(APR_SVC_AFE, port, opcode, &p, sizeof(p));
++}
++
++/* struct afe_clk_set: the bit clock of QUAT MI2S from LPASS, COUPLE_NO, root default; freq 0 = off */
++static int
++afe_mi2s_clock(uint32_t hz)
++{
++	struct {
++		uint32_t minor, clk_id, freq;
++		uint16_t attri, root;
++		uint32_t enable;
++	} c = { 1, AFE_CLK_QUAD_MI2S_IBIT, hz, 1, 0, hz != 0 };
++	_Static_assert(sizeof(c) == 20, "afe_clk_set is 20 bytes");
++	return afe_svc_param(AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, &c, sizeof(c));
++}
++
++static struct {
++	vm_offset_t tlmm;               /* gpio58..61 */
++	uint32_t orig[4];
++	bool saved;
++} ap;
++
++static uint32_t
++ap_rd(unsigned i, uint32_t reg)
++{
++	return *(volatile uint32_t *)(ap.tlmm + i * 0x1000u + reg);
++}
++
++/* sdm845-pinctrl.dtsi quat_mi2s_active + sd0/sd1: qua_mi2s, 8 mA, no pull (SCK, WS, SD0 to the amp, SD1 from it) */
++static bool
++ap_pins(bool on)
++{
++	if (!ap.tlmm && !(ap.tlmm = ml_io_map(AU_TLMM_NORTH_PA + AU_MI2S_PIN0 * 0x1000u, 4 * 0x1000u))) {
++		return false;
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		if (!ap.saved) {
++			ap.orig[i] = ap_rd(i, 0);
++		}
++		uint32_t cfg = on ? (ap.orig[i] & ~TLMM_FUNC_PULL_DRV_MASK) | (AU_MI2S_FUNC << 2) | (3u << 6) : ap.orig[i];
++		*(volatile uint32_t *)(ap.tlmm + i * 0x1000u) = cfg;
++	}
++	ap.saved = true;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("SWEET AUDIO: QUAT MI2S pins gpio58-61 %s: %#x %#x %#x %#x\n", on ? "to qua_mi2s" : "restored", ap_rd(0, 0),
++	    ap_rd(1, 0), ap_rd(2, 0), ap_rd(3, 0));
++	return true;
++}
++
++/* the pads' input levels (GPIO_IN, bit 0 of the io register) sampled back to back: does the bus move */
++static void
++ap_sample_to(const char *when, char *text, size_t cap)
++{
++	static const char *const role[4] = { "SCK", "WS", "SD0", "SD1" };
++	if (!ap.tlmm && !(ap.tlmm = ml_io_map(AU_TLMM_NORTH_PA + AU_MI2S_PIN0 * 0x1000u, 4 * 0x1000u))) {
++		return;
++	}
++	unsigned ones[4] = { 0 }, edges[4] = { 0 }, last[4] = { 0 }, n = 20000;
++	uint64_t t0 = mach_absolute_time();
++	for (unsigned k = 0; k < n; k++) {
++		for (unsigned i = 0; i < 4; i++) {
++			unsigned v = ap_rd(i, 4) & 1u;
++			ones[i] += v;
++			edges[i] += k && v != last[i];
++			last[i] = v;
++		}
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	char out[160];
++	uint32_t o = 0;
++	for (unsigned i = 0; i < 4; i++) {
++		o += (uint32_t)snprintf(out + o, sizeof(out) - o, " %s %u%% high %u edges;", role[i], ones[i] * 100u / n, edges[i]);
++	}
++	if (text) {
++		snprintf(text, cap, "pins %s (%u samples in %llu us):%s cfg %#x %#x %#x %#x\n", when, n, ns / 1000, out,
++		    ap_rd(0, 0), ap_rd(1, 0), ap_rd(2, 0), ap_rd(3, 0));
++	} else {
++		printf("SWEET AUDIO: pins %s (%u samples in %llu us):%s\n", when, n, ns / 1000, out);
++	}
++}
++
++static void
++ap_sample(const char *when)
++{
++	ap_sample_to(when, NULL, 0);
++}
++
++/* the speaker's I2S port with nothing routed to it: LPASS bit clock, I2S config, DEVICE_START; the DSP sends zeros */
++static bool
++au_afe(void)
++{
++	au_fwk_version();
++	if (!ap_pins(true)) {
++		return false;
++	}
++	ap_sample("before the port");
++	int st = -1;
++	for (unsigned tries = 0; tries < 3 && st == -1; tries++) {
++		st = afe_mi2s_clock(AU_BCLK);
++		printf("SWEET AUDIO: AFE clock QUAD_MI2S_IBIT %u Hz: status %d (try %u)\n", AU_BCLK, st, tries);
++	}
++	if (st != 0) {
++		/* anything the DSP still says, for 5 s */
++		for (unsigned w = 0; w < 5000 && !gl.bad; w += 5) {
++			au_sleep(5);
++			gl_poll();
++		}
++		(void)ap_pins(false);
++		sweet_log_sync();
++		return false;
++	}
++	struct {
++		uint32_t minor;
++		uint16_t bit_width, channel_mode, mono_stereo, ws_src;
++		uint32_t sample_rate;
++		uint16_t data_format, reserved;
++	} __attribute__((packed)) i2s = { 1, 16, 1 /* SD0 */, 1 /* stereo */, 1 /* WS internal */, AU_RATE, 0 /* linear PCM */, 0 };
++	_Static_assert(sizeof(i2s) == 20, "afe_param_id_i2s_cfg is 20 bytes");
++	st = afe_port_param(AFE_PORT_QUAT_MI2S_RX, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_I2S_CONFIG, &i2s, sizeof(i2s));
++	printf("SWEET AUDIO: AFE QUAT_MI2S_RX I2S config (16-bit stereo %u Hz, SD0, WS internal): status %d\n", AU_RATE, st);
++	if (st == 0) {
++		st = afe_port_cmd(AFE_PORT_QUAT_MI2S_RX, AFE_PORT_CMD_DEVICE_START);
++		printf("SWEET AUDIO: AFE QUAT_MI2S_RX DEVICE_START: status %d\n", st);
++	}
++	bool ok = st == 0;
++	if (ok) {
++		au_sleep(100);
++		ap_sample("with the port running");
++		sweet_log_sync();
++		au_sleep(2000);
++		ap_sample("2 s later");
++		st = afe_port_cmd(AFE_PORT_QUAT_MI2S_RX, AFE_PORT_CMD_DEVICE_STOP);
++		printf("SWEET AUDIO: AFE QUAT_MI2S_RX DEVICE_STOP: status %d\n", st);
++	}
++	st = afe_mi2s_clock(0);
++	printf("SWEET AUDIO: AFE clock off: status %d\n", st);
++	au_sleep(50);
++	ap_sample("after stop");
++	(void)ap_pins(false);
++	sweet_log_sync();
++	return ok;
++}
++
+ /* ---- stage 1 */
+ static bool
+ au_probe(void)
+@@ -1168,6 +1483,117 @@ au_boot(void)
+ 	return false;
+ }
+ 
++/*
++ * ---- from SSH, once stage 3 is up (test boots only): the audio thread keeps polling GLINK every 20 ms, and
++ *
++ *   kern.sweet_audio_apr   write: struct au_apr_req + payload: one APR command to svc on the DSP, then up to wait_ms
++ *                          (or until its APR_BASIC_RSP_RESULT); read: every APR packet the DSP sent since the last
++ *                          read, each as u16 length + the packet with its header. Write without read is fine.
++ *   kern.sweet_audio_pins  write 1 / 0: the QUAT MI2S pins to qua_mi2s / back; read: the pads sampled, as text.
++ */
++static LCK_GRP_DECLARE(au_lck_grp, "sweetaudio");
++static LCK_MTX_DECLARE(au_mtx, &au_lck_grp);
++static bool au_live;
++struct au_apr_req {
++	uint8_t svc, chan;              /* chan 0 = apr_audio_svc, 1 = apr_apps2 */
++	uint16_t wait_ms;
++	uint32_t token, opcode;
++	uint8_t payload[];
++} __attribute__((packed));
++
++static int
++au_apr_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (!au_live) {
++		return ENXIO;
++	}
++	int err = 0;
++	if (req->newptr != USER_ADDR_NULL) {
++		uint8_t in[sizeof(struct au_apr_req) + 128];
++		size_t n = req->newlen;
++		if (n < sizeof(struct au_apr_req) || n > sizeof(in)) {
++			return EINVAL;
++		}
++		if ((err = SYSCTL_IN(req, in, n))) {
++			return err;
++		}
++		struct au_apr_req r;
++		memcpy(&r, in, sizeof(r));
++		uint32_t len = (uint32_t)(n - sizeof(r));
++		uint8_t pkt[APR_HDR_SIZE + 128];
++		struct au_apr_hdr h = { APR_HDR_FIELD_SEQ_CMD, (uint16_t)(APR_HDR_SIZE + len), r.svc, APR_DOMAIN_APPS, 0, r.svc,
++		    APR_DOMAIN_ADSP, 0, r.token, r.opcode };
++		memcpy(pkt, &h, APR_HDR_SIZE);
++		memcpy(pkt + APR_HDR_SIZE, in + sizeof(r), len);
++		lck_mtx_lock(&au_mtx);
++		gl.apr_answered = false;
++		gl.apr_rsp_of = 0;
++		bool sent = gl_send(r.chan ? CH_APR2 : CH_APR, pkt, APR_HDR_SIZE + len);
++		lck_mtx_unlock(&au_mtx);
++		if (!sent) {
++			return EAGAIN;
++		}
++		for (unsigned w = 0; w < MIN(r.wait_ms, 10000u); w += 2) {
++			au_sleep(2);
++			lck_mtx_lock(&au_mtx);
++			gl_poll();
++			bool done = gl.apr_answered && gl.apr_opcode == APR_BASIC_RSP_RESULT && gl.apr_rsp_of == r.opcode;
++			lck_mtx_unlock(&au_mtx);
++			if (done) {
++				break;
++			}
++		}
++	}
++	if (req->oldptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, NULL, AU_CAP_N * (AU_CAP_SIZE + 2));
++	}
++	uint8_t *out = kalloc_data(AU_CAP_N * (AU_CAP_SIZE + 2), Z_WAITOK | Z_ZERO);
++	if (!out) {
++		return ENOMEM;
++	}
++	size_t o = 0;
++	lck_mtx_lock(&au_mtx);
++	if (au_cap.head - au_cap.tail > AU_CAP_N) {
++		au_cap.tail = au_cap.head - AU_CAP_N;
++	}
++	for (; au_cap.tail != au_cap.head; au_cap.tail++) {
++		unsigned s = au_cap.tail % AU_CAP_N;
++		memcpy(out + o, &au_cap.len[s], 2);
++		memcpy(out + o + 2, au_cap.pkt[s], au_cap.len[s]);
++		o += 2u + au_cap.len[s];
++	}
++	lck_mtx_unlock(&au_mtx);
++	err = SYSCTL_OUT(req, out, o);
++	kfree_data(out, AU_CAP_N * (AU_CAP_SIZE + 2));
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_apr, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_apr_sysctl, "S",
++    "Mi 8 audio DSP: one APR command in, the DSP's APR packets out (bsd/dev/dipper_audio.c)");
++
++static int
++au_pins_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (!au_live) {
++		return ENXIO;
++	}
++	if (req->newptr != USER_ADDR_NULL) {
++		int on = 0, err = SYSCTL_IN(req, &on, sizeof(on));
++		if (err) {
++			return err;
++		}
++		if (!ap_pins(on != 0)) {
++			return EIO;
++		}
++	}
++	char text[256] = "";
++	ap_sample_to("now", text, sizeof(text));
++	return SYSCTL_OUT(req, text, strlen(text) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_pins, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_pins_sysctl, "A",
++    "Mi 8 QUAT MI2S pins: write 1/0 to mux them, read samples them (bsd/dev/dipper_audio.c)");
++
+ static void
+ au_thread(void *arg, wait_result_t w)
+ {
+@@ -1175,8 +1601,19 @@ au_thread(void *arg, wait_result_t w)
+ 	(void)w;
+ 	printf("SWEET AUDIO: stage %u in %u s\n", au.stage, au.delay_s);
+ 	au_sleep(au.delay_s * 1000);
+-	if (au_probe() && au.stage >= 2 && au_boot() && au.stage >= 3) {
+-		(void)au_apr();
++	if (au_probe() && au.stage >= 2 && au_boot() && au.stage >= 3 && au_apr()) {
++		if (au.stage >= 4) {
++			(void)au_afe();
++		}
++		au_live = true;
++		printf("SWEET AUDIO: kern.sweet_audio_apr and kern.sweet_audio_pins live; GLINK polled every 20 ms\n");
++		sweet_log_sync();
++		for (;;) {
++			lck_mtx_lock(&au_mtx);
++			gl_poll();
++			lck_mtx_unlock(&au_mtx);
++			au_sleep(20);
++		}
+ 	}
+ 	sweet_log_sync();
+ 	(void)thread_terminate(current_thread());

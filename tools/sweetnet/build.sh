@@ -105,6 +105,10 @@ if [ "${IOS18:-1}" = 1 ]; then
 		"$here/sweetaq.c" -o "$out18/sweetaq"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetaq"
 	python3 -I "$pacstrip" --sign "$out18/sweetaq"
+	# the Mi 8's audio DSP over SSH: one APR command in, its answers out (kern.sweet_audio_apr, test boots with sweetaudio>=3)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetapr.c" -o "$out18/sweetapr"
+	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetapr"
+	python3 -I "$pacstrip" --sign "$out18/sweetapr"
 	# Wi-Fi over SSH (iOS 26 stand-in, docs/WIFI_IOS26.md): Apple80211 info/power/scan without wifid or the UI
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework CoreFoundation \
 		"$here/sweetwifi.c" -o "$out18/sweetwifi"
