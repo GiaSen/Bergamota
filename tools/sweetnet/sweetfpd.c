@@ -6,10 +6,16 @@
  * on com.apple.fairplayd.versioned), then every CoreLocation client waits for locationd: News' main thread at launch.
  * This takes the job's place (root_tweaks18.py, FAIRPLAY_JOB): a MIG client gets MIG_BAD_ID, anything else loses its message and
  * sees the reply right die. The first requests are logged to /private/var/tmp/sweetfpd.log with their sender.
+ *
+ * sweetfpd NAME...: the same for another job's names (ProgramArguments), logged to /private/var/tmp/sweetfpd-NAME.log after the
+ * first. lskdd (FairPlay Streaming's key daemon, com.apple.lskdd) exits with status 92 at every launch here: mediaplaybackd's
+ * stream player waited on it (MIG 1200) at every HLS stream until the RPC watchdog killed it, and the request left in the
+ * queue made launchd start lskdd about once a second until reboot (root_tweaks18.py, LSKDD_JOB).
  */
 #include <mach/mach.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 extern kern_return_t bootstrap_check_in(mach_port_t bp, const char *name, mach_port_t *sp);
 extern mach_port_t bootstrap_port;
@@ -24,15 +30,24 @@ static const char *const names[] = {
 };
 
 int
-main(void)
+main(int argc, char **argv)
 {
 	static union {
 		mach_msg_header_t h;
 		char b[64 * 1024];
 	} m;
+	const char *const *want = names;
+	unsigned nwant = sizeof(names) / sizeof(names[0]);
+	char path[256] = "/private/var/tmp/sweetfpd.log";
 	mach_port_t set = MACH_PORT_NULL;
 	unsigned seen = 0;
-	FILE *log = fopen("/private/var/tmp/sweetfpd.log", "a");
+
+	if (argc > 1 && strlen(argv[1]) < 200) {
+		want = (const char *const *)&argv[1];
+		nwant = (unsigned)argc - 1;
+		snprintf(path, sizeof(path), "/private/var/tmp/sweetfpd-%s.log", argv[1]);
+	}
+	FILE *log = fopen(path, "a");
 
 	if (log != NULL) {
 		setvbuf(log, NULL, _IOLBF, 0);
@@ -40,14 +55,14 @@ main(void)
 	if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_PORT_SET, &set) != KERN_SUCCESS) {
 		return 1;
 	}
-	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+	for (unsigned i = 0; i < nwant; i++) {
 		mach_port_t p = MACH_PORT_NULL;
-		kern_return_t kr = bootstrap_check_in(bootstrap_port, names[i], &p);
+		kern_return_t kr = bootstrap_check_in(bootstrap_port, want[i], &p);
 		if (kr == KERN_SUCCESS) {
 			kr = mach_port_move_member(mach_task_self(), p, set);
 		}
 		if (log != NULL) {
-			fprintf(log, "check in %s: %s\n", names[i], mach_error_string(kr));
+			fprintf(log, "check in %s: %s\n", want[i], mach_error_string(kr));
 		}
 	}
 	for (;;) {

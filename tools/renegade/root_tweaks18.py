@@ -119,6 +119,10 @@ COMMCENTER_NONCELL = '/System/Library/LaunchDaemons/com.apple.CommCenter-noncell
 # fairplayd.H2 exits at once on this hardware while launchd keeps its names, so its clients wait for ever: tools/sweetnet/sweetfpd.c
 # takes the job and answers them with an error (locationd, then every CoreLocation client, hung behind it).
 FAIRPLAY_JOB = '/System/Library/LaunchDaemons/com.apple.fairplayd.H2.plist'
+# lskdd (FairPlay Streaming keys) exits with status 92 at every launch: mediaplaybackd's stream player waited on it at every HLS
+# stream until its RPC watchdog killed it, and launchd relaunched lskdd about once a second for the request left in the queue.
+# sweetfpd answers its name too.
+LSKDD_JOB = '/System/Library/LaunchDaemons/com.apple.lskdd.plist'
 
 
 def launchd(root):
@@ -152,6 +156,10 @@ def launchd(root):
         install_file(fpd, os.path.join(root, 'usr/local/bin/sweetfpd'))
         jobs[FAIRPLAY_JOB]['Program'] = '/usr/local/bin/sweetfpd'
         print('launchd.plist: fairplayd.H2 runs /usr/local/bin/sweetfpd')
+        if LSKDD_JOB in jobs:
+            jobs[LSKDD_JOB]['Program'] = '/usr/local/bin/sweetfpd'
+            jobs[LSKDD_JOB]['ProgramArguments'] = ['/usr/local/bin/sweetfpd', *jobs[LSKDD_JOB]['MachServices']]
+            print('launchd.plist: lskdd runs', ' '.join(jobs[LSKDD_JOB]['ProgramArguments']))
     elif not fpd:
         print('sweetfpd: not built (tools/sweetnet/build.sh): stock fairplayd.H2, its clients hang')
         note_skip('sweetfpd', not_built())

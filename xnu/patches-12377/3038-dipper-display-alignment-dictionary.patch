@@ -1,0 +1,63 @@
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+index 913d952..e106187 100644
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -70,6 +70,9 @@ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_bl, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_
+ int sweet_fb_keepolder = 1;
+ int sweet_fb_older_shown;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_keepolder, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_keepolder, 0, "keep the swap before the pending one");
++/* sysctl kern.sweet_fb_swaplog (3038): log the layers of the next N swaps, as the first 16 after boot */
++int sweet_fb_swaplog;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_swaplog, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_swaplog, 0, "log the layers of the next N swaps");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_older_shown, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_older_shown, 0, "frames shown from the older slot");
+ int sweet_fb_display_off;      /* 3023: iOS has asked for the display off (RequestPowerChange) */
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_display_off, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_display_off, 0, "display off, as iOS asked");
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d330199..95e1eca 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -68,6 +68,7 @@ extern "C" int sweet_fb_hud;
+ extern "C" int sweet_fb_gatepoll;               /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_gatepoll (3006) */
+ extern "C" int sweet_fb_display_off;            /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_display_off (3023) */
+ extern "C" int sweet_fb_bl, sweet_fb_bl_now;    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_bl, kern.sweet_fb_bl_now (3017, 3019) */
++extern "C" int sweet_fb_swaplog;                /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_swaplog (3038) */
+ extern "C" int sweet_fb_keepolder, sweet_fb_older_shown; /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_keepolder, kern.sweet_fb_older_shown (3020) */
+ extern "C" uint32_t sweet_gpu_fence_snapshot(void);     /* bsd/dev/sweet_a630.c (0229) */
+ extern "C" bool sweet_gpu_blit_window(uint64_t pa, uint64_t size);      /* bsd/dev/sweet_a630.c (0240) */
+@@ -960,7 +961,20 @@ AppleCLCD::start(IOService *provider)
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * 3038: a dictionary. VideoToolbox (FigGetAlignmentForIOSurfaceOutputToDisplayService) and QuartzCore both look
++	 * PlaneBaseAlignmentLinear up in it; on a bare number mediaplaybackd aborted ("-[__NSCFNumber objectForKey:]") at
++	 * every video, so no video played. DisplayPipeStrideRequirements stays unset: VideoToolbox then uses 64 as well.
++	 */
++	{
++		OSDictionary *align = OSDictionary::withCapacity(1);
++		OSNumber *linear = OSNumber::withNumber(64ULL, 32);
++		if (align != NULL && linear != NULL && align->setObject("PlaneBaseAlignmentLinear", linear)) {
++			setProperty("DisplayPipePlaneBaseAlignment", align);
++		}
++		OSSafeReleaseNULL(linear);
++		OSSafeReleaseNULL(align);
++	}
+ 	registerService();
+ 	__atomic_store_n(&sweet_fb_shot_fb, this, __ATOMIC_RELEASE);     /* kern.sweet_fb_shot (patch 0224) */
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u, vsync %u us, copy every %u, scale %u (pad %d,%d), direct %d early %d\n",
+@@ -3651,8 +3665,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 			continue;
+ 		}
+ 		SweetSurface *s = sweet_surface_copy(id);
+-		if (sweet_fb_swaps_logged < 16) {
+-			sweet_fb_swaps_logged++;
++		if (sweet_fb_swaps_logged < 16 || __atomic_load_n(&sweet_fb_swaplog, __ATOMIC_RELAXED) > 0) {
++			if (sweet_fb_swaps_logged < 16) {
++				sweet_fb_swaps_logged++;
++			} else {
++				__atomic_fetch_sub(&sweet_fb_swaplog, 1, __ATOMIC_RELAXED);
++			}
+ 			IOLog("SWEET FB: swap %u layer %u surface %u %ux%u fmt 0x%x bpr %u a %d,%d %ux%u b %d,%d %dx%d\n",
+ 			    get32(rec, 0x50), layer, id, s ? s->width : 0, s ? s->height : 0,
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
