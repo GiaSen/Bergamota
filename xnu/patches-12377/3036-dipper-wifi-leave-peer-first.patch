@@ -1,0 +1,73 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index a728fad..fed4daf 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -6086,6 +6086,8 @@ sta_set_state(int s)
+ 	sta.tries = 0;
+ }
+ 
++static void sta_ps_mode(uint32_t on, const char *what);
++
+ /* tear down whatever was set up (ST_DOWN does it in steps); the result stays (a failed join reports it) */
+ static void
+ sta_teardown_start(uint16_t reason)
+@@ -6103,6 +6105,9 @@ sta_teardown_start(uint16_t reason)
+ 		sweet80211_link(0, reason, sta.by_ap);
+ 	}
+ 	sta.mgmt_busy = false;
++	if (was_connected) {
++		sta_ps_mode(0, "power save off (leaving)");     /* 3036: before the deauthentication, as ieee80211_set_disassoc */
++	}
+ 	if (!sta.by_ap && (sta.vdev_up || sta.state == ST_ASSOC || sta.state == ST_UP || sta.state == ST_4WAY ||
+ 	    sta.state == ST_KEYS || was_connected)) {
+ 		uint8_t f[32];
+@@ -6436,6 +6441,9 @@ sta_step(void)
+ 	if (sta.req_pending && sta.state == ST_IDLE) {
+ 		sta_begin();
+ 	}
++	/* 3036: a state entered just above starts at 0: the time in the old one ran out every wait of ST_DOWN's first pass */
++	now = ms_now_ms();
++	in = now - sta.t_ms;
+ 	switch (sta.state) {
+ 	case ST_STOPSCAN:
+ 		if (wf.state == WS_SCAN_DONE) {
+@@ -6574,14 +6582,10 @@ sta_step(void)
+ 			/*
+ 			 * the deauthentication out and the TX queues empty (mac80211 flushes them before the driver's
+ 			 * disassoc; boot 52: VDEV_DOWN with frames pending asserted the firmware in _wlan_vdev_down), then
+-			 * VDEV_DOWN and PEER_DELETE
++			 * PEER_DELETE
+ 			 */
+ 			if (sta.tx_inflight) {
+-				printf("SWEET WLAN sta: %u frames never completed: VDEV_DOWN anyway\n", sta.tx_inflight);
+-			}
+-			if (sta.vdev_up) {
+-				sta_wmi(c, scan_cmd(c, 0x5007, 94, v, 4), "vdev down");
+-				sta.vdev_up = false;
++				printf("SWEET WLAN sta: %u frames never completed: PEER_DELETE anyway\n", sta.tx_inflight);
+ 			}
+ 			sta.had_peer = sta.peer;
+ 			if (sta.peer) {
+@@ -6593,6 +6597,14 @@ sta_step(void)
+ 			sta.down_step = 1;
+ 			sta.t_ms = now;
+ 		} else if (sta.down_step == 1 && ((sta.wq_n == 0 && (!sta.had_peer || !sta.peer_mapped)) || in > 1000)) {
++			/*
++			 * 3036: the peer gone, then VDEV_DOWN and VDEV_STOP, as ieee80211_set_disassoc: sta_info_flush before
++			 * BSS_CHANGED_ASSOC. VDEV_DOWN with the peer still there asserted _wlan_vdev_down:3440 on every disconnect.
++			 */
++			if (sta.vdev_up) {
++				sta_wmi(c, scan_cmd(c, 0x5007, 94, v, 4), "vdev down");
++				sta.vdev_up = false;
++			}
+ 			if (sta.vdev_started) {
+ 				sta.stopped = false;
+ 				v[1] = v[2] = 0;
+@@ -6605,6 +6617,7 @@ sta_step(void)
+ 				printf("SWEET WLAN sta: no VDEV_STOPPED in 2 s (%u WMI commands still queued: dropped)\n", sta.wq_n);
+ 			}
+ 			sta.wq_n = 0;
++			sta_ps_mode(1, "power save on (no channel)");   /* 3036: as at VDEV_CREATE */
+ 			sta.vdev_started = false;
+ 			sta.peer_mapped = false;
+ 			sta.mgmt_busy = false;

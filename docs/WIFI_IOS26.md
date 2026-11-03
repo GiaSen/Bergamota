@@ -1421,5 +1421,12 @@ The radio listened all the time: the join sent STA_POWERSAVE_MODE 0 and nothing 
 
 Screen off, on the battery, 5 GHz: about 887 mW against about 1332 mW. Latency on an idle link about 75 ms against about 8 ms; no change in throughput. Numbers and the disproved band claim: NOTES.md.
 
-**Known bug, not from this:** any teardown on the Mi 8 asserts the firmware in `wlan_vdev.c:_wlan_vdev_down:3440`, with or without power save (`sweetwifi disassoc` reproduces it), and Wi-Fi stays gone until a reboot. So the leaving path cannot be tested yet: ath10k also forces mode 1 on a stopped vdev, which is not done here.
+Saving: about 9-33% screen off; with it on every boot read about 880-1000 mW, with it off about 970-1400 mW.
 
+### 6.5 3036: a disconnect no longer asserts the firmware (2026-11-02, Mi 8)
+
+Every teardown on the Mi 8 asserted the firmware in `wlan_vdev.c:_wlan_vdev_down:3440`, with or without power save, and Wi-Fi stayed gone until a reboot (no modem restart). `ST_DOWN` sent VDEV_DOWN and then PEER_DELETE. Upstream deletes the peer first (`ieee80211_set_disassoc`: `sta_info_flush`, then BSS_CHANGED_ASSOC, then the channel release), so now:
+
+power save off -> deauthentication (unless the AP kicked us) -> wait for it and the TX queues (PEER_FLUSH_TIDS after 0.8 s, on at the latest after 2 s) -> PEER_DELETE -> wait for PEER_UNMAP (at most 1 s) -> VDEV_DOWN -> VDEV_STOP -> wait for VDEV_STOPPED (at most 2 s) -> power save on (no channel).
+
+The same patch fixes those waits: `sta_step` took the time in the state before handling the leave, so the first pass saw the old state's time and all of them ran out, and the deauthentication was discarded (status 1, the AP was never told). `sweetwifi disassoc` forces a leave; wifid joins again in 8-12 s. Numbers: NOTES.md.
