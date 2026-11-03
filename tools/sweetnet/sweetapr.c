@@ -5,6 +5,7 @@
  *   sweetapr SVC OPCODE [TOKEN [WAIT_MS [FIELD...]]]   send, wait (default 1000 ms or the command's basic result)
  *   sweetapr -r                                       only what the DSP sent since the last read
  *   sweetapr --apps2 ...                              on the apr_apps2 channel instead of apr_audio_svc
+ *   sweetapr --port N ...                             src and dest port (ASM: session << 8 | stream; ADM: AFE port)
  *
  * FIELD: b:N (u8), h:N (u16), w:N (u32), little-endian, in order; N in C notation (0x...). SVC 3 = AVCS core,
  * 4 = AFE, 7 = ASM, 8 = ADM. Each answer prints its header and payload words.
@@ -58,12 +59,16 @@ dump(const uint8_t *b, size_t n)
 int
 main(int argc, char **argv)
 {
-	uint8_t in[12 + 128], out[16 * 258];
+	uint8_t in[16 + 128], out[16 * 258];
 	size_t outlen = sizeof(out), n = 0;
 	int a = 1, chan = 0;
-	if (a < argc && !strcmp(argv[a], "--apps2")) {
-		chan = 1;
-		a++;
+	uint16_t port = 0;
+	for (; a < argc && argv[a][0] == '-' && argv[a][1] == '-'; a++) {
+		if (!strcmp(argv[a], "--apps2")) {
+			chan = 1;
+		} else if (!strcmp(argv[a], "--port") && a + 1 < argc) {
+			port = (uint16_t)strtoul(argv[++a], NULL, 0);
+		}
 	}
 	if (a < argc && !strcmp(argv[a], "-r")) {
 		if (sysctlbyname("kern.sweet_audio_apr", out, &outlen, NULL, 0) != 0) {
@@ -74,7 +79,7 @@ main(int argc, char **argv)
 		return 0;
 	}
 	if (argc - a < 2) {
-		fprintf(stderr, "usage: sweetapr [--apps2] SVC OPCODE [TOKEN [WAIT_MS [b:N|h:N|w:N ...]]] | sweetapr -r\n");
+		fprintf(stderr, "usage: sweetapr [--apps2] [--port N] SVC OPCODE [TOKEN [WAIT_MS [b:N|h:N|w:N ...]]] | sweetapr -r\n");
 		return 2;
 	}
 	uint8_t svc = (uint8_t)strtoul(argv[a], NULL, 0);
@@ -84,9 +89,11 @@ main(int argc, char **argv)
 	in[0] = svc;
 	in[1] = (uint8_t)chan;
 	memcpy(in + 2, &wait, 2);
-	memcpy(in + 4, &token, 4);
-	memcpy(in + 8, &opcode, 4);
-	n = 12;
+	memcpy(in + 4, &port, 2);
+	memset(in + 6, 0, 2);
+	memcpy(in + 8, &token, 4);
+	memcpy(in + 12, &opcode, 4);
+	n = 16;
 	for (int i = a + 4; i < argc; i++) {
 		unsigned long v = strtoul(argv[i] + 2, NULL, 0);
 		unsigned w = argv[i][0] == 'b' ? 1 : argv[i][0] == 'h' ? 2 : argv[i][0] == 'w' ? 4 : 0;

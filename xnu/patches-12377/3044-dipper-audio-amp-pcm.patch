@@ -1,0 +1,407 @@
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 3a00a39..ba0a9bd 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -754,8 +754,8 @@ gl_poll(void)
+ 						static unsigned other_dumps;
+ 						if (other_dumps++ < 24) {
+ 							char hex[3 * 48 + 1];
+-							uint32_t m = MIN(ch->li[k].off, 48u), o = 0;
+-							for (uint32_t i = 0; i < m; i++) {
++							uint32_t dl = MIN(ch->li[k].off, 48u), o = 0;
++							for (uint32_t i = 0; i < dl; i++) {
+ 								o += (uint32_t)snprintf(hex + o, sizeof(hex) - o, "%02x%s", ch->li[k].buf[i],
+ 								    (i & 3) == 3 ? " " : "");
+ 							}
+@@ -1497,6 +1497,7 @@ static bool au_live;
+ struct au_apr_req {
+ 	uint8_t svc, chan;              /* chan 0 = apr_audio_svc, 1 = apr_apps2 */
+ 	uint16_t wait_ms;
++	uint16_t port, reserved;        /* src and dest port: ASM session << 8 | stream, ADM the AFE port */
+ 	uint32_t token, opcode;
+ 	uint8_t payload[];
+ } __attribute__((packed));
+@@ -1522,8 +1523,8 @@ au_apr_sysctl SYSCTL_HANDLER_ARGS
+ 		memcpy(&r, in, sizeof(r));
+ 		uint32_t len = (uint32_t)(n - sizeof(r));
+ 		uint8_t pkt[APR_HDR_SIZE + 128];
+-		struct au_apr_hdr h = { APR_HDR_FIELD_SEQ_CMD, (uint16_t)(APR_HDR_SIZE + len), r.svc, APR_DOMAIN_APPS, 0, r.svc,
+-		    APR_DOMAIN_ADSP, 0, r.token, r.opcode };
++		struct au_apr_hdr h = { APR_HDR_FIELD_SEQ_CMD, (uint16_t)(APR_HDR_SIZE + len), r.svc, APR_DOMAIN_APPS, r.port,
++		    r.svc, APR_DOMAIN_ADSP, r.port, r.token, r.opcode };
+ 		memcpy(pkt, &h, APR_HDR_SIZE);
+ 		memcpy(pkt + APR_HDR_SIZE, in + sizeof(r), len);
+ 		lck_mtx_lock(&au_mtx);
+@@ -1594,6 +1595,372 @@ au_pins_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_pins, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_pins_sysctl, "A",
+     "Mi 8 QUAT MI2S pins: write 1/0 to mux them, read samples them (bsd/dev/dipper_audio.c)");
+ 
++/*
++ * PCM for the DSP: a fixed window of the low DDR bank outside xnu's RAM and every carve-out, after the Wi-Fi pool
++ * (MSS metadata 0xe0000000, WCE pool 0xe0100000 + 12 MiB), mapped write-combined. The DSP reads it through apps_smmu
++ * stream 0x1821 (qcom,msm-audio-ion iommus, sid mask 0xf): the address it is given is IOVA | (0x1821 & 0xf) << 32
++ * (msm_audio_ion.c smmu_sid_bits), and sweet_smmu.c's bank maps IOVA == PA, so lsw = PA, msw = 1.
++ *
++ *   kern.sweet_audio_smmu  write SID: read-only probe (logged); SID | 0x10000: map it to the identity bank
++ *   kern.sweet_audio_pool  write u32 offset + bytes: copied into the window; read: its PA and size, as text
++ */
++#define AU_POOL_PA              0xe1000000ull
++#define AU_POOL_SIZE            0x200000u
++extern int sweet_smmu_map_sid(unsigned sid);
++extern int sweet_smmu_probe_sid(unsigned sid, unsigned level);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++static vm_offset_t au_pool;
++static int au_smmu_last = -100;
++
++static int
++au_smmu_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (req->newptr != USER_ADDR_NULL) {
++		int v = 0, err = SYSCTL_IN(req, &v, sizeof(v));
++		if (err) {
++			return err;
++		}
++		unsigned sid = (unsigned)v & 0xffffu;
++		au_smmu_last = (v & 0x10000) ? sweet_smmu_map_sid(sid) : sweet_smmu_probe_sid(sid, 2);
++		printf("SWEET AUDIO: smmu %s sid %#x -> %d\n", (v & 0x10000) ? "map" : "probe", sid, au_smmu_last);
++	}
++	return SYSCTL_OUT(req, &au_smmu_last, sizeof(au_smmu_last));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_smmu, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_smmu_sysctl, "I",
++    "Mi 8 audio DSP stream in apps_smmu: write SID to probe, SID|0x10000 to map (bsd/dev/dipper_audio.c)");
++
++static int
++au_pool_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (!au.stage) {
++		return ENXIO;
++	}
++	if (!au_pool && !(au_pool = ml_io_map_unmappable((vm_offset_t)AU_POOL_PA, AU_POOL_SIZE, VM_WIMG_WCOMB))) {
++		return ENOMEM;
++	}
++	if (req->newptr != USER_ADDR_NULL) {
++		size_t n = req->newlen;
++		uint32_t off;
++		if (n < 4 || n > 4 + 65536) {
++			return EINVAL;
++		}
++		int err = SYSCTL_IN(req, &off, 4);
++		if (err) {
++			return err;
++		}
++		if (off > AU_POOL_SIZE || n - 4 > AU_POOL_SIZE - off) {
++			return EINVAL;
++		}
++		uint8_t *tmp = kalloc_data(n - 4, Z_WAITOK);
++		if (!tmp) {
++			return ENOMEM;
++		}
++		err = SYSCTL_IN(req, tmp, n - 4);
++		if (!err) {
++			memcpy((void *)(au_pool + off), tmp, n - 4);
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
++		kfree_data(tmp, n - 4);
++		if (err) {
++			return err;
++		}
++	}
++	char text[96];
++	snprintf(text, sizeof(text), "pool pa %#llx size %#x (DSP address lsw %#llx msw 0x1)\n", AU_POOL_PA, AU_POOL_SIZE,
++	    AU_POOL_PA);
++	return SYSCTL_OUT(req, text, strlen(text) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_pool, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_pool_sysctl, "S",
++    "Mi 8 audio PCM window: write u32 offset + bytes, read its address (bsd/dev/dipper_audio.c)");
++
++/*
++ * ---- the TAS2557 speaker amp (dipper DT: tas2557@4c on qupv3_se5_i2c = i2c@894000, reset gpio76): I2C bit-banged on
++ * the bus's own pins, gpio85 SDA / gpio86 SCL (SOUTH tile), as plain GPIOs, open drain by output enable (the board
++ * pulls both up; the DT has bias-disable), ~100 kHz. Nothing else is on that bus. All three pins are in the EAST tile on
++ * this SoC (pinctrl-sdm845-v2.c; the v1 table says SOUTH/NORTH, and a write through the wrong tile resets the phone).
++ *
++ * kern.sweet_audio_i2c (test boots, sweetaudio>=1): write a script, read the result in the same call:
++ *   01 addr n data[n]        START addr+W data... STOP (data[0] is the register)
++ *   02 addr reg n            START addr+W reg, RESTART addr+R, n bytes, STOP: appended to the result
++ *   03 level                 gpio76 (amp reset, active low) driven to level
++ *   04 ms_lo ms_hi           sleep
++ *   05 addr reg mask value   read-modify-write of one register
++ * Result: u32 ops done, i32 error (0, or 1 NACK on the address, 2 NACK on data, 3 SCL held low, 4 bad script), then
++ * the bytes read. tools/audio/tas2557fw.py writes the scripts (from TI's firmware, which stays off git and the kernel).
++ */
++#define AU_TLMM_EAST_PA         0x03500000u     /* TLMM + EAST: gpio76, 85, 86 (v2 table) */
++#define AU_I2C_SDA              85u
++#define AU_I2C_SCL              86u
++#define AU_TAS_RESET            76u
++#define AU_I2C_HALF_US          5u
++static struct {
++	vm_offset_t sda, scl, rst;
++} ai;
++
++static void
++ai_wr(vm_offset_t a, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)a = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static uint32_t
++ai_rd(vm_offset_t a)
++{
++	uint32_t v = *(volatile uint32_t *)a;
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++/* high = released (output disabled), low = output enabled with the latch at 0 */
++static void
++ai_line(vm_offset_t pin, bool high)
++{
++	if (high) {
++		ai_wr(pin, ai_rd(pin) & ~0x200u);
++	} else {
++		ai_wr(pin + 4, ai_rd(pin + 4) & ~2u);
++		ai_wr(pin, ai_rd(pin) | 0x200u);
++	}
++}
++
++static bool
++ai_get(vm_offset_t pin)
++{
++	return ai_rd(pin + 4) & 1u;
++}
++
++static bool
++ai_setup(void)
++{
++	if (ai.sda) {
++		return true;
++	}
++	vm_offset_t s = ml_io_map(AU_TLMM_EAST_PA + AU_I2C_SDA * 0x1000u, 2 * 0x1000u);
++	vm_offset_t r = ml_io_map(AU_TLMM_EAST_PA + AU_TAS_RESET * 0x1000u, 0x1000u);
++	if (!s || !r) {
++		return false;
++	}
++	printf("SWEET AUDIO: amp bus gpio85/86 cfg %#x %#x io %#x %#x, reset gpio76 cfg %#x io %#x\n", ai_rd(s), ai_rd(s + 0x1000u),
++	    ai_rd(s + 4), ai_rd(s + 0x1004u), ai_rd(r), ai_rd(r + 4));
++	for (unsigned i = 0; i < 2; i++) {          /* GPIO function, no pull, 2 mA, released */
++		vm_offset_t p = s + i * 0x1000u;
++		ai_wr(p + 4, ai_rd(p + 4) & ~2u);
++		ai_wr(p, ai_rd(p) & ~0x3ffu);
++	}
++	ai.sda = s;
++	ai.scl = s + 0x1000u;
++	ai.rst = r;
++	delay(10);
++	for (unsigned i = 0; i < 9 && !ai_get(ai.sda); i++) {       /* a slave holding SDA: clock it out */
++		ai_line(ai.scl, false);
++		delay(AU_I2C_HALF_US);
++		ai_line(ai.scl, true);
++		delay(AU_I2C_HALF_US);
++	}
++	printf("SWEET AUDIO: amp bus idle: SDA %u SCL %u\n", ai_get(ai.sda), ai_get(ai.scl));
++	return true;
++}
++
++static bool
++ai_scl_high(void)
++{
++	ai_line(ai.scl, true);
++	for (unsigned i = 0; i < 1000; i++) {      /* clock stretching, up to 1 ms */
++		if (ai_get(ai.scl)) {
++			delay(AU_I2C_HALF_US);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static int
++ai_start(bool repeated)
++{
++	if (repeated) {
++		ai_line(ai.sda, true);
++		delay(AU_I2C_HALF_US);
++		if (!ai_scl_high()) {
++			return 3;
++		}
++	}
++	ai_line(ai.sda, false);
++	delay(AU_I2C_HALF_US);
++	ai_line(ai.scl, false);
++	delay(AU_I2C_HALF_US);
++	return 0;
++}
++
++static void
++ai_stop(void)
++{
++	ai_line(ai.sda, false);
++	delay(AU_I2C_HALF_US);
++	(void)ai_scl_high();
++	ai_line(ai.sda, true);
++	delay(AU_I2C_HALF_US);
++}
++
++/* 0 ACK, 1 NACK, 3 SCL stuck */
++static int
++ai_put(uint8_t v)
++{
++	for (int b = 7; b >= 0; b--) {
++		ai_line(ai.sda, (v >> b) & 1u);
++		delay(AU_I2C_HALF_US);
++		if (!ai_scl_high()) {
++			return 3;
++		}
++		ai_line(ai.scl, false);
++	}
++	ai_line(ai.sda, true);
++	delay(AU_I2C_HALF_US);
++	if (!ai_scl_high()) {
++		return 3;
++	}
++	int nack = ai_get(ai.sda);
++	ai_line(ai.scl, false);
++	delay(AU_I2C_HALF_US);
++	return nack;
++}
++
++static int
++ai_take(uint8_t *v, bool ack)
++{
++	uint8_t x = 0;
++	ai_line(ai.sda, true);
++	for (int b = 7; b >= 0; b--) {
++		delay(AU_I2C_HALF_US);
++		if (!ai_scl_high()) {
++			return 3;
++		}
++		x |= (uint8_t)(ai_get(ai.sda) << b);
++		ai_line(ai.scl, false);
++	}
++	ai_line(ai.sda, !ack);
++	delay(AU_I2C_HALF_US);
++	if (!ai_scl_high()) {
++		return 3;
++	}
++	ai_line(ai.scl, false);
++	ai_line(ai.sda, true);
++	*v = x;
++	return 0;
++}
++
++static int
++ai_write(uint8_t addr, const uint8_t *d, unsigned n)
++{
++	int e = ai_start(false);
++	if (!e) {
++		e = ai_put((uint8_t)(addr << 1)) ? 1 : 0;
++	}
++	for (unsigned i = 0; !e && i < n; i++) {
++		int r = ai_put(d[i]);
++		e = r == 3 ? 3 : r ? 2 : 0;
++	}
++	ai_stop();
++	return e;
++}
++
++static int
++ai_read(uint8_t addr, uint8_t reg, uint8_t *d, unsigned n)
++{
++	int e = ai_start(false);
++	if (!e) {
++		e = ai_put((uint8_t)(addr << 1)) ? 1 : 0;
++	}
++	if (!e) {
++		e = ai_put(reg) ? 2 : 0;
++	}
++	if (!e) {
++		e = ai_start(true);
++	}
++	if (!e) {
++		e = ai_put((uint8_t)(addr << 1 | 1)) ? 1 : 0;
++	}
++	for (unsigned i = 0; !e && i < n; i++) {
++		e = ai_take(&d[i], i + 1 < n);
++	}
++	ai_stop();
++	return e;
++}
++
++static void
++ai_reset_pin(bool high)
++{
++	ai_wr(ai.rst + 4, (ai_rd(ai.rst + 4) & ~2u) | (high ? 2u : 0u));
++	ai_wr(ai.rst, (ai_rd(ai.rst) & ~0x3ffu) | 0x200u);         /* GPIO, no pull, 2 mA, output */
++}
++
++static int
++au_i2c_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (!au.stage || req->newptr == USER_ADDR_NULL || req->newlen < 2 || req->newlen > 65536) {
++		return EINVAL;
++	}
++	size_t n = req->newlen, cap = 8 + 4096, o = 8;
++	uint8_t *s = kalloc_data(n, Z_WAITOK), *out = kalloc_data(cap, Z_WAITOK | Z_ZERO);
++	int err = s && out ? SYSCTL_IN(req, s, n) : ENOMEM;
++	uint32_t done = 0;
++	int32_t e = 0;
++	lck_mtx_lock(&au_mtx);
++	if (!err && !ai_setup()) {
++		err = EIO;
++	}
++	for (size_t i = 0; !err && !e && i < n; done++) {
++		uint8_t op = s[i];
++		if (op == 1 && i + 3 <= n && i + 3 + s[i + 2] <= n) {
++			e = ai_write(s[i + 1], s + i + 3, s[i + 2]);
++			i += 3u + s[i + 2];
++		} else if (op == 2 && i + 4 <= n && o + s[i + 3] <= cap) {
++			e = ai_read(s[i + 1], s[i + 2], out + o, s[i + 3]);
++			o += s[i + 3];
++			i += 4;
++		} else if (op == 3 && i + 2 <= n) {
++			ai_reset_pin(s[i + 1] != 0);
++			i += 2;
++		} else if (op == 4 && i + 3 <= n) {
++			au_sleep(s[i + 1] | (unsigned)s[i + 2] << 8);
++			i += 3;
++		} else if (op == 5 && i + 5 <= n) {
++			uint8_t v = 0, w[2] = { s[i + 2], 0 };
++			e = ai_read(s[i + 1], s[i + 2], &v, 1);
++			w[1] = (uint8_t)((v & ~s[i + 3]) | (s[i + 4] & s[i + 3]));
++			if (!e) {
++				e = ai_write(s[i + 1], w, 2);
++			}
++			i += 5;
++		} else {
++			e = 4;
++		}
++	}
++	lck_mtx_unlock(&au_mtx);
++	if (!err) {
++		if (e) {
++			done--;         /* the failing op */
++		}
++		memcpy(out, &done, 4);
++		memcpy(out + 4, &e, 4);
++		err = req->oldptr == USER_ADDR_NULL ? 0 : SYSCTL_OUT(req, out, o);
++	}
++	if (s) {
++		kfree_data(s, n);
++	}
++	if (out) {
++		kfree_data(out, cap);
++	}
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_i2c, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_i2c_sysctl, "S",
++    "Mi 8 speaker amp bus: an I2C script in, the bytes read out (bsd/dev/dipper_audio.c)");
++
+ static void
+ au_thread(void *arg, wait_result_t w)
+ {
