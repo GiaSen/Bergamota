@@ -1,0 +1,517 @@
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 3ef34c6..3294f2c 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -11,6 +11,10 @@
+  *   2  boot: AOSS QMP load_state adsp on, RPMh cx vote, our SMP2P item (429, "master-kernel"), PAS id 1
+  *      INIT_IMAGE (the .mdt) + MEM_SETUP (the carve-out) + segments + AUTH_AND_RESET, then the DSP's SMP2P item
+  *      (443, "slave-kernel": bit 0 fatal, 1 ready, 2 handover, 3 stop ack) until ready. The DSP keeps running.
++ *   3  GLINK on the "lpass" SMEM edge (descriptor 478, our FIFO 479, the DSP's 480, doorbell bit 8), the DSP's channel
++ *      "apr_audio_svc" opened both ways, then one APR command to the DSP core (AVCS_CMD_ADSP_EVENT_GET_STATE): its
++ *      answer says whether the audio framework is up. Polled, no interrupts (qcom_glink_smem.c, qcom_glink_native.c,
++ *      apr.c, q6core.c; the modem's GLINK in beryllium_wlan.c is the model, with host 2 and one APR channel).
+  *
+  * Facts from the live DT (dtb/dipper/live.dtb): qcom,lpass@17300000 pil-tz-generic, qcom,pas-id 1, firmware "adsp",
+  * memory-region adsp_region@0x8c500000 0x1e00000 (no-map, in the low DDR bank the kernel does not manage),
+@@ -71,6 +75,28 @@ void dipper_audio_init(void);
+ #define MDT_TYPE_HASH           (2u << 24)
+ #define MDT_RELOCATABLE         (1u << 27)
+ #define AU_CHUNK                (1u << 20)
++#define GL_DESC                 478u
++#define GL_TX_ITEM              479u            /* XPRT_FIFO_0: ours */
++#define GL_RX_ITEM              480u            /* XPRT_FIFO_1: the DSP's */
++#define GL_TX_SIZE              0x4000u
++#define GL_DOORBELL             8u              /* glink-smem-native-xprt-adsp qcom,irq-mask = <0x100> */
++#define GL_FEATURE_REUSE        1u
++#define GL_LCID                 1u              /* our id for apr_audio_svc */
++#define GL_INTENTS              5u
++#define GL_INTENT_SIZE          4096u
++#define GL_MAX_LI               16u
++#define GL_MAX_RI               64u
++#define GL_TX_MAX               0x2000u
++#define APR_DOMAIN_APPS         5u
++#define APR_DOMAIN_ADSP         4u
++#define APR_SVC_ADSP_CORE       3u
++#define APR_HDR_FIELD_SEQ_CMD   0x0180u         /* APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD, APR_HDR_LEN(32), APR_PKT_VER) */
++#define APR_BASIC_RSP_RESULT    0x000110e8u
++#define AVCS_GET_STATE          0x0001290cu     /* AVCS_CMD_ADSP_EVENT_GET_STATE */
++#define AVCS_GET_STATE_RSP      0x0001290du
++enum { G_VERSION = 0, G_VERSION_ACK = 1, G_OPEN = 2, G_CLOSE = 3, G_OPEN_ACK = 4, G_INTENT = 5, G_RX_DONE = 6,
++       G_RX_INTENT_REQ = 7, G_RX_INTENT_REQ_ACK = 8, G_TX_DATA = 9, G_CLOSE_ACK = 11, G_TX_DATA_CONT = 12,
++       G_READ_NOTIF = 13, G_RX_DONE_W_REUSE = 14, G_SIGNALS = 15 };
+ 
+ static struct {
+ 	unsigned stage, delay_s;
+@@ -278,6 +304,461 @@ au_crash_reason(void)
+ 	printf("SWEET AUDIO: DSP crash reason: \"%s\"\n", msg);
+ }
+ 
++/* ---- GLINK on the lpass edge: descriptor words tx tail @0, tx head @4, rx tail @8, rx head @12 */
++static struct {
++	uint32_t desc, tx, tx_len, rx, rx_len, features, rcid, next_liid;
++	bool version_acked, open_acked, bad;
++	struct {
++		uint32_t id, size, off;
++		uint8_t *buf;
++		bool bad;
++	} li[GL_MAX_LI];
++	struct {
++		uint32_t id, size;
++		bool valid, used;
++	} ri[GL_MAX_RI];
++	unsigned opens_seen, rx_pkts;
++	uint32_t apr_opcode, apr_status;        /* the last APR answer */
++	bool apr_answered;
++} gl;
++
++static uint32_t
++gl_rx_avail(void)
++{
++	if (!gl.rx) {
++		uint32_t sz = 0, it = sweet_smem_item(AU_HOST, GL_RX_ITEM, &sz);
++		if (!it || sz < 64 || (sz & 7)) {
++			return 0;
++		}
++		gl.rx = it;
++		gl.rx_len = sz;
++		printf("SWEET AUDIO: the DSP's GLINK FIFO (item %u) at +%#x, %u bytes\n", GL_RX_ITEM, it, sz);
++	}
++	uint32_t head = sweet_smem_rd(gl.desc + 12), tail = sweet_smem_rd(gl.desc + 8);
++	if (head >= gl.rx_len || tail >= gl.rx_len) {
++		return 0;
++	}
++	return head >= tail ? head - tail : gl.rx_len - tail + head;
++}
++
++static void
++gl_rx_peek(uint32_t offset, void *dst, uint32_t count)
++{
++	uint8_t *d = dst;
++	uint32_t pos = sweet_smem_rd(gl.desc + 8) + offset;
++	while (count) {
++		while (pos >= gl.rx_len) {
++			pos -= gl.rx_len;
++		}
++		uint32_t w = sweet_smem_rd(gl.rx + (pos & ~3u)), b = pos & 3u, n = MIN(4u - b, count);
++		memcpy(d, (uint8_t *)&w + b, n);
++		d += n;
++		count -= n;
++		pos += n;
++	}
++}
++
++static void
++gl_rx_advance(uint32_t count)
++{
++	uint32_t tail = sweet_smem_rd(gl.desc + 8) + count;
++	while (tail >= gl.rx_len) {
++		tail -= gl.rx_len;
++	}
++	sweet_smem_wr(gl.desc + 8, tail);
++}
++
++static uint32_t
++gl_tx_avail(void)
++{
++	uint32_t head = sweet_smem_rd(gl.desc + 4), tail = sweet_smem_rd(gl.desc + 0);
++	uint32_t avail = tail <= head ? gl.tx_len - head + tail : tail - head;
++	return avail < 16 ? 0 : avail - 16;
++}
++
++static bool
++gl_tx(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
++{
++	static uint8_t buf[GL_TX_MAX + 64];
++	uint32_t tlen = hlen + dlen, total = (tlen + 7u) & ~7u;
++	if (total > sizeof(buf) || tlen >= gl.tx_len) {
++		return false;
++	}
++	for (unsigned i = 0; gl_tx_avail() < tlen; i++) {
++		if (i == 1000) {
++			printf("SWEET AUDIO: GLINK TX FIFO full for 1 s\n");
++			return false;
++		}
++		au_sleep(1);
++	}
++	memcpy(buf, hdr, hlen);
++	if (dlen) {
++		memcpy(buf + hlen, data, dlen);
++	}
++	bzero(buf + tlen, total - tlen);
++	uint32_t head = sweet_smem_rd(gl.desc + 4);
++	for (uint32_t i = 0; i < total; i += 4) {
++		uint32_t w, p = head + i;
++		memcpy(&w, buf + i, 4);
++		if (p >= gl.tx_len) {
++			p -= gl.tx_len;
++		}
++		sweet_smem_wr(gl.tx + p, w);
++	}
++	head += total;
++	if (head >= gl.tx_len) {
++		head -= gl.tx_len;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	sweet_smem_wr(gl.desc + 4, head);
++	sweet_apcs_kick(GL_DOORBELL);
++	return true;
++}
++
++static bool
++gl_tx_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	uint8_t m[8];
++	memcpy(m, &cmd, 2);
++	memcpy(m + 2, &p1, 2);
++	memcpy(m + 4, &p2, 4);
++	return gl_tx(m, 8, NULL, 0);
++}
++
++static bool
++gl_add_intent(uint32_t size)
++{
++	for (unsigned k = 0; k < GL_MAX_LI; k++) {
++		if (gl.li[k].buf) {
++			continue;
++		}
++		if (!(gl.li[k].buf = kalloc_data(size, Z_WAITOK | Z_ZERO))) {
++			return false;
++		}
++		gl.li[k].id = ++gl.next_liid;
++		gl.li[k].size = size;
++		gl.li[k].off = 0;
++		struct {
++			uint16_t cmd, lcid;
++			uint32_t count, size, id;
++		} __attribute__((packed)) c = { G_INTENT, GL_LCID, 1, size, gl.li[k].id };
++		return gl_tx(&c, (uint32_t)sizeof(c), NULL, 0);
++	}
++	return false;
++}
++
++/* one APR packet from the DSP (apr.c apr_callback): what it answered, logged */
++static void
++gl_apr_rx(const uint8_t *p, uint32_t n)
++{
++	if (n < 32) {
++		printf("SWEET AUDIO: APR packet of %u bytes ignored\n", n);
++		return;
++	}
++	uint16_t field, size, sport, dport;
++	uint32_t token, opcode, w0 = 0, w1 = 0;
++	memcpy(&field, p, 2);
++	memcpy(&size, p + 2, 2);
++	memcpy(&sport, p + 6, 2);
++	memcpy(&dport, p + 10, 2);
++	memcpy(&token, p + 12, 4);
++	memcpy(&opcode, p + 16, 4);
++	if (n >= 36) {
++		memcpy(&w0, p + 32, 4);
++	}
++	if (n >= 40) {
++		memcpy(&w1, p + 36, 4);
++	}
++	printf("SWEET AUDIO: APR from svc %u domain %u port %u to svc %u domain %u port %u: opcode %#x token %u, %u bytes, "
++	    "payload %#x %#x\n", p[4], p[5], sport, p[8], p[9], dport, opcode, token, size, w0, w1);
++	gl.apr_opcode = opcode;
++	gl.apr_status = opcode == APR_BASIC_RSP_RESULT ? w1 : w0;
++	gl.apr_answered = true;
++}
++
++static void
++gl_poll(void)
++{
++	for (unsigned guard = 0; guard < 64 && !gl.bad; guard++) {
++		uint32_t avail = gl_rx_avail();
++		if (avail < 8) {
++			return;
++		}
++		uint8_t m[8];
++		gl_rx_peek(0, m, 8);
++		uint16_t cmd, p1;
++		uint32_t p2;
++		memcpy(&cmd, m, 2);
++		memcpy(&p1, m + 2, 2);
++		memcpy(&p2, m + 4, 4);
++		switch (cmd) {
++		case G_VERSION:
++			gl_rx_advance(8);
++			if (p1 == 1) {
++				gl.features &= p2;
++			}
++			printf("SWEET AUDIO: glink version %u features %#x from the DSP -> ack with %#x\n", p1, p2, gl.features);
++			if (p1 != 0) {
++				(void)gl_tx_cmd(G_VERSION_ACK, 1, gl.features);
++			}
++			break;
++		case G_VERSION_ACK:
++			gl_rx_advance(8);
++			printf("SWEET AUDIO: glink version-ack %u features %#x\n", p1, p2);
++			if (p1 == 1 && p2 != gl.features) {
++				gl.features &= p2;
++				(void)gl_tx_cmd(G_VERSION, 1, gl.features);
++			} else if (p1 == 1) {
++				gl.version_acked = true;
++			}
++			break;
++		case G_OPEN: {
++			uint32_t extra = (p2 + 7u) & ~7u;
++			char name[33];
++			if (avail < 8 + extra) {
++				return;
++			}
++			memset(name, 0, sizeof(name));
++			gl_rx_peek(8, name, MIN(p2, 32u));
++			gl_rx_advance(8 + extra);
++			gl.opens_seen++;
++			printf("SWEET AUDIO: glink: the DSP opens \"%s\" (its id %u)\n", name, p1);
++			if (strcmp(name, "apr_audio_svc") == 0 && !gl.rcid) {
++				struct {
++					uint16_t cmd, lcid;
++					uint32_t len;
++					char name[16];
++				} __attribute__((packed)) req = { G_OPEN, GL_LCID, 14, "apr_audio_svc" };
++				gl.rcid = p1;
++				(void)gl_tx_cmd(G_OPEN_ACK, p1, 0);
++				(void)gl_tx(&req, (uint32_t)sizeof(req), NULL, 0);
++			}
++			break;
++		}
++		case G_OPEN_ACK:
++			gl_rx_advance(8);
++			if (p1 == GL_LCID && !gl.open_acked) {
++				gl.open_acked = true;
++				printf("SWEET AUDIO: glink apr_audio_svc open both ways; %u x %u-byte intents\n", GL_INTENTS, GL_INTENT_SIZE);
++				for (unsigned k = 0; k < GL_INTENTS; k++) {
++					(void)gl_add_intent(GL_INTENT_SIZE);
++				}
++			}
++			break;
++		case G_CLOSE:
++			gl_rx_advance(8);
++			printf("SWEET AUDIO: glink: the DSP closes its id %u\n", p1);
++			(void)gl_tx_cmd(G_CLOSE_ACK, p1, 0);
++			break;
++		case G_INTENT: {
++			uint32_t msglen = 8 + 8 * p2;
++			if (p2 > 64 || avail < msglen) {
++				return;
++			}
++			for (uint32_t k = 0; k < p2; k++) {
++				uint32_t pair[2];
++				gl_rx_peek(8 + 8 * k, pair, 8);
++				for (unsigned j = 0; j < GL_MAX_RI; j++) {
++					if (!gl.ri[j].valid) {
++						gl.ri[j].id = pair[1];
++						gl.ri[j].size = pair[0];
++						gl.ri[j].valid = true;
++						gl.ri[j].used = false;
++						break;
++					}
++				}
++			}
++			gl_rx_advance((msglen + 7u) & ~7u);
++			break;
++		}
++		case G_RX_DONE:
++		case G_RX_DONE_W_REUSE:
++			gl_rx_advance(8);
++			for (unsigned j = 0; j < GL_MAX_RI; j++) {
++				if (gl.ri[j].valid && gl.ri[j].id == p2) {
++					gl.ri[j].used = false;
++					if (cmd == G_RX_DONE) {
++						gl.ri[j].valid = false;
++					}
++				}
++			}
++			break;
++		case G_RX_INTENT_REQ:
++			gl_rx_advance(8);
++			(void)gl_tx_cmd(G_RX_INTENT_REQ_ACK, GL_LCID, p2 <= 0x10000u && gl_add_intent(MAX(p2, 1u)));
++			break;
++		case G_RX_INTENT_REQ_ACK:
++		case G_CLOSE_ACK:
++		case G_SIGNALS:
++			gl_rx_advance(8);
++			break;
++		case G_READ_NOTIF:
++			gl_rx_advance(8);
++			sweet_apcs_kick(GL_DOORBELL);
++			break;
++		case G_TX_DATA:
++		case G_TX_DATA_CONT: {
++			if (avail < 16) {
++				return;
++			}
++			uint32_t sizes[2];
++			gl_rx_peek(8, sizes, 8);
++			uint32_t chunk = sizes[0], left = sizes[1];
++			if (chunk > avail - 16) {
++				return;
++			}
++			unsigned k;
++			for (k = 0; k < GL_MAX_LI && !(gl.li[k].buf && gl.li[k].id == p2); k++) {
++			}
++			bool ok = p1 == gl.rcid && k < GL_MAX_LI && gl.li[k].size - gl.li[k].off >= chunk && !gl.li[k].bad;
++			if (ok) {
++				gl_rx_peek(16, gl.li[k].buf + gl.li[k].off, chunk);
++				gl.li[k].off += chunk;
++			} else {
++				printf("SWEET AUDIO: glink data for id %u intent %u (%u bytes) dropped\n", p1, p2, chunk);
++				if (k < GL_MAX_LI) {
++					gl.li[k].bad = true;
++				}
++			}
++			gl_rx_advance((16 + chunk + 7u) & ~7u);
++			if (k < GL_MAX_LI && left == 0) {
++				if (!gl.li[k].bad) {
++					gl.rx_pkts++;
++					gl_apr_rx(gl.li[k].buf, gl.li[k].off);
++				}
++				gl.li[k].bad = false;
++				gl.li[k].off = 0;
++				struct {
++					uint16_t cmd, lcid;
++					uint32_t liid;
++				} __attribute__((packed)) done = { G_RX_DONE_W_REUSE, GL_LCID, gl.li[k].id };
++				(void)gl_tx(&done, (uint32_t)sizeof(done), NULL, 0);
++			}
++			break;
++		}
++		default:
++			printf("SWEET AUDIO: glink: unknown command %u (p1 %u p2 %#x): ring stopped\n", cmd, p1, p2);
++			gl.bad = true;
++			return;
++		}
++	}
++}
++
++/* one packet into the smallest free remote intent that fits */
++static bool
++gl_send(const void *data, uint32_t len)
++{
++	unsigned best = GL_MAX_RI;
++	for (unsigned j = 0; j < GL_MAX_RI; j++) {
++		if (gl.ri[j].valid && !gl.ri[j].used && gl.ri[j].size >= len && (best == GL_MAX_RI || gl.ri[j].size < gl.ri[best].size)) {
++			best = j;
++		}
++	}
++	if (best == GL_MAX_RI || len > GL_TX_MAX) {
++		return false;
++	}
++	gl.ri[best].used = true;
++	struct {
++		uint16_t cmd, lcid;
++		uint32_t iid, chunk, left;
++	} __attribute__((packed)) h = { G_TX_DATA, GL_LCID, gl.ri[best].id, len, 0 };
++	if (!gl_tx(&h, (uint32_t)sizeof(h), data, len)) {
++		gl.ri[best].used = false;
++		return false;
++	}
++	return true;
++}
++
++static bool
++gl_up(void)
++{
++	gl.desc = sweet_smem_alloc(AU_HOST, GL_DESC, 32);
++	uint32_t sz = 0;
++	if (!gl.desc || sweet_smem_item(AU_HOST, GL_DESC, &sz) != gl.desc || sz != 32) {
++		printf("SWEET AUDIO: glink descriptor not usable (size %u)\n", sz);
++		return false;
++	}
++	gl.tx = sweet_smem_alloc(AU_HOST, GL_TX_ITEM, GL_TX_SIZE);
++	if (!gl.tx || sweet_smem_item(AU_HOST, GL_TX_ITEM, &sz) != gl.tx || sz < 1024 || (sz & 7)) {
++		printf("SWEET AUDIO: glink TX FIFO not usable (size %u)\n", sz);
++		return false;
++	}
++	gl.tx_len = sz;
++	gl.features = GL_FEATURE_REUSE;
++	sweet_smem_wr(gl.desc + 8, 0);          /* *rx_pipe->tail = 0 */
++	sweet_smem_wr(gl.desc + 4, 0);          /* *tx_pipe->head = 0 */
++	bool v = gl_tx_cmd(G_VERSION, 1, gl.features);
++	printf("SWEET AUDIO: glink up: descriptor +%#x, TX FIFO +%#x (%u bytes), version 1 %s\n", gl.desc, gl.tx, gl.tx_len,
++	    v ? "sent" : "NOT SENT");
++	return v;
++}
++
++/* stage 3: the channel, then AVCS_CMD_ADSP_EVENT_GET_STATE to the core service */
++static bool
++au_apr(void)
++{
++	if (!gl_up()) {
++		return false;
++	}
++	unsigned t;
++	for (t = 0; t < 10000 && !gl.bad; t += 5) {
++		gl_poll();
++		if (gl.open_acked) {
++			unsigned j;
++			for (j = 0; j < GL_MAX_RI && !gl.ri[j].valid; j++) {
++			}
++			if (j < GL_MAX_RI) {
++				break;
++			}
++		}
++		au_sleep(5);
++	}
++	if (!gl.open_acked) {
++		printf("SWEET AUDIO: apr_audio_svc not open after %u ms (version-acked %u, %u channels offered, rx FIFO %s)\n", t,
++		    gl.version_acked, gl.opens_seen, gl.rx ? "seen" : "never seen");
++		return false;
++	}
++	struct {
++		uint16_t field, size;
++		uint8_t src_svc, src_domain;
++		uint16_t src_port;
++		uint8_t dest_svc, dest_domain;
++		uint16_t dest_port;
++		uint32_t token, opcode;
++	} __attribute__((packed)) q = { APR_HDR_FIELD_SEQ_CMD, 32, APR_SVC_ADSP_CORE, APR_DOMAIN_APPS, 0, APR_SVC_ADSP_CORE,
++	    APR_DOMAIN_ADSP, 0, 1, AVCS_GET_STATE };
++	/* q6core_is_adsp_ready(): ask until it says ready; the services may come up seconds after the DSP itself */
++	for (unsigned tries = 0; tries < 30; tries++) {
++		gl.apr_answered = false;
++		if (!gl_send(&q, sizeof(q))) {
++			printf("SWEET AUDIO: APR send failed (no free intent from the DSP)\n");
++			return false;
++		}
++		for (unsigned w = 0; w < 1000 && !gl.apr_answered && !gl.bad; w += 5) {
++			au_sleep(5);
++			gl_poll();
++		}
++		if (!gl.apr_answered) {
++			if (tries == 0 || tries % 10 == 9) {
++				printf("SWEET AUDIO: no APR answer to AVCS_CMD_ADSP_EVENT_GET_STATE (try %u)\n", tries);
++			}
++			continue;
++		}
++		if (gl.apr_opcode == AVCS_GET_STATE_RSP && gl.apr_status == 1) {
++			printf("SWEET AUDIO: THE DSP ANSWERS: audio framework ready (try %u)\n", tries);
++			sweet_log_sync();
++			return true;
++		}
++		au_sleep(100);
++	}
++	if (!gl.apr_opcode) {
++		printf("SWEET AUDIO: no APR answer at all in 30 s (%u packets from the DSP)\n", gl.rx_pkts);
++	} else {
++		printf("SWEET AUDIO: the DSP answered but never said ready (last opcode %#x status %#x)\n", gl.apr_opcode, gl.apr_status);
++	}
++	return false;
++}
++
+ /* ---- stage 1 */
+ static bool
+ au_probe(void)
+@@ -381,8 +862,8 @@ au_thread(void *arg, wait_result_t w)
+ 	(void)w;
+ 	printf("SWEET AUDIO: stage %u in %u s\n", au.stage, au.delay_s);
+ 	au_sleep(au.delay_s * 1000);
+-	if (au_probe() && au.stage >= 2) {
+-		(void)au_boot();
++	if (au_probe() && au.stage >= 2 && au_boot() && au.stage >= 3) {
++		(void)au_apr();
+ 	}
+ 	sweet_log_sync();
+ 	(void)thread_terminate(current_thread());
