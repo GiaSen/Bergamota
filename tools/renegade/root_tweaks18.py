@@ -1071,6 +1071,9 @@ CHL_TARGETS = (
     ('Applications/UnityPosterApp.app/Extensions/Unity2025Poster.appex/Unity2025Poster', False, False),
     ('Applications/AegirProxyApp.app/Extensions/AegirPoster.appex/AegirPoster', False, False),
     ('Applications/KaleidoscopePosterApp.app/Extensions/KaleidoscopePoster.appex/KaleidoscopePoster', False, False),
+    # the Now Playing UI: force-unwraps MediaCoreUI.MetalContext.shared for its artwork backdrop, SIGTRAP at every video start
+    # without a device; a sandboxed app, so it gets the user client class like PosterBoard
+    ('Applications/MediaRemoteUI.app/MediaRemoteUI', True, True),
 )
 CHL_FLAGS = ('bgmtl.arm', 'bgmtl-bb.arm', 'bgmtl-bb.direct')
 # Processes that stay linked but start stock. None now: iconservicesagent's glass layers were lost on the way through IOSurfaces (NOTES 2026-10-31,
