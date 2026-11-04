@@ -91,3 +91,39 @@ D7. No MobileGestalt, battery, backlight or audio work beyond what topaz/upstrea
  1. Before any DEPCMD: clear GUSB2PHYCFG0 (0xc200) SUSPHY bit6 + ENBLSLPM bit8 (and GUSB3PIPECTL0 0xc2c0 bit17), either permanently or around every command (arielTROY stallion 0084). Log GUSB2PHYCFG/GUSB3PIPECTL/GCTL/GUCTL1 pre and post CSFTRST. If you keep soft reset: wait >=50 ms after it, and re-write the pre-reset values of GSBUSCFG0/1, GUCTL, GUCTL1, GTX/RXFIFOSIZ, GUSB2PHYCFG0, GUSB3PIPECTL0.
  2. When ep0 works, expect SoC reset on first DMA: copy anonbeat1's sweet_smmu.c with SMR reuse (stream IDs for USB1 on sdm845 are in the DTB `iommus`).
  3. Keep your QSCRATCH VBUS override (0074 equivalent, also used by all forks) and the UTMI-as-PIPE-clock selection (not used by any fork, since the others' PIPE clocks survived ABL; no fork has solved a "QMP PHY down" case).
+
+## G. Second survey for the Mi 8 (dipper), 2026-11-04 (read-only)
+
+Method: `gh search repos` (ios-sweet, hackios/hakios, xnu, iOS 26, SDM845 codenames dipper/polaris/enchilada/fajita), READMEs, docs and file trees read through the GitHub API, plus web search for sensors. Nothing was cloned, built or run. All of it is untrusted third-party data; the numbers below are the projects' own claims unless marked observed. Baseline compared against: sections A-F above, and an earlier list of youzjuzi/dipper-xnu, oosexgang/hackios-xnu-kernel (now named hakios), IOS-26-Hot, ios-on-pixel-10, iOSPlus10, ios26-sapphire and hakios-arm64e-dada.
+
+### G1. oosexgang/hakios-metal: native Metal on A6xx, no Vulkan in between (MIT, created 2026-10-28)
+https://github.com/oosexgang/hakios-metal , measurements in https://github.com/oosexgang/hakios-xnu-kernel/blob/main/docs/reference/metal-measurements.md
+ - C++ Metal driver over the kernel GPU driver's msm-DRM-style requests (BOs, submits, fences); Mesa's ir3 compiler runs in-process (AIR -> NIR by their front end -> ir3). Target: Adreno 642L, chip id 0x06030500 (a6xx gen4). Register constants checked against Mesa's a6xx.xml (1652 names).
+ - Their A/B on the same phone (POCO X5 Pro, 1125x2436, 3-4 Nov): page swipe ~101 fps vs 50-57 with UniXNU's Metal-on-Vulkan (metal2vulkan + Turnip); Settings scroll 89-91 vs 41; GPU time per frame ~10 ms vs 14-21 ms. At 828x1792: scroll 118, swipes 110-115. Their explanation of the Vulkan path's cost: every frame renders to a tiled image and a compute pass merges it back into the IOSurface; `VK_NV_linear_color_attachment` stays unused because the pass has a second, non-linear attachment.
+ - Relevance: Chlorophyll on Turnip is the same class as their Metal-on-Vulkan path, and our ~55 fps Control Center scroll matches their Vulkan numbers. SweetAdreno's user client is msm-shaped (GPU_KERNEL.md section 6), so adopting it means a request shim plus a630 (a6xx gen1) register values from Mesa's fd_dev_info.
+ - Not a drop-in (their README): MSAA, GMEM rendering, mipmaps, non-2D textures, stencil and several attachment types are refused by name. SpringBoard's wallpaper needs multisample resolves (NOTES, 2026-10-25).
+ - The window-server plug-in and Metal glue are in hakios-xnu-kernel `userland/src/HakiosMetal.m` (MIT; the XNU patch is APSL).
+
+### G2. HakiOS iOS-side glue for vibration and flashlight (hakios-xnu-kernel, MIT outside the XNU patch)
+ - Vibration (`drivers/haptic/hakios.haptic.c`, haptic=5): Darwin's "Actuator" device in their audio HAL plug-in (`userland/src/audio_plugin.c`) receives CoreHaptics/UIKit feedback as one-channel samples and writes them to /dev/hakios-haptic; the kernel maps each burst to a tap or a looped waveform. SweetSpeaker.driver is already an AudioServerPlugIn, so this is the same mechanism.
+ - Flashlight (`drivers/camera/hakios.torch.c`, torch=3): the loader sets /product/camera "flash" (MobileGestalt camera-flash, Control Center button), and `libhakios.media.dylib` injected into mediaserverd gives FigFlashlight a device that writes a 0-1000 level to /dev/hakios-torch.
+ - Their hardware differs (AW86927 over I2C; PM8350C flash module). Their own review `docs/driver-review/camera-haptic-torch.md` lists bugs not to copy: TORCH-1/2 (LED can stay lit after a failed write), HAPTIC-1, nodes mode 0666.
+
+### G3. Mi 8 hardware side for G2 (observed in `dtb/dipper/live.dtb`)
+ - `qcom,qpnp-haptics` (PMI8998 haptics), `qcom,qpnp-flash-led-v2` (PMI8998 flash), `qcom,msm-ssc-sensors` (sensors behind the SLPI), `qcom,tavil-slim-pgd` (WCD9340 over SLIMbus), `qcom,cci` + `qcom,camera-flash`.
+ - Driver source: `drivers/leds/leds-qpnp-haptics.c` and `drivers/leds/leds-qpnp-flash-v2.c` exist in LineageOS/android_kernel_xiaomi_sdm845 lineage-22.2 (checked via the API) but are not in our sparse checkout `research/lineage-sdm845`; add `drivers/leds` to it. Xiaomi's original is MiCode/Xiaomi_Kernel_OpenSource branch `dipper-q-oss` (same files, plus `dipper-camera-sensor-mtp.dtsi`).
+
+### G4. Sensors (auto-brightness, rotation): SLPI / Snapdragon Sensor Core
+ - Light, proximity and motion sensors on the Mi 8 sit behind the SLPI DSP (G3). postmarketOS reads them on SDM845 (OnePlus 6/6T, Poco F1 tested) with libssc (https://codeberg.org/DylanVanAssche/libssc: QMI messages carrying protobuf) and hexagonrpcd (https://github.com/linux-msm/hexagonrpc, GPL-3.0: serves the sensor registry and calibration files to the DSP over FastRPC). MRs: https://gitlab.com/postmarketOS/pmaports/-/merge_requests/4050 , https://gitlab.com/postmarketOS/pmaports/-/merge_requests/5215 , iio-sensor-proxy https://gitlab.freedesktop.org/hadess/iio-sensor-proxy/-/merge_requests/381 .
+ - We already run QRTR/QMI and rmtfs for Wi-Fi; the SLPI firmware boot and FastRPC are the new parts. No iOS port has done this.
+
+### G5. yfl520/hackios-raphael (Redmi K20 Pro, SM8150; license NOASSERTION)
+https://github.com/yfl520/hackios-raphael , based on HeliumStudio-Dev/hackios-xnu-kernel. README claims: rear camera and pop-up front camera preview, speaker, vibration (PM8150B ERM over SPMI, `kernel/bsd/dev/hakios.raphael-haptic.h`), Bluetooth speaker; microphone and call audio "not verified"; no Metal (GLES via Mesa). Its `hakios.camera.c` drives the Titan CSIPHY/CSID/IFE blocks, the same camera family as SDM845's Titan 170, so it is the closest camera reference among the ports.
+
+### G6. Microphone and cellular: nothing better yet
+ - HakiOS's microphone (`drivers/audio/hakios.mic.c`) goes through SoundWire (WCD938x); only the ADSP/APR side transfers to our WCD9340/SLIMbus. No port has a SLIMbus microphone. Their review `docs/driver-review/sound.md` lists S-01..S-11.
+ - HakiOS `docs/cellular.md` (last change 2026-10-29): MPSS up, RMTFS/TFTP/service registry, IPA running, SIM bound, NAS signal read, WDS/QMAP data session written; no network registration yet.
+
+### G7. Checked, not ahead of dipper
+ - SDM845: edi194/ios-fajita (OnePlus 6T, iOS 16.7.16 home screen, CoreAnimation in software, GPU userspace WIP), johnpanos/UniXNU-fajita (iPadOS 17.7 kernel waits at root mount, no storage driver), wangshaofan82-png/UniXNU-enchilada-port (OnePlus 6, nothing run on hardware), GSHPChina/mi8-ios (Windows PowerShell one-click wrapper around ios-fajita, iOS 16), JaneAwA/polaris-ios14 (Mi MIX 2S, xnu-7195 bring-up), polaris-xnu CI repos (builds only), youzjuzi/dipper-xnu (no commits since 2026-10-31, docs and tools only).
+ - UniXNU/Adreno740 (a7xx kernel driver for SM8550): newer GPU generation; UniXNU itself is covered in GPU_RESEARCH.md. Dozens of other hakios/UniXNU device repos are board files for other SoCs.
