@@ -11,6 +11,9 @@
  * Clock: the host clock at exactly 48 kHz (400 ticks of the 19.2 MHz timebase per frame); the DSP's bit clock comes from
  * the same crystal, so the two do not drift apart.
  *
+ * The kernel player is started at StartIO; when that fails (the DSP comes up about 150 s into a boot, audiomxd starts IO
+ * earlier) or the player stops on its own, a helper thread starts it again once a second while IO runs.
+ *
  * The amp's on/off scripts come from TI's firmware and are registered by root (`dipper-speaker.sh amp-register`);
  * without them the stream runs and the amp stays off. ROM mode has no speaker protection, so the gain never exceeds
  * kGainCeiling whatever the volume control says.
@@ -26,6 +29,7 @@
 #include <string.h>
 #include <sys/errno.h>
 #include <sys/sysctl.h>
+#include <unistd.h>
 
 enum {
 	kObjectID_PlugIn = kAudioObjectPlugInObject,
@@ -42,13 +46,21 @@ enum {
 #define kZeroTimeStampPeriod    16384u          /* frames between two zero time stamps */
 #define kSafetyOffset           480u            /* 10 ms */
 #define kLatency                4800u           /* what plays after our timeline: 4 x 20 ms queued in the DSP + its own */
-#define kPrefillFrames          2400u           /* zeros ahead of the first mix: room for the IO thread's jitter */
+#define kPrefillFrames          4800u           /* zeros ahead of the first mix: room for the IO thread's jitter */
 #define kVolumeMinDB            (-48.0f)
 #define kVolumeMaxDB            0.0f
 #define kGainCeiling            0.25f           /* -12 dB: no speaker protection in the amp's ROM mode */
 
 /* kern.sweet_audio_play (dipper_audio.c) */
 enum { PL_OP_START = 1, PL_OP_STOP = 2, PL_OP_DATA = 3, PL_OP_DRAIN = 4 };
+struct pl_status {
+	uint32_t state, result, ring, period;
+	uint64_t written, sent, played;
+	uint32_t queued, zeros, gaps, writes;
+	uint32_t errors, handle, copp, amp_checks;
+	uint8_t flags1, flags2, amp, reserved;
+	uint64_t done_time;
+} __attribute__((packed));
 #define PL_DATA_MAX             65536u
 
 static os_log_t gLog;
@@ -62,8 +74,17 @@ static UInt32 gMute;
 static Float64 gHostTicksPerFrame;
 static UInt64 gAnchorHostTime;
 static Float64 gNextSample;                     /* the sample time the kernel's ring continues with */
-static Boolean gKernelOK;
+static atomic_bool gKernelOK;                   /* the kernel's player runs and takes our data */
+static atomic_bool gResync;                     /* restart the timeline (prefill) at the next mix */
+static Boolean gLinkRunning;
 static unsigned gDropped, gErrors;
+/* diagnostics, logged at StopIO: the HAL's cycles, our timeline fixes, the kernel ring's lowest fill and its gaps */
+static struct {
+	unsigned cycles, skips, skipped, overlaps, overlapped, min_buf, max_buf, gap_n;
+	uint64_t min_fill;
+	uint32_t last_gaps;
+	unsigned gap_ms[12];
+} gDiag;
 
 static Float32
 volume_db(Float32 scalar)
@@ -104,9 +125,12 @@ static void
 append_zeros(UInt32 frames)
 {
 	static const int16_t zeros[4096 * kChannels];
-	while (frames && gKernelOK) {
+	while (frames && atomic_load(&gKernelOK)) {
 		UInt32 n = frames < 4096u ? frames : 4096u;
-		if (play_op(PL_OP_DATA, zeros, n * kChannels * sizeof(int16_t))) {
+		int e = play_op(PL_OP_DATA, zeros, n * kChannels * sizeof(int16_t));
+		if (e == EPIPE || e == ENXIO) {
+			atomic_store(&gKernelOK, false);       /* the player stopped: the helper thread restarts it */
+		} else if (e) {
 			gDropped += n;
 		}
 		frames -= n;
@@ -770,6 +794,48 @@ SS_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 
 #pragma mark - IO
 
+/* START (a STOP first if something else left it playing), gStateMutex held */
+static int
+kernel_start(void)
+{
+	int e = play_op(PL_OP_START, NULL, 0);
+	if (e == EBUSY) {
+		play_op(PL_OP_STOP, NULL, 0);
+		e = play_op(PL_OP_START, NULL, 0);
+	}
+	if (e == 0) {
+		atomic_store(&gResync, true);
+		atomic_store(&gKernelOK, true);
+	}
+	return e;
+}
+
+static void *
+link_thread(void *arg)
+{
+	(void)arg;
+	unsigned tries = 0;
+	for (;;) {
+		sleep(1);
+		pthread_mutex_lock(&gStateMutex);
+		if (!gIOCount) {
+			gLinkRunning = false;
+			pthread_mutex_unlock(&gStateMutex);
+			return NULL;
+		}
+		if (!atomic_load(&gKernelOK)) {
+			int e = kernel_start();
+			if (e == 0 || tries++ % 60 == 0) {
+				os_log(gLog, "SweetSpeaker: kernel player %{public}s (%d, try %u)", e ? "still not up" : "on", e, tries);
+			}
+			if (e == 0) {
+				tries = 0;
+			}
+		}
+		pthread_mutex_unlock(&gStateMutex);
+	}
+}
+
 static OSStatus
 SS_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID)
 {
@@ -779,16 +845,19 @@ SS_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, 
 	}
 	pthread_mutex_lock(&gStateMutex);
 	if (gIOCount++ == 0) {
-		int e = play_op(PL_OP_START, NULL, 0);
-		if (e == EBUSY) {                       /* already playing (sweetplay, or a stop that did not happen) */
-			play_op(PL_OP_STOP, NULL, 0);
-			e = play_op(PL_OP_START, NULL, 0);
-		}
-		gKernelOK = e == 0;
 		gAnchorHostTime = mach_absolute_time();
-		gNextSample = -1;
 		gDropped = gErrors = 0;
-		os_log(gLog, "SweetSpeaker: start IO: kernel player %{public}s (%d), gain %.4f", e ? "FAILED" : "on", e, output_gain());
+		memset(&gDiag, 0, sizeof(gDiag));
+		gDiag.min_fill = UINT64_MAX;
+		gDiag.min_buf = UINT32_MAX;
+		int e = kernel_start();                 /* here, so the first sound is not lost; else the helper retries */
+		os_log(gLog, "SweetSpeaker: start IO: kernel player %{public}s (%d), gain %.4f", e ? "not up yet" : "on", e,
+		    output_gain());
+		pthread_t th;
+		if (!gLinkRunning && pthread_create(&th, NULL, link_thread, NULL) == 0) {
+			pthread_detach(th);
+			gLinkRunning = true;
+		}
 	}
 	pthread_mutex_unlock(&gStateMutex);
 	return kAudioHardwareNoError;
@@ -803,11 +872,14 @@ SS_StopIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, U
 	}
 	pthread_mutex_lock(&gStateMutex);
 	if (gIOCount && --gIOCount == 0) {
-		if (gKernelOK) {
+		if (atomic_exchange(&gKernelOK, false)) {
 			play_op(PL_OP_STOP, NULL, 0);
 		}
-		os_log(gLog, "SweetSpeaker: stop IO: %u frames dropped, %u write errors", gDropped, gErrors);
-		gKernelOK = false;
+		os_log(gLog, "SweetSpeaker: stop IO: %u frames dropped, %u write errors; %u cycles of %u-%u frames, %u skips (%u frames), "
+		    "%u overlaps (%u frames); kernel ring lowest %llu bytes, %u gaps at ms %u %u %u %u %u %u %u %u %u %u %u %u", gDropped,
+		    gErrors, gDiag.cycles, gDiag.min_buf, gDiag.max_buf, gDiag.skips, gDiag.skipped, gDiag.overlaps, gDiag.overlapped,
+		    gDiag.min_fill, gDiag.last_gaps, gDiag.gap_ms[0], gDiag.gap_ms[1], gDiag.gap_ms[2], gDiag.gap_ms[3], gDiag.gap_ms[4],
+		    gDiag.gap_ms[5], gDiag.gap_ms[6], gDiag.gap_ms[7], gDiag.gap_ms[8], gDiag.gap_ms[9], gDiag.gap_ms[10], gDiag.gap_ms[11]);
 	}
 	pthread_mutex_unlock(&gStateMutex);
 	return kAudioHardwareNoError;
@@ -853,8 +925,11 @@ SS_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObje
     void *ioMainBuffer, void *ioSecondaryBuffer)
 {
 	(void)inDriver; (void)inDeviceObjectID; (void)inStreamObjectID; (void)inClientID; (void)ioSecondaryBuffer;
-	if (inOperationID != kAudioServerPlugInIOOperationWriteMix || !gKernelOK || !ioMainBuffer) {
+	if (inOperationID != kAudioServerPlugInIOOperationWriteMix || !atomic_load(&gKernelOK) || !ioMainBuffer) {
 		return kAudioHardwareNoError;
+	}
+	if (atomic_exchange(&gResync, false)) {
+		gNextSample = -1;
 	}
 	static int16_t pcm[PL_DATA_MAX / sizeof(int16_t)];
 	const Float32 *in = ioMainBuffer;
@@ -863,14 +938,55 @@ SS_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObje
 	if (gNextSample < 0) {
 		append_zeros(kPrefillFrames);
 	} else if (t > gNextSample && t - gNextSample < kSampleRate) {
+		gDiag.skips++;
+		gDiag.skipped += (unsigned)(t - gNextSample);
+		if (gDiag.skips <= 20) {
+			os_log(gLog, "SweetSpeaker: the HAL skipped %.0f frames at sample %.0f (cycle %u, %u frames)", t - gNextSample, t,
+			    gDiag.cycles, inIOBufferFrameSize);
+		}
 		append_zeros((UInt32)(t - gNextSample));        /* the HAL skipped ahead: keep the timeline */
 	} else if (t < gNextSample) {
 		UInt32 skip = (UInt32)fmin(gNextSample - t, (Float64)frames);  /* already appended */
+		gDiag.overlaps++;
+		gDiag.overlapped += skip;
+		if (gDiag.overlaps <= 20) {
+			os_log(gLog, "SweetSpeaker: the HAL went back %u frames at sample %.0f (cycle %u)", skip, t, gDiag.cycles);
+		}
 		in += skip * kChannels;
 		frames -= skip;
 		t += skip;
 	}
 	gNextSample = t + frames;
+	if (gDiag.cycles < 3) {
+		os_log(gLog, "SweetSpeaker: cycle %u: %u frames at %.0f, now %.0f, host ticks per frame main %.3f device %.3f, "
+		    "nominal buffer %u", gDiag.cycles, inIOBufferFrameSize, inIOCycleInfo->mOutputTime.mSampleTime,
+		    inIOCycleInfo->mCurrentTime.mSampleTime, inIOCycleInfo->mMainHostTicksPerFrame,
+		    inIOCycleInfo->mDeviceHostTicksPerFrame, inIOCycleInfo->mNominalIOBufferFrameSize);
+	}
+	gDiag.cycles++;
+	gDiag.min_buf = inIOBufferFrameSize < gDiag.min_buf ? inIOBufferFrameSize : gDiag.min_buf;
+	gDiag.max_buf = inIOBufferFrameSize > gDiag.max_buf ? inIOBufferFrameSize : gDiag.max_buf;
+	{
+		/* the ring's fill before this cycle's data, and any new gap (zeros the kernel sent after the data started) */
+		struct pl_status st;
+		size_t len = sizeof(st);
+		if (sysctlbyname("kern.sweet_audio_play", &st, &len, NULL, 0) == 0) {
+			uint64_t fill = st.written - st.played;
+			if (fill < gDiag.min_fill) {
+				gDiag.min_fill = fill;
+			}
+			while (gDiag.last_gaps < st.gaps) {
+				if (gDiag.gap_n < 12) {
+					gDiag.gap_ms[gDiag.gap_n++] = (unsigned)((mach_absolute_time() - gAnchorHostTime) / gHostTicksPerFrame / 48.0);
+				}
+				if (gDiag.last_gaps < 20) {
+					os_log(gLog, "SweetSpeaker: the kernel ring ran dry (gap %u) at cycle %u, %u frames, ring fill now %llu bytes",
+					    gDiag.last_gaps + 1, gDiag.cycles, inIOBufferFrameSize, fill);
+				}
+				gDiag.last_gaps++;
+			}
+		}
+	}
 	float g = output_gain() * 32767.0f;
 	while (frames) {
 		UInt32 n = frames < PL_DATA_MAX / (kChannels * sizeof(int16_t)) ? frames : PL_DATA_MAX / (kChannels * sizeof(int16_t));
@@ -881,6 +997,9 @@ SS_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObje
 		int e = play_op(PL_OP_DATA, pcm, n * kChannels * sizeof(int16_t));
 		if (e == EAGAIN) {
 			gDropped += n;
+		} else if (e == EPIPE || e == ENXIO) {
+			atomic_store(&gKernelOK, false);       /* the player stopped: the helper thread restarts it */
+			break;
 		} else if (e) {
 			gErrors++;
 		}
