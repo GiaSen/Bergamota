@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 69c192c..608f723 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -2030,7 +2030,9 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_i2c, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLF
+  * reset before the port stops; while playing, the amp's fault flags are read every second and a critical one (TI's
+  * masks: FLAGS_1 & 0xfc over-current/clock/die temperature, FLAGS_2 & 0x0c brownout) stops everything.
+  *
+- *   kern.sweet_audio_amp   write u8 which (1 on, 0 off) + an I2C script; read: their sizes, as text
++ *   kern.sweet_audio_amp   write u8 which (1 on, 0 off) + an I2C script; read: their sizes, as text. Taken while
++ *                          playing too (3047: SweetSpeaker.driver may start the stream before the boot job registers
++ *                          them): a new on script then powers the amp up from the audio thread.
+  *   kern.sweet_audio_play  write u32 op [+ data], then read struct pl_status (both in one call or apart); writable by
+  *                          any user (3046: audiomxd runs as mobile and feeds it from SweetSpeaker.driver):
+  *                          1 start (returns once the stream runs; EIO if a step failed, all undone), 2 stop now,
+@@ -2071,6 +2073,7 @@ static struct {
+ 	uint32_t zeros, gaps, writes, errors, amp_checks;
+ 	uint8_t flags[2];
+ 	bool amp_used;
++	bool amp_pending;                       /* an on script arrived while playing without one */
+ 	uint8_t *amp[2];                        /* [0] off, [1] on */
+ 	uint32_t amp_len[2];
+ } pl;
+@@ -2364,8 +2367,18 @@ pl_step(void)
+ 		__atomic_add_fetch(&pl.gen, 1, __ATOMIC_RELEASE);
+ 	}
+ 	if (pl.state == PL_OFF) {
++		pl.amp_pending = false;
+ 		return;
+ 	}
++	if (pl.amp_pending) {
++		pl.amp_pending = false;
++		pl.amp_used = true;                     /* the off script runs at teardown even if this fails half way */
++		if (!pl_amp(1)) {
++			pl_teardown("amp on failed", true, true, true, true, true);
++			return;
++		}
++		pl.last_check = mach_absolute_time();
++	}
+ 	pl_submit();
+ 	uint64_t now = mach_absolute_time();
+ 	if (pl.qn && now - pl.last_done > one_s * PL_STALL_MS / 1000u) {
+@@ -2482,15 +2495,14 @@ au_amp_sysctl SYSCTL_HANDLER_ARGS
+ 			return err;
+ 		}
+ 		lck_mtx_lock(&au_mtx);
+-		if (pl.state != PL_OFF) {
+-			err = EBUSY;
+-		} else {
+-			uint8_t *old = pl.amp[which];
+-			uint32_t old_len = pl.amp_len[which];
+-			pl.amp[which] = s;
+-			pl.amp_len[which] = len;
+-			s = old;
+-			len = old_len;
++		uint8_t *old = pl.amp[which];
++		uint32_t old_len = pl.amp_len[which];
++		pl.amp[which] = s;
++		pl.amp_len[which] = len;
++		s = old;
++		len = old_len;
++		if (which == 1 && pl.state != PL_OFF && !pl.amp_used) {
++			pl.amp_pending = true;
+ 		}
+ 		lck_mtx_unlock(&au_mtx);
+ 		if (s) {

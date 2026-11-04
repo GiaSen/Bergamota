@@ -614,6 +614,87 @@ def audio(root):
         data['StartRecorderServer'] = False
         save(conf, data, st.st_uid, st.st_gid, st.st_mode & 0o7777, plistlib.FMT_XML)
         print('StartRecorderServer off', os.path.relpath(conf, root))
+    if int(VERSION.split('.')[0]) >= 26:
+        speaker(root)
+
+
+# The Mi 8's loudspeaker (NOTES.md 2026-11-04): tools/audio/SweetSpeaker/SweetSpeaker.driver in the HAL's plug-in folder
+# (VirtualAudio makes UID "Speaker" the built-in speaker port) feeding the kernel's player (xnu 3045-3047, sweetaudio=3),
+# the amp's I2C scripts generated here from TI's firmware (RENEGADE_AMP_FW=DIR with tas2557_uCDSP_aac.bin, from the
+# phone's vendor partition; never in git) and registered by a root job once the DSP is up, and the audio stack's host
+# clock rewritten from Apple's 24 MHz to this counter's 19.2 MHz in the cache (timebase_cache.py): without it the HAL
+# re-anchors the device's clock every 0.4 s and the sound breaks up. RENEGADE_AMP_FW unset: none of it.
+SPEAKER_DRIVER = 'System/Library/Audio/Plug-Ins/HAL/SweetSpeaker.driver'
+SPEAKER_SHARE = 'usr/local/share/sweetspeaker'
+SPEAKER_LABEL = 'org.bergamota.sweetspeaker-amp'
+SPEAKER_SH = 'usr/local/libexec/sweetspeaker-amp.sh'
+SPEAKER_SCRIPT = r'''#!/bin/sh
+# The Mi 8 amp's on/off I2C scripts into the kernel's speaker player (root only), for SweetSpeaker.driver; run once per
+# boot by the launchd job org.bergamota.sweetspeaker-amp (root_tweaks18.speaker). The player answers once the audio DSP
+# is up (sweetaudiodelay, 150 s by default): asked every 5 s, 10 minutes at most.
+i=0
+while [ $i -lt 120 ]; do
+	if /usr/local/bin/sweetplay -s >/dev/null 2>&1; then
+		exec /usr/local/bin/sweetplay -a /usr/local/share/sweetspeaker/amp-on.bin -o /usr/local/share/sweetspeaker/amp-off.bin
+	fi
+	sleep 5
+	i=$((i + 1))
+done
+echo "sweetspeaker-amp: no kernel player after 10 minutes (boot-arg sweetaudio=3?)" >&2
+'''
+
+
+def speaker(root):
+    import subprocess
+    fw_dir = os.environ.get('RENEGADE_AMP_FW')
+    if not fw_dir:
+        print('speaker: RENEGADE_AMP_FW not set: no SweetSpeaker.driver, amp scripts or 19.2 MHz audio clock')
+        return
+    fw = os.path.join(fw_dir, 'tas2557_uCDSP_aac.bin')
+    drv, play = find_sweetnet('ios18/SweetSpeaker.driver'), find_sweetnet('ios18/sweetplay')
+    if not os.path.exists(fw) or not drv or not play:
+        missing = ', '.join(m for m, ok in ((fw, os.path.exists(fw)), ('SweetSpeaker.driver (tools/audio/SweetSpeaker/build.sh)', drv),
+                                            ('sweetplay (tools/sweetnet/build.sh)', play)) if not ok)
+        print('speaker: skipped, missing', missing)
+        note_skip('speaker', 'missing ' + missing)
+        return
+    # the audio stack's clock first: idempotent, prints what it changed
+    cache = os.path.join(root, 'System/Library/Caches/com.apple.dyld')
+    subprocess.run([sys.executable, '-I', os.path.join(HERE, 'timebase_cache.py'), cache, '--hz', '19200000'], check=True)
+    dst = os.path.join(root, SPEAKER_DRIVER)
+    if os.path.exists(dst):
+        shutil.rmtree(dst)
+    shutil.copytree(drv, dst, symlinks=True, ignore=shutil.ignore_patterns('._*', '.DS_Store'))
+    for d, dirs, files in os.walk(dst):
+        for n in dirs + files:
+            os.lchown(os.path.join(d, n), 0, 0)
+    os.lchown(dst, 0, 0)
+    install_file(play, os.path.join(root, 'usr/local/bin/sweetplay'))
+    # ROM mode 1 + config 12 (48 kHz, PLL from the 1.536 MHz bit clock), DAC gain 2 of 15; the same scripts for both
+    # speaker vendors' firmware (tools/audio/tas2557fw.py)
+    share = os.path.join(root, SPEAKER_SHARE)
+    os.makedirs(share, exist_ok=True)
+    tool = os.path.join(HERE, '..', 'audio', 'tas2557fw.py')
+    parts = []
+    for kind, args in (('load', ['1', '12']), ('on', ['2']), ('off', [])):
+        out = os.path.join(share, kind + '.tmp')
+        subprocess.run([sys.executable, '-I', tool, fw, '--script', kind, out, *args], check=True, stdout=subprocess.DEVNULL)
+        parts.append(open(out, 'rb').read())
+        os.unlink(out)
+    for name, data in (('amp-on.bin', parts[0] + parts[1]), ('amp-off.bin', parts[2])):
+        path = os.path.join(share, name)
+        with open(path, 'wb') as f:
+            f.write(data)
+        os.chown(path, 0, 0)
+        os.chmod(path, 0o644)
+    os.lchown(share, 0, 0)
+    write_file(os.path.join(root, SPEAKER_SH), SPEAKER_SCRIPT, 0o755)
+    add_job(root, SPEAKER_LABEL, {
+        'Label': SPEAKER_LABEL, 'ProgramArguments': ['/bin/sh', '/' + SPEAKER_SH],
+        'RunAtLoad': True, 'UserName': 'root', 'StandardErrorPath': '/dev/console',
+        'EnvironmentVariables': {'PATH': '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'}})
+    print('speaker: %s, /usr/local/bin/sweetplay, amp scripts %d + %d bytes, job %s' % (
+        SPEAKER_DRIVER, len(parts[0] + parts[1]), len(parts[2]), SPEAKER_LABEL))
 
 
 # Daemons that only crash-loop or quit at once on this bring-up while containermanagerd refuses every container lookup
