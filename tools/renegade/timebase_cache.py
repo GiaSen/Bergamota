@@ -8,9 +8,10 @@ iOS 26's CoreAudio and the libraries around it hard-code the host clock of Apple
 returns the constant 24e6, host time <-> seconds conversions multiply by 1/24e6, and a few functions build 24000000 as
 an immediate. The Mi 8's counter runs at 19.2 MHz (mach_timebase_info 625/12).
 
-NOT USED by the root build (2026-11-03): an A/B on the phone (xnu 3039, VirtualAudio on) gave the same results with and
-without it: AudioQueue output at 99% of real time (tools/sweetnet/sweetaq) and YouTube 59.3 s of video in 59.3 s.
-Applied and booted fine (AudioGetHostClockFrequency() then returns 19200000); kept for a symptom that does need it.
+Used by the root build since 2026-11-04 (root_tweaks18.speaker, with RENEGADE_AMP_FW): a real output device
+(SweetSpeaker.driver) clocked by mach_absolute_time at 400 ticks per frame read to the HAL, which computes 500 from the
+24 MHz constant, as "host time is not consecutive": it re-anchored and overloaded about every 0.4 s and the sound broke up.
+With the null device alone (2026-11-03) an A/B showed no difference, which is why it was not used before.
 
 Inside the images listed in IMAGES only (cache) or the given file:
   * 8-byte doubles 24e6 and 1/24e6 in the non-executable __TEXT sections -> HZ and 1/HZ,
