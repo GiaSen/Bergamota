@@ -15,12 +15,14 @@
  * earlier) or the player stops on its own, a helper thread starts it again once a second while IO runs.
  *
  * The amp's on/off scripts come from TI's firmware and are registered by root (`dipper-speaker.sh amp-register`);
- * without them the stream runs and the amp stays off. ROM mode has no speaker protection, so the gain never exceeds
- * kGainCeiling whatever the volume control says.
+ * without them the stream runs and the amp stays off. ROM mode has no speaker protection, so everything goes through
+ * the speaker's guard (guard.c: +12 dB make-up for Apple's n104_speaker_general chain, 200 Hz high-pass, power limits
+ * over 0.2/3/60 s, peaks at most -3 dBFS) after the volume control.
  *
  * Logs to the unified log, subsystem com.sweet.SweetSpeaker (`sweetlog 60 SweetSpeaker`).
  */
 #include <CoreAudio/AudioServerPlugIn.h>
+#include "guard.h"
 #include <mach/mach_time.h>
 #include <math.h>
 #include <os/log.h>
@@ -49,7 +51,7 @@ enum {
 #define kPrefillFrames          4800u           /* zeros ahead of the first mix: room for the IO thread's jitter */
 #define kVolumeMinDB            (-48.0f)
 #define kVolumeMaxDB            0.0f
-#define kGainCeiling            0.25f           /* -12 dB: no speaker protection in the amp's ROM mode */
+#define kMakeupDB               12.0f           /* guard.c: Apple's speaker chain leaves 10.7-14 dB of headroom unused */
 
 /* kern.sweet_audio_play (dipper_audio.c) */
 enum { PL_OP_START = 1, PL_OP_STOP = 2, PL_OP_DATA = 3, PL_OP_DRAIN = 4 };
@@ -70,6 +72,8 @@ static pthread_mutex_t gStateMutex = PTHREAD_MUTEX_INITIALIZER;
 static UInt32 gIOCount;
 static Boolean gStreamActive = true;
 static Float32 gVolumeScalar = 0.5f;
+static struct ss_guard gGuard;                 /* touched by the IO thread only, between StartIO and StopIO */
+static UInt64 gStopHostTime;
 static UInt32 gMute;
 static Float64 gHostTicksPerFrame;
 static UInt64 gAnchorHostTime;
@@ -104,7 +108,7 @@ output_gain(void)
 	if (gMute || gVolumeScalar <= 0.0f) {
 		return 0.0f;
 	}
-	return fminf(kGainCeiling, powf(10.0f, volume_db(gVolumeScalar) / 20.0f));
+	return powf(10.0f, volume_db(gVolumeScalar) / 20.0f);        /* the guard limits what reaches the speaker */
 }
 
 /* data comes from the IO thread only (its own buffer); start/stop from the HAL's other threads */
@@ -307,6 +311,7 @@ SS_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 	}
 	gHost = inHost;
 	gLog = os_log_create("com.sweet.SweetSpeaker", "driver");
+	guard_init(&gGuard, (float)kSampleRate, kMakeupDB);
 	mach_timebase_info_data_t tb;
 	mach_timebase_info(&tb);
 	gHostTicksPerFrame = (1e9 * tb.denom / tb.numer) / kSampleRate;
@@ -850,6 +855,9 @@ SS_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, 
 		memset(&gDiag, 0, sizeof(gDiag));
 		gDiag.min_fill = UINT64_MAX;
 		gDiag.min_buf = UINT32_MAX;
+		if (gStopHostTime) {                    /* the speaker cooled while nothing played */
+			guard_rest(&gGuard, (float)((Float64)(gAnchorHostTime - gStopHostTime) / gHostTicksPerFrame / kSampleRate));
+		}
 		int e = kernel_start();                 /* here, so the first sound is not lost; else the helper retries */
 		os_log(gLog, "SweetSpeaker: start IO: kernel player %{public}s (%d), gain %.4f", e ? "not up yet" : "on", e,
 		    output_gain());
@@ -875,6 +883,8 @@ SS_StopIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, U
 		if (atomic_exchange(&gKernelOK, false)) {
 			play_op(PL_OP_STOP, NULL, 0);
 		}
+		gStopHostTime = mach_absolute_time();
+		os_log(gLog, "SweetSpeaker: stop IO: the guard took at most %.1f dB off", -guard_take_min_db(&gGuard));
 		os_log(gLog, "SweetSpeaker: stop IO: %u frames dropped, %u write errors; %u cycles of %u-%u frames, %u skips (%u frames), "
 		    "%u overlaps (%u frames); kernel ring lowest %llu bytes, %u gaps at ms %u %u %u %u %u %u %u %u %u %u %u %u", gDropped,
 		    gErrors, gDiag.cycles, gDiag.min_buf, gDiag.max_buf, gDiag.skips, gDiag.skipped, gDiag.overlaps, gDiag.overlapped,
@@ -987,11 +997,16 @@ SS_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObje
 			}
 		}
 	}
-	float g = output_gain() * 32767.0f;
+	static float work[PL_DATA_MAX / sizeof(int16_t)];
+	float g = output_gain();
 	while (frames) {
 		UInt32 n = frames < PL_DATA_MAX / (kChannels * sizeof(int16_t)) ? frames : PL_DATA_MAX / (kChannels * sizeof(int16_t));
 		for (UInt32 i = 0; i < n * kChannels; i++) {
-			float v = in[i] * g;
+			work[i] = in[i] * g;
+		}
+		guard_run(&gGuard, work, n);
+		for (UInt32 i = 0; i < n * kChannels; i++) {
+			float v = work[i] * 32767.0f;
 			pcm[i] = (int16_t)(v > 32767.0f ? 32767.0f : v < -32768.0f ? -32768.0f : v);
 		}
 		int e = play_op(PL_OP_DATA, pcm, n * kChannels * sizeof(int16_t));
