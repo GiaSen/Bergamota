@@ -1,0 +1,37 @@
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 711b0e8..69c192c 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -2031,7 +2031,8 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_i2c, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLF
+  * masks: FLAGS_1 & 0xfc over-current/clock/die temperature, FLAGS_2 & 0x0c brownout) stops everything.
+  *
+  *   kern.sweet_audio_amp   write u8 which (1 on, 0 off) + an I2C script; read: their sizes, as text
+- *   kern.sweet_audio_play  write u32 op [+ data], then read struct pl_status (both in one call or apart):
++ *   kern.sweet_audio_play  write u32 op [+ data], then read struct pl_status (both in one call or apart); writable by
++ *                          any user (3046: audiomxd runs as mobile and feeds it from SweetSpeaker.driver):
+  *                          1 start (returns once the stream runs; EIO if a step failed, all undone), 2 stop now,
+  *                          3 + PCM (whole frames, up to 64 KiB): appended to the ring, EAGAIN while it does not fit,
+  *                          4 drain: stop once everything appended has been played
+@@ -2053,6 +2054,7 @@ struct pl_status {
+ 	uint32_t queued, zeros, gaps, writes;   /* zeros: periods of zeros sent; gaps: those after the first data */
+ 	uint32_t errors, handle, copp, amp_checks;
+ 	uint8_t flags1, flags2, amp, reserved;
++	uint64_t done_time;                     /* mach_absolute_time of the last WRITE_DONE (the DSP's clock) */
+ } __attribute__((packed));
+ 
+ static struct {
+@@ -2442,11 +2444,12 @@ au_play_sysctl SYSCTL_HANDLER_ARGS
+ 	}
+ 	lck_mtx_lock(&au_mtx);
+ 	struct pl_status s = { pl.state, pl.result, PL_RING, PL_PERIOD, pl.wpos, pl.spos, pl.dpos, pl.qn, pl.zeros, pl.gaps,
+-		               pl.writes, pl.errors, pl.handle, pl.copp, pl.amp_checks, pl.flags[0], pl.flags[1], pl.amp_used, 0 };
++		               pl.writes, pl.errors, pl.handle, pl.copp, pl.amp_checks, pl.flags[0], pl.flags[1], pl.amp_used, 0,
++		               pl.last_done };
+ 	lck_mtx_unlock(&au_mtx);
+ 	return SYSCTL_OUT(req, &s, sizeof(s));
+ }
+-SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_play, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_play_sysctl, "S",
++SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_play, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0, au_play_sysctl, "S",
+     "Mi 8 speaker player: u32 op (1 start, 2 stop, 3 + PCM, 4 drain) in, its state out (bsd/dev/dipper_audio.c)");
+ 
+ static int

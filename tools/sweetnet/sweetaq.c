@@ -1,5 +1,6 @@
 /*
- * sweetaq [SECONDS] [RATE]: play silence through an AudioQueue over SSH and say whether the audio server consumed it.
+ * sweetaq [SECONDS] [RATE] [FREQ [DBFS]]: play silence (or a FREQ Hz sine at DBFS, default -20) through an AudioQueue
+ * over SSH and say whether the audio server consumed it.
  * Prints AudioQueueNewOutput/Start results, then once a second the buffers handed back by the queue and its device time;
  * 0 buffers back means the output device ran no IO cycles. At the end: frames consumed per wall-clock second against the
  * queue's rate (a device clock that runs slow or fast shows here) and mach_timebase_info.
@@ -10,6 +11,7 @@
  */
 #include <AudioToolbox/AudioToolbox.h>
 #include <dlfcn.h>
+#include <math.h>
 #include <mach/mach_time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,13 +22,26 @@
 #define NBUF 8
 
 static volatile unsigned back;
+static double tone_step, tone_amp, tone_phase;      /* 0 step: silence */
+
+static void
+fill(AudioQueueBufferRef b)
+{
+	float *p = b->mAudioData;
+	unsigned n = b->mAudioDataBytesCapacity / 8;
+	for (unsigned i = 0; i < n; i++) {
+		float v = tone_step ? (float)(tone_amp * sin(tone_phase)) : 0.0f;
+		tone_phase = fmod(tone_phase + tone_step, 2 * M_PI);
+		p[2 * i] = p[2 * i + 1] = v;
+	}
+	b->mAudioDataByteSize = b->mAudioDataBytesCapacity;
+}
 
 static void
 refill(void *ud, AudioQueueRef q, AudioQueueBufferRef b)
 {
 	(void)ud;
-	memset(b->mAudioData, 0, b->mAudioDataBytesCapacity);
-	b->mAudioDataByteSize = b->mAudioDataBytesCapacity;
+	fill(b);
 	__atomic_add_fetch(&back, 1, __ATOMIC_RELAXED);
 	AudioQueueEnqueueBuffer(q, b, 0, NULL);
 }
@@ -51,6 +66,10 @@ main(int argc, char **argv)
 {
 	int secs = argc > 1 ? atoi(argv[1]) : 5;
 	double rate = argc > 2 ? atof(argv[2]) : 48000;
+	if (argc > 3) {
+		tone_step = 2 * M_PI * atof(argv[3]) / rate;
+		tone_amp = pow(10, (argc > 4 ? atof(argv[4]) : -20) / 20);
+	}
 	AudioStreamBasicDescription f = {
 		.mSampleRate = rate, .mFormatID = kAudioFormatLinearPCM,
 		.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
@@ -70,8 +89,7 @@ main(int argc, char **argv)
 	for (int i = 0; i < NBUF; i++) {
 		AudioQueueBufferRef b = NULL;
 		if (AudioQueueAllocateBuffer(q, FRAMES * 8, &b) == noErr) {
-			memset(b->mAudioData, 0, FRAMES * 8);
-			b->mAudioDataByteSize = FRAMES * 8;
+			fill(b);
 			AudioQueueEnqueueBuffer(q, b, 0, NULL);
 		}
 	}

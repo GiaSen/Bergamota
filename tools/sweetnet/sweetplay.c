@@ -4,6 +4,7 @@
  *
  *   sweetplay [-a AMP_ON] [-o AMP_OFF] FILE|-   register the amp's I2C scripts (tools/audio/tas2557fw.py), start the
  *                                               stream, feed the file as the ring has room, drain, report
+ *   sweetplay -a AMP_ON -o AMP_OFF              only register the amp's scripts (for SweetSpeaker.driver)
  *   sweetplay -s                                the player's state
  *   sweetplay -x                                stop now
  *
@@ -27,6 +28,7 @@ struct pl_status {
 	uint32_t queued, zeros, gaps, writes;
 	uint32_t errors, handle, copp, amp_checks;
 	uint8_t flags1, flags2, amp, reserved;
+	uint64_t done_time;
 } __attribute__((packed));
 
 enum { OP_START = 1, OP_STOP = 2, OP_DATA = 3, OP_DRAIN = 4 };
@@ -128,6 +130,9 @@ main(int argc, char **argv)
 			fprintf(stderr, "usage: sweetplay [-a AMP_ON] [-o AMP_OFF] FILE|- | sweetplay -s | sweetplay -x\n");
 			return 2;
 		}
+	}
+	if (optind == argc && (on || off)) {
+		return (on && amp_script(1, on)) || (off && amp_script(0, off)) ? 1 : 0;
 	}
 	if (optind + 1 != argc) {
 		fprintf(stderr, "usage: sweetplay [-a AMP_ON] [-o AMP_OFF] FILE|- | sweetplay -s | sweetplay -x\n");
