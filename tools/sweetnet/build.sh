@@ -117,6 +117,10 @@ if [ "${IOS18:-1}" = 1 ]; then
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetpool.c" -o "$out18/sweetpool"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetpool"
 	python3 -I "$pacstrip" --sign "$out18/sweetpool"
+	# and the kernel's speaker player: a PCM file streamed through its ring, amp scripts on/off (kern.sweet_audio_play)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetplay.c" -o "$out18/sweetplay"
+	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetplay"
+	python3 -I "$pacstrip" --sign "$out18/sweetplay"
 	# Wi-Fi over SSH (iOS 26 stand-in, docs/WIFI_IOS26.md): Apple80211 info/power/scan without wifid or the UI
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework CoreFoundation \
 		"$here/sweetwifi.c" -o "$out18/sweetwifi"
