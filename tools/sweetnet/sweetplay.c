@@ -4,7 +4,9 @@
  *
  *   sweetplay [-a AMP_ON] [-o AMP_OFF] FILE|-   register the amp's I2C scripts (tools/audio/tas2557fw.py), start the
  *                                               stream, feed the file as the ring has room, drain, report
- *   sweetplay -a AMP_ON -o AMP_OFF              only register the amp's scripts (for SweetSpeaker.driver)
+ *   sweetplay -a AMP_ON -o AMP_OFF [-w WAKE]    only register the amp's scripts (for SweetSpeaker.driver); WAKE (the on
+ *                                               script without the ROM load) lets the kernel put the amp to sleep
+ *                                               through silence (xnu 3048)
  *   sweetplay -s                                the player's state
  *   sweetplay -x                                stop now
  *
@@ -27,7 +29,7 @@ struct pl_status {
 	uint64_t written, sent, played;
 	uint32_t queued, zeros, gaps, writes;
 	uint32_t errors, handle, copp, amp_checks;
-	uint8_t flags1, flags2, amp, reserved;
+	uint8_t flags1, flags2, amp, idle;
 	uint64_t done_time;
 } __attribute__((packed));
 
@@ -58,7 +60,7 @@ show(const struct pl_status *s)
 	    "%u queued, %u writes, %u periods of zeros (%u after data), %u errors; mem map %#x, COPP %u; amp %s, %u checks, "
 	    "flags %#x %#x\n", s->state < 3 ? states[s->state] : "?", s->result, s->ring, s->period,
 	    (unsigned long long)s->written, (unsigned long long)s->sent, (unsigned long long)s->played, s->queued, s->writes,
-	    s->zeros, s->gaps, s->errors, s->handle, s->copp, s->amp ? "on" : "off", s->amp_checks, s->flags1, s->flags2);
+	    s->zeros, s->gaps, s->errors, s->handle, s->copp, !s->amp ? "off" : s->idle ? "on (asleep: silence)" : "on", s->amp_checks, s->flags1, s->flags2);
 }
 
 static int
@@ -105,16 +107,19 @@ on_int(int sig)
 int
 main(int argc, char **argv)
 {
-	const char *on = NULL, *off = NULL;
+	const char *on = NULL, *off = NULL, *wake = NULL;
 	int c;
 	struct pl_status s;
-	while ((c = getopt(argc, argv, "a:o:sx")) != -1) {
+	while ((c = getopt(argc, argv, "a:o:w:sx")) != -1) {
 		switch (c) {
 		case 'a':
 			on = optarg;
 			break;
 		case 'o':
 			off = optarg;
+			break;
+		case 'w':
+			wake = optarg;
 			break;
 		case 's':
 		case 'x': {
@@ -127,15 +132,15 @@ main(int argc, char **argv)
 			return 0;
 		}
 		default:
-			fprintf(stderr, "usage: sweetplay [-a AMP_ON] [-o AMP_OFF] FILE|- | sweetplay -s | sweetplay -x\n");
+			fprintf(stderr, "usage: sweetplay [-a AMP_ON] [-o AMP_OFF] [-w WAKE] FILE|- | sweetplay -s | sweetplay -x\n");
 			return 2;
 		}
 	}
-	if (optind == argc && (on || off)) {
-		return (on && amp_script(1, on)) || (off && amp_script(0, off)) ? 1 : 0;
+	if (optind == argc && (on || off || wake)) {
+		return (on && amp_script(1, on)) || (off && amp_script(0, off)) || (wake && amp_script(2, wake)) ? 1 : 0;
 	}
 	if (optind + 1 != argc) {
-		fprintf(stderr, "usage: sweetplay [-a AMP_ON] [-o AMP_OFF] FILE|- | sweetplay -s | sweetplay -x\n");
+		fprintf(stderr, "usage: sweetplay [-a AMP_ON] [-o AMP_OFF] [-w WAKE] FILE|- | sweetplay -s | sweetplay -x\n");
 		return 2;
 	}
 	int fd = strcmp(argv[optind], "-") ? open(argv[optind], O_RDONLY) : 0;
@@ -143,7 +148,7 @@ main(int argc, char **argv)
 		perror(argv[optind]);
 		return 1;
 	}
-	if ((on && amp_script(1, on)) || (off && amp_script(0, off))) {
+	if ((on && amp_script(1, on)) || (off && amp_script(0, off)) || (wake && amp_script(2, wake))) {
 		return 1;
 	}
 	signal(SIGINT, on_int);

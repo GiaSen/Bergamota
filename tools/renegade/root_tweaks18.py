@@ -635,7 +635,8 @@ SPEAKER_SCRIPT = r'''#!/bin/sh
 i=0
 while [ $i -lt 120 ]; do
 	if /usr/local/bin/sweetplay -s >/dev/null 2>&1; then
-		exec /usr/local/bin/sweetplay -a /usr/local/share/sweetspeaker/amp-on.bin -o /usr/local/share/sweetspeaker/amp-off.bin
+		exec /usr/local/bin/sweetplay -a /usr/local/share/sweetspeaker/amp-on.bin -o /usr/local/share/sweetspeaker/amp-off.bin \
+			-w /usr/local/share/sweetspeaker/amp-wake.bin
 	fi
 	sleep 5
 	i=$((i + 1))
@@ -681,7 +682,8 @@ def speaker(root):
         subprocess.run([sys.executable, '-I', tool, fw, '--script', kind, out, *args], check=True, stdout=subprocess.DEVNULL)
         parts.append(open(out, 'rb').read())
         os.unlink(out)
-    for name, data in (('amp-on.bin', parts[0] + parts[1]), ('amp-off.bin', parts[2])):
+    # amp-wake.bin: the on part alone, for the kernel's idle sleep (xnu 3048: off without reset, program kept)
+    for name, data in (('amp-on.bin', parts[0] + parts[1]), ('amp-off.bin', parts[2]), ('amp-wake.bin', parts[1])):
         path = os.path.join(share, name)
         with open(path, 'wb') as f:
             f.write(data)
@@ -693,8 +695,8 @@ def speaker(root):
         'Label': SPEAKER_LABEL, 'ProgramArguments': ['/bin/sh', '/' + SPEAKER_SH],
         'RunAtLoad': True, 'UserName': 'root', 'StandardErrorPath': '/dev/console',
         'EnvironmentVariables': {'PATH': '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'}})
-    print('speaker: %s, /usr/local/bin/sweetplay, amp scripts %d + %d bytes, job %s' % (
-        SPEAKER_DRIVER, len(parts[0] + parts[1]), len(parts[2]), SPEAKER_LABEL))
+    print('speaker: %s, /usr/local/bin/sweetplay, amp scripts on %d, off %d, wake %d bytes, job %s' % (
+        SPEAKER_DRIVER, len(parts[0] + parts[1]), len(parts[2]), len(parts[1]), SPEAKER_LABEL))
 
 
 # Daemons that only crash-loop or quit at once on this bring-up while containermanagerd refuses every container lookup
