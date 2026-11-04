@@ -5,7 +5,8 @@ opened with), a sine with 30 ms fades so it starts and stops without a click.
   mkpcm.py OUT --freq 440 --seconds 2 --dbfs -30         one tone
   mkpcm.py OUT --freq 440 --freq 660 --seconds 1 ...     tones one after another, --seconds each
 
-The window the DSP reads (kern.sweet_audio_pool) is 2 MiB: at most 10.9 s.
+The window the DSP reads (kern.sweet_audio_pool) is 2 MiB, so `dipper-speaker.sh write` plays at most 10.9 s; the
+kernel's player (sweetplay, `dipper-speaker.sh play`) streams any length.
 """
 import argparse
 import math
@@ -30,9 +31,9 @@ def main():
             g = min(1.0, i / fade, (n - 1 - i) / fade)
             v = int(round(amp * g * math.sin(2 * math.pi * f * i / RATE)))
             out += struct.pack('<hh', v, v)
-    assert len(out) <= 0x200000, f'{len(out)} bytes: more than the 2 MiB window'
     open(a.out, 'wb').write(out)
-    print(f'{a.out}: {len(out)} bytes, {len(out) / 4 / RATE:.2f} s, peak {a.dbfs} dBFS ({int(amp)})')
+    note = ' (over the 2 MiB window: play it with sweetplay)' if len(out) > 0x200000 else ''
+    print(f'{a.out}: {len(out)} bytes, {len(out) / 4 / RATE:.2f} s, peak {a.dbfs} dBFS ({int(amp)}){note}')
 
 
 if __name__ == '__main__':

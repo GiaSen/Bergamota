@@ -1,0 +1,742 @@
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index ba0a9bd..711b0e8 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -19,6 +19,8 @@
+  *   4  AFE (q6afe.c): the QUAT MI2S pins to qua_mi2s, the LPASS bit clock (AFE_PARAM_ID_CLOCK_SET, 1.536 MHz), the
+  *      QUAT_MI2S_RX port's I2S config (16-bit stereo 48 kHz on SD0, WS internal) and DEVICE_START with nothing routed
+  *      (the DSP sends zeros); the pads are sampled before, while and after it runs; then stopped, clock off, pins back.
++ *   After stage 3 (or 4) the audio thread keeps polling GLINK and serves the test sysctls kern.sweet_audio_*, among them
++ *   the speaker player (3045, kern.sweet_audio_play and _amp), described at its code.
+  *
+  * Facts from the live DT (dtb/dipper/live.dtb): qcom,lpass@17300000 pil-tz-generic, qcom,pas-id 1, firmware "adsp",
+  * memory-region adsp_region@0x8c500000 0x1e00000 (no-map, in the low DDR bank the kernel does not manage),
+@@ -124,6 +126,28 @@ enum { G_VERSION = 0, G_VERSION_ACK = 1, G_OPEN = 2, G_CLOSE = 3, G_OPEN_ACK = 4
+ #define AU_MI2S_PIN0            58u
+ #define AU_MI2S_FUNC            1u              /* qua_mi2s */
+ #define TLMM_FUNC_PULL_DRV_MASK 0x1ffu          /* pull [1:0], func [5:2], drive [8:6] */
++/* the stream to the port (techpack/audio/include/dsp/apr_audio-v2.h) */
++#define APR_SVC_ASM             7u
++#define APR_SVC_ADM             8u
++#define ASM_SESSION             1u
++#define ASM_PORT                0x0101u         /* src and dest port of a stream: session << 8 | stream 1 */
++#define ASM_CMD_SHARED_MEM_MAP_REGIONS 0x00010d92u
++#define ASM_CMDRSP_SHARED_MEM_MAP_REGIONS 0x00010d93u
++#define ASM_CMD_SHARED_MEM_UNMAP_REGIONS 0x00010d94u
++#define ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2 0x00010d98u
++#define ASM_DATA_EVENT_WRITE_DONE_V2 0x00010d99u
++#define ASM_SESSION_CMD_RUN_V2  0x00010daau
++#define ASM_DATA_CMD_WRITE_V2   0x00010dabu
++#define ASM_STREAM_CMD_OPEN_WRITE_V3 0x00010db3u
++#define ASM_SESSION_CMD_PAUSE   0x00010bd3u
++#define ASM_STREAM_CMD_CLOSE    0x00010bcdu
++#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 0x00010da5u
++#define ASM_STREAM_POSTPROC_TOPO_ID_NONE 0x00010c68u
++#define ADM_CMD_MATRIX_MAP_ROUTINGS_V5 0x00010325u
++#define ADM_CMD_DEVICE_OPEN_V5  0x00010326u
++#define ADM_CMD_DEVICE_CLOSE_V5 0x00010327u
++#define ADM_CMDRSP_DEVICE_OPEN_V5 0x00010329u
++#define ADM_NULL_COPP_TOPOLOGY  0x00010312u
+ struct au_apr_hdr {
+ 	uint16_t field, size;
+ 	uint8_t src_svc, src_domain;
+@@ -517,9 +541,11 @@ gl_add_intent(unsigned c, uint32_t size)
+ 	return false;
+ }
+ 
+-/* one APR packet from the DSP (apr.c apr_callback): what it answered, logged */
++static void pl_write_done(uint32_t token, uint32_t status);
++
++/* one APR packet from the DSP (apr.c apr_callback): what it answered, logged; the player's WRITE_DONEs go to it quietly */
+ static void
+-gl_apr_rx(const uint8_t *p, uint32_t n)
++gl_apr_rx(unsigned c, const uint8_t *p, uint32_t n)
+ {
+ 	if (n < APR_HDR_SIZE) {
+ 		printf("SWEET AUDIO: APR packet of %u bytes ignored\n", n);
+@@ -543,6 +569,13 @@ gl_apr_rx(const uint8_t *p, uint32_t n)
+ 	if (n >= hlen + 8) {
+ 		memcpy(&w1, p + hlen + 4, 4);
+ 	}
++	if (opcode == ASM_DATA_EVENT_WRITE_DONE_V2 && p[4] == APR_SVC_ASM && n >= hlen + 16) {
++		uint32_t status;            /* {buf_addr_lsw, buf_addr_msw, mem_map_handle, status} */
++		memcpy(&status, p + hlen + 12, 4);
++		pl_write_done(token, status);
++		return;
++	}
++	printf("SWEET AUDIO: APR packet on %s\n", gl_names[c]);
+ 	static unsigned dumped;
+ 	if (dumped++ < 6) {
+ 		char hex[3 * 64 + 1];
+@@ -746,8 +779,7 @@ gl_poll(void)
+ 				if (!ch->li[k].bad) {
+ 					gl.rx_pkts++;
+ 					if (c == CH_APR || c == CH_APR2) {
+-						printf("SWEET AUDIO: APR packet on %s\n", gl_names[c]);
+-						gl_apr_rx(ch->li[k].buf, ch->li[k].off);
++						gl_apr_rx((unsigned)c, ch->li[k].buf, ch->li[k].off);
+ 					} else if (c == CH_QRTR) {
+ 						qr_rx(ch->li[k].buf, ch->li[k].off);
+ 					} else {
+@@ -1144,14 +1176,15 @@ au_apr(void)
+  * (status 0; payload in gl.apr_pl), or APR_BASIC_RSP_RESULT for this command (its status). -1: nothing came.
+  */
+ static int
+-apr_request(unsigned svc, uint32_t token, uint32_t opcode, const void *pl, uint32_t len, uint32_t want, unsigned ms)
++apr_request_port(unsigned svc, uint16_t sport, uint16_t dport, uint32_t token, uint32_t opcode, const void *pl, uint32_t len,
++    uint32_t want, unsigned ms)
+ {
+ 	uint8_t pkt[APR_HDR_SIZE + 128];
+ 	if (len > sizeof(pkt) - APR_HDR_SIZE) {
+ 		return -1;
+ 	}
+-	struct au_apr_hdr h = { APR_HDR_FIELD_SEQ_CMD, (uint16_t)(APR_HDR_SIZE + len), (uint8_t)svc, APR_DOMAIN_APPS, 0,
+-	    (uint8_t)svc, APR_DOMAIN_ADSP, 0, token, opcode };
++	struct au_apr_hdr h = { APR_HDR_FIELD_SEQ_CMD, (uint16_t)(APR_HDR_SIZE + len), (uint8_t)svc, APR_DOMAIN_APPS, sport,
++	    (uint8_t)svc, APR_DOMAIN_ADSP, dport, token, opcode };
+ 	memcpy(pkt, &h, APR_HDR_SIZE);
+ 	if (len) {
+ 		memcpy(pkt + APR_HDR_SIZE, pl, len);
+@@ -1177,6 +1210,12 @@ apr_request(unsigned svc, uint32_t token, uint32_t opcode, const void *pl, uint3
+ 	return -1;
+ }
+ 
++static int
++apr_request(unsigned svc, uint32_t token, uint32_t opcode, const void *pl, uint32_t len, uint32_t want, unsigned ms)
++{
++	return apr_request_port(svc, 0, 0, token, opcode, pl, len, want, ms);
++}
++
+ static int
+ apr_cmd(unsigned svc, uint32_t token, uint32_t opcode, const void *pl, uint32_t len)
+ {
+@@ -1259,6 +1298,20 @@ afe_mi2s_clock(uint32_t hz)
+ 	return afe_svc_param(AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, &c, sizeof(c));
+ }
+ 
++/* afe_param_id_i2s_cfg of QUAT_MI2S_RX: 16-bit stereo 48 kHz on SD0 (dipper rx-lines 1), WS internal, linear PCM */
++static int
++afe_quat_i2s_config(void)
++{
++	struct {
++		uint32_t minor;
++		uint16_t bit_width, channel_mode, mono_stereo, ws_src;
++		uint32_t sample_rate;
++		uint16_t data_format, reserved;
++	} __attribute__((packed)) i2s = { 1, 16, 1 /* SD0 */, 1 /* stereo */, 1 /* WS internal */, AU_RATE, 0 /* linear PCM */, 0 };
++	_Static_assert(sizeof(i2s) == 20, "afe_param_id_i2s_cfg is 20 bytes");
++	return afe_port_param(AFE_PORT_QUAT_MI2S_RX, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_I2S_CONFIG, &i2s, sizeof(i2s));
++}
++
+ static struct {
+ 	vm_offset_t tlmm;               /* gpio58..61 */
+ 	uint32_t orig[4];
+@@ -1355,14 +1408,7 @@ au_afe(void)
+ 		sweet_log_sync();
+ 		return false;
+ 	}
+-	struct {
+-		uint32_t minor;
+-		uint16_t bit_width, channel_mode, mono_stereo, ws_src;
+-		uint32_t sample_rate;
+-		uint16_t data_format, reserved;
+-	} __attribute__((packed)) i2s = { 1, 16, 1 /* SD0 */, 1 /* stereo */, 1 /* WS internal */, AU_RATE, 0 /* linear PCM */, 0 };
+-	_Static_assert(sizeof(i2s) == 20, "afe_param_id_i2s_cfg is 20 bytes");
+-	st = afe_port_param(AFE_PORT_QUAT_MI2S_RX, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_I2S_CONFIG, &i2s, sizeof(i2s));
++	st = afe_quat_i2s_config();
+ 	printf("SWEET AUDIO: AFE QUAT_MI2S_RX I2S config (16-bit stereo %u Hz, SD0, WS internal): status %d\n", AU_RATE, st);
+ 	if (st == 0) {
+ 		st = afe_port_cmd(AFE_PORT_QUAT_MI2S_RX, AFE_PORT_CMD_DEVICE_START);
+@@ -1605,6 +1651,7 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_pins, CTLTYPE_STRING | CTLFLAG_RW | CTL
+  *   kern.sweet_audio_pool  write u32 offset + bytes: copied into the window; read: its PA and size, as text
+  */
+ #define AU_POOL_PA              0xe1000000ull
++#define AU_POOL_MSW             1u              /* (0x1821 & 0xf): the SID bits above the IOVA */
+ #define AU_POOL_SIZE            0x200000u
+ extern int sweet_smmu_map_sid(unsigned sid);
+ extern int sweet_smmu_probe_sid(unsigned sid, unsigned level);
+@@ -1898,30 +1945,20 @@ ai_reset_pin(bool high)
+ 	ai_wr(ai.rst, (ai_rd(ai.rst) & ~0x3ffu) | 0x200u);         /* GPIO, no pull, 2 mA, output */
+ }
+ 
+-static int
+-au_i2c_sysctl SYSCTL_HANDLER_ARGS
++/* one script (ops above), au_mtx held and the bus set up: the error, the ops done in *done, the bytes read at out + *o */
++static int32_t
++ai_run(const uint8_t *s, size_t n, uint8_t *out, size_t cap, size_t *o, uint32_t *done)
+ {
+-#pragma unused(oidp, arg1, arg2)
+-	if (!au.stage || req->newptr == USER_ADDR_NULL || req->newlen < 2 || req->newlen > 65536) {
+-		return EINVAL;
+-	}
+-	size_t n = req->newlen, cap = 8 + 4096, o = 8;
+-	uint8_t *s = kalloc_data(n, Z_WAITOK), *out = kalloc_data(cap, Z_WAITOK | Z_ZERO);
+-	int err = s && out ? SYSCTL_IN(req, s, n) : ENOMEM;
+-	uint32_t done = 0;
+ 	int32_t e = 0;
+-	lck_mtx_lock(&au_mtx);
+-	if (!err && !ai_setup()) {
+-		err = EIO;
+-	}
+-	for (size_t i = 0; !err && !e && i < n; done++) {
++	*done = 0;
++	for (size_t i = 0; !e && i < n; ++*done) {
+ 		uint8_t op = s[i];
+ 		if (op == 1 && i + 3 <= n && i + 3 + s[i + 2] <= n) {
+ 			e = ai_write(s[i + 1], s + i + 3, s[i + 2]);
+ 			i += 3u + s[i + 2];
+-		} else if (op == 2 && i + 4 <= n && o + s[i + 3] <= cap) {
+-			e = ai_read(s[i + 1], s[i + 2], out + o, s[i + 3]);
+-			o += s[i + 3];
++		} else if (op == 2 && i + 4 <= n && *o + s[i + 3] <= cap) {
++			e = ai_read(s[i + 1], s[i + 2], out + *o, s[i + 3]);
++			*o += s[i + 3];
+ 			i += 4;
+ 		} else if (op == 3 && i + 2 <= n) {
+ 			ai_reset_pin(s[i + 1] != 0);
+@@ -1941,11 +1978,33 @@ au_i2c_sysctl SYSCTL_HANDLER_ARGS
+ 			e = 4;
+ 		}
+ 	}
++	if (e) {
++		--*done;        /* the failing op */
++	}
++	return e;
++}
++
++static int
++au_i2c_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (!au.stage || req->newptr == USER_ADDR_NULL || req->newlen < 2 || req->newlen > 65536) {
++		return EINVAL;
++	}
++	size_t n = req->newlen, cap = 8 + 4096, o = 8;
++	uint8_t *s = kalloc_data(n, Z_WAITOK), *out = kalloc_data(cap, Z_WAITOK | Z_ZERO);
++	int err = s && out ? SYSCTL_IN(req, s, n) : ENOMEM;
++	uint32_t done = 0;
++	int32_t e = 0;
++	lck_mtx_lock(&au_mtx);
++	if (!err && !ai_setup()) {
++		err = EIO;
++	}
++	if (!err) {
++		e = ai_run(s, n, out, cap, &o, &done);
++	}
+ 	lck_mtx_unlock(&au_mtx);
+ 	if (!err) {
+-		if (e) {
+-			done--;         /* the failing op */
+-		}
+ 		memcpy(out, &done, 4);
+ 		memcpy(out + 4, &e, 4);
+ 		err = req->oldptr == USER_ADDR_NULL ? 0 : SYSCTL_OUT(req, out, o);
+@@ -1961,6 +2020,490 @@ au_i2c_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_i2c, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_i2c_sysctl, "S",
+     "Mi 8 speaker amp bus: an I2C script in, the bytes read out (bsd/dev/dipper_audio.c)");
+ 
++/*
++ * ---- the speaker player (test boots, sweetaudio>=3, 3045): PCM from a ring at the start of the PCM window through ASM
++ * session 1 (multi-channel PCM v2, 16-bit stereo 48 kHz, post-processing none) -> an ADM COPP (NULL_COPP_TOPOLOGY) on
++ * QUAT_MI2S_RX -> the TAS2557. The audio thread keeps PL_DEPTH writes of one 20 ms period each queued in the DSP and
++ * sends the next at each ASM_DATA_EVENT_WRITE_DONE_V2 (which comes once the DSP has played the buffer); with nothing in
++ * the ring it sends a period of zeros, so the stream never starves and its WRITE_DONEs keep time. The amp's on and off
++ * scripts come from user space (TI's firmware stays out of the kernel): on once the port's bit clock runs, off and
++ * reset before the port stops; while playing, the amp's fault flags are read every second and a critical one (TI's
++ * masks: FLAGS_1 & 0xfc over-current/clock/die temperature, FLAGS_2 & 0x0c brownout) stops everything.
++ *
++ *   kern.sweet_audio_amp   write u8 which (1 on, 0 off) + an I2C script; read: their sizes, as text
++ *   kern.sweet_audio_play  write u32 op [+ data], then read struct pl_status (both in one call or apart):
++ *                          1 start (returns once the stream runs; EIO if a step failed, all undone), 2 stop now,
++ *                          3 + PCM (whole frames, up to 64 KiB): appended to the ring, EAGAIN while it does not fit,
++ *                          4 drain: stop once everything appended has been played
++ */
++#define AU_SID                  0x1821u         /* apps_smmu stream of qcom,msm-audio-ion */
++#define PL_PERIOD               3840u           /* 20 ms of 16-bit stereo at 48 kHz */
++#define PL_RING                 (273u * PL_PERIOD)      /* 5.46 s at offset 0 of the window */
++#define PL_ZEROS                PL_RING         /* one period of zeros after it */
++#define PL_DEPTH                4u              /* writes queued in the DSP: 80 ms */
++#define PL_STALL_MS             1000u
++#define TAS_ADDR                0x4cu
++enum { PL_OFF, PL_PLAYING, PL_DRAINING };
++enum { PL_OP_START = 1, PL_OP_STOP = 2, PL_OP_DATA = 3, PL_OP_DRAIN = 4 };
++_Static_assert(PL_ZEROS + PL_PERIOD <= AU_POOL_SIZE, "the ring and its zeros fit the window");
++
++struct pl_status {
++	uint32_t state, result, ring, period;
++	uint64_t written, sent, played;         /* bytes appended, handed to the DSP, played */
++	uint32_t queued, zeros, gaps, writes;   /* zeros: periods of zeros sent; gaps: those after the first data */
++	uint32_t errors, handle, copp, amp_checks;
++	uint8_t flags1, flags2, amp, reserved;
++} __attribute__((packed));
++
++static struct {
++	uint32_t state, req, result;
++	uint32_t gen;                           /* bumped by the audio thread once it has taken a request */
++	uint32_t handle, copp;
++	uint64_t wpos, spos, dpos;              /* as written, sent, played above */
++	struct {
++		uint32_t len, token;
++		bool data;
++	} q[PL_DEPTH];                          /* the writes in the DSP, oldest at qhead */
++	uint32_t qhead, qn, seq;
++	uint64_t last_done, last_check;
++	uint32_t zeros, gaps, writes, errors, amp_checks;
++	uint8_t flags[2];
++	bool amp_used;
++	uint8_t *amp[2];                        /* [0] off, [1] on */
++	uint32_t amp_len[2];
++} pl;
++
++/* from gl_apr_rx: the oldest queued write is done */
++static void
++pl_write_done(uint32_t token, uint32_t status)
++{
++	if (!pl.qn) {
++		return;         /* after a stop: the DSP handing back what was queued */
++	}
++	unsigned i = pl.qhead;
++	pl.qhead = (pl.qhead + 1) % PL_DEPTH;
++	pl.qn--;
++	if (pl.q[i].data) {
++		pl.dpos += pl.q[i].len;
++	}
++	pl.writes++;
++	pl.last_done = mach_absolute_time();
++	if ((status || token != pl.q[i].token) && pl.errors++ < 8) {
++		printf("SWEET AUDIO: player: WRITE_DONE token %u (expected %u) status %#x\n", token, pl.q[i].token, status);
++	}
++}
++
++static bool
++pl_send(uint32_t off, uint32_t len, bool data)
++{
++	struct {
++		struct au_apr_hdr h;
++		uint32_t lsw, msw, handle, size, seq, ts_lsw, ts_msw, flags;
++	} __attribute__((packed)) w = {
++		{ APR_HDR_FIELD_SEQ_CMD, (uint16_t)sizeof(w), APR_SVC_ASM, APR_DOMAIN_APPS, ASM_PORT, APR_SVC_ASM, APR_DOMAIN_ADSP,
++		  ASM_PORT, pl.seq, ASM_DATA_CMD_WRITE_V2 },
++		(uint32_t)AU_POOL_PA + off, AU_POOL_MSW, pl.handle, len, pl.seq, 0, 0, 0
++	};
++	if (!gl_send(CH_APR, &w, (uint32_t)sizeof(w))) {
++		return false;   /* no free intent from the DSP: next round */
++	}
++	unsigned i = (pl.qhead + pl.qn) % PL_DEPTH;
++	pl.q[i].len = len;
++	pl.q[i].token = pl.seq++;
++	pl.q[i].data = data;
++	pl.qn++;
++	return true;
++}
++
++static void
++pl_submit(void)
++{
++	while (pl.qn < PL_DEPTH) {
++		uint64_t avail = pl.wpos - pl.spos;
++		if (avail >= PL_PERIOD || (avail && pl.state == PL_DRAINING)) {
++			uint32_t len = (uint32_t)MIN(avail, (uint64_t)PL_PERIOD);
++			if (!pl_send((uint32_t)(pl.spos % PL_RING), len, true)) {      /* spos stays period aligned until the last */
++				return;
++			}
++			pl.spos += len;
++		} else if (pl.state == PL_PLAYING) {
++			if (!pl_send(PL_ZEROS, PL_PERIOD, false)) {
++				return;
++			}
++			pl.zeros++;
++			pl.gaps += pl.spos != 0;
++		} else {
++			return;
++		}
++	}
++}
++
++/* the amp's script which (1 on, 0 off); off also holds the amp in reset afterwards */
++static bool
++pl_amp(unsigned which)
++{
++	if (!pl.amp[which] || !ai_setup()) {
++		return false;
++	}
++	uint8_t rd[64];
++	size_t o = 0;
++	uint32_t done = 0;
++	int32_t e = ai_run(pl.amp[which], pl.amp_len[which], rd, sizeof(rd), &o, &done);
++	if (!which) {
++		ai_reset_pin(false);
++	}
++	char hex[3 * 8 + 1] = "";
++	for (size_t i = o > 8 ? o - 8 : 0, h = 0; i < o; i++) {
++		h += (size_t)snprintf(hex + h, sizeof(hex) - h, " %02x", rd[i]);
++	}
++	printf("SWEET AUDIO: player: amp %s: %u ops, error %d, last bytes read%s\n", which ? "on" : "off", done, e, hex);
++	return e == 0;
++}
++
++/* FLAGS_1 (B0P0R104, cleared by the read) and FLAGS_2 (R108); false: unreadable or critical */
++static bool
++pl_amp_check(void)
++{
++	static const uint8_t page0[2] = { 0, 0 }, book0[2] = { 127, 0 };
++	int e = ai_write(TAS_ADDR, page0, 2);
++	e = e ? e : ai_write(TAS_ADDR, book0, 2);
++	e = e ? e : ai_write(TAS_ADDR, page0, 2);
++	e = e ? e : ai_read(TAS_ADDR, 104, &pl.flags[0], 1);
++	e = e ? e : ai_read(TAS_ADDR, 108, &pl.flags[1], 1);
++	pl.amp_checks++;
++	if (e || (pl.flags[0] & 0xfcu) || (pl.flags[1] & 0x0cu)) {
++		printf("SWEET AUDIO: player: amp flags %#x %#x (I2C error %d): stopping\n", pl.flags[0], pl.flags[1], e);
++		return false;
++	}
++	return true;
++}
++
++/* everything pl_start set up, in reverse; each step's status logged */
++static void
++pl_teardown(const char *why, bool amp, bool stream, bool copp, bool mapped, bool port)
++{
++	pl.state = PL_OFF;
++	bool a = amp ? pl_amp(0) : true;
++	if (!amp && ai.rst) {
++		ai_reset_pin(false);
++	}
++	int st[6] = { -2, -2, -2, -2, -2, -2 };
++	if (stream) {
++		st[0] = apr_request_port(APR_SVC_ASM, ASM_PORT, ASM_PORT, ASM_PORT, ASM_SESSION_CMD_PAUSE, NULL, 0, APR_BASIC_RSP_RESULT, 1000);
++		st[1] = apr_request_port(APR_SVC_ASM, ASM_PORT, ASM_PORT, ASM_PORT, ASM_STREAM_CMD_CLOSE, NULL, 0, APR_BASIC_RSP_RESULT, 1000);
++	}
++	if (copp) {
++		/* q6adm.c adm_close: src port the AFE port, dest port the COPP */
++		st[2] = apr_request_port(APR_SVC_ADM, AFE_PORT_QUAT_MI2S_RX, (uint16_t)pl.copp, 0, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0,
++		    APR_BASIC_RSP_RESULT, 1000);
++	}
++	if (mapped) {
++		uint32_t h = pl.handle;
++		st[3] = apr_request_port(APR_SVC_ASM, 0, 0, ASM_SESSION << 8, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &h, sizeof(h),
++		    APR_BASIC_RSP_RESULT, 1000);
++	}
++	if (port) {
++		st[4] = afe_port_cmd(AFE_PORT_QUAT_MI2S_RX, AFE_PORT_CMD_DEVICE_STOP);
++	}
++	st[5] = afe_mi2s_clock(0);
++	(void)ap_pins(false);
++	pl.qn = 0;
++	printf("SWEET AUDIO: player off (%s): amp off %s, pause %d, close %d, COPP close %d, unmap %d, port stop %d, clock off %d; "
++	    "%llu bytes played of %llu, %u writes, %u periods of zeros (%u after data), %u errors, %u amp checks\n", why,
++	    a ? "ok" : "FAILED", st[0], st[1], st[2], st[3], st[4], st[5], pl.dpos, pl.wpos, pl.writes, pl.zeros, pl.gaps,
++	    pl.errors, pl.amp_checks);
++	sweet_log_sync();
++}
++
++static int
++pl_start(void)
++{
++	if (!au_pool && !(au_pool = ml_io_map_unmappable((vm_offset_t)AU_POOL_PA, AU_POOL_SIZE, VM_WIMG_WCOMB))) {
++		return ENOMEM;
++	}
++	bzero((void *)(au_pool + PL_ZEROS), PL_PERIOD);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	pl.wpos = pl.spos = pl.dpos = 0;
++	pl.qhead = pl.qn = 0;
++	pl.zeros = pl.gaps = pl.writes = pl.errors = pl.amp_checks = 0;
++	pl.flags[0] = pl.flags[1] = 0;
++	pl.handle = pl.copp = 0;
++	pl.amp_used = false;
++	int st = sweet_smmu_map_sid(AU_SID);
++	if (st != 0) {
++		printf("SWEET AUDIO: player: apps_smmu sid %#x not mapped (%d)\n", AU_SID, st);
++		return EIO;
++	}
++	const char *step = "pins";
++	bool port = false, mapped = false, stream = false, copp = false;
++	uint32_t r[2];
++	if (!ap_pins(true)) {
++		goto fail;
++	}
++	step = "clock";
++	if (afe_mi2s_clock(AU_BCLK) != 0) {
++		goto fail;
++	}
++	step = "I2S config";
++	if (afe_quat_i2s_config() != 0) {
++		goto fail;
++	}
++	step = "port start";
++	if (afe_port_cmd(AFE_PORT_QUAT_MI2S_RX, AFE_PORT_CMD_DEVICE_START) != 0) {
++		goto fail;
++	}
++	port = true;
++	step = "amp on";
++	if (pl.amp[1]) {
++		pl.amp_used = true;
++		if (!pl_amp(1)) {
++			goto fail;
++		}
++	}
++	/* ASM_CMD_SHARED_MEM_MAP_REGIONS: pool 3 (SHMEM8_4K), one region (the window), flags 0 -> {mem map handle} */
++	struct {
++		uint16_t pool, regions;
++		uint32_t flags, lsw, msw, size;
++	} __attribute__((packed)) m = { 3, 1, 0, (uint32_t)AU_POOL_PA, AU_POOL_MSW, AU_POOL_SIZE };
++	step = "memory map";
++	if (apr_request_port(APR_SVC_ASM, 0, 0, ASM_SESSION << 8, ASM_CMD_SHARED_MEM_MAP_REGIONS, &m, sizeof(m),
++	    ASM_CMDRSP_SHARED_MEM_MAP_REGIONS, 2000) != 0 || gl.apr_opcode != ASM_CMDRSP_SHARED_MEM_MAP_REGIONS || gl.apr_pl_len < 4) {
++		goto fail;
++	}
++	memcpy(&pl.handle, gl.apr_pl, 4);
++	mapped = true;
++	/* ASM_STREAM_CMD_OPEN_WRITE_V3: mode 0, sink the device matrix, 16 bits, post-processing none, multi-channel PCM */
++	struct {
++		uint32_t mode;
++		uint16_t sink, bits;
++		uint32_t postproc, fmt;
++	} __attribute__((packed)) o = { 0, 0, 16, ASM_STREAM_POSTPROC_TOPO_ID_NONE, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 };
++	step = "stream open";
++	if (apr_request_port(APR_SVC_ASM, ASM_PORT, ASM_PORT, ASM_PORT, ASM_STREAM_CMD_OPEN_WRITE_V3, &o, sizeof(o),
++	    APR_BASIC_RSP_RESULT, 2000) != 0) {
++		goto fail;
++	}
++	stream = true;
++	/* ADM_CMD_DEVICE_OPEN_V5: RX, endpoint the port, NULL_COPP_TOPOLOGY, 2 ch 16 bit 48 kHz FL FR -> {status, COPP} */
++	struct {
++		uint16_t flags, mode, ep1, ep2;
++		uint32_t topology;
++		uint16_t channels, bits;
++		uint32_t rate;
++		uint8_t map[8];
++	} __attribute__((packed)) a = { 0, 1, AFE_PORT_QUAT_MI2S_RX, 0xffff, ADM_NULL_COPP_TOPOLOGY, 2, 16, AU_RATE, { 1, 2 } };
++	step = "COPP open";
++	if (apr_request_port(APR_SVC_ADM, AFE_PORT_QUAT_MI2S_RX, AFE_PORT_QUAT_MI2S_RX, 0, ADM_CMD_DEVICE_OPEN_V5, &a, sizeof(a),
++	    ADM_CMDRSP_DEVICE_OPEN_V5, 2000) != 0 || gl.apr_opcode != ADM_CMDRSP_DEVICE_OPEN_V5 || gl.apr_pl_len < 8) {
++		goto fail;
++	}
++	memcpy(r, gl.apr_pl, 8);
++	if (r[0] != 0) {
++		goto fail;
++	}
++	pl.copp = r[1];
++	copp = true;
++	/* ADM_CMD_MATRIX_MAP_ROUTINGS_V5: the audio RX matrix, session 1 -> that COPP */
++	struct {
++		uint32_t matrix, sessions;
++		uint16_t session, copps, copp, reserved;
++	} __attribute__((packed)) rt = { 0, 1, ASM_SESSION, 1, (uint16_t)pl.copp, 0 };
++	step = "routing";
++	if (apr_request_port(APR_SVC_ADM, 0, 0, 0, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &rt, sizeof(rt), APR_BASIC_RSP_RESULT, 2000) != 0) {
++		goto fail;
++	}
++	/* ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2: multi-channel PCM, 2 ch, 16 bit, 48 kHz, signed, FL FR */
++	struct {
++		uint32_t size;
++		uint16_t channels, bits;
++		uint32_t rate;
++		uint16_t is_signed, reserved;
++		uint8_t map[8];
++	} __attribute__((packed)) f = { 20, 2, 16, AU_RATE, 1, 0, { 1, 2 } };
++	step = "media format";
++	if (apr_request_port(APR_SVC_ASM, ASM_PORT, ASM_PORT, ASM_PORT, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2, &f, sizeof(f),
++	    APR_BASIC_RSP_RESULT, 2000) != 0) {
++		goto fail;
++	}
++	uint32_t run[3] = { 0, 0, 0 };          /* ASM_SESSION_CMD_RUN_V2: now */
++	step = "run";
++	if (apr_request_port(APR_SVC_ASM, ASM_PORT, ASM_PORT, ASM_PORT, ASM_SESSION_CMD_RUN_V2, run, sizeof(run),
++	    APR_BASIC_RSP_RESULT, 2000) != 0) {
++		goto fail;
++	}
++	pl.state = PL_PLAYING;
++	pl.last_done = pl.last_check = mach_absolute_time();
++	pl_submit();
++	printf("SWEET AUDIO: player on: mem map handle %#x, COPP %u, amp %s, %u writes of %u bytes queued, ring %u bytes\n",
++	    pl.handle, pl.copp, pl.amp_used ? "on" : "not scripted (silent)", pl.qn, PL_PERIOD, PL_RING);
++	return 0;
++fail:
++	printf("SWEET AUDIO: player: %s failed (last APR opcode %#x status %#x)\n", step, gl.apr_opcode, gl.apr_status);
++	pl_teardown("start failed", pl.amp_used, stream, copp, mapped, port);
++	return EIO;
++}
++
++/* the audio thread, au_mtx held: requests, refills, the stall/drain/amp checks */
++static void
++pl_step(void)
++{
++	static uint64_t one_s;
++	if (!one_s) {
++		nanoseconds_to_absolutetime(NSEC_PER_SEC, &one_s);
++	}
++	if (pl.req) {
++		uint32_t r = pl.req;
++		pl.req = 0;
++		if (r == PL_OP_START) {
++			pl.result = pl.state == PL_OFF ? (uint32_t)pl_start() : EBUSY;
++		} else if (pl.state != PL_OFF) {
++			pl_teardown("stop", pl.amp_used, true, true, true, true);
++		}
++		__atomic_add_fetch(&pl.gen, 1, __ATOMIC_RELEASE);
++	}
++	if (pl.state == PL_OFF) {
++		return;
++	}
++	pl_submit();
++	uint64_t now = mach_absolute_time();
++	if (pl.qn && now - pl.last_done > one_s * PL_STALL_MS / 1000u) {
++		printf("SWEET AUDIO: player: no WRITE_DONE for %u ms with %u writes queued\n", PL_STALL_MS, pl.qn);
++		pl_teardown("stalled", pl.amp_used, true, true, true, true);
++	} else if (pl.state == PL_DRAINING && !pl.qn && pl.spos == pl.wpos) {
++		pl_teardown("drained", pl.amp_used, true, true, true, true);
++	} else if (pl.amp_used && now - pl.last_check >= one_s) {
++		pl.last_check = now;
++		if (!pl_amp_check()) {
++			pl_teardown("amp fault", pl.amp_used, true, true, true, true);
++		}
++	}
++}
++
++static int
++au_play_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (!au_live) {
++		return ENXIO;
++	}
++	int err = 0;
++	if (req->newptr != USER_ADDR_NULL) {
++		size_t n = req->newlen;
++		uint32_t op = 0;
++		if (n < 4 || n > 4 + 65536) {
++			return EINVAL;
++		}
++		if ((err = SYSCTL_IN(req, &op, 4))) {
++			return err;
++		}
++		if (op == PL_OP_DATA) {
++			uint32_t len = (uint32_t)(n - 4);
++			uint8_t *tmp = len && !(len & 3u) ? kalloc_data(len, Z_WAITOK) : NULL;
++			if (!tmp) {
++				return len && !(len & 3u) ? ENOMEM : EINVAL;
++			}
++			err = SYSCTL_IN(req, tmp, len);
++			lck_mtx_lock(&au_mtx);
++			if (!err && pl.state != PL_PLAYING) {
++				err = EPIPE;
++			} else if (!err && pl.wpos + len - pl.dpos > PL_RING) {
++				err = EAGAIN;
++			} else if (!err) {
++				uint32_t off = (uint32_t)(pl.wpos % PL_RING), first = MIN(len, PL_RING - off);
++				memcpy((void *)(au_pool + off), tmp, first);
++				memcpy((void *)au_pool, tmp + first, len - first);
++				__asm__ volatile ("dsb sy" ::: "memory");
++				pl.wpos += len;
++			}
++			lck_mtx_unlock(&au_mtx);
++			kfree_data(tmp, len);
++		} else if (op == PL_OP_DRAIN) {
++			lck_mtx_lock(&au_mtx);
++			if (pl.state == PL_PLAYING) {
++				pl.state = PL_DRAINING;
++			}
++			lck_mtx_unlock(&au_mtx);
++		} else if (op == PL_OP_START || op == PL_OP_STOP) {
++			lck_mtx_lock(&au_mtx);
++			uint32_t g = pl.gen;
++			pl.req = op;
++			lck_mtx_unlock(&au_mtx);
++			unsigned w = 0;
++			for (; w < 10000 && __atomic_load_n(&pl.gen, __ATOMIC_ACQUIRE) == g; w += 5) {
++				au_sleep(5);
++			}
++			err = w >= 10000 ? ETIMEDOUT : op == PL_OP_START ? (int)pl.result : 0;
++		} else {
++			err = EINVAL;
++		}
++		if (err) {
++			return err;
++		}
++	}
++	lck_mtx_lock(&au_mtx);
++	struct pl_status s = { pl.state, pl.result, PL_RING, PL_PERIOD, pl.wpos, pl.spos, pl.dpos, pl.qn, pl.zeros, pl.gaps,
++		               pl.writes, pl.errors, pl.handle, pl.copp, pl.amp_checks, pl.flags[0], pl.flags[1], pl.amp_used, 0 };
++	lck_mtx_unlock(&au_mtx);
++	return SYSCTL_OUT(req, &s, sizeof(s));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_play, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_play_sysctl, "S",
++    "Mi 8 speaker player: u32 op (1 start, 2 stop, 3 + PCM, 4 drain) in, its state out (bsd/dev/dipper_audio.c)");
++
++static int
++au_amp_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (!au.stage) {
++		return ENXIO;
++	}
++	int err = 0;
++	if (req->newptr != USER_ADDR_NULL) {
++		size_t n = req->newlen;
++		uint8_t which = 0;
++		if (n < 2 || n > 1 + 65536) {
++			return EINVAL;
++		}
++		if ((err = SYSCTL_IN(req, &which, 1))) {
++			return err;
++		}
++		if (which > 1) {
++			return EINVAL;
++		}
++		uint32_t len = (uint32_t)(n - 1);
++		uint8_t *s = kalloc_data(len, Z_WAITOK);
++		if (!s) {
++			return ENOMEM;
++		}
++		if ((err = SYSCTL_IN(req, s, len))) {
++			kfree_data(s, len);
++			return err;
++		}
++		lck_mtx_lock(&au_mtx);
++		if (pl.state != PL_OFF) {
++			err = EBUSY;
++		} else {
++			uint8_t *old = pl.amp[which];
++			uint32_t old_len = pl.amp_len[which];
++			pl.amp[which] = s;
++			pl.amp_len[which] = len;
++			s = old;
++			len = old_len;
++		}
++		lck_mtx_unlock(&au_mtx);
++		if (s) {
++			kfree_data(s, len);
++		}
++		if (err) {
++			return err;
++		}
++	}
++	char text[64];
++	snprintf(text, sizeof(text), "amp scripts: on %u bytes, off %u bytes\n", pl.amp_len[1], pl.amp_len[0]);
++	return SYSCTL_OUT(req, text, strlen(text) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_amp, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_amp_sysctl, "S",
++    "Mi 8 speaker player: the amp's on (1) and off (0) I2C scripts, u8 which + script (bsd/dev/dipper_audio.c)");
++
+ static void
+ au_thread(void *arg, wait_result_t w)
+ {
+@@ -1973,13 +2516,15 @@ au_thread(void *arg, wait_result_t w)
+ 			(void)au_afe();
+ 		}
+ 		au_live = true;
+-		printf("SWEET AUDIO: kern.sweet_audio_apr and kern.sweet_audio_pins live; GLINK polled every 20 ms\n");
++		printf("SWEET AUDIO: kern.sweet_audio_apr, _pins and _play live; GLINK polled every 20 ms, 2 ms while playing\n");
+ 		sweet_log_sync();
+ 		for (;;) {
+ 			lck_mtx_lock(&au_mtx);
+ 			gl_poll();
++			pl_step();
++			bool playing = pl.state != PL_OFF || pl.req;
+ 			lck_mtx_unlock(&au_mtx);
+-			au_sleep(20);
++			au_sleep(playing ? 2 : 20);
+ 		}
+ 	}
+ 	sweet_log_sync();

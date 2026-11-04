@@ -5,8 +5,9 @@
 #   matrix routing, run, writes. Opcodes and structures: techpack/audio/include/dsp/apr_audio-v2.h (downstream).
 #
 #   dipper-speaker.sh port-on | port-off | amp-load | amp-on GAINSCRIPT | amp-off | smmu | stream-on |
-#                     write BYTES [OFFSET] | stream-off | tone | status
-# Tools in /var/root: sweetapr, sweeti2c, sweetsys; amp scripts in /var/root/amp.
+#                     write BYTES [OFFSET] | stream-off | tone | play FILE | status
+# play uses the kernel's player instead (3045, kern.sweet_audio_play: all of the above in the kernel, any length).
+# Tools in /var/root: sweetapr, sweeti2c, sweetsys, sweetpool, sweetplay; amp scripts in /var/root/amp.
 set -u
 A=/var/root/sweetapr
 I=/var/root/sweeti2c
@@ -95,6 +96,12 @@ tone)
 	$I $AMP/off.bin
 	$0 stream-off >/dev/null
 	$0 port-off >/dev/null
+	;;
+play)
+	# FILE: raw 48 kHz 16-bit stereo (mkpcm.py); amp ROM mode at DAC gain 2 of 15, as for tone (no speaker protection)
+	sync
+	[ -s $AMP/amp-on.bin ] || { cat $AMP/load-rom.bin $AMP/on-g2.bin > $AMP/amp-on.bin; sync; }
+	/var/root/sweetplay -a $AMP/amp-on.bin -o $AMP/off.bin "$2"
 	;;
 status)
 	$SYS kern.sweet_audio_pins
