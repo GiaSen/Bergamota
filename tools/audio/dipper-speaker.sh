@@ -100,7 +100,7 @@ tone)
 amp-register)
 	# the amp's scripts into the kernel for SweetSpeaker.driver (root only; once per boot, after the DSP is up)
 	[ -s $AMP/amp-on.bin ] || { cat $AMP/load-rom.bin $AMP/on-g2.bin > $AMP/amp-on.bin; sync; }
-	/var/root/sweetplay -a $AMP/amp-on.bin -o $AMP/off.bin
+	/var/root/sweetplay -a $AMP/amp-on.bin -o $AMP/off.bin -w $AMP/on-g2.bin
 	;;
 play)
 	# FILE: raw 48 kHz 16-bit stereo (mkpcm.py); amp ROM mode at DAC gain 2 of 15, as for tone (no speaker protection)

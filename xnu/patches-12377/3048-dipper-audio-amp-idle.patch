@@ -1,0 +1,231 @@
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 608f723..72853ef 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -2030,9 +2030,13 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_i2c, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLF
+  * reset before the port stops; while playing, the amp's fault flags are read every second and a critical one (TI's
+  * masks: FLAGS_1 & 0xfc over-current/clock/die temperature, FLAGS_2 & 0x0c brownout) stops everything.
+  *
+- *   kern.sweet_audio_amp   write u8 which (1 on, 0 off) + an I2C script; read: their sizes, as text. Taken while
+- *                          playing too (3047: SweetSpeaker.driver may start the stream before the boot job registers
+- *                          them): a new on script then powers the amp up from the audio thread.
++ *   kern.sweet_audio_amp   write u8 which (1 on, 0 off, 2 wake) + an I2C script; read: their sizes, as text. Taken
++ *                          while playing too (3047: SweetSpeaker.driver may start the stream before the boot job
++ *                          registers them): a new on script then powers the amp up from the audio thread.
++ *                          Idle (3048): with a wake script (the on script without the ROM load: startup + gain + unmute),
++ *                          PL_IDLE_S seconds of all-zero PCM shut the amp down with the off script but leave it out of
++ *                          reset, so its program stays loaded; the first non-zero sample appended wakes it, well before
++ *                          that sample plays (ring + DSP queue, about 180 ms); no fault checks while it sleeps.
+  *   kern.sweet_audio_play  write u32 op [+ data], then read struct pl_status (both in one call or apart); writable by
+  *                          any user (3046: audiomxd runs as mobile and feeds it from SweetSpeaker.driver):
+  *                          1 start (returns once the stream runs; EIO if a step failed, all undone), 2 stop now,
+@@ -2045,6 +2049,7 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_i2c, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLF
+ #define PL_ZEROS                PL_RING         /* one period of zeros after it */
+ #define PL_DEPTH                4u              /* writes queued in the DSP: 80 ms */
+ #define PL_STALL_MS             1000u
++#define PL_IDLE_S               5u              /* seconds of zeros before the amp sleeps */
+ #define TAS_ADDR                0x4cu
+ enum { PL_OFF, PL_PLAYING, PL_DRAINING };
+ enum { PL_OP_START = 1, PL_OP_STOP = 2, PL_OP_DATA = 3, PL_OP_DRAIN = 4 };
+@@ -2055,7 +2060,7 @@ struct pl_status {
+ 	uint64_t written, sent, played;         /* bytes appended, handed to the DSP, played */
+ 	uint32_t queued, zeros, gaps, writes;   /* zeros: periods of zeros sent; gaps: those after the first data */
+ 	uint32_t errors, handle, copp, amp_checks;
+-	uint8_t flags1, flags2, amp, reserved;
++	uint8_t flags1, flags2, amp, idle;      /* idle: the amp sleeps through silence (3048) */
+ 	uint64_t done_time;                     /* mach_absolute_time of the last WRITE_DONE (the DSP's clock) */
+ } __attribute__((packed));
+ 
+@@ -2074,8 +2079,11 @@ static struct {
+ 	uint8_t flags[2];
+ 	bool amp_used;
+ 	bool amp_pending;                       /* an on script arrived while playing without one */
+-	uint8_t *amp[2];                        /* [0] off, [1] on */
+-	uint32_t amp_len[2];
++	bool amp_idle, amp_wake;                /* asleep through silence; sound arrived while it sleeps */
++	uint64_t last_sound;                    /* mach_absolute_time of the last non-zero sample appended */
++	uint32_t sleeps, wakes;
++	uint8_t *amp[3];                        /* [0] off, [1] on, [2] wake */
++	uint32_t amp_len[3];
+ } pl;
+ 
+ /* from gl_apr_rx: the oldest queued write is done */
+@@ -2143,10 +2151,11 @@ pl_submit(void)
+ 	}
+ }
+ 
+-/* the amp's script which (1 on, 0 off); off also holds the amp in reset afterwards */
++/* the amp's script which (1 on, 0 off, 2 wake); off with reset also holds the amp in reset afterwards */
+ static bool
+-pl_amp(unsigned which)
++pl_amp(unsigned which, bool reset)
+ {
++	static const char *const names[3] = { "off", "on", "wake" };
+ 	if (!pl.amp[which] || !ai_setup()) {
+ 		return false;
+ 	}
+@@ -2154,14 +2163,15 @@ pl_amp(unsigned which)
+ 	size_t o = 0;
+ 	uint32_t done = 0;
+ 	int32_t e = ai_run(pl.amp[which], pl.amp_len[which], rd, sizeof(rd), &o, &done);
+-	if (!which) {
++	if (!which && reset) {
+ 		ai_reset_pin(false);
+ 	}
+ 	char hex[3 * 8 + 1] = "";
+ 	for (size_t i = o > 8 ? o - 8 : 0, h = 0; i < o; i++) {
+ 		h += (size_t)snprintf(hex + h, sizeof(hex) - h, " %02x", rd[i]);
+ 	}
+-	printf("SWEET AUDIO: player: amp %s: %u ops, error %d, last bytes read%s\n", which ? "on" : "off", done, e, hex);
++	printf("SWEET AUDIO: player: amp %s%s: %u ops, error %d, last bytes read%s\n", names[which], !which && !reset ? " (idle)" : "",
++	    done, e, hex);
+ 	return e == 0;
+ }
+ 
+@@ -2188,7 +2198,7 @@ static void
+ pl_teardown(const char *why, bool amp, bool stream, bool copp, bool mapped, bool port)
+ {
+ 	pl.state = PL_OFF;
+-	bool a = amp ? pl_amp(0) : true;
++	bool a = amp ? pl_amp(0, true) : true;
+ 	if (!amp && ai.rst) {
+ 		ai_reset_pin(false);
+ 	}
+@@ -2214,9 +2224,9 @@ pl_teardown(const char *why, bool amp, bool stream, bool copp, bool mapped, bool
+ 	(void)ap_pins(false);
+ 	pl.qn = 0;
+ 	printf("SWEET AUDIO: player off (%s): amp off %s, pause %d, close %d, COPP close %d, unmap %d, port stop %d, clock off %d; "
+-	    "%llu bytes played of %llu, %u writes, %u periods of zeros (%u after data), %u errors, %u amp checks\n", why,
+-	    a ? "ok" : "FAILED", st[0], st[1], st[2], st[3], st[4], st[5], pl.dpos, pl.wpos, pl.writes, pl.zeros, pl.gaps,
+-	    pl.errors, pl.amp_checks);
++	    "%llu bytes played of %llu, %u writes, %u periods of zeros (%u after data), %u errors, %u amp checks, amp slept %u "
++	    "times, woke %u\n", why, a ? "ok" : "FAILED", st[0], st[1], st[2], st[3], st[4], st[5], pl.dpos, pl.wpos, pl.writes,
++	    pl.zeros, pl.gaps, pl.errors, pl.amp_checks, pl.sleeps, pl.wakes);
+ 	sweet_log_sync();
+ }
+ 
+@@ -2234,6 +2244,8 @@ pl_start(void)
+ 	pl.flags[0] = pl.flags[1] = 0;
+ 	pl.handle = pl.copp = 0;
+ 	pl.amp_used = false;
++	pl.amp_idle = pl.amp_wake = false;
++	pl.sleeps = pl.wakes = 0;
+ 	int st = sweet_smmu_map_sid(AU_SID);
+ 	if (st != 0) {
+ 		printf("SWEET AUDIO: player: apps_smmu sid %#x not mapped (%d)\n", AU_SID, st);
+@@ -2261,7 +2273,7 @@ pl_start(void)
+ 	step = "amp on";
+ 	if (pl.amp[1]) {
+ 		pl.amp_used = true;
+-		if (!pl_amp(1)) {
++		if (!pl_amp(1, false)) {
+ 			goto fail;
+ 		}
+ 	}
+@@ -2337,7 +2349,7 @@ pl_start(void)
+ 		goto fail;
+ 	}
+ 	pl.state = PL_PLAYING;
+-	pl.last_done = pl.last_check = mach_absolute_time();
++	pl.last_done = pl.last_check = pl.last_sound = mach_absolute_time();
+ 	pl_submit();
+ 	printf("SWEET AUDIO: player on: mem map handle %#x, COPP %u, amp %s, %u writes of %u bytes queued, ring %u bytes\n",
+ 	    pl.handle, pl.copp, pl.amp_used ? "on" : "not scripted (silent)", pl.qn, PL_PERIOD, PL_RING);
+@@ -2373,11 +2385,32 @@ pl_step(void)
+ 	if (pl.amp_pending) {
+ 		pl.amp_pending = false;
+ 		pl.amp_used = true;                     /* the off script runs at teardown even if this fails half way */
+-		if (!pl_amp(1)) {
++		if (!pl_amp(1, false)) {
+ 			pl_teardown("amp on failed", true, true, true, true, true);
+ 			return;
+ 		}
+-		pl.last_check = mach_absolute_time();
++		pl.last_check = pl.last_sound = mach_absolute_time();
++	}
++	if (pl.amp_used && pl.amp[2]) {
++		uint64_t t = mach_absolute_time();
++		if (pl.amp_idle && pl.amp_wake) {
++			pl.amp_wake = false;
++			if (!pl_amp(2, false)) {
++				pl_teardown("amp wake failed", true, true, true, true, true);
++				return;
++			}
++			pl.amp_idle = false;
++			pl.wakes++;
++			pl.last_check = t;
++		} else if (!pl.amp_idle && t - pl.last_sound > one_s * PL_IDLE_S) {
++			if (pl_amp(0, false)) {
++				pl.amp_idle = true;
++				pl.amp_wake = false;
++				pl.sleeps++;
++			} else {
++				pl.last_sound = t;      /* still on, the fault checks go on: try again after PL_IDLE_S */
++			}
++		}
+ 	}
+ 	pl_submit();
+ 	uint64_t now = mach_absolute_time();
+@@ -2386,7 +2419,7 @@ pl_step(void)
+ 		pl_teardown("stalled", pl.amp_used, true, true, true, true);
+ 	} else if (pl.state == PL_DRAINING && !pl.qn && pl.spos == pl.wpos) {
+ 		pl_teardown("drained", pl.amp_used, true, true, true, true);
+-	} else if (pl.amp_used && now - pl.last_check >= one_s) {
++	} else if (pl.amp_used && !pl.amp_idle && now - pl.last_check >= one_s) {
+ 		pl.last_check = now;
+ 		if (!pl_amp_check()) {
+ 			pl_teardown("amp fault", pl.amp_used, true, true, true, true);
+@@ -2418,6 +2451,12 @@ au_play_sysctl SYSCTL_HANDLER_ARGS
+ 				return len && !(len & 3u) ? ENOMEM : EINVAL;
+ 			}
+ 			err = SYSCTL_IN(req, tmp, len);
++			bool sound = false;                     /* any non-zero sample: wakes a sleeping amp */
++			for (uint32_t i = 0; !err && !sound && i < len; i += 4) {
++				uint32_t w;
++				memcpy(&w, tmp + i, 4);
++				sound = w != 0;
++			}
+ 			lck_mtx_lock(&au_mtx);
+ 			if (!err && pl.state != PL_PLAYING) {
+ 				err = EPIPE;
+@@ -2429,6 +2468,10 @@ au_play_sysctl SYSCTL_HANDLER_ARGS
+ 				memcpy((void *)au_pool, tmp + first, len - first);
+ 				__asm__ volatile ("dsb sy" ::: "memory");
+ 				pl.wpos += len;
++				if (sound) {
++					pl.last_sound = mach_absolute_time();
++					pl.amp_wake = pl.amp_idle;
++				}
+ 			}
+ 			lck_mtx_unlock(&au_mtx);
+ 			kfree_data(tmp, len);
+@@ -2457,7 +2500,7 @@ au_play_sysctl SYSCTL_HANDLER_ARGS
+ 	}
+ 	lck_mtx_lock(&au_mtx);
+ 	struct pl_status s = { pl.state, pl.result, PL_RING, PL_PERIOD, pl.wpos, pl.spos, pl.dpos, pl.qn, pl.zeros, pl.gaps,
+-		               pl.writes, pl.errors, pl.handle, pl.copp, pl.amp_checks, pl.flags[0], pl.flags[1], pl.amp_used, 0,
++		               pl.writes, pl.errors, pl.handle, pl.copp, pl.amp_checks, pl.flags[0], pl.flags[1], pl.amp_used, pl.amp_idle,
+ 		               pl.last_done };
+ 	lck_mtx_unlock(&au_mtx);
+ 	return SYSCTL_OUT(req, &s, sizeof(s));
+@@ -2482,7 +2525,7 @@ au_amp_sysctl SYSCTL_HANDLER_ARGS
+ 		if ((err = SYSCTL_IN(req, &which, 1))) {
+ 			return err;
+ 		}
+-		if (which > 1) {
++		if (which > 2) {
+ 			return EINVAL;
+ 		}
+ 		uint32_t len = (uint32_t)(n - 1);
+@@ -2512,8 +2555,9 @@ au_amp_sysctl SYSCTL_HANDLER_ARGS
+ 			return err;
+ 		}
+ 	}
+-	char text[64];
+-	snprintf(text, sizeof(text), "amp scripts: on %u bytes, off %u bytes\n", pl.amp_len[1], pl.amp_len[0]);
++	char text[96];
++	snprintf(text, sizeof(text), "amp scripts: on %u bytes, off %u bytes, wake %u bytes\n", pl.amp_len[1], pl.amp_len[0],
++	    pl.amp_len[2]);
+ 	return SYSCTL_OUT(req, text, strlen(text) + 1);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_amp, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_amp_sysctl, "S",
