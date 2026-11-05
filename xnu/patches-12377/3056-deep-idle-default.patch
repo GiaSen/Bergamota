@@ -1,0 +1,89 @@
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index bfdbfbd..dd05f13 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -1028,8 +1028,8 @@ sweet_cpu_signal_is_enabled(unsigned int cpu)
+  *    (sweet_deep_idle_kick from timer_intr). The sleeper's store / fence /
+  *    load of CPU 0's rtcPop and CPU 0's rtcPop store / fence / load of the
+  *    deadlines make sure one of the two sees the other.
+- * Off unless kern.sweet_deep_idle is set; by default only while iOS has the
+- * display off (kern.sweet_deep_idle_screen).
++ * On by default since 3056 (rail-pc; kern.sweet_deep_idle=0 turns it off), and
++ * by default only while iOS has the display off (kern.sweet_deep_idle_screen).
+  */
+ #define SWEET_PSCI_CPU_SUSPEND  0xC4000001ULL
+ #define SWEET_DI_RAIL_PC        0x40000004ULL
+@@ -1052,13 +1052,14 @@ struct sweet_di_cpu {
+ } __attribute__((aligned(128)));
+ 
+ static struct sweet_di_cpu sweet_di[MAX_CPUS];
+-uint32_t sweet_deep_idle;               /* 0 off, 1 rail-pc, 2 pc */
++#define SWEET_DI_DEFAULT        1       /* boot default: rail-pc (3056, after the 3055 soak) */
++uint32_t sweet_deep_idle = SWEET_DI_DEFAULT; /* 0 off, 1 rail-pc, 2 pc */
+ uint32_t sweet_deep_idle_mask = 0xFE;   /* CPUs allowed to power down; CPU 0 never does */
+ uint32_t sweet_deep_idle_screen = 1;    /* 1: only while iOS has the display off */
+ uint32_t sweet_deep_idle_min_us = 3000; /* next pop at least this far away */
+ uint32_t sweet_deep_idle_lead_us = 1100; /* wake this much before the pop (DT rail-pc latency: A55 531, A75 1061 us) */
+-static uint64_t sweet_di_min_abs, sweet_di_lead_abs;
+-static uint32_t sweet_di_used;          /* CPU 0 serves deadlines once this was ever on */
++static uint64_t sweet_di_min_abs, sweet_di_lead_abs; /* 0 until sweet_di_setup */
++static uint32_t sweet_di_used = (SWEET_DI_DEFAULT != 0); /* CPU 0 serves deadlines once this was ever on */
+ static vm_offset_t sweet_di_entry_pa, sweet_di_resume_pa;
+ extern uintptr_t sweet_secondary_entry;
+ extern int sweet_fb_display_off;
+@@ -1077,24 +1078,29 @@ sweet_psci_cpu_suspend(uint64_t state, uint64_t entry, uint64_t context)
+ 	return (int32_t)x0;
+ }
+ 
++/* Addresses and tick counts; idempotent, also run by the first idle core when on by default */
++static void
++sweet_di_setup(void)
++{
++	uint64_t a;
++
++	sweet_di_entry_pa = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
++	sweet_di_resume_pa = ml_static_vtop((vm_offset_t)&resume_idle_cpu);
++	nanoseconds_to_absolutetime((uint64_t)sweet_deep_idle_lead_us * NSEC_PER_USEC, &a);
++	sweet_di_lead_abs = a;
++	nanoseconds_to_absolutetime((uint64_t)sweet_deep_idle_min_us * NSEC_PER_USEC, &a);
++	os_atomic_store(&sweet_di_min_abs, a, release);
++}
++
+ /* -1: bad mode, or min_us not above lead_us + 500 */
+ int sweet_deep_idle_configure(uint32_t mode);
+ int
+ sweet_deep_idle_configure(uint32_t mode)
+ {
+-	uint64_t a;
+-
+ 	if (mode > 2 || sweet_deep_idle_min_us < sweet_deep_idle_lead_us + 500) {
+ 		return -1;
+ 	}
+-	if (sweet_di_entry_pa == 0) {
+-		sweet_di_entry_pa = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
+-		sweet_di_resume_pa = ml_static_vtop((vm_offset_t)&resume_idle_cpu);
+-	}
+-	nanoseconds_to_absolutetime((uint64_t)sweet_deep_idle_min_us * NSEC_PER_USEC, &a);
+-	sweet_di_min_abs = a;
+-	nanoseconds_to_absolutetime((uint64_t)sweet_deep_idle_lead_us * NSEC_PER_USEC, &a);
+-	sweet_di_lead_abs = a;
++	sweet_di_setup();
+ 	if (mode != 0) {
+ 		os_atomic_store(&sweet_di_used, 1, release);
+ 	}
+@@ -1120,9 +1126,14 @@ sweet_deep_idle_enter(cpu_data_t *cdp)
+ 	if (master == NULL || (os_atomic_load(&master->cpu_signal, relaxed) & SIGPdisabled)) {
+ 		return false;
+ 	}
++	uint64_t min_abs = os_atomic_load(&sweet_di_min_abs, acquire);
++	if (__improbable(min_abs == 0)) {
++		sweet_di_setup();
++		min_abs = sweet_di_min_abs;
++	}
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t pop = cdp->cpu_idle_pop ? cdp->cpu_idle_pop : cdp->rtcPop;
+-	if (pop <= now || pop - now < sweet_di_min_abs) {
++	if (pop <= now || pop - now < min_abs) {
+ 		return false;
+ 	}
+ 
