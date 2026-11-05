@@ -111,6 +111,21 @@ def d22ap_product(path=D22AP_ADT):
             return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
     raise SystemExit(f'{path}: no /product node')
 
+def product_haptics(path):
+    """/product/haptics of the real device tree as (props) without the syscfg placeholders and the phandle, or None.
+    Its "closed-loop" is MobileGestalt's DeviceSupportsClosedLoopHaptics: iOS then plays vibrations as waveforms on the
+    audio HAL's "Actuator" device (SweetSpeaker.driver); tools/adt-haptics.py adds it to an ADT already built."""
+    if not os.path.exists(path):
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
+            for h in c.children:
+                if dict((k, v) for k, f, v in h.props).get('name') == b'haptics\0':
+                    return [(k, v) for k, f, v in h.props if not f and k not in ('name', 'AAPL,phandle')]
+    return None
+
+
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
@@ -334,7 +349,9 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
     # (Found by MakrSas/ios-topaz, commit 3eacb48f7.)
     if product_props:
         product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
-    product = [node('product', [ph()] + product_props)] if product_props else []
+    haptics = product_haptics(ident['adt'])
+    product = [node('product', [ph()] + product_props, [node('haptics', [ph()] + haptics)] if haptics else [])] \
+        if product_props else []
 
     # Identity of the iPhone whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP / N104AP), model is hw.machine/hw.product

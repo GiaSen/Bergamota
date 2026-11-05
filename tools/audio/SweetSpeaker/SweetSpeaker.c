@@ -19,11 +19,19 @@
  * the speaker's guard (guard.c: +12 dB make-up for Apple's n104_speaker_general chain, 200 Hz high-pass, power limits
  * over 0.2/3/60 s, peaks at most -3 dBFS) after the volume control.
  *
+ * A second device, UID "Actuator" (1 channel), is the vibration motor: VirtualAudio's actuator device
+ * (n104_actuator_general) renders iOS's haptics there when MobileGestalt says closed-loop haptics (ADT /product/haptics),
+ * and each burst of waveform above kHapThreshold becomes one kern.sweet_haptic request (bsd/dev/dipper_haptics.c, xnu
+ * 3049: duration, drive voltage from the peak) written by a helper thread. Not a waveform player: the PMI8998 drives
+ * the LRA at its own frequency.
+ *
  * Logs to the unified log, subsystem com.sweet.SweetSpeaker (`sweetlog 60 SweetSpeaker`).
  */
 #include <CoreAudio/AudioServerPlugIn.h>
 #include "guard.h"
+#include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/semaphore.h>
 #include <math.h>
 #include <os/log.h>
 #include <pthread.h>
@@ -39,10 +47,14 @@ enum {
 	kObjectID_Stream = 3,
 	kObjectID_Volume = 4,
 	kObjectID_Mute = 5,
+	kObjectID_Actuator = 6,         /* the Taptic Engine's device: VirtualAudio's DeviceFactory knows "Actuator" */
+	kObjectID_ActuatorStream = 7,
 };
 
 #define kDeviceUID              "Speaker"
 #define kDeviceModelUID         "SweetSpeaker"
+#define kActuatorUID            "Actuator"
+#define kActuatorModelUID       "SweetActuator"
 #define kSampleRate             48000.0
 #define kChannels               2u
 #define kZeroTimeStampPeriod    16384u          /* frames between two zero time stamps */
@@ -77,6 +89,20 @@ static UInt64 gStopHostTime;
 static UInt32 gMute;
 static Float64 gHostTicksPerFrame;
 static UInt64 gAnchorHostTime;
+static UInt32 gActIOCount;                      /* the actuator's IO (its waveform becomes kern.sweet_haptic requests) */
+static UInt64 gActAnchorHostTime;
+static struct {
+	unsigned cycles, active, said, commands, refused;
+	float peak;
+} gAct;
+/* motor requests from the IO thread to the worker that writes kern.sweet_haptic (SPMI writes do not belong on it) */
+static _Atomic uint32_t gHapMs, gHapMv;
+static semaphore_t gHapSem;
+#define kHapThreshold           0.02f           /* actuator samples under this are silence */
+#define kHapMinMs               15u             /* a tap shorter than this is not felt */
+#define kHapMinMv               1200u
+#define kHapMaxMv               3100u           /* the DT's vmax-mv; the kernel clamps to it too */
+static void *haptic_thread(void *arg);
 static Float64 gNextSample;                     /* the sample time the kernel's ring continues with */
 static atomic_bool gKernelOK;                   /* the kernel's player runs and takes our data */
 static atomic_bool gResync;                     /* restart the timeline (prefill) at the next mix */
@@ -143,17 +169,29 @@ append_zeros(UInt32 frames)
 
 #pragma mark - property helpers
 
+static bool
+is_actuator(AudioObjectID o)
+{
+	return o == kObjectID_Actuator || o == kObjectID_ActuatorStream;
+}
+
+static UInt32
+channels_of(AudioObjectID o)
+{
+	return is_actuator(o) ? 1u : kChannels;
+}
+
 static void
-fill_format(AudioStreamBasicDescription *f)
+fill_format(AudioStreamBasicDescription *f, UInt32 channels)
 {
 	memset(f, 0, sizeof(*f));
 	f->mSampleRate = kSampleRate;
 	f->mFormatID = kAudioFormatLinearPCM;
 	f->mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked;
-	f->mBytesPerPacket = kChannels * sizeof(Float32);
+	f->mBytesPerPacket = channels * sizeof(Float32);
 	f->mFramesPerPacket = 1;
-	f->mBytesPerFrame = kChannels * sizeof(Float32);
-	f->mChannelsPerFrame = kChannels;
+	f->mBytesPerFrame = channels * sizeof(Float32);
+	f->mChannelsPerFrame = channels;
 	f->mBitsPerChannel = 32;
 }
 
@@ -312,6 +350,11 @@ SS_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 	gHost = inHost;
 	gLog = os_log_create("com.sweet.SweetSpeaker", "driver");
 	guard_init(&gGuard, (float)kSampleRate, kMakeupDB);
+	pthread_t hth;
+	if (semaphore_create(mach_task_self(), &gHapSem, SYNC_POLICY_FIFO, 0) == KERN_SUCCESS &&
+	    pthread_create(&hth, NULL, haptic_thread, NULL) == 0) {
+		pthread_detach(hth);
+	}
 	mach_timebase_info_data_t tb;
 	mach_timebase_info(&tb);
 	gHostTicksPerFrame = (1e9 * tb.denom / tb.numer) / kSampleRate;
@@ -340,7 +383,8 @@ SS_AddDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceOb
     const AudioServerPlugInClientInfo *inClientInfo)
 {
 	(void)inClientInfo;
-	return inDriver == gDriverRef && inDeviceObjectID == kObjectID_Device ? kAudioHardwareNoError : kAudioHardwareBadObjectError;
+	return inDriver == gDriverRef && (inDeviceObjectID == kObjectID_Device || inDeviceObjectID == kObjectID_Actuator) ?
+	    kAudioHardwareNoError : kAudioHardwareBadObjectError;
 }
 
 static OSStatus
@@ -348,7 +392,8 @@ SS_RemoveDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDevic
     const AudioServerPlugInClientInfo *inClientInfo)
 {
 	(void)inClientInfo;
-	return inDriver == gDriverRef && inDeviceObjectID == kObjectID_Device ? kAudioHardwareNoError : kAudioHardwareBadObjectError;
+	return inDriver == gDriverRef && (inDeviceObjectID == kObjectID_Device || inDeviceObjectID == kObjectID_Actuator) ?
+	    kAudioHardwareNoError : kAudioHardwareBadObjectError;
 }
 
 static OSStatus
@@ -394,7 +439,10 @@ SS_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pi
 		}
 		return false;
 	case kObjectID_Device:
+	case kObjectID_Actuator:
 		switch (inAddress->mSelector) {
+		case kAudioDevicePropertyPreferredChannelsForStereo:
+			return inObjectID == kObjectID_Device;
 		case kAudioObjectPropertyBaseClass:
 		case kAudioObjectPropertyClass:
 		case kAudioObjectPropertyOwner:
@@ -418,12 +466,12 @@ SS_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pi
 		case kAudioDevicePropertyAvailableNominalSampleRates:
 		case kAudioDevicePropertyIsHidden:
 		case kAudioDevicePropertyZeroTimeStampPeriod:
-		case kAudioDevicePropertyPreferredChannelsForStereo:
 		case kAudioDevicePropertyPreferredChannelLayout:
 			return true;
 		}
 		return false;
 	case kObjectID_Stream:
+	case kObjectID_ActuatorStream:
 		switch (inAddress->mSelector) {
 		case kAudioObjectPropertyBaseClass:
 		case kAudioObjectPropertyClass:
@@ -482,8 +530,10 @@ SS_IsPropertySettable(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjec
 		return kAudioHardwareUnknownPropertyError;
 	}
 	AudioObjectPropertySelector s = inAddress->mSelector;
-	*outIsSettable = (inObjectID == kObjectID_Device && s == kAudioDevicePropertyNominalSampleRate) ||
-	    (inObjectID == kObjectID_Stream && (s == kAudioStreamPropertyIsActive || s == kAudioStreamPropertyVirtualFormat ||
+	bool device = inObjectID == kObjectID_Device || inObjectID == kObjectID_Actuator;
+	bool stream = inObjectID == kObjectID_Stream || inObjectID == kObjectID_ActuatorStream;
+	*outIsSettable = (device && s == kAudioDevicePropertyNominalSampleRate) ||
+	    (stream && (s == kAudioStreamPropertyIsActive || s == kAudioStreamPropertyVirtualFormat ||
 	    s == kAudioStreamPropertyPhysicalFormat)) ||
 	    (inObjectID == kObjectID_Volume && (s == kAudioLevelControlPropertyScalarValue ||
 	    s == kAudioLevelControlPropertyDecibelValue)) ||
@@ -515,8 +565,8 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 			OUT(CFStringRef, CFSTR("Bergamota"));
 		case kAudioObjectPropertyOwnedObjects:
 		case kAudioPlugInPropertyDeviceList: {
-			AudioObjectID d = kObjectID_Device;
-			return out_ids(&d, 1, inDataSize, outDataSize, outData);
+			AudioObjectID d[2] = { kObjectID_Device, kObjectID_Actuator };
+			return out_ids(d, 2, inDataSize, outDataSize, outData);
 		}
 		case kAudioPlugInPropertyBoxList:
 			*outDataSize = 0;
@@ -528,14 +578,16 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 				return kAudioHardwareBadPropertySizeError;
 			}
 			CFStringRef uid = *(const CFStringRef *)inQualifierData;
-			OUT(AudioObjectID, uid && CFStringCompare(uid, CFSTR(kDeviceUID), 0) == kCFCompareEqualTo ? kObjectID_Device :
-			    kAudioObjectUnknown);
+			OUT(AudioObjectID, !uid ? kAudioObjectUnknown :
+			    CFStringCompare(uid, CFSTR(kDeviceUID), 0) == kCFCompareEqualTo ? kObjectID_Device :
+			    CFStringCompare(uid, CFSTR(kActuatorUID), 0) == kCFCompareEqualTo ? kObjectID_Actuator : kAudioObjectUnknown);
 		}
 		case kAudioPlugInPropertyResourceBundle:
 			OUT(CFStringRef, CFSTR(""));
 		}
 		break;
 	case kObjectID_Device:
+	case kObjectID_Actuator:
 		switch (s) {
 		case kAudioObjectPropertyBaseClass:
 			OUT(AudioClassID, kAudioObjectClassID);
@@ -544,34 +596,33 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 		case kAudioObjectPropertyOwner:
 			OUT(AudioObjectID, kObjectID_PlugIn);
 		case kAudioObjectPropertyName:
-			OUT(CFStringRef, CFSTR("Speaker"));
+			OUT(CFStringRef, inObjectID == kObjectID_Actuator ? CFSTR("Actuator") : CFSTR("Speaker"));
 		case kAudioObjectPropertyManufacturer:
 			OUT(CFStringRef, CFSTR("Bergamota"));
 		case kAudioObjectPropertyOwnedObjects: {
-			AudioObjectID all[3] = { kObjectID_Stream, kObjectID_Volume, kObjectID_Mute };
+			AudioObjectID all[3] = { kObjectID_Stream, kObjectID_Volume, kObjectID_Mute }, act = kObjectID_ActuatorStream;
 			if (scope == kAudioObjectPropertyScopeInput) {
 				*outDataSize = 0;
 				return kAudioHardwareNoError;
 			}
-			return out_ids(all, 3, inDataSize, outDataSize, outData);
+			return inObjectID == kObjectID_Actuator ? out_ids(&act, 1, inDataSize, outDataSize, outData) :
+			    out_ids(all, 3, inDataSize, outDataSize, outData);
 		}
 		case kAudioDevicePropertyDeviceUID:
-			OUT(CFStringRef, CFSTR(kDeviceUID));
+			OUT(CFStringRef, inObjectID == kObjectID_Actuator ? CFSTR(kActuatorUID) : CFSTR(kDeviceUID));
 		case kAudioDevicePropertyModelUID:
-			OUT(CFStringRef, CFSTR(kDeviceModelUID));
+			OUT(CFStringRef, inObjectID == kObjectID_Actuator ? CFSTR(kActuatorModelUID) : CFSTR(kDeviceModelUID));
 		case kAudioDevicePropertyTransportType:
 			OUT(UInt32, kAudioDeviceTransportTypeBuiltIn);
-		case kAudioDevicePropertyRelatedDevices: {
-			AudioObjectID d = kObjectID_Device;
-			return out_ids(&d, 1, inDataSize, outDataSize, outData);
-		}
+		case kAudioDevicePropertyRelatedDevices:
+			return out_ids(&inObjectID, 1, inDataSize, outDataSize, outData);
 		case kAudioDevicePropertyClockDomain:
 			OUT(UInt32, 0);
 		case kAudioDevicePropertyDeviceIsAlive:
 			OUT(UInt32, 1);
 		case kAudioDevicePropertyDeviceIsRunning: {
 			pthread_mutex_lock(&gStateMutex);
-			UInt32 running = gIOCount > 0;
+			UInt32 running = (inObjectID == kObjectID_Actuator ? gActIOCount : gIOCount) > 0;
 			pthread_mutex_unlock(&gStateMutex);
 			OUT(UInt32, running);
 		}
@@ -581,7 +632,7 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 		case kAudioDevicePropertyLatency:
 			OUT(UInt32, scope == kAudioObjectPropertyScopeInput ? 0 : kLatency);
 		case kAudioDevicePropertyStreams: {
-			AudioObjectID st = kObjectID_Stream;
+			AudioObjectID st = inObjectID == kObjectID_Actuator ? kObjectID_ActuatorStream : kObjectID_Stream;
 			if (!is_output_or_global(scope)) {
 				*outDataSize = 0;
 				return kAudioHardwareNoError;
@@ -590,7 +641,7 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 		}
 		case kAudioObjectPropertyControlList: {
 			AudioObjectID c[2] = { kObjectID_Volume, kObjectID_Mute };
-			return out_ids(c, 2, inDataSize, outDataSize, outData);
+			return out_ids(c, inObjectID == kObjectID_Actuator ? 0 : 2, inDataSize, outDataSize, outData);
 		}
 		case kAudioDevicePropertySafetyOffset:
 			OUT(UInt32, scope == kAudioObjectPropertyScopeInput ? 0 : kSafetyOffset);
@@ -614,31 +665,37 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 			return kAudioHardwareNoError;
 		}
 		case kAudioDevicePropertyPreferredChannelLayout: {
-			UInt32 size = (UInt32)(offsetof(AudioChannelLayout, mChannelDescriptions) + kChannels * sizeof(AudioChannelDescription));
+			UInt32 ch = channels_of(inObjectID);
+			UInt32 size = (UInt32)(offsetof(AudioChannelLayout, mChannelDescriptions) + ch * sizeof(AudioChannelDescription));
 			if (inDataSize < size) {
 				return kAudioHardwareBadPropertySizeError;
 			}
 			AudioChannelLayout *l = outData;
 			memset(l, 0, size);
 			l->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
-			l->mNumberChannelDescriptions = kChannels;
-			l->mChannelDescriptions[0].mChannelLabel = kAudioChannelLabel_Left;
-			l->mChannelDescriptions[1].mChannelLabel = kAudioChannelLabel_Right;
+			l->mNumberChannelDescriptions = ch;
+			if (ch == 1) {
+				l->mChannelDescriptions[0].mChannelLabel = kAudioChannelLabel_Mono;
+			} else {
+				l->mChannelDescriptions[0].mChannelLabel = kAudioChannelLabel_Left;
+				l->mChannelDescriptions[1].mChannelLabel = kAudioChannelLabel_Right;
+			}
 			*outDataSize = size;
 			return kAudioHardwareNoError;
 		}
 		}
 		break;
 	case kObjectID_Stream:
+	case kObjectID_ActuatorStream:
 		switch (s) {
 		case kAudioObjectPropertyBaseClass:
 			OUT(AudioClassID, kAudioObjectClassID);
 		case kAudioObjectPropertyClass:
 			OUT(AudioClassID, kAudioStreamClassID);
 		case kAudioObjectPropertyOwner:
-			OUT(AudioObjectID, kObjectID_Device);
+			OUT(AudioObjectID, inObjectID == kObjectID_ActuatorStream ? kObjectID_Actuator : kObjectID_Device);
 		case kAudioObjectPropertyName:
-			OUT(CFStringRef, CFSTR("Speaker"));
+			OUT(CFStringRef, inObjectID == kObjectID_ActuatorStream ? CFSTR("Actuator") : CFSTR("Speaker"));
 		case kAudioObjectPropertyOwnedObjects:
 			*outDataSize = 0;
 			return kAudioHardwareNoError;
@@ -655,13 +712,13 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 		case kAudioStreamPropertyVirtualFormat:
 		case kAudioStreamPropertyPhysicalFormat: {
 			AudioStreamBasicDescription f;
-			fill_format(&f);
+			fill_format(&f, channels_of(inObjectID));
 			OUT(AudioStreamBasicDescription, f);
 		}
 		case kAudioStreamPropertyAvailableVirtualFormats:
 		case kAudioStreamPropertyAvailablePhysicalFormats: {
 			AudioStreamRangedDescription r;
-			fill_format(&r.mFormat);
+			fill_format(&r.mFormat, channels_of(inObjectID));
 			r.mSampleRateRange.mMinimum = r.mSampleRateRange.mMaximum = kSampleRate;
 			OUT(AudioStreamRangedDescription, r);
 		}
@@ -759,7 +816,7 @@ SS_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 	case kAudioStreamPropertyVirtualFormat:
 	case kAudioStreamPropertyPhysicalFormat: {
 		AudioStreamBasicDescription f;
-		fill_format(&f);
+		fill_format(&f, channels_of(inObjectID));
 		if (inDataSize != sizeof(f)) {
 			return kAudioHardwareBadPropertySizeError;
 		}
@@ -841,10 +898,83 @@ link_thread(void *arg)
 	}
 }
 
+/* the actuator: IO start/stop and its counters; actuator_mix turns what iOS plays on it into motor requests */
+static OSStatus
+actuator_io(bool start)
+{
+	pthread_mutex_lock(&gStateMutex);
+	if (start && gActIOCount++ == 0) {
+		gActAnchorHostTime = mach_absolute_time();
+		memset(&gAct, 0, sizeof(gAct));
+		os_log(gLog, "SweetSpeaker: actuator start IO");
+	} else if (!start && gActIOCount && --gActIOCount == 0) {
+		os_log(gLog, "SweetSpeaker: actuator stop IO: %u cycles, %u with a signal, peak %.4f, %u motor requests (%u refused)",
+		    gAct.cycles, gAct.active, gAct.peak, gAct.commands, gAct.refused);
+	}
+	pthread_mutex_unlock(&gStateMutex);
+	return kAudioHardwareNoError;
+}
+
+/* the worker: one kern.sweet_haptic write per request (ms, mV) */
+static void *
+haptic_thread(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		semaphore_wait(gHapSem);
+		struct { uint32_t ms, mv; } req = { atomic_exchange(&gHapMs, 0), atomic_load(&gHapMv) };
+		if (req.ms && sysctlbyname("kern.sweet_haptic", NULL, NULL, &req, sizeof(req)) != 0) {
+			gAct.refused++;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * What iOS renders for the Taptic Engine, turned into what the Mi 8's motor can do (run at a strength, or not): per IO
+ * cycle the span where the waveform is above kHapThreshold and its peak become one request of that many ms (at least
+ * kHapMinMs) at a drive voltage that grows with the peak. A request while the motor runs moves its end on.
+ */
+static void
+actuator_mix(const Float32 *in, UInt32 frames, Float64 sample_time)
+{
+	float peak = 0.0f, sum = 0.0f;
+	UInt32 first = frames, last = 0;
+	for (UInt32 i = 0; i < frames; i++) {
+		float a = fabsf(in[i]);
+		peak = fmaxf(peak, a);
+		sum += in[i] * in[i];
+		if (a > kHapThreshold) {
+			first = i < first ? i : first;
+			last = i;
+		}
+	}
+	gAct.cycles++;
+	gAct.peak = fmaxf(gAct.peak, peak);
+	if (peak <= kHapThreshold) {
+		return;
+	}
+	gAct.active++;
+	uint32_t ms = (uint32_t)((last - first + 1) * 1000.0 / kSampleRate);
+	ms = ms < kHapMinMs ? kHapMinMs : ms;
+	uint32_t mv = kHapMinMv + (uint32_t)(fminf(peak, 1.0f) * (float)(kHapMaxMv - kHapMinMv));
+	atomic_store(&gHapMv, mv);
+	atomic_store(&gHapMs, ms);
+	semaphore_signal(gHapSem);
+	gAct.commands++;
+	if (gAct.said++ < 24) {
+		os_log(gLog, "SweetSpeaker: actuator: %u frames at %.0f, peak %.4f, rms %.4f -> motor %u ms at %u mV", frames,
+		    sample_time, peak, sqrtf(sum / (float)frames), ms, mv);
+	}
+}
+
 static OSStatus
 SS_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID)
 {
 	(void)inClientID;
+	if (inDriver == gDriverRef && inDeviceObjectID == kObjectID_Actuator) {
+		return actuator_io(true);
+	}
 	if (inDriver != gDriverRef || inDeviceObjectID != kObjectID_Device) {
 		return kAudioHardwareBadObjectError;
 	}
@@ -875,6 +1005,9 @@ static OSStatus
 SS_StopIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID)
 {
 	(void)inClientID;
+	if (inDriver == gDriverRef && inDeviceObjectID == kObjectID_Actuator) {
+		return actuator_io(false);
+	}
 	if (inDriver != gDriverRef || inDeviceObjectID != kObjectID_Device) {
 		return kAudioHardwareBadObjectError;
 	}
@@ -900,11 +1033,12 @@ static OSStatus
 SS_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID,
     Float64 *outSampleTime, UInt64 *outHostTime, UInt64 *outSeed)
 {
-	(void)inDriver; (void)inDeviceObjectID; (void)inClientID;
+	(void)inDriver; (void)inClientID;
+	UInt64 anchor = inDeviceObjectID == kObjectID_Actuator ? gActAnchorHostTime : gAnchorHostTime;
 	Float64 ticks = gHostTicksPerFrame * kZeroTimeStampPeriod;
-	UInt64 n = (UInt64)((Float64)(mach_absolute_time() - gAnchorHostTime) / ticks);
+	UInt64 n = (UInt64)((Float64)(mach_absolute_time() - anchor) / ticks);
 	*outSampleTime = (Float64)(n * kZeroTimeStampPeriod);
-	*outHostTime = gAnchorHostTime + (UInt64)((Float64)n * ticks);
+	*outHostTime = anchor + (UInt64)((Float64)n * ticks);
 	*outSeed = 1;
 	return kAudioHardwareNoError;
 }
@@ -935,6 +1069,10 @@ SS_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObje
     void *ioMainBuffer, void *ioSecondaryBuffer)
 {
 	(void)inDriver; (void)inDeviceObjectID; (void)inStreamObjectID; (void)inClientID; (void)ioSecondaryBuffer;
+	if (inOperationID == kAudioServerPlugInIOOperationWriteMix && inDeviceObjectID == kObjectID_Actuator && ioMainBuffer) {
+		actuator_mix(ioMainBuffer, inIOBufferFrameSize, inIOCycleInfo->mOutputTime.mSampleTime);
+		return kAudioHardwareNoError;
+	}
 	if (inOperationID != kAudioServerPlugInIOOperationWriteMix || !atomic_load(&gKernelOK) || !ioMainBuffer) {
 		return kAudioHardwareNoError;
 	}
