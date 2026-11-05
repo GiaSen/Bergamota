@@ -70,7 +70,7 @@ Qualcomm ABL (stock, unlocked)
 | Battery | Real fuel gauge and charger state, charging capped at 1.7 A (0.5 C); Bergamota fastboot charges too. The storage link sleeps when idle (UFS auto-hibernate, xnu 3054): ~110 mA less with the screen off, measured at ~235 mA screen off under iOS background load. With the screen off, cores 1–7 power down when idle (xnu 3055/3056): ~20 mA less, about 140 → 120 mA on a quiet disk. Music keeps playing with the screen locked |
 | Kernel | Heartwood on **xnu-12377.121.6**, Mi 8 patches 3001–3056 |
 | Next candidates | Deeper sleep (the whole CPU cluster and its cache off); microphone and earpiece; sensors (rotation, auto-brightness) |
-| Not working | Cellular (the modem runs and answers QMI queries on a test kernel, xnu 3057; no SIM seen, radio off), microphone, earpiece, camera, sensors (rotation, auto-brightness), fingerprint, SEP / Face ID. App Store and Weather stop at FairPlay. The Files app shows no locations: iOS 26's file provider only runs on APFS and our root is HFS+ |
+| Not working | Cellular (the modem runs and answers QMI queries on a test kernel, xnu 3057; no SIM seen, radio off), microphone and earpiece (their WCD9340 codec answers over SLIMbus on a test kernel, xnu 3058e; no audio path yet), camera, sensors (rotation, auto-brightness), fingerprint, SEP / Face ID. App Store and Weather stop at FairPlay. The Files app shows no locations: iOS 26's file provider only runs on APFS and our root is HFS+ |
 
 Every boot, crash and decision is in [`NOTES.md`](NOTES.md); the newest Mi 8 results are at the top of its Mi 8 section.
 

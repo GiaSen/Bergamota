@@ -1,0 +1,79 @@
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index a581d44..72a1816 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -2800,6 +2800,7 @@ cx_wait(uint8_t *b, unsigned mt, unsigned mc, int tid, unsigned ms)
+ }
+ 
+ extern int sweet_rpmh_lnbclk2_enable(void);
++extern int sweet_smmu_bank_fault(uint32_t *fsr, uint64_t *far, bool clear);
+ 
+ static void
+ cx_reset_pin(bool high)
+@@ -2824,6 +2825,21 @@ cx_stage_qmi(void)
+ 		return false;
+ 	}
+ 	CX_LOG("stage 1: SLIMbus QMI service at %u:%#x\n", cx.node, cx.port);
++	/*
++	 * 3058c: the SLIMbus DMA (BAM) streams of the DT's qcom,iommu_slim_ctrl_cb (iommus <apps_smmu 0x1806 0>,
++	 * <0x180d 0>, <0x180e 1>, <0x1810 1>; Linux attaches them with qcom,iommu-s1-bypass) must match an SMR before
++	 * the DSP powers the bus: under the hypervisor an unmatched stream faults and a fault during a live transfer
++	 * resets the SoC (sweet_smmu.c). Both runs without this reset the phone right after QMI POWER.
++	 */
++	static const uint16_t sids[] = { 0x1806, 0x180d, 0x180e, 0x180f, 0x1810, 0x1811 };
++	for (unsigned k = 0; k < sizeof(sids) / sizeof(sids[0]); k++) {
++		int m = sweet_smmu_map_sid(sids[k]);
++		CX_LOG("SMMU stream %#x -> %d\n", sids[k], m);
++		if (m) {
++			CX_LOG("stopping before QMI POWER: a SLIMbus stream is not mapped\n");
++			return false;
++		}
++	}
+ 	uint8_t sel[14] = { 0x01, 4, 0, 0, 0, 0, 0, 0x10, 4, 0, 1, 0, 0, 0 };    /* instance 0, mode satellite */
+ 	int r = cx_qmi(0x20, sel, sizeof(sel));
+ 	CX_LOG("QMI SELECT_INSTANCE -> %d\n", r);
+@@ -2835,6 +2851,13 @@ cx_stage_qmi(void)
+ 	r = cx_qmi(0x21, pwr, sizeof(pwr));
+ 	CX_LOG("QMI POWER active -> %d\n", r);
+ 	cx_dsp_crash();
++	for (unsigned k = 0; k < 5; k++) {
++		uint32_t fsr = 0;
++		uint64_t far = 0;
++		int cbk = sweet_smmu_bank_fault(&fsr, &far, true);
++		CX_LOG("SMMU bank %d fault status %#x address %#llx (%u ms after POWER)\n", cbk, fsr, far, k * 200);
++		au_sleep(200);
++	}
+ 	cx.powered = r == 0;
+ 	return cx.powered;
+ }
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index d7dc290..2467862 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -156,6 +156,26 @@ smmu_bank_create(void)
+ 	return 0;
+ }
+ 
++/* 3058c: the shared bank's fault status (FSR, FAR) for callers that want to see context faults; -1 without a bank */
++int sweet_smmu_bank_fault(uint32_t *fsr, uint64_t *far, bool clear);
++int
++sweet_smmu_bank_fault(uint32_t *fsr, uint64_t *far, bool clear)
++{
++	if (smmu_cb < 0 || !smmu_base) {
++		return -1;
++	}
++	uint32_t id1 = smmu_rd(0x24);
++	unsigned pgshift = (id1 >> 31) ? 16 : 12;
++	uint32_t cb0 = (1u << (((id1 >> 28) & 7) + 1)) << pgshift;
++	uint32_t cb = cb0 + ((uint32_t)smmu_cb << pgshift);
++	*fsr = smmu_rd(cb + 0x58);
++	*far = (uint64_t)smmu_rd(cb + 0x60) | (uint64_t)smmu_rd(cb + 0x64) << 32;
++	if (clear && *fsr) {
++		smmu_wr(cb + 0x58, *fsr);
++	}
++	return smmu_cb;
++}
++
+ /* Map one stream ID to the shared translating bank. Idempotent per SID. */
+ int
+ sweet_smmu_map_sid(unsigned sid)
