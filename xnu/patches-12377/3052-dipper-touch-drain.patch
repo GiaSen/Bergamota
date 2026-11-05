@@ -1,0 +1,83 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 0feee5c..d93a474 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -425,6 +425,7 @@ static int touch_idle_ms = 4, touch_off_ms = 100;
+  * IC by hand, =2 only pulses its reset, which is what the watchdog below has to notice by itself.
+  */
+ static unsigned touch_loops, touch_reads, touch_read_errs, touch_events, touch_downs, touch_ones, touch_readies, touch_restarts;
++static unsigned touch_stale;    /* 3052: an ENTER on a slot still held: its LEAVE never came, the old contact released first */
+ static int touch_restart_req;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_touch_restart, CTLFLAG_RW | CTLFLAG_LOCKED, &touch_restart_req, 0, "Mi 8 touch IC: 1 restart, 2 pulse reset only");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_touch_idle_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &touch_idle_ms, 0, "Mi 8 touch poll with the screen on and no finger");
+@@ -980,6 +981,14 @@ static const uint8_t stfts_scan[] = { 0xa0, 0x00, 0x01 };                  /* FT
+  * X = [3](3:0) << 8 | [2], Y = [4] << 4 | [3](7:4), panel pixels. The FIFO is drained (at most its depth) and
+  * the contacts that changed are reported; the IC sends LEAVE for every lift, so nothing is held or guessed.
+  * Hover and palm contacts count as lifted. Events other than touches are logged (the first 32).
++ *
++ * 3052: lifts and touch-downs are reported as they are read, motions once per drain. The whole drain used to end in one
++ * report, so a lift and the next touch-down of the same slot read together (fast typing) cancelled out: iOS saw the old
++ * finger slide to the new key and never lift, the key popup stayed up and the taps after it were lost until a later lift
++ * (user, 2026-11-05: 30 taps in Notes, 30 ENTER events in the kernel, 20-24 letters, slot 0 held with no finger on the
++ * glass). Two more ways in: the drain stopped when the IRQ line read high after a read, which can leave a LEAVE in the
++ * FIFO until the next touch brings it in with that touch's ENTER (it now reads until the IC answers "no event"), and an
++ * ENTER on a slot still held means its LEAVE was lost: that contact is lifted first (`stale` in the counters).
+  */
+ static int
+ touch_stfts(void)
+@@ -1015,7 +1024,8 @@ touch_stfts(void)
+ 			touch_readies++;
+ 			touch_suspect = "CONTROLLER_READY: the IC has reset";
+ 		}
+-		bool more = !(touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)) & 1u);    /* 3007: line high = FIFO empty, no empty read */
++		/* 3052: read on until the IC says "no event"; the line can read high with events still queued (3007 stopped there) */
++		bool more = true;
+ 		if (touch_trace) {
+ 			uint64_t ns;
+ 			absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+@@ -1033,8 +1043,10 @@ touch_stfts(void)
+ 			}
+ 			uint32_t bit = 1u << id;
+ 			if (ev[0] == STFTS_EVT_LEAVE || type == STFTS_TYPE_HOVER || type == STFTS_TYPE_PALM) {
+-				changed |= (mask & bit) != 0;
+-				mask &= ~bit;
++				if (mask & bit) {
++					mask &= ~bit;
++					touch_report(mask, x, y);       /* 3052: the lift now, before anything else reuses the slot */
++				}
+ 				if (!more) {
+ 					break;
+ 				}
+@@ -1049,10 +1061,19 @@ touch_stfts(void)
+ 				}
+ 				continue;
+ 			}
++			if (ev[0] == STFTS_EVT_ENTER && (mask & bit)) {
++				touch_stale++;                  /* 3052: a new contact on a held slot: lift the old one first */
++				mask &= ~bit;
++				touch_report(mask, x, y);
++			}
+ 			mask |= bit;
+ 			x[id] = (int)px;
+ 			y[id] = (int)py;
+ 			changed = true;
++			if (ev[0] == STFTS_EVT_ENTER) {
++				touch_report(mask, x, y);       /* 3052: the touch-down now, as its own event */
++				changed = false;
++			}
+ 		} else if (logged < 32 && (ev[0] != 0x43u || status_logged++ < 8)) {
+ 			/* 3031: every restart leaves status events behind, and they used up the lines the unusual ones need */
+ 			logged += ev[0] != 0x43u;
+@@ -1376,9 +1397,9 @@ touch_stfts_restart(const char *why)
+ static int
+ touch_stats_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+ {
+-	char buf[160];
+-	snprintf(buf, sizeof(buf), "loops=%u reads=%u errs=%u events=%u downs=%u ones=%u readies=%u restarts=%u active=%#x irq=%u", touch_loops, touch_reads,
+-	    touch_read_errs, touch_events, touch_downs, touch_ones, touch_readies, touch_restarts, st.active, st.gpio ? touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)) & 1u : 9u);
++	char buf[176];
++	snprintf(buf, sizeof(buf), "loops=%u reads=%u errs=%u events=%u downs=%u stale=%u ones=%u readies=%u restarts=%u active=%#x irq=%u", touch_loops, touch_reads,
++	    touch_read_errs, touch_events, touch_downs, touch_stale, touch_ones, touch_readies, touch_restarts, st.active, st.gpio ? touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)) & 1u : 9u);
+ 	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_touch_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, touch_stats_sysctl, "A", "Mi 8 touch thread counters");

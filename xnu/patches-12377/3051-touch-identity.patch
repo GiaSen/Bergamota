@@ -1,0 +1,47 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 0ede991..c8e40a7 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -405,6 +405,15 @@ private:
+ 	int fScale, fScaleXNum, fScaleXDen, fScaleYNum, fScaleYDen, fPadX, fPadY;
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
++	/*
++	 * 3051: the identity of each contact. It was the slot + 2, so a tap that reused the slot of the tap before it (fast
++	 * typing: one finger, or the other thumb's slot freed a moment earlier) came with the identity of a touch that had
++	 * just ended, often in the same frame, and iOS took it for that touch: about one key in five lost in Notes (user,
++	 * 2026-11-05: 30 taps, 30 touch-downs in the kernel, 24 letters). Apple's touch driver gives every new contact a new
++	 * identity; so does this one now. The slot stays the transducer index.
++	 */
++	UInt32 fIdent[SWEET_TOUCH_FINGERS];
++	UInt32 fNextIdent;
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+ 	IOFixed fY[SWEET_TOUCH_FINGERS];
+ };
+@@ -552,6 +561,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	if (!was && down) {
++		fNextIdent = fNextIdent < 2 || fNextIdent >= 0x7ffffff0u ? 2 : fNextIdent + 1;
++		fIdent[finger] = fNextIdent;
+ 		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > fPanelW - 1 - SWEET_TOUCH_EDGE_PX ||
+ 		    y < SWEET_TOUCH_EDGE_PX || y > fPanelH - 1 - SWEET_TOUCH_EDGE_BOTTOM_PX;
+ 	}
+@@ -580,7 +591,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		}
+ 		IOFixed fx = (i == finger && down) ? nx : fX[i];
+ 		IOFixed fy = (i == finger && down) ? ny : fY[i];
+-		IOHIDEvent *child = IOHIDEvent::digitizerEvent(now, (UInt32)i + 2, kIOHIDDigitizerTransducerTypeFinger,
++		IOHIDEvent *child = IOHIDEvent::digitizerEvent(now, fIdent[i], kIOHIDDigitizerTransducerTypeFinger,
+ 		    d, d ? 1 : 0, fx, fy);
+ 		if (!child) {
+ 			continue;
+@@ -598,7 +609,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 			}
+ 		}
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerIndex, i);
+-		child->setIntegerValue(kIOHIDEventFieldDigitizerIdentity, i + 2);
++		child->setIntegerValue(kIOHIDEventFieldDigitizerIdentity, fIdent[i]);
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerTouch, d);
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerEventMask, mask);
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
