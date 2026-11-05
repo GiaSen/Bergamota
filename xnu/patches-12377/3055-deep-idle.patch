@@ -1,0 +1,444 @@
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 9d3f3c5..5dc3e4d 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -1034,4 +1034,82 @@ sweet_cpufreq_hud_mhz(unsigned *a55_mhz, unsigned *a75_mhz)
+ 		*out[i] = d->state == CF_APPLIED ? cf_state_khz(d, cf_rd(d, CPUFREQ_PERF_STATE)) / 1000 : 0;
+ 	}
+ }
++/*
++ * 3055: per-core power-down in idle (osfmk/arm64/cpu.c, sweet_deep_idle_*). Live switches; the stats count
++ * CPU_SUSPEND calls, real power-downs (res), early returns, CPU 0's wake-up IPIs (kick) and the sleepers' timer
++ * IPIs to CPU 0, the time spent powered down and the worst wake after a core's own timer.
++ */
++extern uint32_t sweet_deep_idle, sweet_deep_idle_mask, sweet_deep_idle_screen;
++extern uint32_t sweet_deep_idle_min_us, sweet_deep_idle_lead_us;
++extern int sweet_deep_idle_configure(uint32_t mode);
++extern int sweet_deep_idle_stats(char *buf, size_t len);
++
++static int
++sysctl_sweet_deep_idle SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = (int)sweet_deep_idle, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (v < 0 || v > 2 || sweet_deep_idle_configure((uint32_t)v) != 0) {
++		return EINVAL;
++	}
++	printf("SWEET CPU: deep idle %s\n", v == 0 ? "off" : (v == 1 ? "rail-pc" : "pc"));
++	return 0;
++}
++
++static int
++sysctl_sweet_deep_idle_us SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg2)
++	uint32_t *p = (uint32_t *)arg1, old = *p;
++	int v = (int)old, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (v < 100 || v > 100000) {
++		return EINVAL;
++	}
++	*p = (uint32_t)v;
++	if (sweet_deep_idle_configure(sweet_deep_idle) != 0) {
++		*p = old;
++		return EINVAL;
++	}
++	return 0;
++}
++
++static int
++sysctl_sweet_deep_idle_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[1024];
++	sweet_deep_idle_stats(buf, sizeof(buf));
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++
++static int
++sysctl_sweet_deep_idle_mask SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = (int)sweet_deep_idle_mask, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	sweet_deep_idle_mask = (uint32_t)v & 0xFEu;    /* never CPU 0: it is the sleepers' timer */
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_deep_idle, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_deep_idle, "I", "power idle cores down: 0 off, 1 rail-pc, 2 pc (3055)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_deep_idle_min_us, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    &sweet_deep_idle_min_us, 0, sysctl_sweet_deep_idle_us, "I", "power down only if the next timer is this far (us)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_deep_idle_lead_us, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    &sweet_deep_idle_lead_us, 0, sysctl_sweet_deep_idle_us, "I", "CPU 0 wakes a core this long before its timer (us)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_deep_idle_mask, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_deep_idle_mask, "I", "CPUs that may power down (bit 0 ignored)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_deep_idle_screen, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_deep_idle_screen, 0,
++    "1: power cores down only while the display is off");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_deep_idle_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_deep_idle_stats, "A", "per-CPU deep idle counters (3055)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index d2a161c..c3e6fa0 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -894,5 +894,11 @@ arm_init_idle_cpu(
+ 
+ 	fiq_context_init(FALSE);
+ 
++#if defined(SWEET)
++	/* 3055: the core was powered down by sweet_deep_idle_enter (osfmk/arm64/cpu.c) */
++	extern void sweet_deep_idle_resume(cpu_data_t *cdp);
++	sweet_deep_idle_resume(cpu_data_ptr);
++#endif
++
+ 	cpu_idle_exit(TRUE);
+ }
+diff --git a/osfmk/arm/arm_timer.c b/osfmk/arm/arm_timer.c
+index f083e22..2858201 100644
+--- a/osfmk/arm/arm_timer.c
++++ b/osfmk/arm/arm_timer.c
+@@ -55,6 +55,11 @@
+ #include <arm/cpu_data_internal.h>
+ #include <arm/cpu_internal.h>
+ 
++#if defined(SWEET)
++extern void sweet_deep_idle_kick(uint64_t now);
++extern void sweet_deep_idle_resync(cpu_data_t *cdp);
++#endif
++
+ /*
+  *      Event timer interrupt.
+  *
+@@ -75,6 +80,13 @@ timer_intr(__unused int inuser, __unused uint64_t iaddr)
+ 	mytimer = &cpu_data_ptr->rtclock_timer; /* Point to the event timer */
+ 	abstime = mach_absolute_time(); /* Get the time now */
+ 
++#if defined(SWEET)
++	/* 3055: CPU 0 is the timer of the cores powered down in idle */
++	if (cpu_data_ptr->cpu_number == 0) {
++		sweet_deep_idle_kick(abstime);
++	}
++#endif
++
+ 	/* is it time for an idle timer event? */
+ 	if ((cpu_data_ptr->idle_timer_deadline > 0) && (cpu_data_ptr->idle_timer_deadline <= abstime)) {
+ 		cpu_data_ptr->idle_timer_deadline = 0x0ULL;
+@@ -181,6 +193,11 @@ timer_resync_deadlines(void)
+ 
+ 		KDBG_RELEASE(DECR_SET_DEADLINE | DBG_FUNC_NONE, decr, 2);
+ 	}
++#if defined(SWEET)
++	if (cpu_data_ptr->cpu_number == 0) {
++		sweet_deep_idle_resync(cpu_data_ptr);
++	}
++#endif
+ 	splx(s);
+ }
+ 
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index db3bb0b..bfdbfbd 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -473,6 +473,10 @@ wfe_to_deadline_or_interrupt(uint32_t cid, uint64_t wfe_deadline, cpu_data_t *cd
+ 	return ipending || (nirqc != irqc);
+ }
+ 
++#if defined(SWEET)
++static bool sweet_deep_idle_enter(cpu_data_t *cdp);
++#endif
++
+ /*
+  *	Routine:	cpu_idle
+  *	Function:
+@@ -611,6 +615,10 @@ cpu_idle(void)
+ #if HAS_RETENTION_STATE
+ 		arm64_retention_wfi();
+ #else
++#if defined(SWEET)
++		/* 3055: power the core down instead when its next timer is far enough */
++		if (!sweet_deep_idle_enter(cpu_data_ptr))
++#endif
+ 		__builtin_arm_wfi();
+ #endif
+ 
+@@ -997,6 +1005,272 @@ sweet_cpu_signal_is_enabled(unsigned int cpu)
+ }
+ #endif
+ 
++#if defined(SWEET)
++/*
++ * 3055: per-core power-down in idle (Mi 8, SDM845). The DT's qcom,lpm-levels
++ * give each core "pc" (PSCI power_state 0x40000003) and "rail-pc"
++ * (0x40000004) besides WFI; both are is-reset and use-broadcast-timer: the
++ * core loses all its state, its timer included. XNU already knows how to come
++ * back from a non-retention idle (Apple cores have one): machine_idle saved the
++ * idle thread with Idle_context, the reset vector finds this CPU's data by
++ * MPIDR and runs cpu_reset_handler, which cpu_machine_idle_init set to
++ * resume_idle_cpu -> start_cpu (MMU, stacks) -> arm_init_idle_cpu ->
++ * cpu_idle_exit(TRUE) -> Idle_load_context. What is SWEET's own:
++ *  - PSCI CPU_SUSPEND with sweet_secondary_entry (the CPU_ON entry: EL2/EL1
++ *    check, then the reset vector) as the entry point;
++ *  - sweet_deep_idle_resume() in arm_init_idle_cpu: the GIC CPU interface
++ *    (PE_init_cpu) and the timer's compare value, both lost;
++ *  - CPU 0 never powers down and stands in for the sleepers' timers: a sleeper
++ *    publishes when it must be woken (its next pop minus the exit latency),
++ *    and sends CPU 0 a timer IPI if that is earlier than CPU 0's own pop; CPU
++ *    0 adds the earliest one to its decrementer (sweet_deep_idle_resync from
++ *    timer_resync_deadlines) and sends the sleeper a nop IPI once it passes
++ *    (sweet_deep_idle_kick from timer_intr). The sleeper's store / fence /
++ *    load of CPU 0's rtcPop and CPU 0's rtcPop store / fence / load of the
++ *    deadlines make sure one of the two sees the other.
++ * Off unless kern.sweet_deep_idle is set; by default only while iOS has the
++ * display off (kern.sweet_deep_idle_screen).
++ */
++#define SWEET_PSCI_CPU_SUSPEND  0xC4000001ULL
++#define SWEET_DI_RAIL_PC        0x40000004ULL
++#define SWEET_DI_PC             0x40000003ULL
++
++struct sweet_di_cpu {
++	uint64_t        deadline;       /* when CPU 0 must wake this core; 0 while it is up */
++	uint64_t        entries;        /* CPU_SUSPEND calls */
++	uint64_t        returns;        /* ... that returned: a wake-up was already pending */
++	uint64_t        resumes;        /* ... that powered the core down (back through the reset vector) */
++	uint64_t        kicks;          /* nop IPIs from CPU 0 at the deadline */
++	uint64_t        ipis;           /* timer IPIs to CPU 0 to bring its pop forward */
++	uint64_t        errors;         /* negative PSCI results */
++	uint64_t        no_reset;       /* skipped: cpu_reset_handler is not resume_idle_cpu */
++	uint64_t        enter_abs;
++	uint64_t        deep_abs;       /* CPU_SUSPEND to arm_init_idle_cpu, summed */
++	uint64_t        late_abs;       /* worst resume after the core's own pop */
++	int32_t         last_rc;
++	uint32_t        prepared;
++} __attribute__((aligned(128)));
++
++static struct sweet_di_cpu sweet_di[MAX_CPUS];
++uint32_t sweet_deep_idle;               /* 0 off, 1 rail-pc, 2 pc */
++uint32_t sweet_deep_idle_mask = 0xFE;   /* CPUs allowed to power down; CPU 0 never does */
++uint32_t sweet_deep_idle_screen = 1;    /* 1: only while iOS has the display off */
++uint32_t sweet_deep_idle_min_us = 3000; /* next pop at least this far away */
++uint32_t sweet_deep_idle_lead_us = 1100; /* wake this much before the pop (DT rail-pc latency: A55 531, A75 1061 us) */
++static uint64_t sweet_di_min_abs, sweet_di_lead_abs;
++static uint32_t sweet_di_used;          /* CPU 0 serves deadlines once this was ever on */
++static vm_offset_t sweet_di_entry_pa, sweet_di_resume_pa;
++extern uintptr_t sweet_secondary_entry;
++extern int sweet_fb_display_off;
++
++/* SMCCC 1.0, as sweet_psci_cpu_on in SweetCPU.cpp */
++static int32_t
++sweet_psci_cpu_suspend(uint64_t state, uint64_t entry, uint64_t context)
++{
++	register uint64_t x0 __asm__("x0") = SWEET_PSCI_CPU_SUSPEND;
++	register uint64_t x1 __asm__("x1") = state;
++	register uint64_t x2 __asm__("x2") = entry;
++	register uint64_t x3 __asm__("x3") = context;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++                 "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++                 "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int32_t)x0;
++}
++
++/* -1: bad mode, or min_us not above lead_us + 500 */
++int sweet_deep_idle_configure(uint32_t mode);
++int
++sweet_deep_idle_configure(uint32_t mode)
++{
++	uint64_t a;
++
++	if (mode > 2 || sweet_deep_idle_min_us < sweet_deep_idle_lead_us + 500) {
++		return -1;
++	}
++	if (sweet_di_entry_pa == 0) {
++		sweet_di_entry_pa = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
++		sweet_di_resume_pa = ml_static_vtop((vm_offset_t)&resume_idle_cpu);
++	}
++	nanoseconds_to_absolutetime((uint64_t)sweet_deep_idle_min_us * NSEC_PER_USEC, &a);
++	sweet_di_min_abs = a;
++	nanoseconds_to_absolutetime((uint64_t)sweet_deep_idle_lead_us * NSEC_PER_USEC, &a);
++	sweet_di_lead_abs = a;
++	if (mode != 0) {
++		os_atomic_store(&sweet_di_used, 1, release);
++	}
++	os_atomic_thread_fence(seq_cst);
++	os_atomic_store(&sweet_deep_idle, mode, release);
++	return 0;
++}
++
++/* cpu_idle, interrupts masked, on the interrupt stack: true if the WFI is done (or not needed) */
++static bool
++sweet_deep_idle_enter(cpu_data_t *cdp)
++{
++	uint32_t mode = os_atomic_load(&sweet_deep_idle, acquire);
++	unsigned int cpu = (unsigned int)cdp->cpu_number;
++
++	if (mode == 0 || cpu == 0 || cpu >= MAX_CPUS || !(sweet_deep_idle_mask & (1U << cpu))) {
++		return false;
++	}
++	if (sweet_deep_idle_screen && !sweet_fb_display_off) {
++		return false;
++	}
++	cpu_data_t *master = CpuDataEntries[0].cpu_data_vaddr;
++	if (master == NULL || (os_atomic_load(&master->cpu_signal, relaxed) & SIGPdisabled)) {
++		return false;
++	}
++	uint64_t now = mach_absolute_time();
++	uint64_t pop = cdp->cpu_idle_pop ? cdp->cpu_idle_pop : cdp->rtcPop;
++	if (pop <= now || pop - now < sweet_di_min_abs) {
++		return false;
++	}
++
++	struct sweet_di_cpu *s = &sweet_di[cpu];
++	if (cdp->cpu_reset_handler != sweet_di_resume_pa) {
++		s->no_reset++;
++		return false;
++	}
++	if (!s->prepared) {
++		/* The reset vector reads these with the MMU and caches off, as for cpu_start */
++		extern uint8_t bootstrap_pagetables[BOOTSTRAP_TABLE_SIZE];
++		CleanPoC_DcacheRegion_Force((vm_offset_t)CpuDataEntries, sizeof(CpuDataEntries));
++		CleanPoC_DcacheRegion_Force((vm_offset_t)cdp, sizeof(cpu_data_t));
++		CleanPoC_DcacheRegion_Force((vm_offset_t)&ResetHandlerData, sizeof(ResetHandlerData));
++		CleanPoC_DcacheRegion_Force((vm_offset_t)BootArgs, sizeof(*BootArgs));
++		CleanPoC_DcacheRegion_Force((vm_offset_t)&cpu_ttep, sizeof(cpu_ttep));
++		CleanPoC_DcacheRegion_Force((vm_offset_t)bootstrap_pagetables, BOOTSTRAP_TABLE_SIZE);
++		__builtin_arm_dsb(DSB_SY);
++		s->prepared = 1;
++	}
++
++	uint64_t wake = pop - sweet_di_lead_abs;
++	os_atomic_store(&s->deadline, wake, relaxed);
++	os_atomic_thread_fence(seq_cst);
++	if (wake < os_atomic_load(&master->rtcPop, relaxed)) {
++		s->ipis++;
++		cpu_signal(master, SIGPTimerLocal, NULL, NULL);
++	}
++	s->entries++;
++	s->enter_abs = now;
++	__builtin_arm_dsb(DSB_SY);
++
++	int32_t rc = sweet_psci_cpu_suspend(mode == 2 ? SWEET_DI_PC : SWEET_DI_RAIL_PC, sweet_di_entry_pa, cpu);
++
++	/* Only if the core did not power down: a wake-up was pending, or PSCI refused */
++	os_atomic_store(&s->deadline, 0, relaxed);
++	s->last_rc = rc;
++	if (rc < 0) {
++		s->errors++;
++		os_atomic_store(&sweet_deep_idle, 0, relaxed); /* do not keep calling a firmware that refuses */
++	} else {
++		s->returns++;
++	}
++	return true;
++}
++
++/* arm_init_idle_cpu, before cpu_idle_exit(TRUE): the core was powered down */
++void sweet_deep_idle_resume(cpu_data_t *cdp);
++void
++sweet_deep_idle_resume(cpu_data_t *cdp)
++{
++	unsigned int cpu = (unsigned int)cdp->cpu_number;
++
++	PE_init_cpu();          /* GIC CPU interface: SRE, PMR, BPR, EOI mode, group 1 enable */
++	if (cpu < MAX_CPUS) {
++		struct sweet_di_cpu *s = &sweet_di[cpu];
++		uint64_t now = mach_absolute_time();
++
++		os_atomic_store(&s->deadline, 0, relaxed);
++		s->resumes++;
++		s->deep_abs += now - s->enter_abs;
++		if (now > cdp->rtcPop && now - cdp->rtcPop > s->late_abs) {
++			s->late_abs = now - cdp->rtcPop;
++		}
++	}
++	cdp->cpu_idle_pop = 0x0ULL;
++	setPop(cdp->rtcPop);    /* the timer lost its compare value; a past pop fires at once */
++}
++
++/* CPU 0, timer_intr: wake the sleepers whose time has come */
++void sweet_deep_idle_kick(uint64_t now);
++void
++sweet_deep_idle_kick(uint64_t now)
++{
++	if (!os_atomic_load(&sweet_di_used, relaxed)) {
++		return;
++	}
++	for (unsigned int cpu = 1; cpu < MAX_CPUS; cpu++) {
++		uint64_t d = os_atomic_load(&sweet_di[cpu].deadline, relaxed);
++		cpu_data_t *t = CpuDataEntries[cpu].cpu_data_vaddr;
++		if (d == 0 || d > now || t == NULL) {
++			continue;
++		}
++		if (os_atomic_cmpxchg(&sweet_di[cpu].deadline, d, 0, relaxed)) {
++			sweet_di[cpu].kicks++;
++			cpu_signal(t, SIGPnop, NULL, NULL);
++		}
++	}
++}
++
++/* CPU 0, end of timer_resync_deadlines: pop no later than the earliest sleeper */
++void sweet_deep_idle_resync(cpu_data_t *cdp);
++void
++sweet_deep_idle_resync(cpu_data_t *cdp)
++{
++	if (!os_atomic_load(&sweet_di_used, relaxed)) {
++		return;
++	}
++	for (int round = 0; round < 8; round++) {
++		uint64_t first = UINT64_MAX;
++
++		os_atomic_thread_fence(seq_cst);
++		for (unsigned int cpu = 1; cpu < MAX_CPUS; cpu++) {
++			uint64_t d = os_atomic_load(&sweet_di[cpu].deadline, relaxed);
++			if (d != 0 && d < first) {
++				first = d;
++			}
++		}
++		if (first >= cdp->rtcPop) {
++			return;
++		}
++		setPop(first);
++	}
++}
++
++int sweet_deep_idle_stats(char *buf, size_t len);
++int
++sweet_deep_idle_stats(char *buf, size_t len)
++{
++	size_t off = 0;
++	int n;
++
++	n = snprintf(buf, len, "mode=%u mask=0x%x screen=%u min_us=%u lead_us=%u display_off=%d\n",
++	    sweet_deep_idle, sweet_deep_idle_mask, sweet_deep_idle_screen, sweet_deep_idle_min_us,
++	    sweet_deep_idle_lead_us, sweet_fb_display_off);
++	off = (n > 0) ? (size_t)n : 0;
++	for (unsigned int cpu = 1; cpu < MAX_CPUS && off < len; cpu++) {
++		struct sweet_di_cpu *s = &sweet_di[cpu];
++		uint64_t deep_ns, late_ns;
++
++		if (CpuDataEntries[cpu].cpu_data_vaddr == NULL) {
++			continue;
++		}
++		absolutetime_to_nanoseconds(s->deep_abs, &deep_ns);
++		absolutetime_to_nanoseconds(s->late_abs, &late_ns);
++		n = snprintf(buf + off, len - off,
++		    "cpu%u ent=%llu ret=%llu res=%llu kick=%llu ipi=%llu err=%llu norst=%llu rc=%d deep_ms=%llu late_us=%llu\n",
++		    cpu, s->entries, s->returns, s->resumes, s->kicks, s->ipis, s->errors, s->no_reset, s->last_rc,
++		    deep_ns / NSEC_PER_MSEC, late_ns / NSEC_PER_USEC);
++		if (n <= 0) {
++			break;
++		}
++		off += (size_t)n;
++	}
++	return 0;
++}
++#endif /* SWEET */
++
+ 
+ void
+ cpu_timebase_init(boolean_t from_boot)

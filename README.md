@@ -67,9 +67,9 @@ Qualcomm ABL (stock, unlocked)
 | Vibration | The PMI8998 haptics motor: CoreHaptics patterns, the keyboard and the system vibrations |
 | Flashlight | Both rear LEDs from Control Center's button, through `sweettorch.dylib` in cameracaptured and the PMI8998 flash LED driver |
 | USB | CDC-ECM Ethernet: SSH at `root@192.168.7.2`, live kernel log on UDP 5140, internet shared from the Mac; iOS sees a cable at once |
-| Battery | Real fuel gauge and charger state, charging capped at 1.7 A (0.5 C); Bergamota fastboot charges too. The storage link sleeps when idle (UFS auto-hibernate, xnu 3054): ~110 mA less with the screen off, measured at ~235 mA screen off under iOS background load. The cores do not power down yet |
+| Battery | Real fuel gauge and charger state, charging capped at 1.7 A (0.5 C); Bergamota fastboot charges too. The storage link sleeps when idle (UFS auto-hibernate, xnu 3054): ~110 mA less with the screen off, measured at ~235 mA screen off under iOS background load. On a test kernel (xnu 3055, not the default yet) cores 1–7 power down when idle with the screen off: ~20 mA less (about 140 → 120 mA on a quiet disk) |
 | Kernel | Heartwood on **xnu-12377.121.6**, Mi 8 patches 3001–3054 |
-| Next candidates | Deep sleep (cores powered down when idle); microphone and earpiece; sensors (rotation, auto-brightness) |
+| Next candidates | Deep sleep (cores powered down by default, then the whole CPU cluster); microphone and earpiece; sensors (rotation, auto-brightness) |
 | Not working | Cellular, microphone, earpiece, camera, sensors (rotation, auto-brightness), fingerprint, SEP / Face ID. App Store and Weather stop at FairPlay |
 
 Every boot, crash and decision is in [`NOTES.md`](NOTES.md); the newest Mi 8 results are at the top of its Mi 8 section.
