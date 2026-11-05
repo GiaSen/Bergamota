@@ -1,0 +1,112 @@
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+index e106187..4d9676a 100644
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -159,6 +159,30 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_trace,
+     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_fb_trace_sysctl, "A",
+     "Poco F1 per-frame display trace: last 128 swaps (see bsd/dev/sweet_fb.c)");
+ 
++/* sysctl kern.sweet_touch_trace (3053): the last 256 touch events dispatched to backboardd (iokit/Kernel/arm/hid/SweetHID.cpp) */
++size_t sweet_touch_trace_text(char *buf, size_t cap);
++
++static int sweet_touch_trace_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	const size_t cap = 12288;
++	if (req->oldptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, NULL, cap);
++	}
++	char *buf = kalloc_data(cap, Z_WAITOK | Z_ZERO);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	size_t n = sweet_touch_trace_text(buf, cap - 1);
++	int err = SYSCTL_OUT(req, buf, n + 1);
++	kfree_data(buf, cap);
++	return err;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_touch_trace,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_touch_trace_sysctl, "A",
++    "last 256 touch events sent to backboardd, absolute us (see iokit/Kernel/arm/hid/SweetHID.cpp)");
++
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb,
+     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_fb_sysctl, "A",
+     "Poco F1 display path statistics, key=value string (see bsd/dev/sweet_fb.c)");
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 95e1eca..6d29009 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -104,10 +104,12 @@ sweet_fb_trace_text(char *buf, size_t cap)
+ 			base = sweet_fb_trace[i].swap;
+ 		}
+ 	}
+-	size_t n = (size_t)snprintf(buf, cap, "id swap_us scan_us latch_us done_us wcall_us wret_us (0 = not seen; relative to the oldest swap)\n");
+ 	if (base == UINT64_MAX) {
+-		return n;
++		return (size_t)snprintf(buf, cap, "id swap_us scan_us latch_us done_us wcall_us wret_us (0 = not seen; relative to the oldest swap)\n");
+ 	}
++	/* 3053: base_us = the oldest swap in absolute microseconds (mach_absolute_time), so kern.sweet_touch_trace can be lined up */
++	size_t n = (size_t)snprintf(buf, cap, "id swap_us scan_us latch_us done_us wcall_us wret_us (0 = not seen; relative to the oldest swap) "
++	    "base_us=%llu\n", sweet_abs_us(base));
+ 	/* oldest first: walk the ring by swap time */
+ 	uint64_t last = 0;
+ 	for (uint32_t k = 0; k < SWEET_FB_TRACE_N && n < cap; k++) {
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index c8e40a7..ee57e88 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -375,6 +375,8 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * absolute digitizers.
+  */
+ #define SWEET_TOUCH_FINGERS 10
++/* 3053: touch events for latency measurements, see sweet_touch_trace_text */
++static void sweet_touch_trace_note(uint64_t abs, char kind, int finger);
+ /*
+  * Contacts that start this close to a panel edge (pixels, ~3 mm) carry
+  * kIOHIDDigitizerEventFromEdgeTip for their whole life, as Apple's touch
+@@ -666,10 +668,44 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		}
+ 		wire_dumps++;
+ 	}
++	sweet_touch_trace_note(now, was != down ? (down ? 'd' : 'u') : 'm', finger);
+ 	dispatchEvent(collection);
+ 	collection->release();
+ }
+ 
++/*
++ * 3053: the last 256 touch events as dispatched to backboardd, for finger-to-screen latency (sysctl kern.sweet_touch_trace,
++ * bsd/dev/sweet_fb.c): absolute microseconds (mach_absolute_time, the clock of kern.sweet_fb_trace's base_us), d/m/u, slot.
++ */
++#define SWEET_TOUCH_TRACE_N 256
++static struct { uint64_t abs; uint8_t kind, finger; } sweet_touch_tr[SWEET_TOUCH_TRACE_N];
++static uint32_t sweet_touch_tr_n;
++
++static void
++sweet_touch_trace_note(uint64_t abs, char kind, int finger)
++{
++	uint32_t i = __atomic_fetch_add(&sweet_touch_tr_n, 1, __ATOMIC_RELAXED) % SWEET_TOUCH_TRACE_N;
++	sweet_touch_tr[i].kind = (uint8_t)kind;
++	sweet_touch_tr[i].finger = (uint8_t)finger;
++	__atomic_store_n(&sweet_touch_tr[i].abs, abs, __ATOMIC_RELEASE);
++}
++
++extern "C" size_t sweet_touch_trace_text(char *buf, size_t cap);
++size_t
++sweet_touch_trace_text(char *buf, size_t cap)
++{
++	uint32_t end = __atomic_load_n(&sweet_touch_tr_n, __ATOMIC_ACQUIRE);
++	uint32_t start = end > SWEET_TOUCH_TRACE_N ? end - SWEET_TOUCH_TRACE_N : 0;
++	size_t n = (size_t)snprintf(buf, cap, "abs_us kind finger (d down, m move, u up; oldest first)\n");
++	for (uint32_t k = start; k < end && n < cap; k++) {
++		uint32_t i = k % SWEET_TOUCH_TRACE_N;
++		uint64_t ns;
++		absolutetime_to_nanoseconds(__atomic_load_n(&sweet_touch_tr[i].abs, __ATOMIC_ACQUIRE), &ns);
++		n += (size_t)snprintf(buf + n, cap - n, "%llu %c %u\n", ns / 1000ull, sweet_touch_tr[i].kind, sweet_touch_tr[i].finger);
++	}
++	return n < cap ? n : cap;
++}
++
+ /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
+ extern "C" void
+ sweet_hid_key(int key, int down)
