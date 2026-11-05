@@ -136,6 +136,10 @@ if [ "${IOS18:-1}" = 1 ]; then
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetax.c" -lAccessibility -o "$out18/sweetax"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetax"
 	python3 -I "$pacstrip" --sign "$out18/sweetax"
+	# sweetqmi: the modem's QMI services through the kernel pass-through (xnu 3057)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetqmi.c" -o "$out18/sweetqmi"
+	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetqmi"
+	python3 -I "$pacstrip" --sign "$out18/sweetqmi"
 	# CoreHaptics over SSH: taps + a buzz or an AHAP file, through audiomxd's haptic server to the Actuator device
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -fobjc-arc -framework Foundation \
 		-framework CoreHaptics "$here/sweethaptic.m" -o "$out18/sweethaptic"
