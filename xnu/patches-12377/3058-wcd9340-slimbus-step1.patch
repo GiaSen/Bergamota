@@ -1,0 +1,440 @@
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 72853ef..024f2ec 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -986,6 +986,73 @@ nf_rx(uint32_t snode, uint32_t sport, const uint8_t *p, uint32_t len)
+ 	}
+ }
+ 
++/*
++ * ---- 3058: the WCD9340 (Tavil) codec over SLIMbus, step 1: bring the bus up and read the codec's chip id
++ * (kern.sweet_codec; nothing runs unless it is written). Facts: live DT slim@171c0000 (qcom,slim-ngd, cell-index 1,
++ * so NGD_BASE_V2 = +0x1000 and QMI instance 1 >> 1 = 0), tavil_codec PGD elemental address 00 01 50 02 17 02,
++ * reset TLMM 64 (NORTH), MCLK = RPMh lnbclka2, supply pm8998 s4 (stub, always on). Sequence and message formats
++ * from Qualcomm's slim-msm-ngd.c / slim-msm.c (register facts only): the DSP is the bus manager; we are a satellite
++ * NGD that uses the register FIFOs (no BAM). QMI to the DSP's SLIMbus service 0x301: SELECT_INSTANCE 0x20 {0x01 u32
++ * instance, 0x10 u32 mode 1 = satellite}, POWER 0x21 {0x01 u32 2 = active}; then NGD CFG = enable, the manager sends
++ * MASTER_CAPABILITY, we answer REPORT_SATELLITE; ADDR_QUERY gives the codec's logical address; REQUEST_VALUE reads
++ * its registers (element address 0x800 + register, page 0 after reset).
++ */
++#define QR_SLIM_SERVICE         0x301u
++#define QR_SLIM_PORT            0x4011u
++#define CX_SLIM_PA              0x171c0000u
++#define CX_SLIM_SIZE            0x2c000u
++#define CX_NGD                  0x1000u
++#define NGD_CFG                 0x0u
++#define NGD_STATUS              0x4u
++#define NGD_RX_MSGQ_CFG         0x8u
++#define NGD_INT_EN              0x10u
++#define NGD_INT_STAT            0x14u
++#define NGD_INT_CLR             0x18u
++#define NGD_TX_MSG              0x30u
++#define NGD_RX_MSG              0x70u
++#define NGD_INT_TX_SENT         (1u << 31)
++#define NGD_INT_RX_RCVD         (1u << 30)
++#define NGD_INT_ERRORS          ((1u << 25) | (1u << 26) | (1u << 27) | (1u << 29))
++#define CX_TLMM_NORTH_PA        0x03900000u
++#define CX_RESET_GPIO           64u
++static const uint8_t cx_pgd_ea[6] = { 0x00, 0x01, 0x50, 0x02, 0x17, 0x02 };
++static struct {
++	uint32_t node, port;            /* the DSP's SLIMbus QMI service */
++	bool have_srv, rsp;
++	uint16_t txn;
++	uint8_t rsp_buf[64];
++	uint32_t rsp_len;
++	vm_offset_t slim, rst;
++	uint8_t tid, la;
++	uint32_t runs;
++	char log[4096];
++	size_t off;
++} cx;
++
++#define CX_LOG(...) do { \
++	int _n = snprintf(cx.log + cx.off, sizeof(cx.log) - cx.off, __VA_ARGS__); \
++	if (_n > 0) { \
++	        printf("SWEET CODEC: %s", cx.log + cx.off); \
++	        cx.off = MIN(sizeof(cx.log) - 1, cx.off + (size_t)_n); \
++	} \
++} while (0)
++
++static void
++cx_qmi_rx(const uint8_t *p, uint32_t len)
++{
++	uint16_t txn;
++	if (len < 7 || p[0] != 2) {
++		return;
++	}
++	memcpy(&txn, p + 1, 2);
++	if (txn != cx.txn) {
++		return;
++	}
++	cx.rsp_len = MIN(len, (uint32_t)sizeof(cx.rsp_buf));
++	memcpy(cx.rsp_buf, p, cx.rsp_len);
++	cx.rsp = true;
++}
++
+ static bool
+ qr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *pl, uint32_t size)
+ {
+@@ -1034,6 +1101,11 @@ qr_rx(const uint8_t *p, uint32_t len)
+ 			gl.servers++;
+ 			printf("SWEET AUDIO: qrtr: the DSP %s service %u (%#x) version %u instance %u at %u:%#x\n",
+ 			    type == Q_NEW_SERVER ? "offers" : "removes", v[1], v[1], v[2] & 0xff, v[2] >> 8, v[3], v[4]);
++			if (v[1] == QR_SLIM_SERVICE) {
++				cx.have_srv = type == Q_NEW_SERVER;
++				cx.node = v[3];
++				cx.port = v[4];
++			}
+ 			if (type == Q_NEW_SERVER && v[1] == QR_NOTIF_SERVICE && (v[2] >> 8) == 74 && !nf.asked) {
+ 				nf.node = v[3];
+ 				nf.port = v[4];
+@@ -1058,6 +1130,8 @@ qr_rx(const uint8_t *p, uint32_t len)
+ 			}
+ 		} else if (dport == QR_NOTIF_PORT) {
+ 			nf_rx(snode, sport, pl, size);
++		} else if (dport == QR_SLIM_PORT) {
++			cx_qmi_rx(pl, size);
+ 		} else {
+ 			printf("SWEET AUDIO: qrtr: %u bytes from %u:%#x to port %#x (no server)\n", size, snode, sport, dport);
+ 		}
+@@ -2563,6 +2637,291 @@ au_amp_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_amp, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_amp_sysctl, "S",
+     "Mi 8 speaker player: the amp's on (1) and off (0) I2C scripts, u8 which + script (bsd/dev/dipper_audio.c)");
+ 
++/* one QMI request to the DSP's SLIMbus service; the QMI error (0 = success), or -1 without an answer */
++static int
++cx_qmi(uint16_t msg, const uint8_t *tlv, uint16_t tlen)
++{
++	uint8_t q[64];
++	if (tlen > sizeof(q) - 7) {
++		return -1;
++	}
++	cx.txn = (uint16_t)(cx.txn + 1);
++	if (!cx.txn) {
++		cx.txn = 1;
++	}
++	q[0] = 0;
++	memcpy(q + 1, &cx.txn, 2);
++	memcpy(q + 3, &msg, 2);
++	memcpy(q + 5, &tlen, 2);
++	memcpy(q + 7, tlv, tlen);
++	cx.rsp = false;
++	if (!qr_send(Q_DATA, QR_SLIM_PORT, cx.node, cx.port, q, 7u + tlen)) {
++		return -1;
++	}
++	for (unsigned w = 0; w < 1500 && !cx.rsp && !gl.bad; w += 2) {
++		au_sleep(2);
++		gl_poll();
++	}
++	if (!cx.rsp) {
++		return -1;
++	}
++	for (uint32_t o = 7; o + 3 <= cx.rsp_len;) {
++		uint16_t l, r, e;
++		memcpy(&l, cx.rsp_buf + o + 1, 2);
++		if (cx.rsp_buf[o] == 0x02 && l >= 4 && o + 7 <= cx.rsp_len) {
++			memcpy(&r, cx.rsp_buf + o + 3, 2);
++			memcpy(&e, cx.rsp_buf + o + 5, 2);
++			return r ? (e ? e : 0xffff) : 0;
++		}
++		o += 3u + l;
++	}
++	return 0xfffe;                          /* answered without a result TLV */
++}
++
++static uint32_t
++cx_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(cx.slim + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++cx_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(cx.slim + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* one received message into b (up to 40 bytes); its length, 0 if none came within ms */
++static unsigned
++cx_rx(uint8_t *b, unsigned ms)
++{
++	for (unsigned t = 0; t <= ms; t++) {
++		uint32_t st = cx_rd(CX_NGD + NGD_INT_STAT);
++		if (st & NGD_INT_ERRORS) {
++			cx_wr(CX_NGD + NGD_INT_CLR, st & NGD_INT_ERRORS);
++			CX_LOG("NGD error interrupt %#x\n", st);
++		}
++		if (st & NGD_INT_RX_RCVD) {
++			uint32_t w[10];
++			w[0] = cx_rd(CX_NGD + NGD_RX_MSG);
++			unsigned len = w[0] & 0x1f;
++			for (unsigned i = 1; i < ((len + 3) >> 2) && i < 10; i++) {
++				w[i] = cx_rd(CX_NGD + NGD_RX_MSG + 4 * i);
++			}
++			cx_wr(CX_NGD + NGD_INT_CLR, NGD_INT_RX_RCVD);
++			len = MIN(len, 40u);
++			memcpy(b, w, len);
++			CX_LOG("rx mt %u mc %#x len %u:", (b[0] >> 5) & 7, b[1], len);
++			for (unsigned i = 0; i < len; i++) {
++				CX_LOG(" %02x", b[i]);
++			}
++			CX_LOG("\n");
++			return len;
++		}
++		au_sleep(1);
++	}
++	return 0;
++}
++
++/* one message (its first byte holds the length) through the TX FIFO registers; 0 when the NGD reports it sent */
++static int
++cx_tx(const uint8_t *m)
++{
++	uint32_t w[10] = { 0 };
++	unsigned len = m[0] & 0x1f;
++	memcpy(w, m, len);
++	cx_wr(CX_NGD + NGD_INT_CLR, NGD_INT_TX_SENT | NGD_INT_ERRORS);
++	for (unsigned i = 0; i < ((len + 3) >> 2); i++) {
++		cx_wr(CX_NGD + NGD_TX_MSG + 4 * i, w[i]);
++	}
++	for (unsigned t = 0; t < 100; t++) {
++		uint32_t st = cx_rd(CX_NGD + NGD_INT_STAT);
++		if (st & NGD_INT_ERRORS) {
++			cx_wr(CX_NGD + NGD_INT_CLR, st & NGD_INT_ERRORS);
++			CX_LOG("tx mt %u mc %#x: error interrupt %#x\n", (m[0] >> 5) & 7, m[1], st);
++			return EIO;
++		}
++		if (st & NGD_INT_TX_SENT) {
++			cx_wr(CX_NGD + NGD_INT_CLR, NGD_INT_TX_SENT);
++			return 0;
++		}
++		au_sleep(1);
++	}
++	CX_LOG("tx mt %u mc %#x: not sent in 100 ms\n", (m[0] >> 5) & 7, m[1]);
++	return ETIMEDOUT;
++}
++
++/* wait for a message of type mt / code mc (and transaction tid when tid >= 0), logging the others */
++static unsigned
++cx_wait(uint8_t *b, unsigned mt, unsigned mc, int tid, unsigned ms)
++{
++	for (unsigned t = 0; t < ms; t += 10) {
++		unsigned n = cx_rx(b, 10);
++		if (n >= 2 && ((b[0] >> 5) & 7) == mt && b[1] == mc && (tid < 0 || (n > 3 && b[3] == tid))) {
++			return n;
++		}
++	}
++	return 0;
++}
++
++extern int sweet_rpmh_lnbclk2_enable(void);
++
++static void
++cx_reset_pin(bool high)
++{
++	vm_offset_t r = cx.rst;
++	uint32_t cfg = *(volatile uint32_t *)r;
++	cfg &= ~((0xfu << 2) | (7u << 6));      /* function 0 = gpio, drive 2 mA */
++	cfg |= 0x200u;                          /* output enable */
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(r + 4) = high ? 2u : 0u;
++	*(volatile uint32_t *)r = cfg;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++cx_step1(void)
++{
++	uint8_t b[40];
++	cx.off = 0;
++	cx.log[0] = 0;
++	cx.runs++;
++	CX_LOG("step 1 (run %u): SLIMbus up, codec chip id\n", cx.runs);
++	if (!au_live || !cx.have_srv) {
++		CX_LOG("not ready: audio DSP %s, SLIMbus QMI service %s\n", au_live ? "up" : "not up",
++		    cx.have_srv ? "seen" : "not announced");
++		return;
++	}
++	CX_LOG("SLIMbus QMI service at %u:%#x\n", cx.node, cx.port);
++	uint8_t sel[14] = { 0x01, 4, 0, 0, 0, 0, 0, 0x10, 4, 0, 1, 0, 0, 0 };    /* instance 0, mode satellite */
++	int r = cx_qmi(0x20, sel, sizeof(sel));
++	CX_LOG("QMI SELECT_INSTANCE -> %d\n", r);
++	if (r) {
++		return;
++	}
++	uint8_t pwr[7] = { 0x01, 4, 0, 2, 0, 0, 0 };                              /* active */
++	r = cx_qmi(0x21, pwr, sizeof(pwr));
++	CX_LOG("QMI POWER active -> %d\n", r);
++	if (r) {
++		return;
++	}
++	if (!cx.slim) {
++		cx.slim = ml_io_map(CX_SLIM_PA, CX_SLIM_SIZE);
++	}
++	if (!cx.slim) {
++		CX_LOG("cannot map the SLIMbus block\n");
++		return;
++	}
++	uint32_t ver = cx_rd(0) >> 16;
++	CX_LOG("controller version %#x; NGD cfg %#x status %#x int_en %#x int_stat %#x\n", ver, cx_rd(CX_NGD + NGD_CFG),
++	    cx_rd(CX_NGD + NGD_STATUS), cx_rd(CX_NGD + NGD_INT_EN), cx_rd(CX_NGD + NGD_INT_STAT));
++	if (!ver) {
++		CX_LOG("version 0: the NGD would be at the V1 offset; stopping\n");
++		return;
++	}
++	if (!(cx_rd(CX_NGD + NGD_STATUS) & 2u)) {
++		cx_wr(CX_NGD + NGD_INT_EN, NGD_INT_TX_SENT | NGD_INT_RX_RCVD | NGD_INT_ERRORS | (1u << 28));
++		cx_wr(CX_NGD + NGD_RX_MSGQ_CFG, cx_rd(CX_NGD + NGD_RX_MSGQ_CFG) | 0x10000u);
++		cx_wr(CX_NGD + NGD_CFG, 1u);
++		CX_LOG("NGD enabled (register FIFOs); waiting for the manager's capability message\n");
++		if (!cx_wait(b, 6, 0x00, -1, 1000)) {
++			CX_LOG("no MASTER_CAPABILITY in 1 s; status %#x int_stat %#x\n", cx_rd(CX_NGD + NGD_STATUS),
++			    cx_rd(CX_NGD + NGD_INT_STAT));
++			return;
++		}
++		const uint8_t sat[7] = { 7 | (6 << 5), 0x01, 0xff, 0xd9, 0xc5, 0x01, 0x01 };    /* REPORT_SATELLITE */
++		r = cx_tx(sat);
++		CX_LOG("REPORT_SATELLITE -> %d\n", r);
++		if (r) {
++			return;
++		}
++		(void)cx_rx(b, 100);
++	}
++	CX_LOG("NGD status %#x (bit 1 = logical address assigned)\n", cx_rd(CX_NGD + NGD_STATUS));
++
++	r = sweet_rpmh_lnbclk2_enable();
++	CX_LOG("codec MCLK (RPMh lnbclka2) -> %d\n", r);
++	if (!cx.rst) {
++		cx.rst = ml_io_map(CX_TLMM_NORTH_PA + CX_RESET_GPIO * 0x1000u, 0x1000u);
++	}
++	if (cx.rst) {
++		CX_LOG("reset gpio64 cfg %#x io %#x before\n", *(volatile uint32_t *)cx.rst, *(volatile uint32_t *)(cx.rst + 4));
++		cx_reset_pin(false);
++		au_sleep(20);
++		cx_reset_pin(true);
++		au_sleep(20);
++		CX_LOG("codec reset pulsed (low 20 ms, high)\n");
++	}
++	cx.la = 0xff;
++	for (unsigned k = 0; k < 10 && cx.la == 0xff; k++) {
++		uint8_t q[10] = { 10 | (2 << 5), 0x0d, 0xff, 0, 0, 0, 0, 0, 0, 0 };   /* ADDR_QUERY to the manager */
++		cx.tid = (uint8_t)((cx.tid + 1) & 0x3f);
++		q[3] = cx.tid;
++		memcpy(q + 4, cx_pgd_ea, 6);
++		if (cx_tx(q)) {
++			return;
++		}
++		unsigned n = cx_wait(b, 6, 0x0e, cx.tid, 300);
++		if (n >= 11 && memcmp(b + 4, "\0\0\0\0\0\0", 6)) {
++			cx.la = b[10];
++		} else {
++			au_sleep(100);
++		}
++	}
++	if (cx.la == 0xff) {
++		CX_LOG("the manager did not give the codec's logical address (not enumerated)\n");
++		return;
++	}
++	CX_LOG("codec PGD logical address %#x\n", cx.la);
++	uint16_t off = 0x800 + 0x21, ec = (uint16_t)(3 | 0x8 | ((off & 0xf) << 4) | ((off & 0xff0) << 4));   /* 4 bytes */
++	uint8_t rq[6] = { 6 | (0 << 5), 0x60, cx.la, 0, (uint8_t)ec, (uint8_t)(ec >> 8) };            /* REQUEST_VALUE */
++	cx.tid = (uint8_t)((cx.tid + 1) & 0x3f);
++	rq[3] = cx.tid;
++	if (cx_tx(rq)) {
++		return;
++	}
++	unsigned n = cx_wait(b, 0, 0x64, cx.tid, 300);
++	if (n >= 8) {
++		CX_LOG("THE CODEC ANSWERS: chip id bytes 0-3 = %02x %02x %02x %02x (minor %#x, major %#x)\n", b[4], b[5], b[6],
++		    b[7], b[4] | b[5] << 8, b[6] | b[7] << 8);
++	} else {
++		CX_LOG("no REPLY_VALUE for the chip id\n");
++	}
++}
++
++static int
++cx_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = 0, err;
++	if (req->newptr) {
++		char in[8] = { 0 };
++		size_t n = MIN(req->newlen, sizeof(in) - 1);
++		err = SYSCTL_IN(req, in, n);
++		if (err) {
++			return err;
++		}
++		if (n == sizeof(int) && in[0] >= 0 && in[0] < 10) {
++			memcpy(&v, in, sizeof(int));    /* an int (sweetsys) */
++		} else {
++			v = in[0] - '0';                /* or text ("1") */
++		}
++		if (v == 1) {
++			lck_mtx_lock(&au_mtx);
++			cx_step1();
++			lck_mtx_unlock(&au_mtx);
++		} else {
++			return EINVAL;
++		}
++	}
++	return SYSCTL_OUT(req, cx.log, strnlen(cx.log, sizeof(cx.log)) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_codec, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, cx_sysctl, "A",
++    "Mi 8 WCD9340: write 1 = SLIMbus up + chip id (3058); read = the last run's log");
++
+ static void
+ au_thread(void *arg, wait_result_t w)
+ {
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 26734d0..0e2958c 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -449,6 +449,44 @@ out:
+ 	return error;
+ }
+ 
++/*
++ * Mi 8 (dipper) WCD9340 MCLK, 3058: live DT audio_ext_clk_lnbb (qcom,audio-ref-clk) clocks = <&clock_rpmh 2> =
++ * RPMH_LN_BB_CLK2; clk-rpmh.c DEFINE_CLK_RPMH_VRM(sdm845, ln_bb_clk2, ..., "lnbclka2") votes 1 at the cmd-db address
++ * + CLK_RPMH_VRM_EN_OFFSET (4), like rfclka2 above. Active-set vote only, never voted off. Dipper only.
++ */
++int sweet_rpmh_lnbclk2_enable(void);
++int
++sweet_rpmh_lnbclk2_enable(void)
++{
++	if (!sweet_board_is("xiaomi,dipper")) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup("lnbclka2", &address);
++	}
++	if (!error) {
++		const uint32_t a[1] = { address + 4 }, v[1] = { 1 };
++		printf("SWEET RPMH: clock lnbclka2 enable at %#x\n", address + 4);
++		error = rh_cmds(a, v, 1);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: clock lnbclka2 enable failed errno=%d\n", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ /* Read-only: RSC geometry check, cmd-db lookup, no TCS access. */
+ int
+ sweet_rpmh_lookup(const char *res, uint32_t *address)
