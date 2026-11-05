@@ -616,6 +616,8 @@ def audio(root):
         print('StartRecorderServer off', os.path.relpath(conf, root))
     if int(VERSION.split('.')[0]) >= 26:
         speaker(root)
+        if enabled('torch'):       # the flashlight (cameracaptured); RENEGADE_NO_TORCH=1 opts out
+            torch(root)
 
 
 # The Mi 8's loudspeaker (NOTES.md 2026-11-04): tools/audio/SweetSpeaker/SweetSpeaker.driver in the HAL's plug-in folder
@@ -707,6 +709,58 @@ def speaker(root):
     if os.path.exists(mg):
         os.unlink(mg)
         print('speaker: removed the MobileGestalt cache (rewritten at boot with the ADT\'s closed-loop haptics)')
+
+
+# The flashlight (iOS 26; Mi 8: xnu 3050, sweethap=3, and /product/camera "flash" in the ADT for Control Center's
+# button): tools/sweetnet/sweettorch.dylib weak-linked into cameracaptured, where FigFlashlight lives. With no camera there
+# is no capture device vendor; the dylib gives FigFlashlight's code one whose torch level goes to kern.sweet_torch. On a
+# kernel or ADT without the flashlight it changes nothing (no button; a write the kernel refuses is only logged).
+TORCH_DYLIB = '/usr/local/lib/sweettorch.dylib'
+TORCH_BIN = 'usr/libexec/cameracaptured'
+TORCH_ORIG = 'private/var/root/torch-orig'
+
+
+def torch(root):
+    import subprocess, tempfile
+    sys.path.insert(0, HERE)
+    import pacstrip
+    binp = os.path.join(root, TORCH_BIN)
+    if not os.path.exists(binp):
+        print('torch: no', TORCH_BIN, 'in the image: skipped')
+        return
+    dylib = find_sweetnet('ios18/sweettorch.dylib')
+    if not dylib:
+        print('torch: sweettorch.dylib not built (tools/sweetnet/build.sh): skipped, cameracaptured left alone')
+        note_skip('torch', not_built() + '; cameracaptured left alone')
+        return
+    install_file(dylib, os.path.join(root, TORCH_DYLIB.lstrip('/')), 0o755)    # first: the binary must never name a missing dylib
+    if macho_has_dylib(binp, TORCH_DYLIB):
+        print('torch: cameracaptured already links', TORCH_DYLIB)
+        return
+    mode = os.stat(binp).st_mode & 0o7777
+    orig = os.path.join(root, TORCH_ORIG, 'cameracaptured')
+    if not os.path.exists(orig):
+        install_file(binp, orig, mode)
+    tmpd = tempfile.mkdtemp(prefix='renegade-torch-')
+    try:
+        tmp = os.path.join(tmpd, 'cameracaptured')
+        shutil.copyfile(binp, tmp)
+        os.chmod(tmp, 0o755)
+        ents, ident = entitlements_of(tmp) or {}, pacstrip.cs_identity(tmp)
+        subprocess.run([sys.executable, '-I', ADDLC, '--weak', '--make-room', tmp, TORCH_DYLIB], check=True)
+        rplat.adhoc_sign(tmp, ident[0], ident[2], plistlib.dumps(ents) if ents else None)
+        new = pacstrip.cs_identity(tmp)
+        if not new or new[:2] != ident[:2] or (ident[2] & ~new[2]) & ~pacstrip.CS_FLAG_IGNORED:
+            sys.exit('torch: identity or CS flags changed by the re-sign of cameracaptured: %s -> %s' % (ident, new))
+        if (entitlements_of(tmp) or {}) != ents:
+            sys.exit('torch: entitlements of cameracaptured changed by the re-sign: left alone')
+        if not macho_has_dylib(tmp, TORCH_DYLIB):
+            sys.exit('torch: LC_LOAD_WEAK_DYLIB missing after addlc.py')
+        install_file(tmp, binp, mode)
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+    print('torch: cameracaptured weak-links %s (re-signed ad hoc as %s, %d entitlements; original in /%s)' % (
+        TORCH_DYLIB, ident[0], len(ents), TORCH_ORIG))
 
 
 # Daemons that only crash-loop or quit at once on this bring-up while containermanagerd refuses every container lookup

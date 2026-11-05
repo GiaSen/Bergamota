@@ -64,11 +64,12 @@ Qualcomm ABL (stock, unlocked)
 | Wi-Fi | WCN3990: WPA2 join and internet, rejoins after a reboot, power save, the Settings switch works |
 | Bluetooth | The controller runs next to Wi-Fi and bluetoothd stays up; nearby devices show in Settings. Pairing and Bluetooth audio not tried yet |
 | Speaker | TAS2557 amp through the audio DSP. iOS plays through `SweetSpeaker.driver` with a speaker guard (high-pass, power and peak limits); the amp sleeps during silence |
-| Vibration | The PMI8998 haptics motor: CoreHaptics patterns and the system vibrations |
+| Vibration | The PMI8998 haptics motor: CoreHaptics patterns, the keyboard and the system vibrations |
+| Flashlight | Both rear LEDs from Control Center's button, through `sweettorch.dylib` in cameracaptured and the PMI8998 flash LED driver |
 | USB | CDC-ECM Ethernet: SSH at `root@192.168.7.2`, live kernel log on UDP 5140, internet shared from the Mac; iOS sees a cable at once |
 | Battery | Real fuel gauge and charger state, charging capped at 1.7 A (0.5 C); Bergamota fastboot charges too |
-| Kernel | Heartwood on **xnu-12377.121.6**, Mi 8 patches 3001–3049 |
-| Working on | Tuning the vibration strength |
+| Kernel | Heartwood on **xnu-12377.121.6**, Mi 8 patches 3001–3050 |
+| Next candidates | Microphone and earpiece; sensors (rotation, auto-brightness) |
 | Not working | Cellular, microphone, earpiece, camera, sensors (rotation, auto-brightness), fingerprint, SEP / Face ID. App Store and Weather stop at FairPlay |
 
 Every boot, crash and decision is in [`NOTES.md`](NOTES.md); the newest Mi 8 results are at the top of its Mi 8 section.
@@ -86,7 +87,7 @@ python3 tools/mkadt.py enxerto/out/dipper-n104-2x.adt --board dipper --highmem -
 python3 tools/adt-wlan.py enxerto/out/dipper-n104-2x.adt enxerto/out/dipper-n104-2x-wlan.adt
 python3 tools/adt-gpufw.py enxerto/out/dipper-n104-2x-wlan.adt enxerto/out/dipper-n104-2x-wlan-gpu.adt \
     --fw research/gpu-fw/dipper --zap research/gpu-fw/dipper
-# an ADT made before mkadt.py copied /product/haptics (it does now) gets it with:
+# an ADT made before mkadt.py copied /product/haptics and /product/camera "flash" (it does now) gets them with:
 python3 tools/adt-haptics.py enxerto/out/dipper-n104-2x-wlan-gpu.adt enxerto/out/dipper-n104-2x-wlan-gpu-hap.adt
 
 # iOS root (RENEGADE_TARGET=ios26 is the default): Chlorophyll, Bluetooth firmware, the speaker, quieter daemons
@@ -276,7 +277,7 @@ It does this for every Mach-O in the root and for all of the dyld shared cache. 
 | `tools/mkadt.py`, `mkpayload.py` | Apple Device Tree generator; kernel + ADT + boot-args payload packer |
 | `tools/sweetnet/` | Small on-device tools (`sweetps`, `sweetprefs`, `sweetuicache`, …) |
 | `tools/dipper-mkboot.sh` | The Mi 8 boot image with its current boot-args and ADT |
-| `tools/adt-wlan.py`, `adt-haptics.py` | Wi-Fi node and `/product/haptics` (iOS's vibration route) into an ADT |
+| `tools/adt-wlan.py`, `adt-haptics.py` | Wi-Fi node; `/product/haptics` and `/product/camera` "flash" (iOS's vibration route and flashlight button) into an ADT |
 | `tools/audio/` | `SweetSpeaker.driver` (the speaker and vibration motor as Core Audio devices, with the speaker guard), TAS2557 amp scripts from TI's firmware |
 | `gpu/metal/` | Chlorophyll, Metal on the Adreno 630 (submodule) |
 | `tools/identity/` | The Bergamota identity (Newton halftone, lime ground, Archivo + JetBrains Mono): `mkidentity.py` generates Enxerto's `art.h` and the kernel console's portrait, `mkicon.sh` the app icon |
@@ -288,4 +289,4 @@ Not in git: partition backups, device trees, Apple firmware and root images, or 
 
 ## Credits
 
-The Mi 8 port is a fork of [Bergamota](https://github.com/ry-diffusion/Bergamota) (Poco F1), which itself started as a fork of [ios-sweet](https://github.com/dipa-studio/ios-sweet) (iOS 16 on the Redmi Note 10 Pro). The iOS 16 days of this port are in [`docs/IOS16_README.md`](docs/IOS16_README.md). The route to iOS's vibration (`/product/haptics`) and the speaker guard's design come from HakiOS ([oosexgang/hakios-xnu-kernel](https://github.com/oosexgang/hakios-xnu-kernel)); our code for them is our own. It is built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build) and [ipsw](https://github.com/blacktop/ipsw), the Linux kernel's SDM845 drivers (and LineageOS's Mi 8 kernel) for the hardware details, [Mesa](https://mesa3d.org)'s Turnip for Chlorophyll, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
+The Mi 8 port is a fork of [Bergamota](https://github.com/ry-diffusion/Bergamota) (Poco F1), which itself started as a fork of [ios-sweet](https://github.com/dipa-studio/ios-sweet) (iOS 16 on the Redmi Note 10 Pro). The iOS 16 days of this port are in [`docs/IOS16_README.md`](docs/IOS16_README.md). The route to iOS's vibration (`/product/haptics`), the flashlight's way in through the capture device vendor, and the speaker guard's design come from HakiOS ([oosexgang/hakios-xnu-kernel](https://github.com/oosexgang/hakios-xnu-kernel)); our code for them is our own. It is built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build) and [ipsw](https://github.com/blacktop/ipsw), the Linux kernel's SDM845 drivers (and LineageOS's Mi 8 kernel) for the hardware details, [Mesa](https://mesa3d.org)'s Turnip for Chlorophyll, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.

@@ -89,6 +89,12 @@ if [ "${IOS18:-1}" = 1 ]; then
 		-install_name /usr/local/lib/sweetpb26.dylib -framework Foundation "$here/sweetpb26.m" -o "$out18/sweetpb26.dylib"
 	codesign -s - -f "$out18/sweetpb26.dylib"
 	python3 -I "$pacstrip" --sign "$out18/sweetpb26.dylib"
+	# iOS 26: the flashlight in cameracaptured (FigFlashlight gets a vendor whose torch level goes to kern.sweet_torch)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -Wno-objc-designated-initializers -fobjc-arc \
+		-dynamiclib -install_name /usr/local/lib/sweettorch.dylib -framework Foundation "$here/sweettorch.m" \
+		-o "$out18/sweettorch.dylib"
+	codesign -s - -f "$out18/sweettorch.dylib"
+	python3 -I "$pacstrip" --sign "$out18/sweettorch.dylib"
 	b18 sweeticonstyle sweeticonstyle.m iconstyle.entitlements -framework UIKit
 	b18 sweetopen sweetopen.m uicache.entitlements
 	# remote testing over SSH: screenshot of the panel (PNG) and synthetic touch/buttons
