@@ -1,0 +1,307 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 759ef60..706de3e 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -5519,6 +5519,277 @@ wf_teardown(void)
+ 	}
+ }
+ 
++/*
++ * ---- 3057: QMI pass-through to the modem's services, for telephony bring-up from user space.
++ * The modem's name-service announcements (NEW/DEL_SERVER) are kept in qsvc[] (kern.sweet_qmi_services). One request
++ * per sysctl call (kern.sweet_qmi, root): in {u32 service, u32 instance or 0xffffffff, QMI message: u8 type, u16 txn,
++ * u16 msg, u16 len, TLVs}; the service thread sends it from client port QRTR_QMI_PORT with its own transaction id and
++ * fixes the length, and the matching response (type 2) is the old value. Over QRTR each port is its own QMI client,
++ * so no client id is allocated. One request at a time (EBUSY), 5 s timeout. Indications (type 4) sent to our port go
++ * to a ring (kern.sweet_qmi_ind). What a request does is up to the caller: this code only carries bytes.
++ */
++#define QRTR_QMI_PORT           0x4004u
++#define QSVC_MAX                96u
++#define QP_REQ_MAX              1024u
++#define QP_RSP_MAX              8192u
++#define QP_IND_RING             16u
++#define QP_IND_MAX              2048u
++static struct qsvc_entry {
++	uint32_t svc, vi, node, port;           /* vi: version | instance << 8, as announced */
++} qsvc[QSVC_MAX];
++static unsigned nqsvc;
++static LCK_GRP_DECLARE(qp_grp, "sweet_qmi");
++static LCK_MTX_DECLARE(qp_lock, &qp_grp);
++static struct {
++	bool busy, queued, sent, done;
++	uint32_t svc, inst, node, port, req_len, rsp_len;
++	uint16_t txn;
++	int err;
++	uint64_t sent_ms, requests, responses, timeouts, indications;
++	uint8_t req[QP_REQ_MAX], rsp[QP_RSP_MAX];
++	struct {
++		uint64_t ms;
++		uint32_t svc, len;
++		uint8_t b[QP_IND_MAX];
++	} ind[QP_IND_RING];
++	uint32_t ind_head;
++} qp;
++
++static void
++qsvc_note(const uint32_t s[5], bool add)
++{
++	unsigned i;
++	lck_mtx_lock(&qp_lock);
++	for (i = 0; i < nqsvc; i++) {
++		if (qsvc[i].node == s[3] && qsvc[i].port == s[4]) {
++			break;
++		}
++	}
++	if (add && (i < nqsvc || nqsvc < QSVC_MAX)) {
++		if (i == nqsvc) {
++			nqsvc++;
++		}
++		qsvc[i] = (struct qsvc_entry){ s[1], s[2], s[3], s[4] };
++	} else if (!add && i < nqsvc) {
++		qsvc[i] = qsvc[--nqsvc];
++	}
++	lck_mtx_unlock(&qp_lock);
++}
++
++/* service thread: send a queued request, or give up on one that was not answered */
++static void
++qp_pump(void)
++{
++	if (!qp.queued && !(qp.sent && !qp.done)) {
++		return;
++	}
++	lck_mtx_lock(&qp_lock);
++	if (qp.queued) {
++		unsigned i;
++		qp.queued = false;
++		for (i = 0; i < nqsvc; i++) {
++			if (qsvc[i].svc == qp.svc && (qp.inst == 0xffffffffu || (qsvc[i].vi >> 8) == qp.inst)) {
++				break;
++			}
++		}
++		if (i == nqsvc) {
++			qp.err = ENOENT;
++			qp.done = true;
++			thread_wakeup(&qp);
++		} else {
++			qp.node = qsvc[i].node;
++			qp.port = qsvc[i].port;
++			qp.txn = (uint16_t)(qp.txn + 1);
++			if (qp.txn == 0) {
++				qp.txn = 1;
++			}
++			memcpy(qp.req + 1, &qp.txn, 2);
++			qp.sent = true;
++			qp.sent_ms = ms_now_ms();
++			qp.requests++;
++			if (!ipc_qrtr_send(Q_DATA, QRTR_QMI_PORT, qp.node, qp.port, qp.req, qp.req_len)) {
++				qp.err = EIO;
++				qp.done = true;
++				thread_wakeup(&qp);
++			}
++		}
++	} else if (qp.sent && !qp.done && ms_now_ms() > qp.sent_ms + 5000) {
++		qp.timeouts++;
++		qp.err = ETIMEDOUT;
++		qp.done = true;
++		thread_wakeup(&qp);
++	}
++	lck_mtx_unlock(&qp_lock);
++}
++
++static void
++qp_rx(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len)
++{
++	uint16_t txn;
++	if (len < 7) {
++		return;
++	}
++	memcpy(&txn, p + 1, 2);
++	lck_mtx_lock(&qp_lock);
++	if (p[0] == 2 && qp.sent && !qp.done && txn == qp.txn && node == qp.node && port == qp.port) {
++		qp.rsp_len = MIN(len, QP_RSP_MAX);
++		memcpy(qp.rsp, p, qp.rsp_len);
++		qp.err = 0;
++		qp.done = true;
++		qp.responses++;
++		thread_wakeup(&qp);
++	} else if (p[0] == 4) {
++		uint32_t svc = 0;
++		for (unsigned i = 0; i < nqsvc; i++) {
++			if (qsvc[i].node == node && qsvc[i].port == port) {
++				svc = qsvc[i].svc;
++				break;
++			}
++		}
++		__typeof__(qp.ind[0]) *e = &qp.ind[qp.ind_head % QP_IND_RING];
++		e->ms = ms_now_ms();
++		e->svc = svc;
++		e->len = MIN(len, QP_IND_MAX);
++		memcpy(e->b, p, e->len);
++		qp.ind_head++;
++		qp.indications++;
++	} else {
++		printf("SWEET QMI: %u-byte message type %u txn %u from %u:%#x not expected\n", len, p[0], txn, node, port);
++	}
++	lck_mtx_unlock(&qp_lock);
++}
++
++static int
++sweet_qmi_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int error, err;
++	uint8_t *in, *out = NULL;
++	uint32_t n, out_len = 0;
++	uint64_t deadline;
++
++	if (!req->newptr || req->newlen < 8 + 7 || req->newlen > 8 + QP_REQ_MAX) {
++		return EINVAL;
++	}
++	n = (uint32_t)req->newlen;
++	in = kalloc_data(n, Z_WAITOK);
++	if (!in) {
++		return ENOMEM;
++	}
++	error = SYSCTL_IN(req, in, n);
++	if (error) {
++		kfree_data(in, n);
++		return error;
++	}
++	lck_mtx_lock(&qp_lock);
++	if (qp.busy) {
++		lck_mtx_unlock(&qp_lock);
++		kfree_data(in, n);
++		return EBUSY;
++	}
++	qp.busy = true;
++	memcpy(&qp.svc, in, 4);
++	memcpy(&qp.inst, in + 4, 4);
++	qp.req_len = n - 8;
++	memcpy(qp.req, in + 8, qp.req_len);
++	qp.req[0] = 0;                          /* QMI_REQUEST */
++	uint16_t body = (uint16_t)(qp.req_len - 7);
++	memcpy(qp.req + 5, &body, 2);
++	qp.sent = false;
++	qp.done = false;
++	qp.err = 0;
++	qp.queued = true;
++	lck_mtx_unlock(&qp_lock);
++	kfree_data(in, n);
++	thread_wakeup(&wl.sleep_chan);
++
++	clock_interval_to_deadline(6000, NSEC_PER_MSEC, &deadline);
++	lck_mtx_lock(&qp_lock);
++	while (!qp.done) {
++		if (lck_mtx_sleep_deadline(&qp_lock, LCK_SLEEP_DEFAULT, (event_t)&qp, THREAD_UNINT, deadline) == THREAD_TIMED_OUT) {
++			break;
++		}
++	}
++	err = qp.done ? qp.err : ETIMEDOUT;     /* not done: the service thread is not running */
++	if (!err) {
++		out_len = qp.rsp_len;
++		out = kalloc_data(out_len, Z_WAITOK);
++		if (out) {
++			memcpy(out, qp.rsp, out_len);
++		} else {
++			err = ENOMEM;
++		}
++	}
++	qp.queued = false;
++	qp.done = true;                         /* a late answer is dropped */
++	qp.busy = false;
++	lck_mtx_unlock(&qp_lock);
++	if (err) {
++		return err;
++	}
++	error = SYSCTL_OUT(req, out, out_len);
++	kfree_data(out, out_len);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_qmi, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sweet_qmi_sysctl, "S",
++    "QMI request to a modem service: in u32 service, u32 instance (~0 any), QMI message; out the response (3057)");
++
++static int
++sweet_qmi_services_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char *buf = kalloc_data(4096, Z_WAITOK | Z_ZERO);
++	size_t off = 0;
++	int error;
++	if (!buf) {
++		return ENOMEM;
++	}
++	lck_mtx_lock(&qp_lock);
++	off += (size_t)snprintf(buf, 4096, "requests %llu responses %llu timeouts %llu indications %llu\n", qp.requests,
++	    qp.responses, qp.timeouts, qp.indications);
++	for (unsigned i = 0; i < nqsvc && off < 4000; i++) {
++		off += (size_t)snprintf(buf + off, 4096 - off, "%#x v%u i%u %u:%#x\n", qsvc[i].svc, qsvc[i].vi & 0xff,
++		    qsvc[i].vi >> 8, qsvc[i].node, qsvc[i].port);
++	}
++	lck_mtx_unlock(&qp_lock);
++	error = SYSCTL_OUT(req, buf, strnlen(buf, 4096) + 1);
++	kfree_data(buf, 4096);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_qmi_services, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sweet_qmi_services_sysctl, "A", "modem QMI services: service version instance node:port (3057)");
++
++/* out: u32 count, then per indication oldest first {u64 ms, u32 service, u32 len, len bytes} */
++static int
++sweet_qmi_ind_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint32_t cap = 4 + QP_IND_RING * (16 + QP_IND_MAX), off = 4, cnt = 0;
++	uint8_t *buf = kalloc_data(cap, Z_WAITOK);
++	int error;
++	if (!buf) {
++		return ENOMEM;
++	}
++	lck_mtx_lock(&qp_lock);
++	uint32_t first = qp.ind_head > QP_IND_RING ? qp.ind_head - QP_IND_RING : 0;
++	for (uint32_t k = first; k < qp.ind_head; k++) {
++		__typeof__(qp.ind[0]) *e = &qp.ind[k % QP_IND_RING];
++		memcpy(buf + off, &e->ms, 8);
++		memcpy(buf + off + 8, &e->svc, 4);
++		memcpy(buf + off + 12, &e->len, 4);
++		memcpy(buf + off + 16, e->b, e->len);
++		off += 16 + e->len;
++		cnt++;
++	}
++	lck_mtx_unlock(&qp_lock);
++	memcpy(buf, &cnt, 4);
++	error = SYSCTL_OUT(req, buf, off);
++	kfree_data(buf, cap);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_qmi_ind, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_qmi_ind_sysctl,
++    "S", "the last 16 QMI indications to the pass-through port (3057)");
++
+ static void
+ ipc_qrtr_rx(const uint8_t *p, uint32_t len)
+ {
+@@ -5573,6 +5844,7 @@ ipc_qrtr_rx(const uint8_t *p, uint32_t len)
+ 			    type == Q_NEW_SERVER ? "modem offers" : "modem removes", s[1], s[1], s[2] & 0xff, s[2] >> 8, s[3],
+ 			    s[4]);
+ 			ipc_note(" %csvc %#x/%u@%u:%#x;", type == Q_NEW_SERVER ? '+' : '-', s[1], s[2] >> 8, s[3], s[4]);
++			qsvc_note(s, type == Q_NEW_SERVER);
+ 			if (s[1] == WLFW_SERVICE && type == Q_NEW_SERVER) {
+ 				ipc.wlfw_seen = true;
+ 				printf("SWEET IPC: WLFW is up at %u:%#x: the WLAN PD runs\n", s[3], s[4]);
+@@ -5589,6 +5861,8 @@ ipc_qrtr_rx(const uint8_t *p, uint32_t len)
+ 			pdm_rx(snode, sport, pl, size);
+ 		} else if (ipc.wlfw && dport == WLFW_PORT_LOCAL) {
+ 			wf_rx(snode, sport, pl, size);
++		} else if (dport == QRTR_QMI_PORT) {
++			qp_rx(snode, sport, pl, size);
+ 		} else if (tftp_rx(dport, snode, sport, pl, size)) {
+ 			/* TFTP server or one of its transfers */
+ 		} else {
+@@ -7339,6 +7613,7 @@ ms_ipc_run(unsigned hold_s)
+ 		ipc_flush();
+ 		tftp_pump();
+ 		wf_poll();
++		qp_pump();
+ 		if (ipc.open_acked && !ipc.announced && ms_now_ms() > ipc.open_ms + 3000) {
+ 			printf("SWEET IPC: qrtr: no hello from the modem 3 s after IPCRTR opened: sending ours\n");
+ 			ipc_qrtr_announce();
