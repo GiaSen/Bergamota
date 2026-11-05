@@ -1329,7 +1329,31 @@ def chlorophyll(root):
         write_file(logp, '', 0o666)
     print('chlorophyll: flags', ', '.join(CHL_FLAGS + CHL_OFF), 'in /private/var/tmp; bgmtl.log 0666')
     chlorophyll_jetsam(root)
+    icon_metal_cache(root)
     return True
+
+
+def icon_metal_cache(root):
+    """Metal keeps the functions MTLCompilerService specialises for a process in <cache dir>/<bundle id>/com.apple.metal. The
+    cache dir comes from the process's data container, and when that lookup fails (containermanagerd refuses every one on
+    this port) from $HOME/Library/Caches. iconservicesagent runs as _iconservices, home /var/empty, which has no Library:
+    "Failed to get cache main folder", and every glass-icon render specialised its shaders again (Mi 8, 2026-11-05: 67
+    compiles, 3.4 s of CPU, for six home page flicks; then none, once the folder existed). The folder, the user's own."""
+    uid = None
+    for line in open(os.path.join(root, 'private/etc/passwd'), errors='replace'):
+        f = line.split(':')
+        if f[0] == '_iconservices' and len(f) > 3:
+            uid, gid = int(f[2]), int(f[3])
+    if uid is None:
+        print('icon metal cache: no _iconservices in /etc/passwd: skipped')
+        return
+    lib = os.path.join(root, 'private/var/empty/Library')
+    cache = os.path.join(lib, 'Caches')
+    os.makedirs(cache, exist_ok=True)
+    for d in (lib, cache):
+        os.chown(d, uid, gid)
+        os.chmod(d, 0o755)
+    print('icon metal cache: /private/var/empty/Library/Caches for _iconservices (%d): Metal keeps its compiled shaders' % uid)
 
 
 FIRSTBOOT_LABEL = 'org.bergamota.renegade-firstboot'

@@ -132,6 +132,10 @@ if [ "${IOS18:-1}" = 1 ]; then
 		-o "$out18/sweetvibe"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetvibe"
 	python3 -I "$pacstrip" --sign "$out18/sweetvibe"
+	# Reduce Motion / Reduce Transparency over SSH (libAccessibility's setters, as mobile): A/B of what the effects cost
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetax.c" -lAccessibility -o "$out18/sweetax"
+	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetax"
+	python3 -I "$pacstrip" --sign "$out18/sweetax"
 	# CoreHaptics over SSH: taps + a buzz or an AHAP file, through audiomxd's haptic server to the Actuator device
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -fobjc-arc -framework Foundation \
 		-framework CoreHaptics "$here/sweethaptic.m" -o "$out18/sweethaptic"
