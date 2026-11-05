@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""Copy the real iPhone's /product/haptics node into an Apple Device Tree that has a /product node without it.
+"""Copy the real iPhone's /product/haptics node into an Apple Device Tree that has a /product node without it, and add a
+/product/camera node holding only the iPhone's "flash" property.
   adt-haptics.py IN.adt OUT.adt [--from research/ios26/n104ap.adt]
+MobileGestalt's camera-flash comes from /product/camera "flash": with it Control Center shows the flashlight button and
+FigFlashlight (cameracaptured) offers a torch (the Mi 8's: xnu 3050 + sweettorch.dylib). The iPhone's other camera
+properties are left out on purpose: this phone has no camera for them to describe.
 MobileGestalt reads DeviceSupportsClosedLoopHaptics from /product/haptics "closed-loop": with it iOS plays the system's
 vibrations and feedbacks as waveforms on the audio HAL's "Actuator" device (SweetSpeaker.driver), without it it looks
 for an old vibration motor in IOKit (found by HakiOS, xnuloader/mkidentity.py; docs/FORKS_SURVEY.md G9). The node's
@@ -59,6 +63,19 @@ def main():
     n.props.append(('AAPL,phandle', 0, struct.pack('<I', ph)))
     n.children = []
     product.children.append(n)
+    scam = child(sproduct, 'camera')
+    flash = next((v for k, f, v in scam.props if k == 'flash' and not f), None) if scam is not None else None
+    if flash is None:
+        sys.exit('%s: no /product/camera "flash"' % a.src)
+    oldcam = child(product, 'camera')
+    if oldcam is not None:
+        product.children.remove(oldcam)
+    cam = adt.Node()
+    cam.props = [('name', 0, b'camera\0'), ('flash', 0, flash), ('AAPL,phandle', 0, struct.pack('<I', ph + 1))]
+    cam.children = []
+    product.children.append(cam)
+    print('%s: /product/camera with only "flash" %s, phandle %#x%s' % (a.out, flash.hex(), ph + 1,
+          ', replacing the old one' if oldcam is not None else ''))
     open(a.out, 'wb').write(adt.serialize(root))
     print('%s: /product/haptics (%s) from %s, phandle %#x%s' % (a.out, ', '.join(k for k, f, v in n.props if k not in ('name', 'AAPL,phandle')),
           os.path.basename(a.src), ph, ', replacing the old one' if old is not None else ''))

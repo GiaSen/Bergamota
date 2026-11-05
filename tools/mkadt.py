@@ -126,6 +126,21 @@ def product_haptics(path):
     return None
 
 
+def product_camera_flash(path):
+    """/product/camera "flash" of the real device tree, or None: MobileGestalt's camera-flash (Control Center's flashlight
+    button; the Mi 8's torch is xnu 3050 + sweettorch.dylib). Only that property: this port has no camera."""
+    if not os.path.exists(path):
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
+            for h in c.children:
+                props = dict((k, v) for k, f, v in h.props if not f)
+                if props.get('name') == b'camera\0' and 'flash' in props:
+                    return props['flash']
+    return None
+
+
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
@@ -349,9 +364,10 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
     # (Found by MakrSas/ios-topaz, commit 3eacb48f7.)
     if product_props:
         product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
-    haptics = product_haptics(ident['adt'])
-    product = [node('product', [ph()] + product_props, [node('haptics', [ph()] + haptics)] if haptics else [])] \
-        if product_props else []
+    haptics, flash = product_haptics(ident['adt']), product_camera_flash(ident['adt'])
+    pchildren = ([node('haptics', [ph()] + haptics)] if haptics else []) + \
+        ([node('camera', [ph(), ('flash', flash)])] if flash is not None else [])
+    product = [node('product', [ph()] + product_props, pchildren)] if product_props else []
 
     # Identity of the iPhone whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP / N104AP), model is hw.machine/hw.product

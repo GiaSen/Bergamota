@@ -1,0 +1,295 @@
+diff --git a/bsd/dev/dipper_haptics.c b/bsd/dev/dipper_haptics.c
+index cabb169..74ff34c 100644
+--- a/bsd/dev/dipper_haptics.c
++++ b/bsd/dev/dipper_haptics.c
+@@ -6,13 +6,22 @@
+  * is drivers/leds/leds-qpnp-haptics.c (LineageOS android_kernel_xiaomi_sdm845); left out here: auto-resonance (its enable
+  * is in the secure TEST2 register), buffer-mode patterns, the play and short-circuit interrupts.
+  *
+- * OFF by default: boot-arg sweethap=1 (short: the boot-args field holds 607 bytes). Then, once SPMI is up:
++ * OFF by default: boot-arg sweethap=1 (short: the boot-args field holds 607 bytes; bit 1 adds the flashlight, below).
++ * Then, once SPMI is up:
+  *   kern.sweet_haptic   write struct { u32 ms; u32 mv; }: vibrate for ms (at most HAP_MAX_MS; a write while it runs
+  *                       moves its end and may change the strength) at mv (VMAX, 116..HAP_VMAX_MAX_MV); ms 0 stops.
+  *                       Any user may write it: SweetSpeaker.driver plays iOS's haptics from audiomxd (user mobile).
+  *                       Read: the state and counters, as text.
+  * Once configured it publishes AHSFirmwareReadyNotifier (SweetHaptics.cpp), without which audiomxd's haptic server
+  * (CoreHaptics, UIKit feedbacks, system vibrations) never initialises.
++ *
++ * Patch 3050, the flashlight: the PMI8998 flash LED block (qcom,leds@d300 on SID 3, qcom,qpnp-flash-led-v2) in torch mode,
++ * both LEDs of led_switch_0 (mask 0x03; the cameras' torch-source torch_0/torch_1: max-current 300 mA, Android's
++ * default 75 mA each). Android's driver is drivers/leds/leds-qpnp-flash-v2.c: switch on = IRES 12.5 mA steps, software
++ * strobe, the target current, the safety timer off (torch), the module on, then the LEDs; off in the reverse order.
++ * Bit 1 of the boot-arg: sweethap=3 = vibration + flashlight, sweethap=2 = flashlight alone. Then:
++ *   kern.sweet_torch    write u32 level 0..1000 (thousandths of TOR_MAX_MA per LED; 0 off), any user (cameracaptured,
++ *                       user mobile, sets iOS's torch level); read: the state, the level and the block's status, as text.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -54,6 +63,26 @@ void dipper_haptics_init(void);
+ #define HAP_VMAX_MAX_MV         3100u                   /* qcom,vmax-mv */
+ #define HAP_MAX_MS              1000u
+ 
++#define HAP_ON_HAPTICS          0x1u                    /* sweethap bits */
++#define HAP_ON_TORCH            0x2u
++
++#define TOR_BASE                0xd300u                 /* qcom,leds@d300 */
++#define TOR_STATUS1             (TOR_BASE + 0x08)
++#define TOR_STATUS2             (TOR_BASE + 0x09)
++#define TOR_SAFETY_TMR(n)       (TOR_BASE + 0x40 + (n)) /* 0x13: off (torch) */
++#define TOR_TGR_CURRENT(n)      (TOR_BASE + 0x43 + (n)) /* bits 6:0: mA / IRES - 1 */
++#define TOR_MOD_CTRL            (TOR_BASE + 0x46)       /* bit 7 module enable */
++#define TOR_IRES                (TOR_BASE + 0x47)       /* 2 bits per LED: 0 = 12.5 mA steps */
++#define TOR_STROBE_CTRL(n)      (TOR_BASE + 0x49 + (n)) /* bit 2: 0 = software strobe */
++#define TOR_EN_LED_CTRL         (TOR_BASE + 0x4c)       /* bit n: LED n on */
++#define TOR_HDRM_PRGM(n)        (TOR_BASE + 0x4d + (n)) /* read only here */
++#define TOR_LEDS                0x03u                   /* led_switch_0 qcom,led-mask */
++#define TOR_NLEDS               2u
++#define TOR_IRES_UA             12500u
++#define TOR_SAFETY_TMR_OFF      0x13u
++#define TOR_MAX_MA              150u                    /* per LED at level 1000: half the DT's torch max-current 300 */
++#define TOR_LEVEL_MAX           1000u
++
+ static struct {
+ 	bool live, playing, bad;
+ 	uint8_t vmax_code;
+@@ -62,6 +91,11 @@ static struct {
+ 	thread_call_t stop;
+ } hap;
+ 
++static struct {
++	bool live, on;
++	uint32_t level, ons, errors;
++} tor;
++
+ static LCK_GRP_DECLARE(hap_lck_grp, "sweethaptics");
+ static LCK_MTX_DECLARE(hap_mtx, &hap_lck_grp);
+ 
+@@ -208,21 +242,178 @@ hap_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_haptic, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
+     hap_sysctl, "S", "Mi 8 vibration motor: u32 ms [+ u32 mV] in, the state out (bsd/dev/dipper_haptics.c)");
+ 
++/* ---- the flashlight (3050) ---- */
++
++static int
++tor_wr(unsigned addr, uint8_t v)
++{
++	int e = sweet_spmi_write(HAP_SID, addr, &v, 1);
++	if (e) {
++		tor.errors++;
++	}
++	return e;
++}
++
++static int
++tor_update(unsigned addr, uint8_t mask, uint8_t v)
++{
++	uint8_t old = 0;
++	if (sweet_spmi_read(HAP_SID, addr, &old) != 0) {
++		tor.errors++;
++		return -1;
++	}
++	return tor_wr(addr, (uint8_t)((old & ~mask) | (v & mask)));
++}
++
++/* get_current_reg_code(): mA / IRES - 1, rounded; at least the 12.5 mA step */
++static uint8_t
++tor_code(uint32_t level)
++{
++	uint32_t ua = level * TOR_MAX_MA;                       /* level/1000 * TOR_MAX_MA mA = level * TOR_MAX_MA uA */
++	uint32_t steps = (ua + TOR_IRES_UA / 2) / TOR_IRES_UA;
++	return (uint8_t)(steps > 1 ? steps - 1 : 0);
++}
++
++/* qpnp_flash_led_switch_disable(): LEDs off, module off, current 0, safety timer off; hap_mtx held */
++static void
++tor_off(void)
++{
++	(void)tor_update(TOR_EN_LED_CTRL, TOR_LEDS, 0);
++	(void)tor_update(TOR_MOD_CTRL, 0x80, 0);
++	for (unsigned n = 0; n < TOR_NLEDS; n++) {
++		(void)tor_update(TOR_TGR_CURRENT(n), 0x7f, 0);
++		(void)tor_wr(TOR_SAFETY_TMR(n), TOR_SAFETY_TMR_OFF);
++	}
++	tor.on = false;
++	tor.level = 0;
++}
++
++/* qpnp_flash_led_switch_set(on) for led_switch_0 in torch mode, or a new level while on; hap_mtx held */
++static int
++tor_set(uint32_t level)
++{
++	uint8_t code = tor_code(level);
++	if (tor.on) {
++		for (unsigned n = 0; n < TOR_NLEDS; n++) {
++			if (tor_update(TOR_TGR_CURRENT(n), 0x7f, code) != 0) {
++				tor_off();
++				return EIO;
++			}
++		}
++		tor.level = level;
++		return 0;
++	}
++	bool ok = tor_update(TOR_IRES, 0x0f, 0x00) == 0;        /* 12.5 mA steps for LED1 and LED2 */
++	for (unsigned n = 0; ok && n < TOR_NLEDS; n++) {
++		ok = tor_update(TOR_STROBE_CTRL(n), 0x04, 0x00) == 0 &&    /* software strobe */
++		    tor_update(TOR_TGR_CURRENT(n), 0x7f, code) == 0 &&
++		    tor_wr(TOR_SAFETY_TMR(n), TOR_SAFETY_TMR_OFF) == 0;
++	}
++	ok = ok && tor_update(TOR_MOD_CTRL, 0x80, 0x80) == 0 && tor_update(TOR_EN_LED_CTRL, TOR_LEDS, TOR_LEDS) == 0;
++	if (!ok) {
++		tor_off();
++		return EIO;
++	}
++	tor.on = true;
++	tor.level = level;
++	tor.ons++;
++	return 0;
++}
++
++static void
++tor_status(char *text, size_t len, const char *what)
++{
++	uint8_t st1 = 0, st2 = 0, mod = 0, en = 0, ires = 0, cur[TOR_NLEDS] = { 0 }, hdrm[TOR_NLEDS] = { 0 };
++	(void)sweet_spmi_read(HAP_SID, TOR_STATUS1, &st1);
++	(void)sweet_spmi_read(HAP_SID, TOR_STATUS2, &st2);
++	(void)sweet_spmi_read(HAP_SID, TOR_MOD_CTRL, &mod);
++	(void)sweet_spmi_read(HAP_SID, TOR_EN_LED_CTRL, &en);
++	(void)sweet_spmi_read(HAP_SID, TOR_IRES, &ires);
++	for (unsigned n = 0; n < TOR_NLEDS; n++) {
++		(void)sweet_spmi_read(HAP_SID, TOR_TGR_CURRENT(n), &cur[n]);
++		(void)sweet_spmi_read(HAP_SID, TOR_HDRM_PRGM(n), &hdrm[n]);
++	}
++	snprintf(text, len, "%s %s, level %u of %u (%u.%u mA per LED, %u max), %u times on, %u SPMI errors; STATUS1 %#x "
++	    "STATUS2 %#x MOD %#x EN %#x IRES %#x TGR %#x %#x HDRM %#x %#x\n", what, tor.on ? "on" : "off", tor.level,
++	    TOR_LEVEL_MAX, tor.on ? ((cur[0] & 0x7fu) + 1u) * 125u / 10u : 0u, tor.on ? ((cur[0] & 0x7fu) + 1u) * 125u % 10u : 0u,
++	    TOR_MAX_MA, tor.ons, tor.errors, st1, st2, mod, en, ires, cur[0], cur[1], hdrm[0], hdrm[1]);
++}
++
++static int
++tor_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (!tor.live) {
++		return ENXIO;
++	}
++	int err = 0;
++	if (req->newptr != USER_ADDR_NULL) {
++		uint32_t level = 0;
++		if (req->newlen != sizeof(level)) {
++			return EINVAL;
++		}
++		if ((err = SYSCTL_IN(req, &level, sizeof(level)))) {
++			return err;
++		}
++		level = MIN(level, TOR_LEVEL_MAX);
++		lck_mtx_lock(&hap_mtx);
++		if (!level) {
++			if (tor.on) {
++				tor_off();
++			}
++		} else {
++			err = tor_set(level);
++		}
++		lck_mtx_unlock(&hap_mtx);
++		if (err) {
++			return err;
++		}
++	}
++	char text[256];
++	lck_mtx_lock(&hap_mtx);
++	tor_status(text, sizeof(text), "torch");
++	lck_mtx_unlock(&hap_mtx);
++	return SYSCTL_OUT(req, text, strlen(text) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_torch, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
++    tor_sysctl, "S", "Mi 8 flashlight: u32 level 0..1000 in (0 off), the state out (bsd/dev/dipper_haptics.c)");
++
++static bool
++tor_config(void)
++{
++	if (sweet_spmi_prepare_write(HAP_SID, TOR_EN_LED_CTRL) != 0) {
++		return false;                                   /* not ours (EE ownership) or no APID: logged there */
++	}
++	tor_off();                                              /* a known state: nothing lit */
++	char text[256];
++	tor_status(text, sizeof(text), "SWEET HAPTICS: PMI8998 flash LED block, torch");
++	printf("%s", text);
++	return tor.errors == 0;
++}
++
+ static void
+ hap_thread(void *arg, wait_result_t w)
+ {
+-	(void)arg;
++	unsigned on = (unsigned)(uintptr_t)arg;
+ 	(void)w;
+ 	for (unsigned i = 0; i < 60 && sweet_spmi_init() != 0; i++) {
+ 		delay(1000 * 1000);
+ 	}
+-	hap.stop = thread_call_allocate(hap_stop_call, NULL);
+-	lck_mtx_lock(&hap_mtx);
+-	hap.live = hap.stop && hap_config();
+-	lck_mtx_unlock(&hap_mtx);
+-	printf("SWEET HAPTICS: kern.sweet_haptic %s\n", hap.live ? "live" : "NOT live");
+-	if (hap.live && sweet_haptics_publish_ready() != 0) {
+-		printf("SWEET HAPTICS: AHSFirmwareReadyNotifier not published\n");
++	if (on & HAP_ON_HAPTICS) {
++		hap.stop = thread_call_allocate(hap_stop_call, NULL);
++		lck_mtx_lock(&hap_mtx);
++		hap.live = hap.stop && hap_config();
++		lck_mtx_unlock(&hap_mtx);
++		printf("SWEET HAPTICS: kern.sweet_haptic %s\n", hap.live ? "live" : "NOT live");
++		if (hap.live && sweet_haptics_publish_ready() != 0) {
++			printf("SWEET HAPTICS: AHSFirmwareReadyNotifier not published\n");
++		}
++	}
++	if (on & HAP_ON_TORCH) {
++		lck_mtx_lock(&hap_mtx);
++		tor.live = tor_config();
++		lck_mtx_unlock(&hap_mtx);
++		printf("SWEET HAPTICS: kern.sweet_torch %s\n", tor.live ? "live" : "NOT live");
+ 	}
+ 	(void)thread_terminate(current_thread());
+ }
+@@ -240,7 +431,7 @@ dipper_haptics_init(void)
+ 		return;
+ 	}
+ 	thread_t th;
+-	if (kernel_thread_start(hap_thread, NULL, &th) == KERN_SUCCESS) {
++	if (kernel_thread_start(hap_thread, (void *)(uintptr_t)on, &th) == KERN_SUCCESS) {
+ 		thread_set_thread_name(th, "sweet haptics");
+ 		thread_deallocate(th);
+ 	}
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index dc02dd1..51d8c78 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -176,7 +176,8 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		allowed = (sid == 2 && (peripheral == 0x10 || peripheral == 0x13 ||
+ 		    peripheral == 0x16 || peripheral == 0x40 || peripheral == 0x41 ||
+ 		    peripheral == 0x45)) ||
+-		    (sid == 3 && (peripheral == 0xd8 || peripheral == 0xd9 || peripheral == 0xc0)) ||  /* 0xc0: haptics */
++		    (sid == 3 && (peripheral == 0xd8 || peripheral == 0xd9 || peripheral == 0xc0 ||  /* 0xc0: haptics */
++		    peripheral == 0xd3)) ||        /* 0xd3: flash LED block (the torch, dipper_haptics.c) */
+ 		    (sid == 2 && addr == 0x09f3u) ||   /* MISC clock trim error, the haptics' period (dipper_haptics.c) */
+ 		    (sid == 0 && (peripheral == 0x08 || peripheral == 0x60 || peripheral == 0x61));  /* 0x60/0x61: PM8998 RTC, alarm (sweet_rtc_*) */
+ 	} else {
+@@ -304,6 +305,17 @@ sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
+ 		return len == 1;
+ 	case 0xc054u:                   /* RATE_CFG1 + 2 */
+ 		return true;
++	/* PMI8998 flash LED block, torch (dipper_haptics.c): SAFETY_TMR 1/2, TGR_CURRENT 1/2, MOD_CTRL, IRES, STROBE_CTRL 1/2, EN_LED_CTRL */
++	case 0xd340u:
++	case 0xd341u:
++	case 0xd343u:
++	case 0xd344u:
++	case 0xd346u:
++	case 0xd347u:
++	case 0xd349u:
++	case 0xd34au:
++	case 0xd34cu:
++		return len == 1;
+ 	case 0xd947u:
+ 	case 0xd958u:
+ 	case 0xd968u:
