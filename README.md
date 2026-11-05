@@ -68,7 +68,7 @@ Qualcomm ABL (stock, unlocked)
 | Flashlight | Both rear LEDs from Control Center's button, through `sweettorch.dylib` in cameracaptured and the PMI8998 flash LED driver |
 | USB | CDC-ECM Ethernet: SSH at `root@192.168.7.2`, live kernel log on UDP 5140, internet shared from the Mac; iOS sees a cable at once |
 | Battery | Real fuel gauge and charger state, charging capped at 1.7 A (0.5 C); Bergamota fastboot charges too |
-| Kernel | Heartwood on **xnu-12377.121.6**, Mi 8 patches 3001–3052 |
+| Kernel | Heartwood on **xnu-12377.121.6**, Mi 8 patches 3001–3053 |
 | Next candidates | Microphone and earpiece; sensors (rotation, auto-brightness) |
 | Not working | Cellular, microphone, earpiece, camera, sensors (rotation, auto-brightness), fingerprint, SEP / Face ID. App Store and Weather stop at FairPlay |
 
