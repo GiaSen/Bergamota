@@ -1,0 +1,30 @@
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 942dc24..dfa24e3 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -1441,6 +1441,25 @@ update:
+ 			error = EPERM;
+ 			goto out1;
+ 		}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * 3059: boot-arg sweetrootro=1 keeps the root read-only for the whole boot (iOS remounts it
++		 * read-write early even without rootrw=1), so fsck_hfs -fy can repair it from a shell.
++		 */
++		if (mp->mnt_flag & MNT_ROOTFS) {
++			static int sweet_rootro = -1;
++			if (sweet_rootro < 0) {
++				uint32_t v = 0;
++				sweet_rootro = (PE_parse_boot_argn("sweetrootro", &v, sizeof(v)) && v) ? 1 : 0;
++			}
++			if (sweet_rootro) {
++				printf("SWEET: sweetrootro=1: read-write remount of / by %s[%d] refused\n",
++				    proc_best_name(current_proc()), proc_pid(current_proc()));
++				error = EROFS;
++				goto out1;
++			}
++		}
++#endif
+ 		mp->mnt_kern_flag |= MNTK_WANTRDWR;
+ 	}
+ 	mp->mnt_flag &= ~(MNT_NOSUID | MNT_NOEXEC | MNT_NODEV |
