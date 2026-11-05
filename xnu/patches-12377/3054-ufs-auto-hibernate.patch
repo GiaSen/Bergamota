@@ -1,0 +1,117 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 05405a6..f89fe4f 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -94,6 +94,19 @@ extern void sweet_a630_probe(void);
+ #define HCS_DP          (1u << 0)
+ #define HCS_UTRLRDY     (1u << 1)
+ #define CAP_64AS        (1u << 24)              /* 64-bit DMA addressing */
++/*
++ * 3054: auto-hibernate (UFSHCI 2.1). With AHIT set the host puts the link into Hibern8 after that much idle time
++ * and brings it back by itself when the next command is rung, so the polled path needs nothing more. Live with
++ * kern.sweet_ufs.ahit_ms (0 off, 1-1023 ms; written with no command in flight, as the spec asks); IS bits UHES /
++ * UHXS, acknowledged after every command anyway, count the entries and exits.
++ */
++#define REG_AHIT        0x18
++#define CAP_AUTOH8      (1u << 23)
++#define IS_UHXS         (1u << 5)               /* UIC Hibern8 exit */
++#define IS_UHES         (1u << 6)               /* UIC Hibern8 enter */
++/* 10 ms (Mi 8, screen off, cable in, on the battery: median 215-222 mA off, 114-124 mA on; 40 synced 4K writes after
++ * idle gaps took the same time at 0, 10 and 100 ms; 0 errors). kern.sweet_ufs.ahit_ms changes it live. */
++#define UFS_AHIT_MS_DEFAULT 10u
+ 
+ #define UFS_BLOCK       4096u
+ #define BOUNCE_SIZE     (1u << 20)
+@@ -148,6 +161,7 @@ static struct {
+ 	uint32_t retries;                       /* ufsretries */
+ 	uint32_t syncsecs;                      /* ufssyncsecs */
+ 	bool dirty;                             /* writes completed since the last SYNCHRONIZE CACHE */
++	uint32_t ahit_ms;                       /* 3054: auto-hibernate idle time, 0 off */
+ } su;
+ 
+ /*
+@@ -175,6 +189,7 @@ static struct {
+ 	uint32_t last_ocs, last_upiu, last_resp, last_status, last_sense;   /* last failed attempt */
+ 	uint32_t last_is, last_hcs;
+ 	uint32_t last_cdb;                      /* opcode of the last failed attempt */
++	uint64_t h8_enters, h8_exits;           /* 3054: auto-hibernate, from IS at each command */
+ } ss;
+ 
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+@@ -351,6 +366,8 @@ ufs_scsi_once(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write, ui
+ 	__builtin_arm_dsb(0xf);
+ 	uint32_t is = ufs_rd(REG_IS);
+ 	ufs_wr(REG_IS, is);                     /* acknowledge completion status */
++	ss.h8_enters += (is & IS_UHES) != 0;
++	ss.h8_exits += (is & IS_UHXS) != 0;
+ 
+ 	dma_sync(DMA_UTRL, sizeof(*utrd));
+ 	if (su.cache) {
+@@ -652,6 +669,10 @@ ufs_take_over_host(void)
+ 	ufs_wr(REG_UTRLBA, (uint32_t)list);
+ 	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+ 	ufs_wr(REG_UTRLRSR, 1);
++	if (UFS_AHIT_MS_DEFAULT && (ufs_rd(REG_CAP) & CAP_AUTOH8)) {
++		su.ahit_ms = UFS_AHIT_MS_DEFAULT;
++		ufs_wr(REG_AHIT, (3u << 10) | su.ahit_ms);      /* scale 3: 1 ms units */
++	}
+ 	/* Never ring a doorbell unless the host uses our list. */
+ 	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+ 	    !(ufs_rd(REG_UTRLRSR) & 1)) {
+@@ -1609,6 +1630,43 @@ sweet_ufs_flush_sysctl SYSCTL_HANDLER_ARGS
+ 	return sweet_ufs_sync_all();
+ }
+ 
++/* kern.sweet_ufs.ahit_ms (3054): auto-hibernate idle time in ms, 0 off; written with no command in flight */
++static int
++sweet_ufs_ahit_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = (int)su.ahit_ms, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (!su.ready) {
++		return ENXIO;
++	}
++	if (v < 0 || v > 1023) {
++		return EINVAL;
++	}
++	if (v && !(ufs_rd(REG_CAP) & CAP_AUTOH8)) {
++		return ENOTSUP;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);          /* no command in flight while AHIT changes */
++	ufs_wr(REG_AHIT, v ? ((3u << 10) | (uint32_t)v) : 0);
++	su.ahit_ms = (uint32_t)v;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	printf("SWEET UFS: auto-hibernate %s (AHIT 0x%x, CAP 0x%x)\n", v ? "on" : "off", ufs_rd(REG_AHIT), ufs_rd(REG_CAP));
++	return 0;
++}
++
++/* kern.sweet_ufs.regs: CAP, AHIT, HCS, IS as they read now (3054) */
++static int
++sweet_ufs_regs_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[96];
++	snprintf(buf, sizeof(buf), "cap=0x%x ahit=0x%x hcs=0x%x is=0x%x", su.ready ? ufs_rd(REG_CAP) : 0,
++	    su.ready ? ufs_rd(REG_AHIT) : 0, su.ready ? ufs_rd(REG_HCS) : 0, su.ready ? ufs_rd(REG_IS) : 0);
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++
+ SYSCTL_NODE(_kern, OID_AUTO, sweet_ufs, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
+     "SWEET UFS root device: I/O counters and durability controls (patch 0221)");
+ SYSCTL_PROC(_kern_sweet_ufs, OID_AUTO, flush, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_LOCKED, 0, 0,
+@@ -1649,6 +1707,12 @@ SYSCTL_UINT(_kern_sweet_ufs, OID_AUTO, cfg_verify, CTLFLAG_RD | CTLFLAG_LOCKED,
+ SYSCTL_UINT(_kern_sweet_ufs, OID_AUTO, cfg_fua, CTLFLAG_RD | CTLFLAG_LOCKED, &su.fua, 0, "boot-arg ufsfua");
+ SYSCTL_UINT(_kern_sweet_ufs, OID_AUTO, cfg_retries, CTLFLAG_RD | CTLFLAG_LOCKED, &su.retries, 0, "boot-arg ufsretries");
+ SYSCTL_UINT(_kern_sweet_ufs, OID_AUTO, cfg_syncsecs, CTLFLAG_RD | CTLFLAG_LOCKED, &su.syncsecs, 0, "boot-arg ufssyncsecs");
++SYSCTL_PROC(_kern_sweet_ufs, OID_AUTO, ahit_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sweet_ufs_ahit_sysctl, "I", "auto-hibernate idle time in ms, 0 off (3054)");
++SYSCTL_PROC(_kern_sweet_ufs, OID_AUTO, regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sweet_ufs_regs_sysctl, "A", "CAP AHIT HCS IS now (3054)");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, h8_enters, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.h8_enters, "commands that found a Hibern8 entry since the last (3054)");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, h8_exits, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.h8_exits, "commands that found a Hibern8 exit since the last (3054)");
+ 
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
