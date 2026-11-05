@@ -1,0 +1,385 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9e9ff71..11b9a41 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,6 +119,7 @@ bsd/dev/sweet_a630.c			standard
+ bsd/dev/sweet_a630_pas.c			standard
+ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/dipper_audio.c		standard
++bsd/dev/dipper_haptics.c	standard
+ bsd/dev/sweet_80211.c			standard
+ bsd/dev/sweet_wpa.c			standard
+ bsd/dev/sweet_wlan_frames.c		standard
+diff --git a/bsd/dev/dipper_haptics.c b/bsd/dev/dipper_haptics.c
+new file mode 100644
+index 0000000..cabb169
+--- /dev/null
++++ b/bsd/dev/dipper_haptics.c
+@@ -0,0 +1,248 @@
++/*
++ * Mi 8 (dipper) vibration, patch 3049: the PMI8998 haptics block, a linear resonant actuator, driven in direct mode
++ * (the motor runs at VMAX for as long as PLAY is set). Live DT (dtb/dipper/live.dtb) qcom,haptics@c000 on SID 3:
++ * qcom,actuator-type 0 (LRA), vmax-mv 3100, ilim-ma 800, sc-dbc-cycles 8, wave-play-rate-us 4878 (the LRA's resonance
++ * period, ~205 Hz), wave-shape sine, en-brake, misc-clk-trim-error-reg 0xf3 of qcom,misc@900 (SID 2). Android's driver
++ * is drivers/leds/leds-qpnp-haptics.c (LineageOS android_kernel_xiaomi_sdm845); left out here: auto-resonance (its enable
++ * is in the secure TEST2 register), buffer-mode patterns, the play and short-circuit interrupts.
++ *
++ * OFF by default: boot-arg sweethap=1 (short: the boot-args field holds 607 bytes). Then, once SPMI is up:
++ *   kern.sweet_haptic   write struct { u32 ms; u32 mv; }: vibrate for ms (at most HAP_MAX_MS; a write while it runs
++ *                       moves its end and may change the strength) at mv (VMAX, 116..HAP_VMAX_MAX_MV); ms 0 stops.
++ *                       Any user may write it: SweetSpeaker.driver plays iOS's haptics from audiomxd (user mobile).
++ *                       Read: the state and counters, as text.
++ * Once configured it publishes AHSFirmwareReadyNotifier (SweetHaptics.cpp), without which audiomxd's haptic server
++ * (CoreHaptics, UIKit feedbacks, system vibrations) never initialises.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/thread_call.h>
++#include <pexpert/pexpert.h>
++#include "sweet_board.h"
++#include "sweet_spmi.h"
++
++extern void thread_set_thread_name(thread_t th, const char *name);
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_haptics_publish_ready(void);      /* iokit/Kernel/arm/SweetHaptics.cpp */
++void dipper_haptics_init(void);
++
++#define HAP_SID                 3u
++#define HAP_BASE                0xc000u
++#define HAP_STATUS_1            (HAP_BASE + 0x0a)       /* bit 1 busy */
++#define HAP_EN_CTL              (HAP_BASE + 0x46)       /* bit 7 module enable */
++#define HAP_EN_CTL2             (HAP_BASE + 0x48)       /* bit 0 brake enable */
++#define HAP_CFG1                (HAP_BASE + 0x4c)       /* bit 0 actuator type: 0 LRA, 1 ERM */
++#define HAP_CFG2                (HAP_BASE + 0x4d)       /* bit 0 wave shape: 0 sine, 1 square */
++#define HAP_SEL                 (HAP_BASE + 0x4e)       /* bits 5:4 waveform source: 0 VMAX (direct) */
++#define HAP_VMAX_CFG            (HAP_BASE + 0x51)       /* bits 5:1 VMAX in 116 mV steps */
++#define HAP_ILIM_CFG            (HAP_BASE + 0x52)       /* bit 0: 1 = 800 mA */
++#define HAP_SC_DEB              (HAP_BASE + 0x53)       /* bits 2:0 short-circuit debounce */
++#define HAP_RATE_CFG1           (HAP_BASE + 0x54)       /* play rate / LRA period in 5 us steps, low byte */
++#define HAP_RATE_CFG2           (HAP_BASE + 0x55)       /* bits 3:0 high */
++#define HAP_BRAKE               (HAP_BASE + 0x5c)       /* brake pattern, 4 x 2 bits */
++#define HAP_PLAY                (HAP_BASE + 0x70)       /* bit 7 play */
++#define HAP_MISC_SID            2u
++#define HAP_MISC_TRIM           0x09f3u                 /* qcom,misc@900 + misc-clk-trim-error-reg 0xf3 */
++#define HAP_PERIOD_US           4878u                   /* qcom,wave-play-rate-us */
++#define HAP_VMAX_MV_STEP        116u
++#define HAP_VMAX_MAX_MV         3100u                   /* qcom,vmax-mv */
++#define HAP_MAX_MS              1000u
++
++static struct {
++	bool live, playing, bad;
++	uint8_t vmax_code;
++	uint64_t end;                           /* mach_absolute_time at which the current play stops */
++	uint32_t plays, extends, errors;
++	thread_call_t stop;
++} hap;
++
++static LCK_GRP_DECLARE(hap_lck_grp, "sweethaptics");
++static LCK_MTX_DECLARE(hap_mtx, &hap_lck_grp);
++
++static int
++hap_wr(unsigned addr, uint8_t v)
++{
++	int e = sweet_spmi_write(HAP_SID, addr, &v, 1);
++	if (e) {
++		hap.errors++;
++	}
++	return e;
++}
++
++static int
++hap_update(unsigned addr, uint8_t mask, uint8_t v)
++{
++	uint8_t old = 0;
++	if (sweet_spmi_read(HAP_SID, addr, &old) != 0) {
++		hap.errors++;
++		return -1;
++	}
++	return hap_wr(addr, (uint8_t)((old & ~mask) | (v & mask)));
++}
++
++static uint8_t
++hap_vmax_code(uint32_t mv)
++{
++	mv = mv < HAP_VMAX_MV_STEP ? HAP_VMAX_MV_STEP : mv > HAP_VMAX_MAX_MV ? HAP_VMAX_MAX_MV : mv;
++	return (uint8_t)(((mv + HAP_VMAX_MV_STEP / 2) / HAP_VMAX_MV_STEP) << 1);
++}
++
++/* stop: PLAY off, module off (qpnp_haptics_play(false)); hap_mtx held */
++static void
++hap_off(void)
++{
++	(void)hap_wr(HAP_PLAY, 0);
++	(void)hap_wr(HAP_EN_CTL, 0);
++	hap.playing = false;
++}
++
++static void
++hap_stop_call(thread_call_param_t p0, thread_call_param_t p1)
++{
++	(void)p0;
++	(void)p1;
++	lck_mtx_lock(&hap_mtx);
++	if (hap.playing) {
++		if (mach_absolute_time() + 1000 < hap.end) {        /* moved on by a later write: wait for the new end */
++			thread_call_enter_delayed(hap.stop, hap.end);
++		} else {
++			hap_off();
++		}
++	}
++	lck_mtx_unlock(&hap_mtx);
++}
++
++/* qpnp_haptics_config(), direct mode, no auto-resonance */
++static bool
++hap_config(void)
++{
++	uint8_t trim = 0;
++	uint32_t rate = HAP_PERIOD_US / 5u;
++	if (sweet_spmi_read(HAP_MISC_SID, HAP_MISC_TRIM, &trim) == 0) {
++		uint32_t pct10 = (trim & 0x0fu) * 7u;           /* 0.7 % per step, bit 7 the sign */
++		rate = (trim & 0x80u) ? rate * (1000u - pct10) / 1000u : rate * (1000u + pct10) / 1000u;
++	} else {
++		printf("SWEET HAPTICS: clock trim not readable, period uncorrected\n");
++	}
++	if (sweet_spmi_prepare_write(HAP_SID, HAP_PLAY) != 0) {
++		return false;                                   /* not ours (EE ownership) or no APID: logged there */
++	}
++	hap.vmax_code = hap_vmax_code(HAP_VMAX_MAX_MV);
++	uint8_t rate2[2] = { (uint8_t)(rate & 0xffu), (uint8_t)((rate >> 8) & 0x0fu) };
++	bool ok = hap_wr(HAP_PLAY, 0) == 0 && hap_wr(HAP_EN_CTL, 0) == 0 &&
++	    hap_update(HAP_CFG1, 0x01, 0x00) == 0 &&                    /* LRA */
++	    hap_update(HAP_SEL, 0x30, 0x00) == 0 &&                     /* direct: VMAX */
++	    hap_update(HAP_VMAX_CFG, 0x7e, hap.vmax_code) == 0 &&
++	    hap_update(HAP_ILIM_CFG, 0x01, 0x01) == 0 &&                /* 800 mA */
++	    hap_update(HAP_SC_DEB, 0x07, 0x01) == 0 &&                  /* 8 cycles: ilog2(8 / 8) + 1 */
++	    hap_update(HAP_CFG2, 0x01, 0x00) == 0 &&                    /* sine */
++	    sweet_spmi_write(HAP_SID, HAP_RATE_CFG1, rate2, 2) == 0 &&
++	    hap_update(HAP_EN_CTL2, 0x01, 0x01) == 0 &&                 /* brake */
++	    hap_wr(HAP_BRAKE, 0x00) == 0;
++	uint8_t st = 0, cfg1 = 0, vmax = 0;
++	(void)sweet_spmi_read(HAP_SID, HAP_STATUS_1, &st);
++	(void)sweet_spmi_read(HAP_SID, HAP_CFG1, &cfg1);
++	(void)sweet_spmi_read(HAP_SID, HAP_VMAX_CFG, &vmax);
++	printf("SWEET HAPTICS: PMI8998 haptics %s: LRA direct, period %u x 5 us (trim %#x), VMAX %#x, CFG1 %#x, STATUS_1 %#x, "
++	    "%u errors\n", ok ? "configured" : "NOT configured", rate, trim, vmax, cfg1, st, hap.errors);
++	return ok;
++}
++
++static int
++hap_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (!hap.live) {
++		return ENXIO;
++	}
++	int err = 0;
++	if (req->newptr != USER_ADDR_NULL) {
++		struct { uint32_t ms, mv; } in = { 0, HAP_VMAX_MAX_MV };
++		if (req->newlen < sizeof(in.ms) || req->newlen > sizeof(in)) {
++			return EINVAL;
++		}
++		if ((err = SYSCTL_IN(req, &in, req->newlen))) {
++			return err;
++		}
++		lck_mtx_lock(&hap_mtx);
++		if (!in.ms) {
++			if (hap.playing) {
++				hap_off();
++			}
++		} else {
++			uint64_t dur;
++			nanoseconds_to_absolutetime((uint64_t)MIN(in.ms, HAP_MAX_MS) * NSEC_PER_MSEC, &dur);
++			uint8_t code = hap_vmax_code(in.mv);
++			if (code != hap.vmax_code && hap_update(HAP_VMAX_CFG, 0x7e, code) == 0) {
++				hap.vmax_code = code;
++			}
++			hap.end = mach_absolute_time() + dur;
++			if (hap.playing) {
++				hap.extends++;
++			} else if (hap_wr(HAP_EN_CTL, 0x80) == 0 && hap_wr(HAP_PLAY, 0x80) == 0) {
++				hap.playing = true;
++				hap.plays++;
++				thread_call_enter_delayed(hap.stop, hap.end);
++			} else {
++				hap_off();
++				err = EIO;
++			}
++		}
++		lck_mtx_unlock(&hap_mtx);
++		if (err) {
++			return err;
++		}
++	}
++	char text[128];
++	snprintf(text, sizeof(text), "haptics %s, VMAX %u mV, %u plays, %u extended, %u SPMI errors\n",
++	    hap.playing ? "playing" : "idle", (unsigned)(hap.vmax_code >> 1) * HAP_VMAX_MV_STEP, hap.plays, hap.extends,
++	    hap.errors);
++	return SYSCTL_OUT(req, text, strlen(text) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_haptic, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
++    hap_sysctl, "S", "Mi 8 vibration motor: u32 ms [+ u32 mV] in, the state out (bsd/dev/dipper_haptics.c)");
++
++static void
++hap_thread(void *arg, wait_result_t w)
++{
++	(void)arg;
++	(void)w;
++	for (unsigned i = 0; i < 60 && sweet_spmi_init() != 0; i++) {
++		delay(1000 * 1000);
++	}
++	hap.stop = thread_call_allocate(hap_stop_call, NULL);
++	lck_mtx_lock(&hap_mtx);
++	hap.live = hap.stop && hap_config();
++	lck_mtx_unlock(&hap_mtx);
++	printf("SWEET HAPTICS: kern.sweet_haptic %s\n", hap.live ? "live" : "NOT live");
++	if (hap.live && sweet_haptics_publish_ready() != 0) {
++		printf("SWEET HAPTICS: AHSFirmwareReadyNotifier not published\n");
++	}
++	(void)thread_terminate(current_thread());
++}
++
++void
++dipper_haptics_init(void)
++{
++	unsigned on = 0;
++	(void)PE_parse_boot_argn("sweethap", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	if (!sweet_board_is("xiaomi,dipper")) {
++		printf("SWEET HAPTICS: sweethap=%u is for the Mi 8 (dipper): ignored\n", on);
++		return;
++	}
++	thread_t th;
++	if (kernel_thread_start(hap_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_set_thread_name(th, "sweet haptics");
++		thread_deallocate(th);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 8555200..dc02dd1 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -176,7 +176,8 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		allowed = (sid == 2 && (peripheral == 0x10 || peripheral == 0x13 ||
+ 		    peripheral == 0x16 || peripheral == 0x40 || peripheral == 0x41 ||
+ 		    peripheral == 0x45)) ||
+-		    (sid == 3 && (peripheral == 0xd8 || peripheral == 0xd9)) ||
++		    (sid == 3 && (peripheral == 0xd8 || peripheral == 0xd9 || peripheral == 0xc0)) ||  /* 0xc0: haptics */
++		    (sid == 2 && addr == 0x09f3u) ||   /* MISC clock trim error, the haptics' period (dipper_haptics.c) */
+ 		    (sid == 0 && (peripheral == 0x08 || peripheral == 0x60 || peripheral == 0x61));  /* 0x60/0x61: PM8998 RTC, alarm (sweet_rtc_*) */
+ 	} else {
+ 		allowed = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 ||
+@@ -289,6 +290,20 @@ sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
+ 		return false;
+ 	}
+ 	switch (addr) {
++	/* PMI8998 haptics (dipper_haptics.c): EN_CTL, EN_CTL2, CFG1, CFG2, SEL, VMAX, ILIM, SC_DEB, BRAKE, PLAY */
++	case 0xc046u:
++	case 0xc048u:
++	case 0xc04cu:
++	case 0xc04du:
++	case 0xc04eu:
++	case 0xc051u:
++	case 0xc052u:
++	case 0xc053u:
++	case 0xc05cu:
++	case 0xc070u:
++		return len == 1;
++	case 0xc054u:                   /* RATE_CFG1 + 2 */
++		return true;
+ 	case 0xd947u:
+ 	case 0xd958u:
+ 	case 0xd968u:
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index d812017..05405a6 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -73,6 +73,7 @@ extern void sweet_reboot_init(void);
+ extern void sweet_touch_init(void);
+ extern void beryllium_wlan_init(void);
+ extern void dipper_audio_init(void);
++extern void dipper_haptics_init(void);
+ extern void sweet80211_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_cpufreq_max(void);
+@@ -1161,6 +1162,7 @@ sweet_ufs_init(void)
+ 	beryllium_wlan_init();      /* boot-arg sweetwlan=N, off by default */
+ 	sweet80211_init();          /* boot-arg sweet80211=N (iOS 26 Wi-Fi stand-in), off by default */
+ 	dipper_audio_init();        /* boot-arg sweetaudio=N (Mi 8 audio DSP, 3040), off by default */
++	dipper_haptics_init();      /* boot-arg sweethap=1 (Mi 8 vibration motor, 3049), off by default */
+ 	return 0;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetHaptics.cpp b/iokit/Kernel/arm/SweetHaptics.cpp
+new file mode 100644
+index 0000000..0ff90e8
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetHaptics.cpp
+@@ -0,0 +1,46 @@
++/*
++ * The Mi 8's stand-in for what Apple's haptics driver (AppleHapticsSupport) tells user space, patch 3049.
++ *
++ * audiomxd's haptic server (AudioToolbox, AVHapticServer: com.apple.audio.hapticd, what CoreHaptics, UIKit's
++ * feedbacks and the system sounds' vibrations talk to) initialises only after an IOKit matching notification for an
++ * AHSFirmwareReadyNotifier service ("Failed to add matching notification for AHSFirmwareReadyNotifier"): on an iPhone
++ * the haptics driver publishes it once the Taptic Engine's firmware is up. Here bsd/dev/dipper_haptics.c publishes this
++ * empty one once the PMI8998 motor is configured (sweethap=1); the waveforms themselves reach the motor through the
++ * audio HAL's "Actuator" device (SweetSpeaker.driver) and kern.sweet_haptic.
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOLib.h>
++
++extern "C" int sweet_haptics_publish_ready(void);
++
++class AHSFirmwareReadyNotifier : public IOService
++{
++	OSDeclareDefaultStructors(AHSFirmwareReadyNotifier);
++};
++
++OSDefineMetaClassAndStructors(AHSFirmwareReadyNotifier, IOService);
++
++extern "C" int
++sweet_haptics_publish_ready(void)
++{
++	static bool published;
++	if (published) {
++		return 0;
++	}
++	IOService *platform = IOService::getPlatform();
++	AHSFirmwareReadyNotifier *n = OSTypeAlloc(AHSFirmwareReadyNotifier);
++	if (platform == NULL || n == NULL || !n->init()) {
++		OSSafeReleaseNULL(n);
++		return -1;
++	}
++	if (!n->attach(platform)) {
++		n->release();
++		return -1;
++	}
++	n->registerService();
++	n->release();
++	published = true;
++	IOLog("SWEET HAPTICS: AHSFirmwareReadyNotifier published\n");
++	return 0;
++}
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 31cb0ef..8fa09e0 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetAdreno.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetNetwork.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetHaptics.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp

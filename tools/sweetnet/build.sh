@@ -121,6 +121,16 @@ if [ "${IOS18:-1}" = 1 ]; then
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetplay.c" -o "$out18/sweetplay"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetplay"
 	python3 -I "$pacstrip" --sign "$out18/sweetplay"
+	# iOS system sounds / the vibration over SSH: what reaches SweetSpeaker.driver's Actuator device
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework AudioToolbox "$here/sweetvibe.c" \
+		-o "$out18/sweetvibe"
+	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetvibe"
+	python3 -I "$pacstrip" --sign "$out18/sweetvibe"
+	# CoreHaptics over SSH: taps + a buzz or an AHAP file, through audiomxd's haptic server to the Actuator device
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -fobjc-arc -framework Foundation \
+		-framework CoreHaptics "$here/sweethaptic.m" -o "$out18/sweethaptic"
+	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweethaptic"
+	python3 -I "$pacstrip" --sign "$out18/sweethaptic"
 	# Wi-Fi over SSH (iOS 26 stand-in, docs/WIFI_IOS26.md): Apple80211 info/power/scan without wifid or the UI
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -framework CoreFoundation \
 		"$here/sweetwifi.c" -o "$out18/sweetwifi"

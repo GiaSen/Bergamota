@@ -626,6 +626,8 @@ def audio(root):
 # re-anchors the device's clock every 0.4 s and the sound breaks up. RENEGADE_AMP_FW unset: none of it.
 SPEAKER_DRIVER = 'System/Library/Audio/Plug-Ins/HAL/SweetSpeaker.driver'
 SPEAKER_SHARE = 'usr/local/share/sweetspeaker'
+MG_CACHE = ('private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/'
+            'com.apple.MobileGestalt.plist')
 SPEAKER_LABEL = 'org.bergamota.sweetspeaker-amp'
 SPEAKER_SH = 'usr/local/libexec/sweetspeaker-amp.sh'
 SPEAKER_SCRIPT = r'''#!/bin/sh
@@ -697,6 +699,14 @@ def speaker(root):
         'EnvironmentVariables': {'PATH': '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'}})
     print('speaker: %s, /usr/local/bin/sweetplay, amp scripts on %d, off %d, wake %d bytes, job %s' % (
         SPEAKER_DRIVER, len(parts[0] + parts[1]), len(parts[2]), len(parts[1]), SPEAKER_LABEL))
+    # Vibration (xnu 3049, sweethap=1): MobileGestalt answers DeviceSupportsClosedLoopHaptics from the ADT's
+    # /product/haptics, but keeps its answers in a cache; one written under an ADT without the node keeps the
+    # vibrations off (on the Mi 8 the cache was deleted by hand, 2026-11-05). The restore root has none, so this only
+    # matters for a root built over a used /private/var: drop it there and let the first boot write it again.
+    mg = os.path.join(root, MG_CACHE)
+    if os.path.exists(mg):
+        os.unlink(mg)
+        print('speaker: removed the MobileGestalt cache (rewritten at boot with the ADT\'s closed-loop haptics)')
 
 
 # Daemons that only crash-loop or quit at once on this bring-up while containermanagerd refuses every container lookup
