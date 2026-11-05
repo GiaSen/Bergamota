@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 86f7de0..815e9d7 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -993,7 +993,7 @@ nf_rx(uint32_t snode, uint32_t sport, const uint8_t *p, uint32_t len)
+  * reset TLMM 64 (NORTH), MCLK = RPMh lnbclka2, supply pm8998 s4 (stub, always on). Sequence and message formats
+  * from Qualcomm's slim-msm-ngd.c / slim-msm.c (register facts only): the DSP is the bus manager; we are a satellite
+  * NGD that uses the register FIFOs (no BAM). QMI to the DSP's SLIMbus service 0x301: SELECT_INSTANCE 0x20 {0x01 u32
+- * instance, 0x10 u32 mode 1 = satellite}, POWER 0x21 {0x01 u32 2 = active}; then NGD CFG = enable, the manager sends
++ * instance, 0x10 u32 mode 2 = the DSP is master}, POWER 0x21 {0x01 u32 2 = active}; then NGD CFG = enable, the manager sends
+  * MASTER_CAPABILITY, we answer REPORT_SATELLITE; ADDR_QUERY gives the codec's logical address; REQUEST_VALUE reads
+  * its registers (element address 0x800 + register, page 0 after reset).
+  */
+@@ -2860,7 +2860,12 @@ cx_stage_qmi(void)
+ 		}
+ 	}
+ 	sweet_log_sync();
+-	uint8_t sel[14] = { 0x01, 4, 0, 0, 0, 0, 0, 0x10, 4, 0, 1, 0, 0, 0 };    /* instance 0, mode satellite */
++	/*
++	 * 3058e: the mode is the DSP's role (slim-msm.c: "Mode indicates the role of the ADSP"; the NGD calls
++	 * msm_slim_qmi_init(dev, false) = apps not master -> SLIMBUS_MODE_MASTER_V01 = 2). 3058-3058d sent 1
++	 * (satellite: the DSP waiting for an apps master) and the SoC reset during the POWER request every time.
++	 */
++	uint8_t sel[14] = { 0x01, 4, 0, 0, 0, 0, 0, 0x10, 4, 0, 2, 0, 0, 0 };    /* instance 0, the DSP is master */
+ 	int r = cx_qmi(0x20, sel, sizeof(sel));
+ 	CX_LOG("QMI SELECT_INSTANCE -> %d\n", r);
+ 	sweet_log_sync();
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 78f1ba1..5c86fa6 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1286,7 +1286,7 @@ sweet_log_keep_prev(uint64_t base)
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error || memcmp(h.magic, "SWEETLOG", 8) || h.version != 1 || h.size != SWEET_LOG_SIZE || !h.total) {
+-		printf("SWEET LOG: no previous boot's log (read %d)\\n", error);
++		printf("SWEET LOG: no previous boot's log (read %d)\n", error);
+ 		return;
+ 	}
+ 	uint32_t keep = (uint32_t)MIN((uint64_t)SWEET_LOG_PREV_KEEP, MIN(h.total, (uint64_t)SWEET_LOG_SIZE));
+@@ -1313,14 +1313,14 @@ sweet_log_keep_prev(uint64_t base)
+ 	}
+ 	if (error) {
+ 		kfree_data(buf, keep);
+-		printf("SWEET LOG: previous boot's log not read (%d)\\n", error);
++		printf("SWEET LOG: previous boot's log not read (%d)\n", error);
+ 		return;
+ 	}
+ 	sweet_log_prev_total = h.total;
+ 	sweet_log_prev_seq = h.seq;
+ 	sweet_log_prev_len = keep;
+ 	sweet_log_prev = buf;
+-	printf("SWEET LOG: previous boot's log kept: last %u of %llu bytes, flush #%llu (kern.sweet_log_prev)\\n", keep,
++	printf("SWEET LOG: previous boot's log kept: last %u of %llu bytes, flush #%llu (kern.sweet_log_prev)\n", keep,
+ 	    h.total, h.seq);
+ }
+ 
