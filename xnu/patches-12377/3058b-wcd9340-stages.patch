@@ -1,0 +1,303 @@
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 024f2ec..a581d44 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -1025,6 +1025,7 @@ static struct {
+ 	vm_offset_t slim, rst;
+ 	uint8_t tid, la;
+ 	uint32_t runs;
++	bool busy, powered, regs_ok, ngd_up;
+ 	char log[4096];
+ 	size_t off;
+ } cx;
+@@ -2637,14 +2638,17 @@ au_amp_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_amp, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_amp_sysctl, "S",
+     "Mi 8 speaker player: the amp's on (1) and off (0) I2C scripts, u8 which + script (bsd/dev/dipper_audio.c)");
+ 
+-/* one QMI request to the DSP's SLIMbus service; the QMI error (0 = success), or -1 without an answer */
++/* one QMI request to the DSP's SLIMbus service; the QMI error (0 = success), or -1 without an answer.
++ * Called without au_mtx: it is taken only around each GLINK send/poll, so the audio thread keeps running. */
+ static int
+ cx_qmi(uint16_t msg, const uint8_t *tlv, uint16_t tlen)
+ {
+ 	uint8_t q[64];
++	bool sent, got = false;
+ 	if (tlen > sizeof(q) - 7) {
+ 		return -1;
+ 	}
++	lck_mtx_lock(&au_mtx);
+ 	cx.txn = (uint16_t)(cx.txn + 1);
+ 	if (!cx.txn) {
+ 		cx.txn = 1;
+@@ -2655,14 +2659,22 @@ cx_qmi(uint16_t msg, const uint8_t *tlv, uint16_t tlen)
+ 	memcpy(q + 5, &tlen, 2);
+ 	memcpy(q + 7, tlv, tlen);
+ 	cx.rsp = false;
+-	if (!qr_send(Q_DATA, QR_SLIM_PORT, cx.node, cx.port, q, 7u + tlen)) {
++	sent = qr_send(Q_DATA, QR_SLIM_PORT, cx.node, cx.port, q, 7u + tlen);
++	lck_mtx_unlock(&au_mtx);
++	CX_LOG("QMI %#x %s, waiting up to 1.5 s\n", msg, sent ? "sent" : "NOT SENT");
++	if (!sent) {
+ 		return -1;
+ 	}
+-	for (unsigned w = 0; w < 1500 && !cx.rsp && !gl.bad; w += 2) {
++	for (unsigned w = 0; w < 1500 && !got; w += 2) {
+ 		au_sleep(2);
+-		gl_poll();
++		lck_mtx_lock(&au_mtx);
++		if (!gl.bad) {
++			gl_poll();
++		}
++		got = cx.rsp;
++		lck_mtx_unlock(&au_mtx);
+ 	}
+-	if (!cx.rsp) {
++	if (!got) {
+ 		return -1;
+ 	}
+ 	for (uint32_t o = 7; o + 3 <= cx.rsp_len;) {
+@@ -2678,6 +2690,26 @@ cx_qmi(uint16_t msg, const uint8_t *tlv, uint16_t tlen)
+ 	return 0xfffe;                          /* answered without a result TLV */
+ }
+ 
++/* the DSP's crash reason in SMEM (item 423), if it wrote one */
++static void
++cx_dsp_crash(void)
++{
++	uint32_t sz = 0, it = sweet_smem_item(0xfffe, AU_CRASH_ITEM, &sz);
++	char msg[129];
++	uint32_t n;
++	if (!it || !sz) {
++		CX_LOG("DSP crash reason: none in SMEM\n");
++		return;
++	}
++	n = MIN(sz, 128u);
++	for (uint32_t k = 0; k < n; k += 4) {
++		uint32_t w = sweet_smem_rd(it + k);
++		memcpy(msg + k, &w, MIN(4u, n - k));
++	}
++	msg[n] = 0;
++	CX_LOG("DSP crash reason: \"%s\"\n", msg[0] ? msg : "(empty)");
++}
++
+ static uint32_t
+ cx_rd(uint32_t off)
+ {
+@@ -2782,46 +2814,69 @@ cx_reset_pin(bool high)
+ 	__asm__ volatile ("dsb osh" ::: "memory");
+ }
+ 
+-static void
+-cx_step1(void)
++/* stage 1: QMI only (SELECT_INSTANCE satellite, POWER active), then the DSP's crash reason */
++static bool
++cx_stage_qmi(void)
+ {
+-	uint8_t b[40];
+-	cx.off = 0;
+-	cx.log[0] = 0;
+-	cx.runs++;
+-	CX_LOG("step 1 (run %u): SLIMbus up, codec chip id\n", cx.runs);
+ 	if (!au_live || !cx.have_srv) {
+ 		CX_LOG("not ready: audio DSP %s, SLIMbus QMI service %s\n", au_live ? "up" : "not up",
+ 		    cx.have_srv ? "seen" : "not announced");
+-		return;
++		return false;
+ 	}
+-	CX_LOG("SLIMbus QMI service at %u:%#x\n", cx.node, cx.port);
++	CX_LOG("stage 1: SLIMbus QMI service at %u:%#x\n", cx.node, cx.port);
+ 	uint8_t sel[14] = { 0x01, 4, 0, 0, 0, 0, 0, 0x10, 4, 0, 1, 0, 0, 0 };    /* instance 0, mode satellite */
+ 	int r = cx_qmi(0x20, sel, sizeof(sel));
+ 	CX_LOG("QMI SELECT_INSTANCE -> %d\n", r);
+ 	if (r) {
+-		return;
++		cx_dsp_crash();
++		return false;
+ 	}
+ 	uint8_t pwr[7] = { 0x01, 4, 0, 2, 0, 0, 0 };                              /* active */
+ 	r = cx_qmi(0x21, pwr, sizeof(pwr));
+ 	CX_LOG("QMI POWER active -> %d\n", r);
+-	if (r) {
+-		return;
++	cx_dsp_crash();
++	cx.powered = r == 0;
++	return cx.powered;
++}
++
++/* stage 2: map the block and read the version and NGD registers (reads only) */
++static bool
++cx_stage_regs(void)
++{
++	if (!cx.powered) {
++		CX_LOG("stage 2 needs stage 1 (QMI POWER) first\n");
++		return false;
+ 	}
+ 	if (!cx.slim) {
+ 		cx.slim = ml_io_map(CX_SLIM_PA, CX_SLIM_SIZE);
+ 	}
+ 	if (!cx.slim) {
+ 		CX_LOG("cannot map the SLIMbus block\n");
+-		return;
++		return false;
+ 	}
+-	uint32_t ver = cx_rd(0) >> 16;
+-	CX_LOG("controller version %#x; NGD cfg %#x status %#x int_en %#x int_stat %#x\n", ver, cx_rd(CX_NGD + NGD_CFG),
+-	    cx_rd(CX_NGD + NGD_STATUS), cx_rd(CX_NGD + NGD_INT_EN), cx_rd(CX_NGD + NGD_INT_STAT));
+-	if (!ver) {
++	CX_LOG("stage 2: reading the controller version at %#x\n", CX_SLIM_PA);
++	uint32_t ver = cx_rd(0);
++	CX_LOG("controller word 0 = %#x (version %#x)\n", ver, ver >> 16);
++	CX_LOG("NGD cfg %#x status %#x rx_msgq %#x int_en %#x int_stat %#x\n", cx_rd(CX_NGD + NGD_CFG),
++	    cx_rd(CX_NGD + NGD_STATUS), cx_rd(CX_NGD + NGD_RX_MSGQ_CFG), cx_rd(CX_NGD + NGD_INT_EN),
++	    cx_rd(CX_NGD + NGD_INT_STAT));
++	cx.regs_ok = (ver >> 16) != 0;
++	if (!cx.regs_ok) {
+ 		CX_LOG("version 0: the NGD would be at the V1 offset; stopping\n");
+-		return;
+ 	}
++	return cx.regs_ok;
++}
++
++/* stage 3: enable the NGD (register FIFOs), the manager's capability message, our REPORT_SATELLITE */
++static bool
++cx_stage_ngd(void)
++{
++	uint8_t b[40];
++	if (!cx.regs_ok) {
++		CX_LOG("stage 3 needs stage 2 first\n");
++		return false;
++	}
++	CX_LOG("stage 3: NGD up\n");
+ 	if (!(cx_rd(CX_NGD + NGD_STATUS) & 2u)) {
+ 		cx_wr(CX_NGD + NGD_INT_EN, NGD_INT_TX_SENT | NGD_INT_RX_RCVD | NGD_INT_ERRORS | (1u << 28));
+ 		cx_wr(CX_NGD + NGD_RX_MSGQ_CFG, cx_rd(CX_NGD + NGD_RX_MSGQ_CFG) | 0x10000u);
+@@ -2830,18 +2885,32 @@ cx_step1(void)
+ 		if (!cx_wait(b, 6, 0x00, -1, 1000)) {
+ 			CX_LOG("no MASTER_CAPABILITY in 1 s; status %#x int_stat %#x\n", cx_rd(CX_NGD + NGD_STATUS),
+ 			    cx_rd(CX_NGD + NGD_INT_STAT));
+-			return;
++			return false;
+ 		}
+ 		const uint8_t sat[7] = { 7 | (6 << 5), 0x01, 0xff, 0xd9, 0xc5, 0x01, 0x01 };    /* REPORT_SATELLITE */
+-		r = cx_tx(sat);
++		int r = cx_tx(sat);
+ 		CX_LOG("REPORT_SATELLITE -> %d\n", r);
+ 		if (r) {
+-			return;
++			return false;
+ 		}
+ 		(void)cx_rx(b, 100);
+ 	}
+ 	CX_LOG("NGD status %#x (bit 1 = logical address assigned)\n", cx_rd(CX_NGD + NGD_STATUS));
++	cx.ngd_up = true;
++	return true;
++}
+ 
++/* stage 4: codec MCLK + reset, its logical address from the manager, its chip id */
++static bool
++cx_stage_codec(void)
++{
++	uint8_t b[40];
++	int r;
++	if (!cx.ngd_up) {
++		CX_LOG("stage 4 needs stage 3 first\n");
++		return false;
++	}
++	CX_LOG("stage 4: codec\n");
+ 	r = sweet_rpmh_lnbclk2_enable();
+ 	CX_LOG("codec MCLK (RPMh lnbclka2) -> %d\n", r);
+ 	if (!cx.rst) {
+@@ -2862,7 +2931,7 @@ cx_step1(void)
+ 		q[3] = cx.tid;
+ 		memcpy(q + 4, cx_pgd_ea, 6);
+ 		if (cx_tx(q)) {
+-			return;
++			return false;
+ 		}
+ 		unsigned n = cx_wait(b, 6, 0x0e, cx.tid, 300);
+ 		if (n >= 11 && memcmp(b + 4, "\0\0\0\0\0\0", 6)) {
+@@ -2873,7 +2942,7 @@ cx_step1(void)
+ 	}
+ 	if (cx.la == 0xff) {
+ 		CX_LOG("the manager did not give the codec's logical address (not enumerated)\n");
+-		return;
++		return false;
+ 	}
+ 	CX_LOG("codec PGD logical address %#x\n", cx.la);
+ 	uint16_t off = 0x800 + 0x21, ec = (uint16_t)(3 | 0x8 | ((off & 0xf) << 4) | ((off & 0xff0) << 4));   /* 4 bytes */
+@@ -2881,22 +2950,27 @@ cx_step1(void)
+ 	cx.tid = (uint8_t)((cx.tid + 1) & 0x3f);
+ 	rq[3] = cx.tid;
+ 	if (cx_tx(rq)) {
+-		return;
++		return false;
+ 	}
+ 	unsigned n = cx_wait(b, 0, 0x64, cx.tid, 300);
+ 	if (n >= 8) {
+ 		CX_LOG("THE CODEC ANSWERS: chip id bytes 0-3 = %02x %02x %02x %02x (minor %#x, major %#x)\n", b[4], b[5], b[6],
+ 		    b[7], b[4] | b[5] << 8, b[6] | b[7] << 8);
+-	} else {
+-		CX_LOG("no REPLY_VALUE for the chip id\n");
++		return true;
+ 	}
++	CX_LOG("no REPLY_VALUE for the chip id\n");
++	return false;
+ }
+ 
++/*
++ * kern.sweet_codec: 1 = stage 1 (QMI), 2 = stage 2 (register reads), 3 = stage 3 (NGD), 4 = stage 4 (codec),
++ * 9 = all in order, stopping at the first failure; 0 = QMI POWER inactive. Read = the last run's log.
++ */
+ static int
+ cx_sysctl SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	int v = 0, err;
++	int v = -1, err;
+ 	if (req->newptr) {
+ 		char in[8] = { 0 };
+ 		size_t n = MIN(req->newlen, sizeof(in) - 1);
+@@ -2909,18 +2983,37 @@ cx_sysctl SYSCTL_HANDLER_ARGS
+ 		} else {
+ 			v = in[0] - '0';                /* or text ("1") */
+ 		}
+-		if (v == 1) {
+-			lck_mtx_lock(&au_mtx);
+-			cx_step1();
+-			lck_mtx_unlock(&au_mtx);
+-		} else {
++		if (v < 0 || v > 9) {
+ 			return EINVAL;
+ 		}
++		if (__atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
++			return EBUSY;
++		}
++		cx.off = 0;
++		cx.log[0] = 0;
++		cx.runs++;
++		CX_LOG("run %u, stage %d\n", cx.runs, v);
++		if (v == 0) {
++			uint8_t pwr[7] = { 0x01, 4, 0, 1, 0, 0, 0 };                      /* inactive */
++			CX_LOG("QMI POWER inactive -> %d\n", cx_qmi(0x21, pwr, sizeof(pwr)));
++			cx.powered = cx.regs_ok = cx.ngd_up = false;
++		} else if (v == 1) {
++			(void)cx_stage_qmi();
++		} else if (v == 2) {
++			(void)cx_stage_regs();
++		} else if (v == 3) {
++			(void)cx_stage_ngd();
++		} else if (v == 4) {
++			(void)cx_stage_codec();
++		} else if (v == 9) {
++			(void)(cx_stage_qmi() && cx_stage_regs() && cx_stage_ngd() && cx_stage_codec());
++		}
++		__atomic_store_n(&cx.busy, false, __ATOMIC_RELEASE);
+ 	}
+ 	return SYSCTL_OUT(req, cx.log, strnlen(cx.log, sizeof(cx.log)) + 1);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_codec, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, cx_sysctl, "A",
+-    "Mi 8 WCD9340: write 1 = SLIMbus up + chip id (3058); read = the last run's log");
++    "Mi 8 WCD9340 bring-up: 1 QMI, 2 register reads, 3 NGD, 4 codec, 9 all, 0 power off; read = last log (3058)");
+ 
+ static void
+ au_thread(void *arg, wait_result_t w)
