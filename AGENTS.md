@@ -7,6 +7,9 @@
 - The user switches agents frequently. Update the active handoff in `NOTES.md`
   after each milestone and before stopping. Record commits, CI run IDs, exact
   build/boot results and unfinished work. Distinguish observations from guesses.
+- After each milestone also update `README.md` (user, 2026-11-05): the
+  "Status (Mi 8, DATE)" table and its date, and "Building for the Mi 8" if a
+  command changed. Only claims NOTES.md or the user backs; "not tried" over guesses.
 - Commit completed changes. Build kernels on this Mac with
   `tools/xnu-local-build.sh` (from scratch about 28 minutes, `--remake` 18 s; see
   the KERNEL BUILDS bullet in `NOTES.md`). Do not start `xnu.yml` runs without

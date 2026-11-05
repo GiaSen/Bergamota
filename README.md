@@ -5,14 +5,14 @@
 <h1 align="center">Bergamota Project</h1>
 
 <p align="center">
-  <b>Apple's iOS 18 on a Poco F1</b><br>
-  Xiaomi <code>beryllium</code> · Qualcomm Snapdragon 845 · iOS 18.7.8 (22H352)
+  <b>Apple's iOS 26 on a Xiaomi Mi 8</b><br>
+  Xiaomi <code>dipper</code> · Qualcomm Snapdragon 845 · iOS 26.6.2 (23G90)
 </p>
 
 <p align="center">
-  <img alt="iOS 18.7.8" src="https://img.shields.io/badge/iOS-18.7.8-1a5933?style=flat-square">
-  <img alt="SpringBoard" src="https://img.shields.io/badge/SpringBoard-booting-d7e98a?style=flat-square">
-  <img alt="Kernel" src="https://img.shields.io/badge/kernel-Heartwood-161616?style=flat-square">
+  <img alt="iOS 26.6.2" src="https://img.shields.io/badge/iOS-26.6.2-1a5933?style=flat-square">
+  <img alt="SpringBoard" src="https://img.shields.io/badge/SpringBoard-on%20the%20GPU-d7e98a?style=flat-square">
+  <img alt="Kernel" src="https://img.shields.io/badge/kernel-Heartwood%20xnu--12377-161616?style=flat-square">
   <img alt="Host" src="https://img.shields.io/badge/host-macOS-555?style=flat-square">
 </p>
 
@@ -20,14 +20,17 @@
 
 ---
 
-The Poco F1 boots the **unmodified iOS 18.7.8 userland of the iPhone XR** (`iPhone11,8`) to SpringBoard. It runs from its own UFS storage and is driven from a Mac over USB. Four parts make that work, each named after a piece of the bergamot tree:
+This is the `dipper` branch of [GiaSen/Bergamota](https://github.com/GiaSen/Bergamota): the port to the **Xiaomi Mi 8**. Upstream [Bergamota](https://github.com/ry-diffusion/Bergamota) (`develop`) runs iOS 18.7.8 on the Poco F1, which has the same Snapdragon 845. The Getting started guide further down is still upstream's Poco F1 route; the Mi 8 steps are in [Building for the Mi 8](#building-for-the-mi-8).
+
+The Mi 8 boots the **unmodified iOS 26.6.2 userland of the iPhone 11** (`iPhone12,1`) to SpringBoard and its home screen, composited on the phone's own GPU. It runs from its own UFS storage and is driven from a Mac over USB. Five parts make that work, four of them named after a piece of the bergamot tree:
 
 | | Part | What it does | Where |
 | --- | --- | --- | --- |
 | 🍋 | **Bergamota** | The macOS control plane. It shows phone status and the live kernel log, builds boot images, and runs the boot and flash queue. A second-screen Control Plane view also handles sideloading and media upload. | [`apps/Bergamota`](apps/Bergamota) |
 | 🌿 | **Enxerto** | The bootloader ("graft"). Qualcomm ABL starts it from the `boot` partition. It inflates the kernel with the MMU on, hands it a device tree and boots it. It also has its own fastboot and an off-mode charging screen. | [`enxerto/`](enxerto) |
-| 🪵 | **Heartwood** | The kernel: Apple's open-source XNU (xnu-11215, the iOS 18 generation) plus our patches for the Snapdragon 845 hardware. It is built by GitHub Actions. | [`xnu/patches-11215`](xnu/patches-11215) |
+| 🪵 | **Heartwood** | The kernel: Apple's open-source XNU (xnu-12377, the iOS 26 generation) plus our patches for the Snapdragon 845. The Mi 8's own drivers are patches 3001 onwards. Built on the Mac with `tools/xnu-local-build.sh`. | [`xnu/patches-12377`](xnu/patches-12377) |
 | 🏴 | **Renegade** | The patcher. It rewrites every arm64e Mach-O and the whole dyld shared cache so they run on a CPU without pointer authentication. It then builds the flashable iOS root image. | [`tools/renegade`](tools/renegade) |
+| 🌱 | **Chlorophyll** | Metal for iOS on the Adreno 630, on top of Mesa's Turnip Vulkan driver. With it, backboardd, SpringBoard and the icon renderer draw on the GPU. | [`gpu/metal`](gpu/metal) (submodule, [GiaSen/Chlorophyll](https://github.com/GiaSen/Chlorophyll) `dipper`) |
 
 > [!WARNING]
 > This is an experimental bring-up, not a usable phone OS. It installs into `userdata` and **erases Android's user data**. Apple's security model is mostly switched off, so do not put anything personal on it.
@@ -37,9 +40,9 @@ The Poco F1 boots the **unmodified iOS 18.7.8 userland of the iPhone XR** (`iPho
 ```
 Qualcomm ABL (stock, unlocked)
   └─ Enxerto            boot partition · logo + progress bar · Bergamota fastboot · charging screen
-      └─ Heartwood      XNU + Apple Device Tree (@3x iPhone XR identity) + boot-args
-          └─ HFS+ root  userdata · iOS 18.7.8, rewritten by Renegade
-              └─ dyld → launchd → daemons → backboardd → SpringBoard
+      └─ Heartwood      XNU + Apple Device Tree (@2x iPhone 11 identity) + boot-args
+          └─ HFS+ root  userdata · iOS 26.6.2, rewritten by Renegade
+              └─ dyld → launchd → daemons → backboardd (Chlorophyll) → SpringBoard
 ```
 
 <p align="center">
@@ -49,21 +52,56 @@ Qualcomm ABL (stock, unlocked)
 </p>
 <p align="center"><sub>Enxerto's screens, rendered by its host test: boot, Bergamota fastboot, off-mode charging</sub></p>
 
-## Status
+## Status (Mi 8, 2026-11-05)
 
 | Area | State |
 | --- | --- |
-| iOS | 18.7.8 (22H352) to **SpringBoard and the home screen**, with Safari, Settings and the other stock apps registered |
+| iOS | 26.6.2 (23G90) to **SpringBoard and the home screen**, with Settings, Safari and the other stock apps. Safari plays video (MP4 and HLS); YouTube plays with sound |
 | CPU | All 8 cores (4× A55 + 4× A75). Instead of pointer authentication, the code is rewritten by Renegade |
-| Display | 1080×2246 panel, iOS renders at @3x; page flipping on the MDP. **CPU rendering**, no GPU yet |
-| Touch / buttons | Novatek NT36672A (bit-banged I²C), power and volume keys over SPMI |
-| USB | CDC-ECM Ethernet: SSH at `root@192.168.7.2`, live kernel log on UDP 5140, internet shared from the Mac |
-| Battery | Real fuel gauge and charger state; the off-mode charging screen lives in Enxerto |
-| Kernel | Heartwood on **xnu-11215.81.4** since 2026-10-23 (it was xnu-8796, the iOS 16 generation, before that) |
-| Working on | GPU acceleration on the Adreno 630 (OpenGL ES over Mesa freedreno, then Metal) |
-| Not working | Wi-Fi, cellular, Bluetooth, audio, camera, sensors, SEP / Face ID, GPU acceleration |
+| GPU | Adreno 630 with the Mi 8's own firmware. iOS composites on it through Chlorophyll (backboardd, SpringBoard, the icon renderer). By hand: "decent", not as smooth as a real iPhone |
+| Display | Samsung EA8074 AMOLED, 1080×2248 with the notch, command mode at 60 Hz. iOS draws an 828×1792 @2x canvas that the display engine scales up. The brightness slider drives the panel |
+| Touch / buttons | ST FTS touch controller; power and volume keys |
+| Wi-Fi | WCN3990: WPA2 join and internet, rejoins after a reboot, power save, the Settings switch works |
+| Bluetooth | The controller runs next to Wi-Fi and bluetoothd stays up; nearby devices show in Settings. Pairing and Bluetooth audio not tried yet |
+| Speaker | TAS2557 amp through the audio DSP. iOS plays through `SweetSpeaker.driver` with a speaker guard (high-pass, power and peak limits); the amp sleeps during silence |
+| Vibration | The PMI8998 haptics motor: CoreHaptics patterns and the system vibrations |
+| USB | CDC-ECM Ethernet: SSH at `root@192.168.7.2`, live kernel log on UDP 5140, internet shared from the Mac; iOS sees a cable at once |
+| Battery | Real fuel gauge and charger state, charging capped at 1.7 A (0.5 C); Bergamota fastboot charges too |
+| Kernel | Heartwood on **xnu-12377.121.6**, Mi 8 patches 3001–3049 |
+| Working on | Tuning the vibration strength |
+| Not working | Cellular, microphone, earpiece, camera, sensors (rotation, auto-brightness), fingerprint, SEP / Face ID. App Store and Weather stop at FairPlay |
 
-## Getting started
+Every boot, crash and decision is in [`NOTES.md`](NOTES.md); the newest Mi 8 results are at the top of its Mi 8 section.
+
+## Building for the Mi 8
+
+The same tools as the Poco F1 guide below, with these differences. Firmware for the GPU, Wi-Fi, Bluetooth and audio comes from the Mi 8's own partitions (back them up first, see `NOTES.md`) and stays out of git, like the device trees and Apple's files.
+
+```sh
+# Heartwood, on this Mac (about 28 minutes from scratch; --remake about 18 s after an edit)
+tools/xnu-local-build.sh 26.5      # -> research/xnu-local/dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
+
+# Apple Device Tree: the iPhone 11 identity (needs research/ios26/n104ap.adt), then Wi-Fi and the GPU firmware
+python3 tools/mkadt.py enxerto/out/dipper-n104-2x.adt --board dipper --highmem --identity n104ap --display-scale 2 --points 414x896
+python3 tools/adt-wlan.py enxerto/out/dipper-n104-2x.adt enxerto/out/dipper-n104-2x-wlan.adt
+python3 tools/adt-gpufw.py enxerto/out/dipper-n104-2x-wlan.adt enxerto/out/dipper-n104-2x-wlan-gpu.adt \
+    --fw research/gpu-fw/dipper --zap research/gpu-fw/dipper
+# an ADT made before mkadt.py copied /product/haptics (it does now) gets it with:
+python3 tools/adt-haptics.py enxerto/out/dipper-n104-2x-wlan-gpu.adt enxerto/out/dipper-n104-2x-wlan-gpu-hap.adt
+
+# iOS root (RENEGADE_TARGET=ios26 is the default): Chlorophyll, Bluetooth firmware, the speaker, quieter daemons
+RENEGADE_AMP_FW=research/audio-dipper/fw RENEGADE_BT_FW=research/bt-dipper/fw SWEET_QUIET=1 RENEGADE_CHL=1 \
+    tools/renegade/renegade update research/ios26/ios26-root-chl.simg --no-jb
+
+# boot image with the current boot-args (default ADT: dipper-n104-2x-wlan-gpu-hap.adt, needs dtb/dipper/dtb)
+tools/dipper-mkboot.sh KERNEL research/ios26/enxerto-boot-dipper-ios26-NN.img
+python3 tools/bergamota-flash.py flash userdata research/ios26/ios26-root-chl.simg   # from Bergamota fastboot, delta
+fastboot -s bergamota0001 boot research/ios26/enxerto-boot-dipper-ios26-NN.img
+```
+
+## Getting started (Poco F1, upstream)
+
+This is upstream's route for the Poco F1 on iOS 18.7.8; for the Mi 8 see [Building for the Mi 8](#building-for-the-mi-8).
 
 You need a Mac (the Renegade root step also runs on Linux, see 3b), a Poco F1 with an **unlocked bootloader**, and a backup of its partitions (see [`NOTES.md`](NOTES.md)).
 
@@ -229,6 +267,7 @@ It does this for every Mach-O in the root and for all of the dyld shared cache. 
 | --- | --- |
 | `apps/Bergamota/` | Bergamota, the SwiftUI control plane, plus its CLI (`scripts/bergamota`) |
 | `enxerto/` | Enxerto, the bare-metal bootloader (C + asm): loader, inflate, UFS, USB/DWC3, fastboot, PMIC, boot UI |
+| `xnu/patches-12377/` | Heartwood for iOS 26 (xnu-12377), applied in order by `tools/xnu-local-build.sh` and `.github/workflows/xnu.yml`; 3001 onwards are the Mi 8's drivers |
 | `xnu/patches-11215/` | Heartwood, the XNU patch series (xnu-11215), applied in order by `.github/workflows/xnu.yml`; `xnu/patches/` is the older xnu-8796 series |
 | `tools/renegade/` | Renegade: `pacstrip*`, `fips_rehmac`, root build, HFS+ and sparse-image tools, `dsctools` (shared-cache symbolication) |
 | `tools/adt-gpufw.py`, `zap-split.py` | GPU firmware into the ADT (`/sweet-gpu`); split a squashed `.mbn` into `.mdt` + `.bNN` |
@@ -236,13 +275,17 @@ It does this for every Mach-O in the root and for all of the dyld shared cache. 
 | `tools/extract-dtb.py` | Extracts the stock DTBs from a boot.img (also the Poco F1's appended Image.gz-dtb) and picks yours |
 | `tools/mkadt.py`, `mkpayload.py` | Apple Device Tree generator; kernel + ADT + boot-args payload packer |
 | `tools/sweetnet/` | Small on-device tools (`sweetps`, `sweetprefs`, `sweetuicache`, …) |
+| `tools/dipper-mkboot.sh` | The Mi 8 boot image with its current boot-args and ADT |
+| `tools/adt-wlan.py`, `adt-haptics.py` | Wi-Fi node and `/product/haptics` (iOS's vibration route) into an ADT |
+| `tools/audio/` | `SweetSpeaker.driver` (the speaker and vibration motor as Core Audio devices, with the speaker guard), TAS2557 amp scripts from TI's firmware |
+| `gpu/metal/` | Chlorophyll, Metal on the Adreno 630 (submodule) |
 | `tools/identity/` | The Bergamota identity (Newton halftone, lime ground, Archivo + JetBrains Mono): `mkidentity.py` generates Enxerto's `art.h` and the kernel console's portrait, `mkicon.sh` the app icon |
 | `tools/mksplash.py` | The ABL screens of the `logo` partition, from Enxerto's own renders |
-| `docs/` | Design notes: iOS 18 port, Bergamota fastboot and charging, GPU research, … |
+| `docs/` | Design notes: iOS 18 and iOS 26 ports, Wi-Fi on iOS 26, Bergamota fastboot and charging, GPU research, forks survey, … |
 | `NOTES.md` | The engineering log: every boot, crash and decision |
 
 Not in git: partition backups, device trees, Apple firmware and root images, or anything with serial numbers or calibration data.
 
 ## Credits
 
-This started as a fork of [ios-sweet](https://github.com/dipa-studio/ios-sweet) (iOS 16 on the Redmi Note 10 Pro). The iOS 16 days of this port are in [`docs/IOS16_README.md`](docs/IOS16_README.md). It is built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build) and [ipsw](https://github.com/blacktop/ipsw), the Linux kernel's SDM845 drivers for the hardware details, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
+The Mi 8 port is a fork of [Bergamota](https://github.com/ry-diffusion/Bergamota) (Poco F1), which itself started as a fork of [ios-sweet](https://github.com/dipa-studio/ios-sweet) (iOS 16 on the Redmi Note 10 Pro). The iOS 16 days of this port are in [`docs/IOS16_README.md`](docs/IOS16_README.md). The route to iOS's vibration (`/product/haptics`) and the speaker guard's design come from HakiOS ([oosexgang/hakios-xnu-kernel](https://github.com/oosexgang/hakios-xnu-kernel)); our code for them is our own. It is built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build) and [ipsw](https://github.com/blacktop/ipsw), the Linux kernel's SDM845 drivers (and LineageOS's Mi 8 kernel) for the hardware details, [Mesa](https://mesa3d.org)'s Turnip for Chlorophyll, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
