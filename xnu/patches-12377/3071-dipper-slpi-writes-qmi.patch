@@ -1,0 +1,557 @@
+From e0afd9718385a398dbb47b0df42d99b9fcde90f9 Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@wlan-114021.nbw.tue.nl>
+Date: Fri, 6 Nov 2026 15:55:29 +0100
+Subject: [PATCH] 3071: the SLPI's registry writes go to the iOS copy (fopen w
+ + fwrite, written at fclose, persist/sensors only), quieter FastRPC log, QMI
+ pass-through to the SLPI's services (kern.sweet_ssc_qmi, _ind, _services)
+
+---
+ bsd/dev/dipper_sensors.c | 416 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 402 insertions(+), 14 deletions(-)
+
+diff --git a/bsd/dev/dipper_sensors.c b/bsd/dev/dipper_sensors.c
+index e028e6b..eeecae8 100644
+--- a/bsd/dev/dipper_sensors.c
++++ b/bsd/dev/dipper_sensors.c
+@@ -24,7 +24,8 @@
+  *      3069: from ready on, GLINK on the "dsps" edge and QRTR on its IPCRTR channel (pd-mapper answers, servreg
+  *      listener for msm/slpi/sensor_pd), in the thread "sweet ssc"; the sysctl waits 60 s and logs a summary.
+  *      3070: FastRPC on GLINK fastrpcglink-apps-dsp: attach to the sensors PD and serve its file reads (registry,
+- *      config, socinfo) from /private/var/sweet/qcom on the iOS root (see the FastRPC section).
++ *      config, socinfo) from /private/var/sweet/qcom on the iOS root (see the FastRPC section); 3071: its registry
++ *      writes too (into that copy), and a QMI pass-through to the SLPI's services: kern.sweet_ssc_qmi, _ind, _services.
+  *
+  * Facts from the live DT (dtb/dipper/live.dtb): qcom,ssc@5c00000 pil-tz-generic, qcom,pas-id 12, qcom,smem-id 424,
+  * qcom,signal-aop, vdd_cx = lcx.lvl and vdd_mx = lmx.lvl (rpmh-arc-regulator, level 0x181, keep-proxy-regs-on),
+@@ -49,6 +50,8 @@
+ #include <sys/proc.h>
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
+ #include <kern/thread.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+@@ -632,6 +635,9 @@ qs_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port,
+ 	return sg_send((unsigned)sg.qrtr, pkt, 32 + padded);
+ }
+ 
++static void ssq_note(const uint32_t v[5], bool add);
++static void ssq_rx(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len);
++
+ static const char *
+ nf_state_name(uint32_t st)
+ {
+@@ -782,6 +788,7 @@ qs_rx(const uint8_t *p, uint32_t len)
+ 			sg.servers++;
+ 			SG_LOG("qrtr: the SLPI %s service %u (%#x) version %u instance %u at %u:%#x\n",
+ 			    type == Q_NEW_SERVER ? "offers" : "removes", v[1], v[1], v[2] & 0xff, v[2] >> 8, v[3], v[4]);
++			ssq_note(v, type == Q_NEW_SERVER);
+ 			if (v[1] == QR_SNS_SERVICE) {
+ 				sg.sns_node = type == Q_NEW_SERVER ? v[3] : 0;
+ 				sg.sns_port = type == Q_NEW_SERVER ? v[4] : 0;
+@@ -813,6 +820,8 @@ qs_rx(const uint8_t *p, uint32_t len)
+ 			}
+ 		} else if (dport == QR_NOTIF_PORT) {
+ 			nf_rx(snode, sport, pl, size);
++		} else if (dport == 0x4020u) {          /* QR_SSQ_PORT: the pass-through (3071) */
++			ssq_rx(snode, sport, pl, size);
+ 		} else {
+ 			char hex[3 * 48 + 1];
+ 			sg_hex(hex, sizeof(hex), pl, MIN(size, 48u));
+@@ -1119,7 +1128,7 @@ sg_up(void)
+ #define SS_VENDOR_MTIME         1230768000ll    /* 2009-01-01: every file of the vendor image; persist's sns_reg_config has it */
+ #define FS_MAX                  32u
+ #define FS_FILE_MAX             0x100000u
+-#define FR_LOG_MAX              900u
++#define FR_LOG_MAX              1500u
+ extern bool sweet_scm_assign(const char *what, uint64_t pa, uint64_t size, const uint32_t *src, unsigned nsrc,
+     const uint32_t *dst, const uint32_t *perm, unsigned ndst);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+@@ -1152,12 +1161,12 @@ static struct {
+ 	uint8_t *req, *reply;
+ 	uint32_t reply_len;
+ 	bool reply_short;
+-	unsigned calls, reverse, logged, unsupported;
+-	uint64_t bytes;
++	unsigned calls, reverse, logged, unsupported, quiet_opens, writes, write_errors;
++	uint64_t bytes, written;
+ } fr;
+ 
+ static struct fs_file {
+-	bool used, dir;
++	bool used, dir, write;          /* write (3071): contents kept here, written to the iOS copy at fclose */
+ 	char name[96];                  /* as the PD named it, for the log */
+ 	uint8_t *data;                  /* the contents; for a directory its names, each NUL-terminated */
+ 	uint32_t size, off, cap;
+@@ -1466,6 +1475,89 @@ fs_stat(const char *name, uint8_t out[96])
+ 	return 0;
+ }
+ 
++/* 3071: the PD's registry reads and socinfo reads are counted, not logged one by one */
++static bool
++fs_quiet(const char *name)
++{
++	return fs_soc_leaf(name) != NULL || strncmp(name, "/mnt/vendor/persist/sensors/registry/registry/", 46) == 0;
++}
++
++/* 3071: writes go to the iOS copy, and only under persist/sensors (the PD's registry); the file is created or truncated */
++static bool
++fs_writable(const char *name, char *path, size_t cap)
++{
++	static const char pfx[] = SS_FILES "/mnt/vendor/persist/sensors/";
++	return fs_path(name, path, cap) && strncmp(path, pfx, sizeof(pfx) - 1) == 0;
++}
++
++static int
++fs_open_write(const char *name)
++{
++	char path[256];
++	if (!fs_writable(name, path, sizeof(path))) {
++		return -EPERM;
++	}
++	int i = fs_alloc(name);
++	if (i < 0) {
++		return -EMFILE;
++	}
++	fs[i].write = true;
++	fs[i].cap = 4096;
++	fs[i].data = kalloc_data(fs[i].cap, Z_WAITOK | Z_ZERO);
++	if (!fs[i].data) {
++		fs_free((unsigned)i);
++		return -ENOMEM;
++	}
++	return i + 3;
++}
++
++static int
++fs_append(struct fs_file *f, const uint8_t *d, uint32_t n)
++{
++	if (f->size + n > FS_FILE_MAX) {
++		return EFBIG;
++	}
++	if (f->size + n > f->cap) {
++		uint32_t cap = f->cap;
++		while (cap < f->size + n) {
++			cap *= 2;
++		}
++		uint8_t *nd = kalloc_data(cap, Z_WAITOK | Z_ZERO);
++		if (!nd) {
++			return ENOMEM;
++		}
++		memcpy(nd, f->data, f->size);
++		kfree_data(f->data, f->cap);
++		f->data = nd;
++		f->cap = cap;
++	}
++	memcpy(f->data + f->size, d, n);
++	f->size += n;
++	return 0;
++}
++
++static int
++fs_commit(struct fs_file *f)
++{
++	char path[256];
++	if (!fs_writable(f->name, path, sizeof(path))) {
++		return EPERM;
++	}
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int err = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, S_IRUSR | S_IWUSR, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (err) {
++		return err;
++	}
++	int resid = 0;
++	if (f->size) {
++		err = vn_rdwr(UIO_WRITE, vp, (caddr_t)f->data, (int)f->size, 0, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	}
++	int err2 = vnode_close(vp, FWRITE, ctx);
++	return err ? err : resid ? EIO : err2;
++}
++
+ /* ---- the reverse calls */
+ static uint32_t
+ fr_word(const struct fr_buf *b, unsigned i)
+@@ -1557,8 +1649,17 @@ static uint32_t
+ fr_fopen(const char *env, const char *name, const char *mode, uint32_t *fd)
+ {
+ 	char full[256];
++	if (mode[0] == 'w' && !strchr(mode, '+')) {             /* 3071: create / truncate, written at fclose */
++		int w = fs_open_write(name);
++		if (w < 0) {
++			FR_LOG("apps_std open \"%s\" mode \"%s\" -> errno %d (writes only under persist/sensors)\n", name, mode, -w);
++			return AEE_EFAILED;
++		}
++		*fd = (uint32_t)w;
++		return 0;
++	}
+ 	if (mode[0] != 'r' || strchr(mode, '+')) {
+-		FR_LOG("apps_std open \"%s\" mode \"%s\": writing is not served -> EUNSUPPORTED\n", name, mode);
++		FR_LOG("apps_std open \"%s\" mode \"%s\": not served -> EUNSUPPORTED\n", name, mode);
+ 		return AEE_EUNSUPPORTED;
+ 	}
+ 	if (name[0] != '/') {
+@@ -1567,8 +1668,12 @@ fr_fopen(const char *env, const char *name, const char *mode, uint32_t *fd)
+ 		name = full;
+ 	}
+ 	int r = fs_open(name, false);
+-	FR_LOG("apps_std open %s%s%s\"%s\" -> %s%d (%u bytes)\n", *env ? "$" : "", env, *env ? " " : "", name,
+-	    r < 0 ? "errno " : "fd ", r < 0 ? -r : r, r < 0 ? 0 : fs[r - 3].size);
++	if (r >= 0 && fs_quiet(name)) {
++		fr.quiet_opens++;
++	} else {
++		FR_LOG("apps_std open %s%s%s\"%s\" -> %s%d (%u bytes)\n", *env ? "$" : "", env, *env ? " " : "", name,
++		    r < 0 ? "errno " : "fd ", r < 0 ? -r : r, r < 0 ? 0 : fs[r - 3].size);
++	}
+ 	if (r < 0) {
+ 		return AEE_EFAILED;
+ 	}
+@@ -1609,7 +1714,18 @@ fr_apps_std(uint32_t m, const struct fr_buf *in, unsigned nin, const struct fr_b
+ 			FR_LOG("apps_std %s of an unknown fd %u\n", apps_std_names[m], fr_word(prim, 0));
+ 			return AEE_EFAILED;
+ 		}
+-		FR_LOG("apps_std %s \"%s\" (%llu bytes read)\n", apps_std_names[m], f->name, f->read);
++		if (f->write) {
++			int err = fs_commit(f);
++			fr.writes++;
++			fr.written += f->size;
++			fr.write_errors += err != 0;
++			FR_LOG("apps_std wrote \"%s\": %u bytes%s%d\n", f->name, f->size, err ? ", FAILED errno " : "", err);
++			fs_free((unsigned)(f - fs));
++			return err ? AEE_EFAILED : 0;
++		}
++		if (!fs_quiet(f->name)) {
++			FR_LOG("apps_std %s \"%s\" (%llu bytes read)\n", apps_std_names[m], f->name, f->read);
++		}
+ 		fs_free((unsigned)(f - fs));
+ 		return 0;
+ 	case 4: {               /* fread(fd, size) -> written, eof, data */
+@@ -1633,6 +1749,18 @@ fr_apps_std(uint32_t m, const struct fr_buf *in, unsigned nin, const struct fr_b
+ 		fr.bytes += n;
+ 		return d || !want ? 0 : AEE_EFAILED;
+ 	}
++	case 5: {               /* fwrite(fd, data) -> written, eof (3071) */
++		uint32_t out[2] = { 0, 0 };
++		f = fs_get(fr_word(prim, 0));
++		const struct fr_buf *d = nin >= 2 ? &in[1] : NULL;
++		int err = !f || !f->write || !d ? EBADF : fs_append(f, d->p, d->len);
++		out[0] = err ? 0 : d->len;
++		fr_put(out, 8);
++		if (err) {
++			FR_LOG("apps_std fwrite fd %u -> errno %d\n", fr_word(prim, 0), err);
++		}
++		return err ? AEE_EFAILED : 0;
++	}
+ 	case 8: {               /* ftell(fd) -> pos */
+ 		f = fs_get(fr_word(prim, 0));
+ 		uint32_t pos = f ? f->off : 0;
+@@ -1692,7 +1820,9 @@ fr_apps_std(uint32_t m, const struct fr_buf *in, unsigned nin, const struct fr_b
+ 		int r = fs_stat(name, out);
+ 		uint64_t sz;
+ 		memcpy(&sz, out + 40, 8);
+-		FR_LOG("apps_std stat \"%s\" -> %s%d, %llu bytes\n", name, r < 0 ? "errno " : "", r < 0 ? -r : 0, r < 0 ? 0 : sz);
++		if (r < 0 || !fs_quiet(name)) {
++			FR_LOG("apps_std stat \"%s\" -> %s%d, %llu bytes\n", name, r < 0 ? "errno " : "", r < 0 ? -r : 0, r < 0 ? 0 : sz);
++		}
+ 		fr_put(out, sizeof(out));
+ 		return r < 0 ? AEE_EFAILED : 0;
+ 	}
+@@ -2061,6 +2191,261 @@ fr_step(void)
+ 	}
+ }
+ 
++/*
++ * ---- 3071: QMI pass-through to the SLPI's services (S3), for tools/sweetnet/sweetssc: the sensors' QMI front end is
++ * SNS client service 400 (requests 0x20 carry a protobuf sns_client_request; reports come back as indications 0x21 /
++ * 0x22). Same shape as the modem's kern.sweet_qmi (3057): one request per sysctl call (kern.sweet_ssc_qmi, root): in
++ * {u32 service, u32 instance or ~0, QMI message: u8 type, u16 txn, u16 msg, u16 len, TLVs}; the thread sends it from
++ * client port QR_SSQ_PORT with its own transaction id and fixes the length; out = the response (type 2). One request
++ * at a time (EBUSY), 5 s timeout. Indications to the port go to a ring (kern.sweet_ssc_ind); the SLPI's announced
++ * services are in kern.sweet_ssc_services. Over QRTR the port is one QMI client: the SNS service gives it one client id.
++ */
++#define QR_SSQ_PORT             0x4020u
++#define SSQ_SVC_MAX             24u
++#define SSQ_REQ_MAX             1024u
++#define SSQ_RSP_MAX             4096u
++#define SSQ_IND_RING            64u
++#define SSQ_IND_MAX             2048u
++static LCK_GRP_DECLARE(ssq_grp, "sweet_ssc_qmi");
++static LCK_MTX_DECLARE(ssq_lock, &ssq_grp);
++static struct {
++	struct {
++		uint32_t svc, vi, node, port;
++	} srv[SSQ_SVC_MAX];
++	unsigned nsrv;
++	bool busy, queued, sent, done;
++	uint32_t svc, inst, node, port, req_len, rsp_len;
++	uint16_t txn;
++	int err;
++	unsigned sent_ms;
++	uint64_t requests, responses, timeouts, indications;
++	uint8_t req[SSQ_REQ_MAX], rsp[SSQ_RSP_MAX];
++	struct {
++		uint32_t seq, ms, len;
++		uint8_t b[SSQ_IND_MAX];
++	} ind[SSQ_IND_RING];
++	uint32_t ind_head;
++} ssq;
++
++static void
++ssq_note(const uint32_t v[5], bool add)
++{
++	unsigned i;
++	lck_mtx_lock(&ssq_lock);
++	for (i = 0; i < ssq.nsrv; i++) {
++		if (ssq.srv[i].node == v[3] && ssq.srv[i].port == v[4]) {
++			break;
++		}
++	}
++	if (add && (i < ssq.nsrv || ssq.nsrv < SSQ_SVC_MAX)) {
++		if (i == ssq.nsrv) {
++			ssq.nsrv++;
++		}
++		ssq.srv[i].svc = v[1];
++		ssq.srv[i].vi = v[2];
++		ssq.srv[i].node = v[3];
++		ssq.srv[i].port = v[4];
++	} else if (!add && i < ssq.nsrv) {
++		ssq.srv[i] = ssq.srv[--ssq.nsrv];
++	}
++	lck_mtx_unlock(&ssq_lock);
++}
++
++/* the thread: send a queued request, or give up on one that was not answered */
++static void
++ssq_pump(void)
++{
++	if (!ssq.queued && !(ssq.sent && !ssq.done)) {
++		return;
++	}
++	lck_mtx_lock(&ssq_lock);
++	if (ssq.queued) {
++		unsigned i;
++		ssq.queued = false;
++		for (i = 0; i < ssq.nsrv; i++) {
++			if (ssq.srv[i].svc == ssq.svc && (ssq.inst == 0xffffffffu || (ssq.srv[i].vi >> 8) == ssq.inst)) {
++				break;
++			}
++		}
++		if (i == ssq.nsrv) {
++			ssq.err = ENOENT;
++			ssq.done = true;
++			thread_wakeup(&ssq);
++		} else {
++			ssq.node = ssq.srv[i].node;
++			ssq.port = ssq.srv[i].port;
++			ssq.txn = (uint16_t)(ssq.txn + 1 ? ssq.txn + 1 : 1);
++			memcpy(ssq.req + 1, &ssq.txn, 2);
++			ssq.sent = true;
++			ssq.sent_ms = sg_ms();
++			ssq.requests++;
++			if (!qs_send(Q_DATA, QR_SSQ_PORT, ssq.node, ssq.port, ssq.req, ssq.req_len)) {
++				ssq.err = EIO;
++				ssq.done = true;
++				thread_wakeup(&ssq);
++			}
++		}
++	} else if (ssq.sent && !ssq.done && sg_ms() > ssq.sent_ms + 5000) {
++		ssq.timeouts++;
++		ssq.err = ETIMEDOUT;
++		ssq.done = true;
++		thread_wakeup(&ssq);
++	}
++	lck_mtx_unlock(&ssq_lock);
++}
++
++static void
++ssq_rx(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len)
++{
++	uint16_t txn;
++	if (len < 7) {
++		return;
++	}
++	memcpy(&txn, p + 1, 2);
++	lck_mtx_lock(&ssq_lock);
++	if (p[0] == 2 && ssq.sent && !ssq.done && txn == ssq.txn && node == ssq.node && port == ssq.port) {
++		ssq.rsp_len = MIN(len, SSQ_RSP_MAX);
++		memcpy(ssq.rsp, p, ssq.rsp_len);
++		ssq.err = 0;
++		ssq.done = true;
++		ssq.responses++;
++		thread_wakeup(&ssq);
++	} else if (p[0] == 4) {
++		__typeof__(ssq.ind[0]) *e = &ssq.ind[ssq.ind_head % SSQ_IND_RING];
++		e->seq = ssq.ind_head;
++		e->ms = sg_ms();
++		e->len = MIN(len, SSQ_IND_MAX);
++		memcpy(e->b, p, e->len);
++		ssq.ind_head++;
++		ssq.indications++;
++	} else {
++		SG_LOG("qmi: %u-byte message type %u txn %u from %u:%#x not expected\n", len, p[0], txn, node, port);
++	}
++	lck_mtx_unlock(&ssq_lock);
++}
++
++static int
++ssq_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint8_t in[8 + SSQ_REQ_MAX], *out = NULL;
++	uint32_t n, out_len = 0;
++	uint64_t deadline;
++	int err;
++	if (!req->newptr || req->newlen < 8 + 7 || req->newlen > sizeof(in)) {
++		return EINVAL;
++	}
++	if (!sg.up || sg.fatal) {
++		return ENXIO;
++	}
++	n = (uint32_t)req->newlen;
++	if ((err = SYSCTL_IN(req, in, n))) {
++		return err;
++	}
++	lck_mtx_lock(&ssq_lock);
++	if (ssq.busy) {
++		lck_mtx_unlock(&ssq_lock);
++		return EBUSY;
++	}
++	ssq.busy = true;
++	memcpy(&ssq.svc, in, 4);
++	memcpy(&ssq.inst, in + 4, 4);
++	ssq.req_len = n - 8;
++	memcpy(ssq.req, in + 8, ssq.req_len);
++	ssq.req[0] = 0;                         /* QMI_REQUEST */
++	uint16_t body = (uint16_t)(ssq.req_len - 7);
++	memcpy(ssq.req + 5, &body, 2);
++	ssq.sent = false;
++	ssq.done = false;
++	ssq.err = 0;
++	ssq.queued = true;
++	clock_interval_to_deadline(6000, NSEC_PER_MSEC, &deadline);
++	while (!ssq.done) {
++		if (lck_mtx_sleep_deadline(&ssq_lock, LCK_SLEEP_DEFAULT, (event_t)&ssq, THREAD_UNINT, deadline) == THREAD_TIMED_OUT) {
++			break;
++		}
++	}
++	err = ssq.done ? ssq.err : ETIMEDOUT;
++	if (!err) {
++		out_len = ssq.rsp_len;
++		out = kalloc_data(out_len, Z_WAITOK);
++		if (out) {
++			memcpy(out, ssq.rsp, out_len);
++		} else {
++			err = ENOMEM;
++		}
++	}
++	ssq.queued = false;
++	ssq.done = true;                        /* a late answer is dropped */
++	ssq.busy = false;
++	lck_mtx_unlock(&ssq_lock);
++	if (err) {
++		return err;
++	}
++	err = SYSCTL_OUT(req, out, out_len);
++	kfree_data(out, out_len);
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ssc_qmi, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, ssq_sysctl, "S",
++    "QMI request to an SLPI service: in u32 service, u32 instance (~0 any), QMI message; out the response (3071)");
++
++static int
++ssq_services_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char *buf = kalloc_data(2048, Z_WAITOK | Z_ZERO);
++	size_t off;
++	int err;
++	if (!buf) {
++		return ENOMEM;
++	}
++	lck_mtx_lock(&ssq_lock);
++	off = (size_t)snprintf(buf, 2048, "requests %llu responses %llu timeouts %llu indications %llu\n", ssq.requests,
++	    ssq.responses, ssq.timeouts, ssq.indications);
++	for (unsigned i = 0; i < ssq.nsrv && off < 1900; i++) {
++		off += (size_t)snprintf(buf + off, 2048 - off, "%#x v%u i%u %u:%#x\n", ssq.srv[i].svc, ssq.srv[i].vi & 0xff,
++		    ssq.srv[i].vi >> 8, ssq.srv[i].node, ssq.srv[i].port);
++	}
++	lck_mtx_unlock(&ssq_lock);
++	err = SYSCTL_OUT(req, buf, strnlen(buf, 2048) + 1);
++	kfree_data(buf, 2048);
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ssc_services, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, ssq_services_sysctl,
++    "A", "SLPI QMI services: service version instance node:port (3071)");
++
++/* out: u32 next sequence number, u32 count, then oldest first {u32 seq, u32 ms since the SLPI started, u32 len, bytes} */
++static int
++ssq_ind_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint32_t cap = 8 + SSQ_IND_RING * (12 + SSQ_IND_MAX), off = 8, cnt = 0;
++	uint8_t *buf = kalloc_data(cap, Z_WAITOK);
++	int err;
++	if (!buf) {
++		return ENOMEM;
++	}
++	lck_mtx_lock(&ssq_lock);
++	uint32_t first = ssq.ind_head > SSQ_IND_RING ? ssq.ind_head - SSQ_IND_RING : 0, head = ssq.ind_head;
++	for (uint32_t k = first; k < head; k++) {
++		__typeof__(ssq.ind[0]) *e = &ssq.ind[k % SSQ_IND_RING];
++		memcpy(buf + off, &e->seq, 4);
++		memcpy(buf + off + 4, &e->ms, 4);
++		memcpy(buf + off + 8, &e->len, 4);
++		memcpy(buf + off + 12, e->b, e->len);
++		off += 12 + e->len;
++		cnt++;
++	}
++	lck_mtx_unlock(&ssq_lock);
++	memcpy(buf, &head, 4);
++	memcpy(buf + 4, &cnt, 4);
++	err = SYSCTL_OUT(req, buf, off);
++	kfree_data(buf, cap);
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ssc_ind, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, ssq_ind_sysctl, "S",
++    "the last 64 QMI indications from the SLPI to the pass-through port (3071)");
++
+ /* the SLPI from ready on: GLINK polled every 5 ms (20 ms after 2 min), its bits watched; ends on fatal */
+ static void
+ ss_thread(void *arg, wait_result_t w)
+@@ -2072,6 +2457,7 @@ ss_thread(void *arg, wait_result_t w)
+ 	for (;;) {
+ 		sg_poll();
+ 		fr_step();
++		ssq_pump();
+ 		uint32_t bits = 0;
+ 		if (ss_smp2p_in(&bits) && bits != last) {
+ 			SG_LOG("slave-kernel %#x (fatal %u ready %u handover %u stop-ack %u)\n", bits, bits & 1, (bits >> 1) & 1,
+@@ -2090,8 +2476,9 @@ ss_thread(void *arg, wait_result_t w)
+ 			SG_LOG("status: %u channels opened by the SLPI, qrtr node %u, %u hellos, %u servers, %u lookups, %u locator "
+ 			    "requests, %u other data, %s %s\n", sg.nch, sg.qnode, sg.hellos, sg.servers, sg.lookups, sg.pdm_reqs,
+ 			    sg.data_other, sg_pd_path, sg.nf.answered || sg.nf.state ? nf_state_name(sg.nf.state) : "state unknown");
+-			SG_LOG("status: fastrpc %s, %u calls, %u reverse calls (%u not served), %llu file bytes served\n",
+-			    fr.va ? fr_state_name[fr.state] : "off", fr.calls, fr.reverse, fr.unsupported, fr.bytes);
++			SG_LOG("status: fastrpc %s, %u calls, %u reverse calls (%u not served), %u quiet opens, %llu bytes served, "
++			    "%u files written (%llu bytes, %u failed)\n", fr.va ? fr_state_name[fr.state] : "off", fr.calls, fr.reverse,
++			    fr.unsupported, fr.quiet_opens, fr.bytes, fr.writes, fr.written, fr.write_errors);
+ 			sweet_log_sync();
+ 			next_note = t < 60000 ? t + 5000 : t + 60000;
+ 		}
+@@ -2136,8 +2523,9 @@ ss_live(uint32_t bits)
+ 	SS_LOG("qrtr node %u: %u hellos, %u servers, %u lookups, %u locator requests, %u other data; SNS 400 %s; %s %s\n",
+ 	    sg.qnode, sg.hellos, sg.servers, sg.lookups, sg.pdm_reqs, sg.data_other, sg.sns_port ? "offered" : "not offered",
+ 	    sg_pd_path, sg.nf.answered || sg.nf.state ? nf_state_name(sg.nf.state) : "state unknown");
+-	SS_LOG("fastrpc %s: %u calls, %u reverse calls (%u not served), %llu file bytes served\n",
+-	    fr.va ? fr_state_name[fr.state] : "off", fr.calls, fr.reverse, fr.unsupported, fr.bytes);
++	SS_LOG("fastrpc %s: %u calls, %u reverse calls (%u not served), %llu bytes served, %u files written (%llu bytes, "
++	    "%u failed)\n", fr.va ? fr_state_name[fr.state] : "off", fr.calls, fr.reverse, fr.unsupported, fr.bytes, fr.writes,
++	    fr.written, fr.write_errors);
+ 	return !sg.fatal;
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
