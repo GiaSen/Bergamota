@@ -14,6 +14,7 @@
  *        first sample), else Apple's ("unknown")
  * UIDeviceOrientation values: 1 portrait, 2 upside down, 3 landscape left (top to the left), 4 landscape right, 5 face up,
  * 6 face down. Accelerometer in g with Apple's sign (gravity vector: upright = y -1, face up = z -1).
+ * Test switch: /private/var/tmp/sweetorient.force (one digit 1-6) forces that orientation while it exists.
  * Does nothing (logs why) when /private/var/root/sweetorient.off exists, outside backboardd (unless
  * SWEETORIENT_ANY=1, for tools/sweetnet/sweetorient), or when a class or method it wraps is missing.
  * Built by tools/sweetnet/build.sh (arm64e, pacstrip --sign); installed by tools/sweetnet/sweetorient-install.sh.
@@ -27,6 +28,7 @@
 #import <stdlib.h>
 #import <string.h>
 #import <unistd.h>
+#import <fcntl.h>
 
 #define DEBOUNCE 3              /* samples (10 Hz): ~0.3 s, about what an iPhone takes */
 
@@ -89,6 +91,23 @@ deliver(int o, double ts)
 	os_log(lg, "sweetorient: orientation %d to %lu client(s)", o, (unsigned long)cs.count);
 }
 
+/*
+ * Test switch (2026-11-07, for checking rotations without hands on the phone): /private/var/tmp/sweetorient.force holding
+ * one digit 1-6 replaces the accelerometer's answer while it exists; 0 = none. Read at the feed's 10 Hz.
+ */
+static int
+force_read(void)
+{
+	char c = 0;
+	int fd = open("/private/var/tmp/sweetorient.force", O_RDONLY);
+	if (fd < 0) {
+		return 0;
+	}
+	ssize_t n = read(fd, &c, 1);
+	close(fd);
+	return n == 1 && c >= '1' && c <= '6' ? c - '0' : 0;
+}
+
 static void
 feed_start(void)
 {
@@ -104,6 +123,12 @@ feed_start(void)
 			}
 			bool firstSample = cur == 0;
 			int o = orientation_from(d.acceleration.x, d.acceleration.y, d.acceleration.z, cur);
+			int forced = force_read();
+			if (forced) {                           /* test switch: that orientation, no debounce */
+				o = forced;
+				cand = o;
+				cand_n = DEBOUNCE;
+			}
 			if (o == cand) {
 				cand_n++;
 			} else {
