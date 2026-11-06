@@ -25,6 +25,13 @@
  * 3049: duration, drive voltage from the peak) written by a helper thread. Not a waveform player: the PMI8998 drives
  * the LRA at its own frequency.
  *
+ * A third device, UID "Mic" (1 input channel), is the handset's analog microphone: VirtualAudio's DeviceFactory makes
+ * "Mic" (like "DigitalMic" and "Digital Mic") a Device_DigitalMic_Aspen, which creates the built-in microphone port. A
+ * reader thread keeps the kernel's capture running (kern.sweet_audio_rec, dipper_audio.c, xnu 3065: its start brings the
+ * codec up when needed) and copies what it captured into a local ring by kernel sample position; ReadInput takes the
+ * HAL's input sample time kMicDelay frames behind the newest captured sample (the kernel's data comes in 20 ms pieces)
+ * and moves that point again when the two timelines drift apart (counted as resyncs). Same host clock as the speaker.
+ *
  * Logs to the unified log, subsystem com.sweet.SweetSpeaker (`sweetlog 60 SweetSpeaker`).
  */
 #include <CoreAudio/AudioServerPlugIn.h>
@@ -49,12 +56,20 @@ enum {
 	kObjectID_Mute = 5,
 	kObjectID_Actuator = 6,         /* the Taptic Engine's device: VirtualAudio's DeviceFactory knows "Actuator" */
 	kObjectID_ActuatorStream = 7,
+	kObjectID_Mic = 8,              /* the handset mic: VirtualAudio's DeviceFactory knows "Mic" (Device_DigitalMic_Aspen) */
+	kObjectID_MicStream = 9,
+	kObjectID_MicSource = 10,       /* the mic's data source control: the HAL's 'ssrc' / 'ssc#' come from it */
 };
 
 #define kDeviceUID              "Speaker"
 #define kDeviceModelUID         "SweetSpeaker"
 #define kActuatorUID            "Actuator"
 #define kActuatorModelUID       "SweetActuator"
+#define kMicUID                 "Mic"
+#define kMicModelUID            "SweetMic"
+#define kMicRing                65536u          /* samples of the local capture ring (1.4 s), a power of 2 */
+#define kMicDelay               2880u           /* 60 ms: 2 of the kernel's 20 ms pieces + the reader's 5 ms polls + margin */
+#define kMicSafetyOffset        480u
 #define kSampleRate             48000.0
 #define kChannels               2u
 #define kZeroTimeStampPeriod    16384u          /* frames between two zero time stamps */
@@ -115,6 +130,33 @@ static struct {
 	uint32_t last_gaps;
 	unsigned gap_ms[12];
 } gDiag;
+/* the microphone (kern.sweet_audio_rec): the reader thread fills gMicRing up to gMicWpos (kernel sample positions) */
+static UInt32 gMicIOCount;
+static UInt64 gMicAnchorHostTime;
+static Boolean gMicThreadRunning;
+static int16_t gMicRing[kMicRing];
+static _Atomic uint64_t gMicWpos, gMicBase;     /* captured up to (exclusive) / since (this capture's first sample) */
+static atomic_bool gMicLive;                    /* the kernel capture runs and the reader follows it */
+static atomic_bool gMicResync;                  /* place the read point again at the next ReadInput */
+static Float64 gMicOffset;                      /* kernel sample position = HAL input sample time + gMicOffset */
+static struct {
+	unsigned cycles, silent, resyncs, restarts, said;
+	uint64_t lost;
+	float peak;
+	double sum2, n;
+} gMicDiag;
+static void *mic_thread(void *arg);
+/*
+ * The mic's input data sources: VirtualAudio's SubPortPolicy reads the device's kAudioDevicePropertyDataSource ('ssrc',
+ * input scope, a list), writes the built-in mic's active sub-ports there ('imic' 'smic' 'fmic' 'lmic' on this N104
+ * database) and waits for the change notification (HALPropertySynchronizer). The HAL makes 'ssrc' / 'ssc#' of a plug-in
+ * device from its data source control (kAudioDataSourceControlClassID, input scope): kObjectID_MicSource, a selector
+ * whose current items are that list. There is one physical mic: the list is kept and reported, nothing else.
+ */
+#define kMicMaxSources          8u
+static const UInt32 kMicKnownSources[4] = { 'imic', 'smic', 'fmic', 'lmic' };
+static UInt32 gMicSources[kMicMaxSources] = { 'imic', 'smic', 'fmic', 'lmic' };
+static UInt32 gMicNSources = 4;
 
 static Float32
 volume_db(Float32 scalar)
@@ -175,10 +217,22 @@ is_actuator(AudioObjectID o)
 	return o == kObjectID_Actuator || o == kObjectID_ActuatorStream;
 }
 
+static bool
+is_mic(AudioObjectID o)
+{
+	return o == kObjectID_Mic || o == kObjectID_MicStream;
+}
+
+static bool
+is_device(AudioObjectID o)
+{
+	return o == kObjectID_Device || o == kObjectID_Actuator || o == kObjectID_Mic;
+}
+
 static UInt32
 channels_of(AudioObjectID o)
 {
-	return is_actuator(o) ? 1u : kChannels;
+	return is_actuator(o) || is_mic(o) ? 1u : kChannels;
 }
 
 static void
@@ -358,8 +412,8 @@ SS_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHo
 	mach_timebase_info_data_t tb;
 	mach_timebase_info(&tb);
 	gHostTicksPerFrame = (1e9 * tb.denom / tb.numer) / kSampleRate;
-	os_log(gLog, "SweetSpeaker: initialized, device UID %{public}s, %.1f host ticks per frame", kDeviceUID,
-	    gHostTicksPerFrame);
+	os_log(gLog, "SweetSpeaker: initialized, devices %{public}s, %{public}s, %{public}s, %.1f host ticks per frame", kDeviceUID,
+	    kActuatorUID, kMicUID, gHostTicksPerFrame);
 	return kAudioHardwareNoError;
 }
 
@@ -383,8 +437,7 @@ SS_AddDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceOb
     const AudioServerPlugInClientInfo *inClientInfo)
 {
 	(void)inClientInfo;
-	return inDriver == gDriverRef && (inDeviceObjectID == kObjectID_Device || inDeviceObjectID == kObjectID_Actuator) ?
-	    kAudioHardwareNoError : kAudioHardwareBadObjectError;
+	return inDriver == gDriverRef && is_device(inDeviceObjectID) ? kAudioHardwareNoError : kAudioHardwareBadObjectError;
 }
 
 static OSStatus
@@ -392,8 +445,7 @@ SS_RemoveDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDevic
     const AudioServerPlugInClientInfo *inClientInfo)
 {
 	(void)inClientInfo;
-	return inDriver == gDriverRef && (inDeviceObjectID == kObjectID_Device || inDeviceObjectID == kObjectID_Actuator) ?
-	    kAudioHardwareNoError : kAudioHardwareBadObjectError;
+	return inDriver == gDriverRef && is_device(inDeviceObjectID) ? kAudioHardwareNoError : kAudioHardwareBadObjectError;
 }
 
 static OSStatus
@@ -440,6 +492,7 @@ SS_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pi
 		return false;
 	case kObjectID_Device:
 	case kObjectID_Actuator:
+	case kObjectID_Mic:
 		switch (inAddress->mSelector) {
 		case kAudioDevicePropertyPreferredChannelsForStereo:
 			return inObjectID == kObjectID_Device;
@@ -470,8 +523,23 @@ SS_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pi
 			return true;
 		}
 		return false;
+	case kObjectID_MicSource:
+		switch (inAddress->mSelector) {
+		case kAudioObjectPropertyBaseClass:
+		case kAudioObjectPropertyClass:
+		case kAudioObjectPropertyOwner:
+		case kAudioObjectPropertyOwnedObjects:
+		case kAudioControlPropertyScope:
+		case kAudioControlPropertyElement:
+		case kAudioSelectorControlPropertyCurrentItem:
+		case kAudioSelectorControlPropertyAvailableItems:
+		case kAudioSelectorControlPropertyItemName:
+			return true;
+		}
+		return false;
 	case kObjectID_Stream:
 	case kObjectID_ActuatorStream:
+	case kObjectID_MicStream:
 		switch (inAddress->mSelector) {
 		case kAudioObjectPropertyBaseClass:
 		case kAudioObjectPropertyClass:
@@ -530,9 +598,10 @@ SS_IsPropertySettable(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjec
 		return kAudioHardwareUnknownPropertyError;
 	}
 	AudioObjectPropertySelector s = inAddress->mSelector;
-	bool device = inObjectID == kObjectID_Device || inObjectID == kObjectID_Actuator;
-	bool stream = inObjectID == kObjectID_Stream || inObjectID == kObjectID_ActuatorStream;
+	bool device = is_device(inObjectID);
+	bool stream = inObjectID == kObjectID_Stream || inObjectID == kObjectID_ActuatorStream || inObjectID == kObjectID_MicStream;
 	*outIsSettable = (device && s == kAudioDevicePropertyNominalSampleRate) ||
+	    (inObjectID == kObjectID_MicSource && s == kAudioSelectorControlPropertyCurrentItem) ||
 	    (stream && (s == kAudioStreamPropertyIsActive || s == kAudioStreamPropertyVirtualFormat ||
 	    s == kAudioStreamPropertyPhysicalFormat)) ||
 	    (inObjectID == kObjectID_Volume && (s == kAudioLevelControlPropertyScalarValue ||
@@ -565,8 +634,8 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 			OUT(CFStringRef, CFSTR("Bergamota"));
 		case kAudioObjectPropertyOwnedObjects:
 		case kAudioPlugInPropertyDeviceList: {
-			AudioObjectID d[2] = { kObjectID_Device, kObjectID_Actuator };
-			return out_ids(d, 2, inDataSize, outDataSize, outData);
+			AudioObjectID d[3] = { kObjectID_Device, kObjectID_Actuator, kObjectID_Mic };
+			return out_ids(d, 3, inDataSize, outDataSize, outData);
 		}
 		case kAudioPlugInPropertyBoxList:
 			*outDataSize = 0;
@@ -580,7 +649,8 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 			CFStringRef uid = *(const CFStringRef *)inQualifierData;
 			OUT(AudioObjectID, !uid ? kAudioObjectUnknown :
 			    CFStringCompare(uid, CFSTR(kDeviceUID), 0) == kCFCompareEqualTo ? kObjectID_Device :
-			    CFStringCompare(uid, CFSTR(kActuatorUID), 0) == kCFCompareEqualTo ? kObjectID_Actuator : kAudioObjectUnknown);
+			    CFStringCompare(uid, CFSTR(kActuatorUID), 0) == kCFCompareEqualTo ? kObjectID_Actuator :
+			    CFStringCompare(uid, CFSTR(kMicUID), 0) == kCFCompareEqualTo ? kObjectID_Mic : kAudioObjectUnknown);
 		}
 		case kAudioPlugInPropertyResourceBundle:
 			OUT(CFStringRef, CFSTR(""));
@@ -588,6 +658,8 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 		break;
 	case kObjectID_Device:
 	case kObjectID_Actuator:
+	case kObjectID_Mic: {
+		bool mic = inObjectID == kObjectID_Mic;
 		switch (s) {
 		case kAudioObjectPropertyBaseClass:
 			OUT(AudioClassID, kAudioObjectClassID);
@@ -596,11 +668,19 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 		case kAudioObjectPropertyOwner:
 			OUT(AudioObjectID, kObjectID_PlugIn);
 		case kAudioObjectPropertyName:
-			OUT(CFStringRef, inObjectID == kObjectID_Actuator ? CFSTR("Actuator") : CFSTR("Speaker"));
+			OUT(CFStringRef, mic ? CFSTR("Mic") : inObjectID == kObjectID_Actuator ? CFSTR("Actuator") : CFSTR("Speaker"));
 		case kAudioObjectPropertyManufacturer:
 			OUT(CFStringRef, CFSTR("Bergamota"));
 		case kAudioObjectPropertyOwnedObjects: {
 			AudioObjectID all[3] = { kObjectID_Stream, kObjectID_Volume, kObjectID_Mute }, act = kObjectID_ActuatorStream;
+			AudioObjectID mst[2] = { kObjectID_MicStream, kObjectID_MicSource };
+			if (mic) {
+				if (scope == kAudioObjectPropertyScopeOutput) {
+					*outDataSize = 0;
+					return kAudioHardwareNoError;
+				}
+				return out_ids(mst, 2, inDataSize, outDataSize, outData);
+			}
 			if (scope == kAudioObjectPropertyScopeInput) {
 				*outDataSize = 0;
 				return kAudioHardwareNoError;
@@ -609,9 +689,10 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 			    out_ids(all, 3, inDataSize, outDataSize, outData);
 		}
 		case kAudioDevicePropertyDeviceUID:
-			OUT(CFStringRef, inObjectID == kObjectID_Actuator ? CFSTR(kActuatorUID) : CFSTR(kDeviceUID));
+			OUT(CFStringRef, mic ? CFSTR(kMicUID) : inObjectID == kObjectID_Actuator ? CFSTR(kActuatorUID) : CFSTR(kDeviceUID));
 		case kAudioDevicePropertyModelUID:
-			OUT(CFStringRef, inObjectID == kObjectID_Actuator ? CFSTR(kActuatorModelUID) : CFSTR(kDeviceModelUID));
+			OUT(CFStringRef, mic ? CFSTR(kMicModelUID) : inObjectID == kObjectID_Actuator ? CFSTR(kActuatorModelUID) :
+			    CFSTR(kDeviceModelUID));
 		case kAudioDevicePropertyTransportType:
 			OUT(UInt32, kAudioDeviceTransportTypeBuiltIn);
 		case kAudioDevicePropertyRelatedDevices:
@@ -622,28 +703,38 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 			OUT(UInt32, 1);
 		case kAudioDevicePropertyDeviceIsRunning: {
 			pthread_mutex_lock(&gStateMutex);
-			UInt32 running = (inObjectID == kObjectID_Actuator ? gActIOCount : gIOCount) > 0;
+			UInt32 running = (mic ? gMicIOCount : inObjectID == kObjectID_Actuator ? gActIOCount : gIOCount) > 0;
 			pthread_mutex_unlock(&gStateMutex);
 			OUT(UInt32, running);
 		}
 		case kAudioDevicePropertyDeviceCanBeDefaultDevice:
 		case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
-			OUT(UInt32, scope != kAudioObjectPropertyScopeInput);
+			OUT(UInt32, mic ? scope != kAudioObjectPropertyScopeOutput : scope != kAudioObjectPropertyScopeInput);
 		case kAudioDevicePropertyLatency:
+			if (mic) {
+				OUT(UInt32, scope == kAudioObjectPropertyScopeOutput ? 0 : kMicDelay);
+			}
 			OUT(UInt32, scope == kAudioObjectPropertyScopeInput ? 0 : kLatency);
 		case kAudioDevicePropertyStreams: {
-			AudioObjectID st = inObjectID == kObjectID_Actuator ? kObjectID_ActuatorStream : kObjectID_Stream;
-			if (!is_output_or_global(scope)) {
+			AudioObjectID st = mic ? kObjectID_MicStream : inObjectID == kObjectID_Actuator ? kObjectID_ActuatorStream :
+			    kObjectID_Stream;
+			if (mic ? scope == kAudioObjectPropertyScopeOutput : !is_output_or_global(scope)) {
 				*outDataSize = 0;
 				return kAudioHardwareNoError;
 			}
 			return out_ids(&st, 1, inDataSize, outDataSize, outData);
 		}
 		case kAudioObjectPropertyControlList: {
-			AudioObjectID c[2] = { kObjectID_Volume, kObjectID_Mute };
-			return out_ids(c, inObjectID == kObjectID_Actuator ? 0 : 2, inDataSize, outDataSize, outData);
+			AudioObjectID c[2] = { kObjectID_Volume, kObjectID_Mute }, ms = kObjectID_MicSource;
+			if (mic) {
+				return out_ids(&ms, 1, inDataSize, outDataSize, outData);
+			}
+			return out_ids(c, inObjectID == kObjectID_Device ? 2 : 0, inDataSize, outDataSize, outData);
 		}
 		case kAudioDevicePropertySafetyOffset:
+			if (mic) {
+				OUT(UInt32, scope == kAudioObjectPropertyScopeOutput ? 0 : kMicSafetyOffset);
+			}
 			OUT(UInt32, scope == kAudioObjectPropertyScopeInput ? 0 : kSafetyOffset);
 		case kAudioDevicePropertyNominalSampleRate:
 			OUT(Float64, kSampleRate);
@@ -685,26 +776,30 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 		}
 		}
 		break;
+	}
 	case kObjectID_Stream:
 	case kObjectID_ActuatorStream:
+	case kObjectID_MicStream:
 		switch (s) {
 		case kAudioObjectPropertyBaseClass:
 			OUT(AudioClassID, kAudioObjectClassID);
 		case kAudioObjectPropertyClass:
 			OUT(AudioClassID, kAudioStreamClassID);
 		case kAudioObjectPropertyOwner:
-			OUT(AudioObjectID, inObjectID == kObjectID_ActuatorStream ? kObjectID_Actuator : kObjectID_Device);
+			OUT(AudioObjectID, inObjectID == kObjectID_MicStream ? kObjectID_Mic :
+			    inObjectID == kObjectID_ActuatorStream ? kObjectID_Actuator : kObjectID_Device);
 		case kAudioObjectPropertyName:
-			OUT(CFStringRef, inObjectID == kObjectID_ActuatorStream ? CFSTR("Actuator") : CFSTR("Speaker"));
+			OUT(CFStringRef, inObjectID == kObjectID_MicStream ? CFSTR("Mic") :
+			    inObjectID == kObjectID_ActuatorStream ? CFSTR("Actuator") : CFSTR("Speaker"));
 		case kAudioObjectPropertyOwnedObjects:
 			*outDataSize = 0;
 			return kAudioHardwareNoError;
 		case kAudioStreamPropertyIsActive:
 			OUT(UInt32, gStreamActive);
 		case kAudioStreamPropertyDirection:
-			OUT(UInt32, 0);         /* output */
+			OUT(UInt32, inObjectID == kObjectID_MicStream ? 1 : 0);  /* 1 input, 0 output */
 		case kAudioStreamPropertyTerminalType:
-			OUT(UInt32, kAudioStreamTerminalTypeSpeaker);
+			OUT(UInt32, inObjectID == kObjectID_MicStream ? kAudioStreamTerminalTypeMicrophone : kAudioStreamTerminalTypeSpeaker);
 		case kAudioStreamPropertyStartingChannel:
 			OUT(UInt32, 1);
 		case kAudioStreamPropertyLatency:
@@ -721,6 +816,42 @@ SS_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 			fill_format(&r.mFormat, channels_of(inObjectID));
 			r.mSampleRateRange.mMinimum = r.mSampleRateRange.mMaximum = kSampleRate;
 			OUT(AudioStreamRangedDescription, r);
+		}
+		}
+		break;
+	case kObjectID_MicSource:
+		switch (s) {
+		case kAudioObjectPropertyBaseClass:
+			OUT(AudioClassID, kAudioSelectorControlClassID);
+		case kAudioObjectPropertyClass:
+			OUT(AudioClassID, kAudioDataSourceControlClassID);
+		case kAudioObjectPropertyOwner:
+			OUT(AudioObjectID, kObjectID_Mic);
+		case kAudioObjectPropertyOwnedObjects:
+			*outDataSize = 0;
+			return kAudioHardwareNoError;
+		case kAudioControlPropertyScope:
+			OUT(AudioObjectPropertyScope, kAudioObjectPropertyScopeInput);
+		case kAudioControlPropertyElement:
+			OUT(AudioObjectPropertyElement, kAudioObjectPropertyElementMain);
+		case kAudioSelectorControlPropertyCurrentItem: {
+			/* as many as fit: the HAL reads one UInt32 when it activates the device, VirtualAudio the whole list */
+			pthread_mutex_lock(&gStateMutex);
+			OSStatus r = out_ids(gMicSources, gMicNSources, inDataSize, outDataSize, outData);
+			pthread_mutex_unlock(&gStateMutex);
+			return r;
+		}
+		case kAudioSelectorControlPropertyAvailableItems:
+			return out_ids(kMicKnownSources, 4, inDataSize, outDataSize, outData);
+		case kAudioSelectorControlPropertyItemName: {
+			UInt32 id = inQualifierDataSize == sizeof(UInt32) && inQualifierData ? *(const UInt32 *)inQualifierData : 0;
+			if (inDataSize < sizeof(CFStringRef)) {
+				return kAudioHardwareBadPropertySizeError;
+			}
+			*(CFStringRef *)outData = CFStringCreateWithFormat(NULL, NULL, CFSTR("%c%c%c%c"), (char)(id >> 24),
+			    (char)(id >> 16), (char)(id >> 8), (char)id);
+			*outDataSize = sizeof(CFStringRef);
+			return kAudioHardwareNoError;
 		}
 		}
 		break;
@@ -785,6 +916,14 @@ SS_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver, AudioObjectID inObje
 	UInt32 size = 0;
 	OSStatus r = SS_GetPropertyData(inDriver, inObjectID, inClientProcessID, inAddress, inQualifierDataSize,
 	    inQualifierData, sizeof(scratch), &size, &scratch);
+	if (r == kAudioHardwareNoError && inObjectID == kObjectID_MicSource && inAddress &&
+	    inAddress->mSelector == kAudioSelectorControlPropertyItemName) {
+		CFStringRef made;
+		memcpy(&made, scratch.bytes, sizeof(made));
+		if (made) {
+			CFRelease(made);                        /* the size query made a name nobody takes */
+		}
+	}
 	*outDataSize = size;
 	return r;
 }
@@ -802,6 +941,24 @@ SS_SetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 	AudioObjectPropertySelector s = inAddress->mSelector;
 	AudioObjectPropertyAddress changed = { s, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
 	switch (s) {
+	case kAudioSelectorControlPropertyCurrentItem: {
+		if (!inDataSize || inDataSize % sizeof(UInt32) || inDataSize > kMicMaxSources * sizeof(UInt32)) {
+			return kAudioHardwareBadPropertySizeError;
+		}
+		pthread_mutex_lock(&gStateMutex);
+		gMicNSources = inDataSize / sizeof(UInt32);
+		memcpy(gMicSources, inData, inDataSize);
+		pthread_mutex_unlock(&gStateMutex);
+		char list[kMicMaxSources * 5 + 1] = "";
+		for (UInt32 i = 0; i < inDataSize / sizeof(UInt32); i++) {
+			UInt32 v = ((const UInt32 *)inData)[i];
+			char one[6] = { (char)(v >> 24), (char)(v >> 16), (char)(v >> 8), (char)v, ' ', 0 };
+			strlcat(list, one, sizeof(list));
+		}
+		os_log(gLog, "SweetSpeaker: mic: input data sources set to %{public}s(%u)", list, inDataSize / (UInt32)sizeof(UInt32));
+		gHost->PropertiesChanged(gHost, kObjectID_MicSource, 1, &changed);
+		return kAudioHardwareNoError;
+	}
 	case kAudioDevicePropertyNominalSampleRate:
 		if (inDataSize != sizeof(Float64)) {
 			return kAudioHardwareBadPropertySizeError;
@@ -968,12 +1125,204 @@ actuator_mix(const Float32 *in, UInt32 frames, Float64 sample_time)
 	}
 }
 
+/* the microphone: kern.sweet_audio_rec ops, from the reader thread only (its buffer is static) */
+enum { REC_OP_START = 1, REC_OP_STOP = 2, REC_OP_READ = 3 };
+struct rec_hdr {
+	uint64_t wpos, from;
+	uint32_t n, state;
+};
+#define REC_READ_MAX            9600u           /* what the kernel returns per call: 200 ms */
+
+static int
+rec_op(uint32_t op, uint64_t pos, struct rec_hdr *h, int16_t **samples)
+{
+	static uint8_t buf[sizeof(struct rec_hdr) + REC_READ_MAX * sizeof(int16_t)];
+	struct {
+		uint32_t op, max;
+		uint64_t pos;
+	} q = { op, op == REC_OP_READ ? REC_READ_MAX : 0, pos };
+	size_t len = sizeof(buf);
+	if (sysctlbyname("kern.sweet_audio_rec", buf, &len, &q, sizeof(q)) != 0) {
+		return errno;
+	}
+	if (len < sizeof(*h)) {
+		return EIO;
+	}
+	memcpy(h, buf, sizeof(*h));
+	if (len < sizeof(*h) + h->n * sizeof(int16_t)) {
+		h->n = (uint32_t)((len - sizeof(*h)) / sizeof(int16_t));
+	}
+	if (samples) {
+		*samples = (int16_t *)(void *)(buf + sizeof(*h));
+	}
+	return 0;
+}
+
+/*
+ * While the mic's IO runs: start the kernel capture (again when it stopped), read what it captured every 5 ms into
+ * gMicRing and publish the position; stop the capture when IO stops.
+ */
+static void *
+mic_thread(void *arg)
+{
+	(void)arg;
+	unsigned tries = 0;
+	bool live = false;
+	uint64_t rpos = 0, w0 = 0, w1 = 0, h0 = 0, h1 = 0, hstart = 0;
+	for (;;) {
+		pthread_mutex_lock(&gStateMutex);
+		bool run = gMicIOCount > 0;
+		if (!run) {
+			gMicThreadRunning = false;
+		}
+		pthread_mutex_unlock(&gStateMutex);
+		if (!run) {
+			break;
+		}
+		struct rec_hdr h;
+		int16_t *smp = NULL;
+		if (!live) {
+			int e = rec_op(REC_OP_START, 0, &h, NULL);
+			if (e) {
+				if (tries++ % 30 == 0) {
+					os_log(gLog, "SweetSpeaker: mic: the kernel capture is not up yet (%d, try %u)", e, tries);
+				}
+				usleep(500000);
+				continue;
+			}
+			rpos = h.wpos;
+			h0 = 0;                                 /* the rate is measured from the first samples on */
+			hstart = mach_absolute_time();
+			atomic_store(&gMicBase, rpos);
+			atomic_store_explicit(&gMicWpos, rpos, memory_order_release);
+			atomic_store(&gMicResync, true);
+			atomic_store(&gMicLive, true);
+			live = true;
+			os_log(gLog, "SweetSpeaker: mic: kernel capture on (after %u tries) at kernel sample %llu", tries,
+			    (unsigned long long)rpos);
+			tries = 0;
+		}
+		int e = rec_op(REC_OP_READ, rpos, &h, &smp);
+		if (e || h.state == 0) {
+			atomic_store(&gMicLive, false);
+			live = false;
+			gMicDiag.restarts++;
+			os_log(gLog, "SweetSpeaker: mic: the kernel capture stopped (%d, state %u): starting it again", e, e ? 0 : h.state);
+			continue;
+		}
+		if (h.from > rpos) {
+			gMicDiag.lost += h.from - rpos;         /* the reader fell more than the kernel's 2 s behind */
+		}
+		for (uint32_t i = 0; i < h.n; i++) {
+			gMicRing[(h.from + i) & (kMicRing - 1)] = smp[i];
+		}
+		rpos = h.from + h.n;
+		atomic_store_explicit(&gMicWpos, rpos, memory_order_release);
+		if (h.n) {
+			uint64_t now = mach_absolute_time();
+			if (!h0) {
+				h0 = now;
+				w0 = rpos;
+				os_log(gLog, "SweetSpeaker: mic: first samples %.0f ms after the capture start",
+				    (double)(now - hstart) / gHostTicksPerFrame / 48.0);
+			}
+			w1 = rpos;
+			h1 = now;
+		}
+		if (h.n < REC_READ_MAX) {
+			usleep(5000);
+		}
+	}
+	if (live) {
+		struct rec_hdr h;
+		rec_op(REC_OP_STOP, 0, &h, NULL);
+	}
+	atomic_store(&gMicLive, false);
+	double frames = h1 > h0 ? (double)(h1 - h0) / gHostTicksPerFrame : 0;
+	os_log(gLog, "SweetSpeaker: mic: reader stopped: %llu samples in %.2f s of host time (%+.0f ppm against 48 kHz), %llu lost, "
+	    "%u restarts", (unsigned long long)(w1 - w0), frames / kSampleRate, frames > 0 ? ((double)(w1 - w0) / frames - 1) * 1e6 : 0,
+	    (unsigned long long)gMicDiag.lost, gMicDiag.restarts);
+	return NULL;
+}
+
+static OSStatus
+mic_io(bool start)
+{
+	pthread_mutex_lock(&gStateMutex);
+	if (start && gMicIOCount++ == 0) {
+		gMicAnchorHostTime = mach_absolute_time();
+		memset(&gMicDiag, 0, sizeof(gMicDiag));
+		atomic_store(&gMicResync, true);
+		pthread_t th;
+		if (!gMicThreadRunning && pthread_create(&th, NULL, mic_thread, NULL) == 0) {
+			pthread_detach(th);
+			gMicThreadRunning = true;
+		}
+		os_log(gLog, "SweetSpeaker: mic start IO");
+	} else if (!start && gMicIOCount && --gMicIOCount == 0) {
+		os_log(gLog, "SweetSpeaker: mic stop IO: %u cycles, %u without the kernel capture (zeros), %u resyncs; peak %.1f dBFS, "
+		    "rms %.1f dBFS", gMicDiag.cycles, gMicDiag.silent, gMicDiag.resyncs, 20.0 * log10(gMicDiag.peak + 1e-9),
+		    10.0 * log10(gMicDiag.n > 0 ? gMicDiag.sum2 / gMicDiag.n + 1e-18 : 1e-18));
+	}
+	pthread_mutex_unlock(&gStateMutex);
+	return kAudioHardwareNoError;
+}
+
+/* ReadInput: frames of the HAL's input time line t.. from the local ring (zeros until the kernel capture runs) */
+static void
+mic_read(Float32 *out, UInt32 frames, Float64 t)
+{
+	gMicDiag.cycles++;
+	if (!atomic_load(&gMicLive)) {
+		memset(out, 0, frames * sizeof(Float32));
+		gMicDiag.silent++;
+		atomic_store(&gMicResync, true);
+		return;
+	}
+	int64_t w = (int64_t)atomic_load_explicit(&gMicWpos, memory_order_acquire), base = (int64_t)atomic_load(&gMicBase);
+	int64_t k = (int64_t)llround(t + gMicOffset);
+	bool resync = atomic_exchange(&gMicResync, false);
+	/* not there yet, or so old that the reader (up to REC_READ_MAX samples per write) may be overwriting it */
+	if (!resync && (k + (int64_t)frames > w || k < w - (int64_t)(kMicRing - 2u * REC_READ_MAX))) {
+		gMicDiag.resyncs++;
+		if (gMicDiag.resyncs <= 20) {
+			os_log(gLog, "SweetSpeaker: mic: input %lld..%lld but the capture is at %lld (cycle %u): placed again", k,
+			    k + (int64_t)frames, w, gMicDiag.cycles);
+		}
+		resync = true;
+	}
+	if (resync) {
+		gMicOffset = (Float64)(w - (int64_t)kMicDelay - (int64_t)frames) - t;
+		k = (int64_t)llround(t + gMicOffset);
+	}
+	float peak = gMicDiag.peak;
+	double s2 = 0;
+	for (UInt32 i = 0; i < frames; i++) {
+		int64_t p = k + (int64_t)i;
+		float v = p < base || p >= w ? 0.0f : (float)gMicRing[(uint64_t)p & (kMicRing - 1)] * (1.0f / 32768.0f);
+		out[i] = v;
+		peak = fmaxf(peak, fabsf(v));
+		s2 += (double)v * v;
+	}
+	gMicDiag.peak = peak;
+	gMicDiag.sum2 += s2;
+	gMicDiag.n += frames;
+	if (gMicDiag.said < 3) {
+		gMicDiag.said++;
+		os_log(gLog, "SweetSpeaker: mic cycle: %u frames at %.0f -> kernel %lld (captured up to %lld), rms %.1f dBFS", frames, t,
+		    k, w, 10.0 * log10(s2 / frames + 1e-18));
+	}
+}
+
 static OSStatus
 SS_StartIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID)
 {
 	(void)inClientID;
 	if (inDriver == gDriverRef && inDeviceObjectID == kObjectID_Actuator) {
 		return actuator_io(true);
+	}
+	if (inDriver == gDriverRef && inDeviceObjectID == kObjectID_Mic) {
+		return mic_io(true);
 	}
 	if (inDriver != gDriverRef || inDeviceObjectID != kObjectID_Device) {
 		return kAudioHardwareBadObjectError;
@@ -1008,6 +1357,9 @@ SS_StopIO(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, U
 	if (inDriver == gDriverRef && inDeviceObjectID == kObjectID_Actuator) {
 		return actuator_io(false);
 	}
+	if (inDriver == gDriverRef && inDeviceObjectID == kObjectID_Mic) {
+		return mic_io(false);
+	}
 	if (inDriver != gDriverRef || inDeviceObjectID != kObjectID_Device) {
 		return kAudioHardwareBadObjectError;
 	}
@@ -1034,7 +1386,8 @@ SS_GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceO
     Float64 *outSampleTime, UInt64 *outHostTime, UInt64 *outSeed)
 {
 	(void)inDriver; (void)inClientID;
-	UInt64 anchor = inDeviceObjectID == kObjectID_Actuator ? gActAnchorHostTime : gAnchorHostTime;
+	UInt64 anchor = inDeviceObjectID == kObjectID_Mic ? gMicAnchorHostTime :
+	    inDeviceObjectID == kObjectID_Actuator ? gActAnchorHostTime : gAnchorHostTime;
 	Float64 ticks = gHostTicksPerFrame * kZeroTimeStampPeriod;
 	UInt64 n = (UInt64)((Float64)(mach_absolute_time() - anchor) / ticks);
 	*outSampleTime = (Float64)(n * kZeroTimeStampPeriod);
@@ -1047,8 +1400,9 @@ static OSStatus
 SS_WillDoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID,
     UInt32 inOperationID, Boolean *outWillDo, Boolean *outWillDoInPlace)
 {
-	(void)inDriver; (void)inDeviceObjectID; (void)inClientID;
-	*outWillDo = inOperationID == kAudioServerPlugInIOOperationWriteMix;
+	(void)inDriver; (void)inClientID;
+	*outWillDo = inOperationID == (inDeviceObjectID == kObjectID_Mic ? kAudioServerPlugInIOOperationReadInput :
+	    kAudioServerPlugInIOOperationWriteMix);
 	*outWillDoInPlace = true;
 	return kAudioHardwareNoError;
 }
@@ -1069,6 +1423,12 @@ SS_DoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObje
     void *ioMainBuffer, void *ioSecondaryBuffer)
 {
 	(void)inDriver; (void)inDeviceObjectID; (void)inStreamObjectID; (void)inClientID; (void)ioSecondaryBuffer;
+	if (inDeviceObjectID == kObjectID_Mic) {
+		if (inOperationID == kAudioServerPlugInIOOperationReadInput && ioMainBuffer) {
+			mic_read(ioMainBuffer, inIOBufferFrameSize, inIOCycleInfo->mInputTime.mSampleTime);
+		}
+		return kAudioHardwareNoError;
+	}
 	if (inOperationID == kAudioServerPlugInIOOperationWriteMix && inDeviceObjectID == kObjectID_Actuator && ioMainBuffer) {
 		actuator_mix(ioMainBuffer, inIOBufferFrameSize, inIOCycleInfo->mOutputTime.mSampleTime);
 		return kAudioHardwareNoError;
