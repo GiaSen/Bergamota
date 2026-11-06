@@ -1,0 +1,302 @@
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 5b65319..ffe10fb 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -148,6 +148,11 @@ enum { G_VERSION = 0, G_VERSION_ACK = 1, G_OPEN = 2, G_CLOSE = 3, G_OPEN_ACK = 4
+ #define ADM_CMD_DEVICE_CLOSE_V5 0x00010327u
+ #define ADM_CMDRSP_DEVICE_OPEN_V5 0x00010329u
+ #define ADM_NULL_COPP_TOPOLOGY  0x00010312u
++#define ASM_STREAM_CMD_OPEN_READ_V3 0x00010db4u
++#define ASM_STREAM_CMD_SET_ENCDEC_PARAM 0x00010c10u
++#define ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2 0x00010da3u
++#define ASM_DATA_CMD_READ_V2    0x00010dacu
++#define ASM_DATA_EVENT_READ_DONE_V2 0x00010d9au
+ struct au_apr_hdr {
+ 	uint16_t field, size;
+ 	uint8_t src_svc, src_domain;
+@@ -398,6 +403,7 @@ static struct {
+ } gl;
+ 
+ static void qr_rx(const uint8_t *p, uint32_t len);
++static void cx_cap_done(const uint8_t *pl11);      /* 3061 capture READ_DONE */
+ 
+ /* every APR packet from the DSP, for kern.sweet_audio_apr */
+ #define AU_CAP_N                16u
+@@ -569,6 +575,10 @@ gl_apr_rx(unsigned c, const uint8_t *p, uint32_t n)
+ 	if (n >= hlen + 8) {
+ 		memcpy(&w1, p + hlen + 4, 4);
+ 	}
++	if (opcode == ASM_DATA_EVENT_READ_DONE_V2 && p[4] == APR_SVC_ASM && n >= hlen + 44) {
++		cx_cap_done(p + hlen);
++		return;
++	}
+ 	if (opcode == ASM_DATA_EVENT_WRITE_DONE_V2 && p[4] == APR_SVC_ASM && n >= hlen + 16) {
+ 		uint32_t status;            /* {buf_addr_lsw, buf_addr_msw, mem_map_handle, status} */
+ 		memcpy(&status, p + hlen + 12, 4);
+@@ -1040,6 +1050,22 @@ static struct {
+ 	} \
+ } while (0)
+ 
++/* 3061: the capture stream's READ_DONE events (status, buffer, size, offset, ... seq) */
++static struct {
++	uint32_t handle, copp, status, size, offset, seq;
++	bool mapped, stream, copp_open, done;
++} cap;
++
++static void
++cx_cap_done(const uint8_t *pl11)
++{
++	memcpy(&cap.status, pl11, 4);
++	memcpy(&cap.size, pl11 + 16, 4);
++	memcpy(&cap.offset, pl11 + 20, 4);
++	memcpy(&cap.seq, pl11 + 40, 4);
++	cap.done = true;
++}
++
+ static void
+ cx_qmi_rx(const uint8_t *p, uint32_t len)
+ {
+@@ -3329,6 +3355,225 @@ cx_stage_port(void)
+ 	return true;
+ }
+ 
++/*
++ * stage 7 (3061): capture from SLIMBUS_0_TX into the shared pool and measure it. q6asm/q6adm order for a record
++ * stream: ASM shared memory map (the pool's last 512 KiB, session 2), ASM_STREAM_CMD_OPEN_READ_V3 (device matrix,
++ * multi-channel PCM, 16 bit), ASM_STREAM_CMD_SET_ENCDEC_PARAM (ENC_CFG_BLK_V2: 1 channel, 16 bit, 48 kHz, signed, FC),
++ * ADM_CMD_DEVICE_OPEN_V5 (TX, endpoint 0x4001, null COPP topology, 1 channel FC), ADM_CMD_MATRIX_MAP_ROUTINGS_V5 (TX
++ * matrix, session 2 <- COPP), ASM_SESSION_CMD_RUN_V2, then ASM_DATA_CMD_READ_V2 of 40 ms buffers, each answered by
++ * ASM_DATA_EVENT_READ_DONE_V2. Per 200 ms: RMS and peak in dBFS and the mean (DC). Then everything closed again.
++ */
++#define CX_CAP_SESSION          2u
++#define CX_CAP_PORT             0x0201u
++#define CX_CAP_OFF              0x180000u
++#define CX_CAP_MAP              0x80000u
++#define CX_CAP_BUF              3840u           /* 40 ms of 16-bit mono at 48 kHz */
++#define CX_CAP_NBUF             8u
++
++/* 20*log10(x / 32768) in tenths of a dB: log2 from the top bit plus 1000*log2(1 + i/16) for the next 4 bits */
++static int
++cx_db10(uint64_t x)
++{
++	static const uint16_t l2[16] = { 0, 87, 170, 248, 322, 392, 459, 523, 585, 644, 700, 755, 807, 858, 907, 954 };
++	if (x == 0) {
++		return -999;
++	}
++	int lb = 63 - __builtin_clzll(x);
++	unsigned f = lb >= 4 ? (unsigned)((x >> (lb - 4)) & 15) : (unsigned)((x << (4 - lb)) & 15);
++	int64_t log2_milli = (int64_t)lb * 1000 + l2[f];
++	return (int)(60206 * (log2_milli - 15000) / 1000000);     /* 200*log10(2) = 60.206 */
++}
++
++static bool
++cx_cap_open(void)
++{
++	uint32_t r[2];
++	(void)sweet_smmu_map_sid(AU_SID);
++	if (!au_pool && !(au_pool = ml_io_map_unmappable((vm_offset_t)AU_POOL_PA, AU_POOL_SIZE, VM_WIMG_WCOMB))) {
++		CX_LOG("pool not mapped\n");
++		return false;
++	}
++	bzero((void *)(au_pool + CX_CAP_OFF), CX_CAP_MAP);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	struct {
++		uint16_t pool, regions;
++		uint32_t flags, lsw, msw, size;
++	} __attribute__((packed)) m = { 3, 1, 0, (uint32_t)AU_POOL_PA + CX_CAP_OFF, AU_POOL_MSW, CX_CAP_MAP };
++	if (apr_request_port(APR_SVC_ASM, 0, 0, CX_CAP_SESSION << 8, ASM_CMD_SHARED_MEM_MAP_REGIONS, &m, sizeof(m),
++	    ASM_CMDRSP_SHARED_MEM_MAP_REGIONS, 2000) != 0 || gl.apr_opcode != ASM_CMDRSP_SHARED_MEM_MAP_REGIONS || gl.apr_pl_len < 4) {
++		CX_LOG("capture: memory map failed (opcode %#x status %#x)\n", gl.apr_opcode, gl.apr_status);
++		return false;
++	}
++	memcpy(&cap.handle, gl.apr_pl, 4);
++	cap.mapped = true;
++	struct {
++		uint32_t mode, src, preproc, enc;
++		uint16_t bits, reserved;
++	} __attribute__((packed)) o = { 0, 0, ASM_STREAM_POSTPROC_TOPO_ID_NONE, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2, 16, 0 };
++	if (apr_request_port(APR_SVC_ASM, CX_CAP_PORT, CX_CAP_PORT, CX_CAP_PORT, ASM_STREAM_CMD_OPEN_READ_V3, &o, sizeof(o),
++	    APR_BASIC_RSP_RESULT, 2000) != 0) {
++		CX_LOG("capture: stream open failed (status %#x)\n", gl.apr_status);
++		return false;
++	}
++	cap.stream = true;
++	struct {
++		uint32_t param_id, param_size, frames_per_buf, blk_size;
++		uint16_t channels, bits;
++		uint32_t rate;
++		uint16_t is_signed, reserved;
++		uint8_t map[8];
++	} __attribute__((packed)) e = { ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2, 28, 0, 20, 1, 16, AU_RATE, 1, 0, { 3 } };
++	if (apr_request_port(APR_SVC_ASM, CX_CAP_PORT, CX_CAP_PORT, CX_CAP_PORT, ASM_STREAM_CMD_SET_ENCDEC_PARAM, &e,
++	    sizeof(e), APR_BASIC_RSP_RESULT, 2000) != 0) {
++		CX_LOG("capture: encoder config failed (status %#x)\n", gl.apr_status);
++		return false;
++	}
++	struct {
++		uint16_t flags, mode, ep1, ep2;
++		uint32_t topology;
++		uint16_t channels, bits;
++		uint32_t rate;
++		uint8_t map[8];
++	} __attribute__((packed)) a = { 0, 2, AFE_PORT_SLIMBUS_0_TX, 0xffff, ADM_NULL_COPP_TOPOLOGY, 1, 16, AU_RATE, { 3 } };
++	if (apr_request_port(APR_SVC_ADM, AFE_PORT_SLIMBUS_0_TX, AFE_PORT_SLIMBUS_0_TX, 0, ADM_CMD_DEVICE_OPEN_V5, &a,
++	    sizeof(a), ADM_CMDRSP_DEVICE_OPEN_V5, 2000) != 0 || gl.apr_opcode != ADM_CMDRSP_DEVICE_OPEN_V5 || gl.apr_pl_len < 8) {
++		CX_LOG("capture: COPP open failed (opcode %#x status %#x)\n", gl.apr_opcode, gl.apr_status);
++		return false;
++	}
++	memcpy(r, gl.apr_pl, 8);
++	if (r[0] != 0) {
++		CX_LOG("capture: COPP open status %#x\n", r[0]);
++		return false;
++	}
++	cap.copp = r[1];
++	cap.copp_open = true;
++	struct {
++		uint32_t matrix, sessions;
++		uint16_t session, copps, copp, reserved;
++	} __attribute__((packed)) rt = { 1, 1, CX_CAP_SESSION, 1, (uint16_t)cap.copp, 0 };
++	if (apr_request_port(APR_SVC_ADM, 0, 0, 0, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &rt, sizeof(rt), APR_BASIC_RSP_RESULT,
++	    2000) != 0) {
++		CX_LOG("capture: routing failed (status %#x)\n", gl.apr_status);
++		return false;
++	}
++	uint32_t run[3] = { 0, 0, 0 };
++	if (apr_request_port(APR_SVC_ASM, CX_CAP_PORT, CX_CAP_PORT, CX_CAP_PORT, ASM_SESSION_CMD_RUN_V2, run, sizeof(run),
++	    APR_BASIC_RSP_RESULT, 2000) != 0) {
++		CX_LOG("capture: run failed (status %#x)\n", gl.apr_status);
++		return false;
++	}
++	CX_LOG("capture: map handle %#x, COPP %u, running\n", cap.handle, cap.copp);
++	return true;
++}
++
++static void
++cx_cap_close(void)
++{
++	int st[4] = { -2, -2, -2, -2 };
++	if (cap.stream) {
++		st[0] = apr_request_port(APR_SVC_ASM, CX_CAP_PORT, CX_CAP_PORT, CX_CAP_PORT, ASM_SESSION_CMD_PAUSE, NULL, 0,
++		    APR_BASIC_RSP_RESULT, 1000);
++		st[1] = apr_request_port(APR_SVC_ASM, CX_CAP_PORT, CX_CAP_PORT, CX_CAP_PORT, ASM_STREAM_CMD_CLOSE, NULL, 0,
++		    APR_BASIC_RSP_RESULT, 1000);
++	}
++	if (cap.copp_open) {
++		st[2] = apr_request_port(APR_SVC_ADM, AFE_PORT_SLIMBUS_0_TX, (uint16_t)cap.copp, 0, ADM_CMD_DEVICE_CLOSE_V5, NULL,
++		    0, APR_BASIC_RSP_RESULT, 1000);
++	}
++	if (cap.mapped) {
++		uint32_t h = cap.handle;
++		st[3] = apr_request_port(APR_SVC_ASM, 0, 0, CX_CAP_SESSION << 8, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &h, sizeof(h),
++		    APR_BASIC_RSP_RESULT, 1000);
++	}
++	cap.stream = cap.copp_open = cap.mapped = false;
++	CX_LOG("capture closed: pause %d, close %d, COPP close %d, unmap %d\n", st[0], st[1], st[2], st[3]);
++}
++
++/* one 40 ms read into buffer k; the byte count (0 on failure); au_mtx held */
++static uint32_t
++cx_cap_read(unsigned k, uint32_t seq)
++{
++	struct {
++		uint32_t lsw, msw, handle, size, seq;
++	} __attribute__((packed)) rd = { (uint32_t)AU_POOL_PA + CX_CAP_OFF + k * CX_CAP_BUF, AU_POOL_MSW, cap.handle, CX_CAP_BUF,
++		                         seq };
++	uint8_t pkt[APR_HDR_SIZE + 32];
++	struct au_apr_hdr h = { APR_HDR_FIELD_SEQ_CMD, (uint16_t)(APR_HDR_SIZE + sizeof(rd)), APR_SVC_ASM, APR_DOMAIN_APPS,
++		                CX_CAP_PORT, APR_SVC_ASM, APR_DOMAIN_ADSP, CX_CAP_PORT, seq, ASM_DATA_CMD_READ_V2 };
++	memcpy(pkt, &h, APR_HDR_SIZE);
++	memcpy(pkt + APR_HDR_SIZE, &rd, sizeof(rd));
++	cap.done = false;
++	if (!gl_send(CH_APR, pkt, APR_HDR_SIZE + sizeof(rd))) {
++		return 0;
++	}
++	for (unsigned w = 0; w < 500 && !cap.done && !gl.bad; w += 2) {
++		au_sleep(2);
++		gl_poll();
++	}
++	if (!cap.done || cap.status != 0 || cap.size > CX_CAP_BUF) {
++		CX_LOG("capture read %u: %s, status %#x size %u\n", seq, cap.done ? "done" : "NO ANSWER", cap.status, cap.size);
++		return 0;
++	}
++	return cap.size;
++}
++
++static bool
++cx_stage_capture(unsigned seconds)
++{
++	if (!cx.port_up) {
++		CX_LOG("stage 7 needs stage 6 first\n");
++		return false;
++	}
++	CX_LOG("stage 7: %u s of capture from SLIMBUS_0_TX\n", seconds);
++	lck_mtx_lock(&au_mtx);
++	bool ok = cx_cap_open();
++	uint64_t sum2 = 0, n = 0;
++	int64_t sum = 0;
++	unsigned peak = 0, reads = 0, bytes = 0, zero_bufs = 0;
++	for (unsigned i = 0; ok && i < seconds * 25u; i++) {
++		unsigned k = i % CX_CAP_NBUF;
++		uint32_t got = cx_cap_read(k, i + 1);
++		if (!got) {
++			ok = false;
++			break;
++		}
++		reads++;
++		bytes += got;
++		const volatile int16_t *smp = (const volatile int16_t *)(au_pool + CX_CAP_OFF + k * CX_CAP_BUF + cap.offset);
++		unsigned cnt = MIN(got, CX_CAP_BUF - cap.offset) / 2, nz = 0;
++		for (unsigned j = 0; j < cnt; j++) {
++			int v = smp[j];
++			unsigned a = (unsigned)(v < 0 ? -v : v);
++			nz |= a;
++			peak = MAX(peak, a);
++			sum += v;
++			sum2 += (uint64_t)((int64_t)v * v);
++			n++;
++		}
++		zero_bufs += nz == 0;
++		if ((i % 5) == 4 && n) {            /* every 200 ms */
++			uint64_t ms = sum2 / n;
++			uint64_t rms = 0;
++			for (uint64_t bit = 1ull << 30; bit; bit >>= 1) {       /* integer square root */
++				if ((rms + bit) * (rms + bit) <= ms) {
++					rms += bit;
++				}
++			}
++			int rdb = cx_db10(rms), pdb = cx_db10(peak);
++			CX_LOG("  %4u ms: rms %d.%d dBFS (%llu), peak %d.%d dBFS (%u), mean %lld\n", (i + 1) * 40, rdb / 10,
++			    rdb < 0 ? -rdb % 10 : rdb % 10, rms, pdb / 10, pdb < 0 ? -pdb % 10 : pdb % 10, peak, sum / (int64_t)n);
++			sum2 = 0;
++			sum = 0;
++			n = 0;
++			peak = 0;
++		}
++	}
++	cx_cap_close();
++	lck_mtx_unlock(&au_mtx);
++	CX_LOG("capture: %u reads, %u bytes, %u all-zero buffers\n", reads, bytes, zero_bufs);
++	return ok;
++}
++
+ /*
+  * kern.sweet_codec: 1 = stage 1 (QMI), 2 = stage 2 (register reads), 3 = stage 3 (NGD), 4 = stage 4 (codec id),
+  * 5 = codec init + mic path, 6 = SLIMbus channel + AFE capture port (3060),
+@@ -3377,6 +3622,8 @@ cx_sysctl SYSCTL_HANDLER_ARGS
+ 			(void)cx_stage_mic();
+ 		} else if (v == 6) {
+ 			(void)cx_stage_port();
++		} else if (v == 7) {
++			(void)cx_stage_capture(2);
+ 		} else if (v == 9) {
+ 			(void)(cx_stage_qmi() && cx_stage_regs() && cx_stage_ngd() && cx_stage_codec() && cx_stage_mic() &&
+ 			    cx_stage_port());
+@@ -3386,7 +3633,7 @@ cx_sysctl SYSCTL_HANDLER_ARGS
+ 	return SYSCTL_OUT(req, cx.log, strnlen(cx.log, sizeof(cx.log)) + 1);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_codec, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, cx_sysctl, "A",
+-    "Mi 8 WCD9340 bring-up: 1 QMI, 2 regs, 3 NGD, 4 codec id, 5 init + mic path, 6 SLIMbus channel + AFE, 9 all, 0 off (3060)");
++    "Mi 8 WCD9340 bring-up: 1 QMI, 2 regs, 3 NGD, 4 codec id, 5 init + mic path, 6 SLIMbus channel + AFE, 7 capture 2 s, 9 all, 0 off (3061)");
+ 
+ static void
+ au_thread(void *arg, wait_result_t w)
