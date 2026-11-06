@@ -1,0 +1,26 @@
+From 452bee5220f192f9b251a7ecd577a4313b01906c Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@wlan-114021.nbw.tue.nl>
+Date: Fri, 6 Nov 2026 11:41:33 +0100
+Subject: [PATCH] 3067i: the player leaves the earpiece's AFE port to stages
+ 10/11
+
+---
+ bsd/dev/dipper_audio.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 22b597e..6132d0a 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -2343,7 +2343,7 @@ pl_teardown(const char *why, bool amp, bool stream, bool copp, bool mapped, bool
+ 		st[3] = apr_request_port(APR_SVC_ASM, 0, 0, ASM_SESSION << 8, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &h, sizeof(h),
+ 		    APR_BASIC_RSP_RESULT, 1000);
+ 	}
+-	if (port) {
++	if (port && pl.out == 0) {              /* 3067i: the earpiece's AFE port belongs to stages 10 / 11 */
+ 		st[4] = afe_port_cmd(pl_port(), AFE_PORT_CMD_DEVICE_STOP);
+ 	}
+ 	if (pl.out == 0) {                      /* the earpiece's port, channel and codec stay up (stage 10) */
+-- 
+2.54.0 (Apple Git-157)
+
