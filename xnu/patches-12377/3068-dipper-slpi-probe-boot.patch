@@ -1,0 +1,510 @@
+From a829e0f78b4f92172edf743842f24cbb27d2688c Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@wlan-114021.nbw.tue.nl>
+Date: Fri, 6 Nov 2026 12:59:10 +0100
+Subject: [PATCH] 3068: kern.sweet_ssc, the Mi 8 sensor DSP (SLPI): 1 read-only
+ probe (slpi_dp firmware, carve-out, SMEM host 3), 2 boot (QMP, lcx/lmx, SMP2P
+ 430/481, PAS 12)
+
+---
+ bsd/conf/files           |   1 +
+ bsd/dev/dipper_sensors.c | 462 +++++++++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_rpmh.c     |   2 +-
+ 3 files changed, 464 insertions(+), 1 deletion(-)
+ create mode 100644 bsd/dev/dipper_sensors.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 11b9a41..701e2fe 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -120,6 +120,7 @@ bsd/dev/sweet_a630_pas.c			standard
+ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/dipper_audio.c		standard
+ bsd/dev/dipper_haptics.c	standard
++bsd/dev/dipper_sensors.c	standard
+ bsd/dev/sweet_80211.c			standard
+ bsd/dev/sweet_wpa.c			standard
+ bsd/dev/sweet_wlan_frames.c		standard
+diff --git a/bsd/dev/dipper_sensors.c b/bsd/dev/dipper_sensors.c
+new file mode 100644
+index 0000000..3ea1a1a
+--- /dev/null
++++ b/bsd/dev/dipper_sensors.c
+@@ -0,0 +1,462 @@
++/*
++ * Mi 8 (dipper, SDM845) sensors, patch 3068 onwards: the sensor DSP (SLPI, Qualcomm "Snapdragon Sensor Core").
++ *
++ * Every motion and environment sensor of the Mi 8 sits on the SSC's own buses (its 18-pin TLMM, its QUP serial
++ * engines, PMIC rails it votes itself), so only the SLPI reaches them. From the phone's own sensor registry
++ * (persist partition, sensors/registry, made by Android) and /vendor/etc/sensors/config:
++ *   icm206xx_0  TDK ICM-206xx accel + gyro   SPI, SSC bus instance 2, IRQ 118 (OIS streams: likely the ICM-20690)
++ *   ak0991x_0   AKM AK0991x magnetometer      I2C, SSC bus instance 1, address 0x0c, IRQ 119
++ *   tmd2725     AMS TMD2725 ALS + proximity   I2C, SSC bus instance 1, address 0x39, IRQ 120
++ *   adux1050_0  ADI ADUX1050 (proximity)      I2C, SSC bus instance 1, address 0x2c, IRQ 120 (shared with the TMD2725)
++ *   bmp285_0    Bosch BMP285 pressure + temp  I2C, SSC bus instance 1, address 0x77
++ * The Android sensor list on persist (sensors_list.txt) names one ambient_light and one proximity.
++ *
++ * OFF until asked: kern.sweet_ssc (sweetsys kern.sweet_ssc=N from SSH) runs a stage now, read = that run's log.
++ *   1  read-only probe: image/slpi_dp.mdt from the modem partition (Linux: sensors_ssc.c, qcom,msm-ssc-sensors
++ *      qcom,firmware-name "slpi_dp", subsystem_get_with_fwname("slpi", ...)), its segments against the
++ *      pil_slpi_region carve-out, every slpi_dp.bNN present with the right size, and the apps<->slpi SMEM partition
++ *      (host 3): SMP2P items 481 (theirs) / 430 (ours), GLINK descriptor 478, crash reason 424. Writes nothing.
++ *   2  boot: AOSS QMP load_state slpi on, RPMh lcx + lmx votes (the SLPI's vdd_cx / vdd_mx proxies), our SMP2P item
++ *      (430, "master-kernel", doorbell bit 26), PAS id 12 INIT_IMAGE (the .mdt) + MEM_SETUP (the carve-out) +
++ *      segments + AUTH_AND_RESET, then the SLPI's SMP2P item (481, "slave-kernel": bit 0 fatal, 1 ready, 2 handover,
++ *      3 stop ack) until ready. The SLPI keeps running; there is no stop path yet.
++ *
++ * Facts from the live DT (dtb/dipper/live.dtb): qcom,ssc@5c00000 pil-tz-generic, qcom,pas-id 12, qcom,smem-id 424,
++ * qcom,signal-aop, vdd_cx = lcx.lvl and vdd_mx = lmx.lvl (rpmh-arc-regulator, level 0x181, keep-proxy-regs-on),
++ * memory-region pil_slpi_region 0x96b00000 + 0x1400000 (no-map; low DDR bank, outside the kernel's --highmem RAM);
++ * smp2p-dsps remote pid 3, doorbell 0x1799000c bit 26 (irq-bitmask 0x4000000), IRQ 172; GLINK SMEM edge "dsps"
++ * (doorbell bit 24, IRQ 170). SMP2P item numbers from mainline sdm845.dtsi smp2p-slpi qcom,smem = <481>, <430>.
++ * Firmware (observed in backup/dipper/modem.img): SLPI_DP.MDT + B00..B23 (no B20: filesz 0), 25 phdrs,
++ * relocatable, 0x1300000 bytes; also SLPI/SLPI_BR/SLPI_PS/SLPI_US for other Xiaomi boards, and SLPIR.JSN /
++ * SLPIUS.JSN (pd-mapper: msm/slpi/root_pd and msm/slpi/sensor_pd, tms/servreg, instance 90).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
++#include "sweet_board.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
++extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
++extern void sweet_log_sync(void);
++extern int sweet_rpmh_arc_vote(const char *res, bool max);
++extern int sweet_scm_pas(uint32_t pas_id, uint32_t cmd, uint32_t arginfo, uint64_t arg1, uint64_t arg2);
++extern uint32_t sweet_smem_rd(uint32_t off);
++extern void sweet_smem_wr(uint32_t off, uint32_t val);
++extern uint32_t sweet_smem_item(uint32_t host, uint32_t item, uint32_t *size);
++extern uint32_t sweet_smem_alloc(uint32_t host, uint32_t item, uint32_t size);
++extern void sweet_apcs_kick(unsigned bit);
++extern bool sweet_qmp_send(const char *msg);
++extern int sweet_modem_file(const char *path, uint32_t *cluster, uint32_t *size);
++extern int sweet_modem_file_read(uint32_t cluster, uint64_t off, void *dst, uint64_t len);
++
++#define SS_PAS_ID               12u
++#define SS_FW                   "image/slpi_dp"
++#define SS_REGION_PA            0x96b00000ull   /* pil_slpi_region */
++#define SS_REGION_SIZE          0x1400000u
++#define SS_HOST                 3u              /* qcom_smem host / smp2p remote pid of the SLPI */
++#define SS_SMP2P_IN             481u
++#define SS_SMP2P_OUT            430u
++#define SS_SMP2P_DOORBELL       26u
++#define SS_CRASH_ITEM           424u
++#define SS_GLINK_DESC           478u            /* SMEM_GLINK_NATIVE_XPRT_DESCRIPTOR, in the apps<->slpi partition */
++#define SMP2P_MAGIC             0x504d5324u     /* "$SMP" */
++#define SMP2P_MAX_ENTRY         16u
++#define SMP2P_ITEM_SIZE         (20u + SMP2P_MAX_ENTRY * 20u)
++#define SMP2P_FEATURE_SSR_ACK   1u
++#define MDT_MAX_PHDRS           32u
++#define PT_LOAD                 1u
++#define MDT_TYPE_MASK           (7u << 24)
++#define MDT_TYPE_HASH           (2u << 24)
++#define MDT_RELOCATABLE         (1u << 27)
++#define SS_CHUNK                (1u << 20)
++
++static struct {
++	uint8_t *mdt;
++	uint32_t mdt_size;
++	unsigned phnum;
++	uint64_t lo, hi;                /* extent of the loadable segments */
++	bool relocate, booted;
++	uint32_t smp2p_out;
++	vm_offset_t region;
++	uint32_t runs;
++	bool busy;
++	char log[4096];
++	size_t off;
++} ss;
++
++#define SS_LOG(...) do { \
++	int _n = snprintf(ss.log + ss.off, sizeof(ss.log) - ss.off, __VA_ARGS__); \
++	if (_n > 0) { \
++	        printf("SWEET SSC: %s", ss.log + ss.off); \
++	        ss.off = MIN(sizeof(ss.log) - 1, ss.off + (size_t)_n); \
++	} \
++} while (0)
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/* ---- the .mdt: ELF32 header + program headers + hash segment, which is also the PAS metadata */
++static bool
++ss_mdt_load(void)
++{
++	uint32_t cl = 0, size = 0;
++	int err = sweet_modem_file(SS_FW ".mdt", &cl, &size);
++	if (err || size < 52 || size > 0x10000) {
++		SS_LOG(SS_FW ".mdt: error %d, %u bytes\n", err, size);
++		return false;
++	}
++	if (!ss.mdt) {
++		ss.mdt = kalloc_data(0x10000, Z_WAITOK | Z_ZERO);
++	}
++	if (!ss.mdt || sweet_modem_file_read(cl, 0, ss.mdt, size)) {
++		SS_LOG(SS_FW ".mdt: read failed\n");
++		return false;
++	}
++	ss.mdt_size = size;
++	const uint8_t *e = ss.mdt;
++	uint32_t phoff = le32(e + 28);
++	ss.phnum = (unsigned)(e[44] | (e[45] << 8));
++	if (le32(e) != 0x464c457fu || e[4] != 1 || ss.phnum == 0 || ss.phnum > MDT_MAX_PHDRS || phoff + 32u * ss.phnum > size) {
++		SS_LOG(SS_FW ".mdt is not a Qualcomm ELF32 (magic %#x phnum %u)\n", le32(e), ss.phnum);
++		return false;
++	}
++	ss.lo = ~0ull;
++	ss.hi = 0;
++	ss.relocate = false;
++	for (unsigned i = 0; i < ss.phnum; i++) {
++		const uint8_t *p = e + phoff + 32 * i;
++		uint32_t type = le32(p), paddr = le32(p + 12), memsz = le32(p + 20), flags = le32(p + 24);
++		if (type != PT_LOAD || (flags & MDT_TYPE_MASK) == MDT_TYPE_HASH || memsz == 0) {
++			continue;
++		}
++		ss.relocate |= !!(flags & MDT_RELOCATABLE);
++		ss.lo = MIN(ss.lo, paddr);
++		ss.hi = MAX(ss.hi, ((uint64_t)paddr + memsz + 0xfff) & ~0xfffull);
++	}
++	bool fits = ss.hi > ss.lo && ss.hi - ss.lo <= SS_REGION_SIZE && (ss.relocate || ss.lo == SS_REGION_PA);
++	SS_LOG("slpi_dp.mdt %u bytes, %u phdrs, %s image %#llx..%#llx (%llu KiB), carve-out %#llx+%#x: %s\n", size,
++	    ss.phnum, ss.relocate ? "relocatable" : "fixed", ss.lo, ss.hi, (ss.hi - ss.lo) >> 10, SS_REGION_PA,
++	    SS_REGION_SIZE, fits ? "fits" : "DOES NOT FIT");
++	return fits;
++}
++
++/* each loadable segment's slpi_dp.bNN, checked (copy == 0) or copied into the mapped carve-out */
++static bool
++ss_segments(vm_offset_t copy)
++{
++	const uint8_t *e = ss.mdt;
++	uint32_t phoff = le32(e + 28);
++	uint8_t *buf = copy ? kalloc_data(SS_CHUNK, Z_WAITOK) : NULL;
++	bool ok = !copy || buf;
++	unsigned files = 0;
++	uint64_t bytes = 0;
++	for (unsigned i = 0; ok && i < ss.phnum; i++) {
++		const uint8_t *p = e + phoff + 32 * i;
++		uint32_t type = le32(p), paddr = le32(p + 12), filesz = le32(p + 16), memsz = le32(p + 20), flags = le32(p + 24);
++		if (type != PT_LOAD || (flags & MDT_TYPE_MASK) == MDT_TYPE_HASH || memsz == 0) {
++			continue;
++		}
++		uint64_t off = (uint64_t)paddr - (ss.relocate ? ss.lo : SS_REGION_PA);
++		char name[32];
++		snprintf(name, sizeof(name), SS_FW ".b%02u", i);
++		uint32_t cl = 0, size = 0;
++		if (filesz && (sweet_modem_file(name, &cl, &size) || size != filesz)) {
++			SS_LOG("%s: %u bytes, segment wants %u\n", name, size, filesz);
++			ok = false;
++			break;
++		}
++		if (off + memsz > SS_REGION_SIZE || filesz > memsz) {
++			SS_LOG("segment %u outside the carve-out\n", i);
++			ok = false;
++			break;
++		}
++		files += filesz ? 1 : 0;
++		bytes += filesz;
++		if (!copy) {
++			continue;
++		}
++		for (uint32_t o = 0; o < filesz; o += SS_CHUNK) {
++			uint32_t n = MIN(SS_CHUNK, filesz - o);
++			if (sweet_modem_file_read(cl, o, buf, n)) {
++				SS_LOG("%s: read failed at %u\n", name, o);
++				ok = false;
++				break;
++			}
++			for (uint32_t w = 0; w < n; w += 4) {
++				uint32_t v = 0;
++				for (uint32_t b = 0; b < 4 && w + b < n; b++) {
++					v |= (uint32_t)buf[w + b] << (8 * b);
++				}
++				*(volatile uint32_t *)(copy + off + o + w) = v;
++			}
++		}
++		for (uint32_t z = (filesz + 3) & ~3u; ok && z < memsz; z += 4) {    /* qcom_mdt_load: the rest of memsz zeroed */
++			*(volatile uint32_t *)(copy + off + z) = 0;
++		}
++	}
++	if (buf) {
++		kfree_data(buf, SS_CHUNK);
++	}
++	if (ok) {
++		SS_LOG("segments: %u files, %llu bytes %s\n", files, bytes, copy ? "copied into the carve-out" : "present, sizes match");
++	}
++	return ok;
++}
++
++/* ---- SMP2P with the SLPI (qcom_smp2p.c), in the apps<->slpi SMEM partition */
++static void
++ss_smp2p_entry(uint32_t d, const char *name)
++{
++	uint32_t valid = sweet_smem_rd(d + 12) >> 16;
++	char b[16];
++	memset(b, 0, sizeof(b));
++	strlcpy(b, name, sizeof(b));
++	for (uint32_t c = 0; c < 16; c += 4) {
++		uint32_t w;
++		memcpy(&w, b + c, 4);
++		sweet_smem_wr(d + 20 + valid * 20 + c, w);
++	}
++	sweet_smem_wr(d + 20 + valid * 20 + 16, 0);
++	sweet_smem_wr(d + 12, SMP2P_MAX_ENTRY | ((valid + 1) << 16));
++}
++
++static bool
++ss_smp2p_out(void)
++{
++	uint32_t d = sweet_smem_alloc(SS_HOST, SS_SMP2P_OUT, SMP2P_ITEM_SIZE);
++	if (!d) {
++		SS_LOG("smp2p item %u: SMEM allocation failed\n", SS_SMP2P_OUT);
++		return false;
++	}
++	for (uint32_t k = 0; k < SMP2P_ITEM_SIZE; k += 4) {
++		sweet_smem_wr(d + k, 0);
++	}
++	sweet_smem_wr(d + 0, SMP2P_MAGIC);
++	sweet_smem_wr(d + 4, SMP2P_FEATURE_SSR_ACK << 8);
++	sweet_smem_wr(d + 8, 0u | (SS_HOST << 16));            /* local pid 0, remote pid 3 */
++	sweet_smem_wr(d + 12, SMP2P_MAX_ENTRY);
++	sweet_smem_wr(d + 4, (SMP2P_FEATURE_SSR_ACK << 8) | 1u);
++	sweet_apcs_kick(SS_SMP2P_DOORBELL);
++	ss_smp2p_entry(d, "master-kernel");
++	sweet_apcs_kick(SS_SMP2P_DOORBELL);
++	ss.smp2p_out = d;
++	SS_LOG("smp2p item %u at +%#x: version 1, pid 0->3, entry master-kernel, doorbell bit %u\n", SS_SMP2P_OUT, d,
++	    SS_SMP2P_DOORBELL);
++	return true;
++}
++
++/* the SLPI's "slave-kernel" bits, false while its item or entry does not exist */
++static bool
++ss_smp2p_in(uint32_t *bits)
++{
++	uint32_t sz = 0, it = sweet_smem_item(SS_HOST, SS_SMP2P_IN, &sz);
++	if (!it || sz < 20 || sweet_smem_rd(it) != SMP2P_MAGIC) {
++		return false;
++	}
++	uint32_t valid = MIN(sweet_smem_rd(it + 12) >> 16, SMP2P_MAX_ENTRY);
++	for (uint32_t k = 0; k < valid && 20 + (k + 1) * 20 <= sz; k++) {
++		char name[17];
++		for (uint32_t c = 0; c < 16; c += 4) {
++			uint32_t w = sweet_smem_rd(it + 20 + k * 20 + c);
++			memcpy(name + c, &w, 4);
++		}
++		name[16] = 0;
++		if (strcmp(name, "slave-kernel") == 0) {
++			*bits = sweet_smem_rd(it + 20 + k * 20 + 16);
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++ss_crash_reason(void)
++{
++	uint32_t sz = 0, it = sweet_smem_item(0xfffe, SS_CRASH_ITEM, &sz);
++	if (!it || !sz) {
++		SS_LOG("no crash reason in SMEM (item %u)\n", SS_CRASH_ITEM);
++		return;
++	}
++	char msg[129];
++	uint32_t n = MIN(sz, 128u);
++	for (uint32_t k = 0; k < n; k += 4) {
++		uint32_t w = sweet_smem_rd(it + k);
++		memcpy(msg + k, &w, MIN(4u, n - k));
++	}
++	msg[n] = 0;
++	SS_LOG("SLPI crash reason (item %u, %u bytes): \"%s\"\n", SS_CRASH_ITEM, sz, msg);
++}
++
++/* ---- stage 1 */
++static bool
++ss_probe(void)
++{
++	bool ok = ss_mdt_load() && ss_segments(0);
++	uint32_t in_sz = 0, out_sz = 0, gl_sz = 0, cr_sz = 0, bits = 0;
++	uint32_t in = sweet_smem_item(SS_HOST, SS_SMP2P_IN, &in_sz);
++	uint32_t out = sweet_smem_item(SS_HOST, SS_SMP2P_OUT, &out_sz);
++	uint32_t gl = sweet_smem_item(SS_HOST, SS_GLINK_DESC, &gl_sz);
++	uint32_t cr = sweet_smem_item(0xfffe, SS_CRASH_ITEM, &cr_sz);
++	bool have = ss_smp2p_in(&bits);
++	SS_LOG("SMEM apps<->slpi (host %u): smp2p in %u at +%#x (%u bytes)%s, out %u at +%#x (%u bytes), glink descriptor %u "
++	    "at +%#x (%u bytes); crash item %u at +%#x (%u bytes)\n", SS_HOST, SS_SMP2P_IN, in, in_sz,
++	    have ? "" : " (no slave-kernel)", SS_SMP2P_OUT, out, out_sz, SS_GLINK_DESC, gl, gl_sz, SS_CRASH_ITEM, cr, cr_sz);
++	if (have) {
++		SS_LOG("slave-kernel %#x already there: the SLPI ran before (bits fatal %u ready %u)\n", bits, bits & 1,
++		    (bits >> 1) & 1);
++	}
++	SS_LOG("probe %s\n", ok ? "OK: firmware complete and fits" : "FAILED");
++	sweet_log_sync();
++	return ok;
++}
++
++/* ---- stage 2 */
++static bool
++ss_boot(void)
++{
++	if (ss.booted) {
++		SS_LOG("already booted in this kernel run\n");
++		return true;
++	}
++	if (!sweet_qmp_send("{class: image, res: load_state, name: slpi, val: on}")) {
++		SS_LOG("QMP load_state slpi not consumed\n");
++		return false;
++	}
++	SS_LOG("QMP load_state slpi on: consumed\n");
++	int lcx = sweet_rpmh_arc_vote("lcx.lvl", true), lmx = sweet_rpmh_arc_vote("lmx.lvl", true);
++	SS_LOG("RPMh votes: lcx.lvl err=%d, lmx.lvl err=%d\n", lcx, lmx);
++	if (lcx || lmx) {
++		return false;
++	}
++	if (!ss_smp2p_out()) {
++		return false;
++	}
++	/* metadata in contiguous write-combined memory (dma_alloc_coherent in Linux), as for the audio DSP */
++	vm_offset_t kva;
++	vm_size_t msize = round_page(ss.mdt_size);
++	if (kmem_alloc_contig(kernel_map, &kva, msize, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		SS_LOG("metadata allocation failed\n");
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	for (unsigned i = 1; pn && i < msize / PAGE_SIZE; i++) {
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(kva + i * PAGE_SIZE)) != pn + i) {
++			pn = 0;
++		}
++	}
++	if (!pn) {
++		SS_LOG("metadata not physically contiguous\n");
++		return false;
++	}
++	memcpy((void *)kva, ss.mdt, ss.mdt_size);
++	sweet_dma_sync_va((const void *)kva, msize);
++	for (unsigned i = 0; i < msize / PAGE_SIZE; i++) {
++		pmap_set_cache_attributes(pn + i, VM_WIMG_WCOMB);
++	}
++	sweet_dma_sync_va((const void *)kva, msize);
++	uint64_t size = ss.hi - ss.lo;
++	int r = sweet_scm_pas(SS_PAS_ID, 1, 0x82, ptoa_64(pn), 0);                 /* INIT_IMAGE, SCM_ARGS(2, VAL, RW) */
++	SS_LOG("PAS %u INIT_IMAGE: %d\n", SS_PAS_ID, r);
++	if (r != 0) {
++		return false;
++	}
++	bool started = false;
++	r = sweet_scm_pas(SS_PAS_ID, 2, 3, SS_REGION_PA, size);                    /* MEM_SETUP */
++	SS_LOG("PAS %u MEM_SETUP %#llx+%#llx: %d\n", SS_PAS_ID, SS_REGION_PA, size, r);
++	if (r == 0 && (ss.region = ml_io_map((vm_offset_t)SS_REGION_PA, SS_REGION_SIZE)) != 0 && ss_segments(ss.region)) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		r = sweet_scm_pas(SS_PAS_ID, 5, 1, 0, 0);                         /* AUTH_AND_RESET */
++		SS_LOG("PAS %u AUTH_AND_RESET: %d\n", SS_PAS_ID, r);
++		started = r == 0;
++	}
++	if (!started) {
++		SS_LOG("PAS %u SHUTDOWN: %d\n", SS_PAS_ID, sweet_scm_pas(SS_PAS_ID, 6, 1, 0, 0));
++		return false;
++	}
++	ss.booted = true;
++	SS_LOG("SLPI authenticated and started\n");
++	sweet_log_sync();
++	uint32_t bits = 0, last = ~0u;
++	for (unsigned t = 0; t < 10000; t += 10) {
++		bool have = ss_smp2p_in(&bits);
++		if (have && bits != last) {
++			SS_LOG("+%u ms: slave-kernel %#x (fatal %u ready %u handover %u stop-ack %u)\n", t, bits, bits & 1,
++			    (bits >> 1) & 1, (bits >> 2) & 1, (bits >> 3) & 1);
++			last = bits;
++		}
++		if (have && (bits & 1)) {
++			ss_crash_reason();
++			return false;
++		}
++		if (have && (bits & 2)) {
++			uint32_t gl = sweet_smem_item(SS_HOST, SS_GLINK_DESC, NULL);
++			SS_LOG("SLPI READY after %u ms; glink descriptor %u %s\n", t, SS_GLINK_DESC, gl ? "present" : "not there yet");
++			sweet_log_sync();
++			return true;
++		}
++		delay(10 * 1000);
++	}
++	SS_LOG("no ready from the SLPI in 10 s (slave-kernel %s %#x)\n", last == ~0u ? "never seen," : "last", bits);
++	ss_crash_reason();
++	return false;
++}
++
++/*
++ * kern.sweet_ssc: write 1 = stage 1 (read-only probe), 2 = stages 1 + 2 (boot the SLPI); an int (sweetsys) or text.
++ * Read = the last run's log.
++ */
++static int
++ss_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (req->newptr) {
++		char in[8] = { 0 };
++		int v = -1;
++		size_t n = MIN(req->newlen, sizeof(in) - 1);
++		int err = SYSCTL_IN(req, in, n);
++		if (err) {
++			return err;
++		}
++		if (n == sizeof(int)) {
++			memcpy(&v, in, sizeof(int));
++		} else {
++			v = in[0] - '0';
++		}
++		if (v < 1 || v > 2) {
++			return EINVAL;
++		}
++		if (!sweet_board_is("xiaomi,dipper")) {
++			return ENODEV;
++		}
++		if (__atomic_exchange_n(&ss.busy, true, __ATOMIC_ACQUIRE)) {
++			return EBUSY;
++		}
++		ss.off = 0;
++		ss.log[0] = 0;
++		ss.runs++;
++		SS_LOG("run %u, stage %d\n", ss.runs, v);
++		if (ss_probe() && v >= 2) {
++			(void)ss_boot();
++		}
++		sweet_log_sync();
++		__atomic_store_n(&ss.busy, false, __ATOMIC_RELEASE);
++	}
++	return SYSCTL_OUT(req, ss.log, strnlen(ss.log, sizeof(ss.log)) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ssc, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, ss_sysctl, "A",
++    "Mi 8 sensor DSP (SLPI) bring-up: 1 read-only probe, 2 probe + boot (3068)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 0e2958c..f050404 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -663,7 +663,7 @@ out:
+ int
+ sweet_rpmh_arc_vote(const char *res, bool max)
+ {
+-	static const char *const allowed[] = { "cx.lvl", "mx.lvl", "mss.lvl" };
++	static const char *const allowed[] = { "cx.lvl", "mx.lvl", "mss.lvl", "lcx.lvl", "lmx.lvl" };  /* 3068: lcx/lmx = the SLPI's vdd_cx/vdd_mx */
+ 	unsigned i;
+ 	if (!sweet_board_beryllium() || !res) {
+ 		return EINVAL;
+-- 
+2.54.0 (Apple Git-157)
+
