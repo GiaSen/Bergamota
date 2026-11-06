@@ -1,0 +1,69 @@
+From 614d4cba454733b2d10b94a1c4df03a9bcf905bb Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@Giammarcos-Air.home>
+Date: Fri, 6 Nov 2026 03:46:57 +0100
+Subject: [PATCH] 3067d: the codec's SLIMbus slave layout to the DSP
+ (AFE_PARAM_ID_CDC_SLIMBUS_SLAVE_CFG, rx offset 16) before the earpiece's
+ port; codec sysctl takes ints from 10
+
+---
+ bsd/dev/dipper_audio.c | 30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 6d49bc5..0be0d79 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -3715,6 +3715,31 @@ cx_amic_off(void)
+  */
+ #define CX_RX_PORT              16u
+ #define CX_RX_CHAN              144u
++#define AFE_MODULE_CDC_DEV_CFG  0x00010234u
++#define AFE_PARAM_ID_CDC_SLIMBUS_SLAVE_CFG 0x00010235u
++
++/*
++ * 3067d: the codec's SLIMbus slave layout for the DSP, as the machine driver sends it at card init (sdm845.c
++ * msm_afe_set_config -> q6afe afe_send_slimbus_slave_cfg, AFE_SVC_CMD_SET_PARAM): the PGD's enumeration address
++ * (little-endian from the DT's elemental-addr) and the port offsets, TX ports from 0, RX ports from 16
++ * (tavil_init_slim_slave_cfg). Never sent before 3067d; the TX path works with offset 0 either way.
++ */
++static int
++cx_afe_slave_cfg(void)
++{
++	struct {
++		uint32_t minor, ea_lsw, ea_msw;
++		uint16_t tx_off, rx_off;
++	} __attribute__((packed)) c = { 1, 0, 0, 0, CX_RX_PORT };
++	_Static_assert(sizeof(c) == 16, "afe_param_cdc_slimbus_slave_cfg is 16 bytes");
++	memcpy(&c.ea_lsw, cx_pgd_ea, 4);
++	memcpy(&c.ea_msw, cx_pgd_ea + 4, 2);
++	lck_mtx_lock(&au_mtx);
++	int r = afe_svc_param(AFE_MODULE_CDC_DEV_CFG, AFE_PARAM_ID_CDC_SLIMBUS_SLAVE_CFG, &c, sizeof(c));
++	lck_mtx_unlock(&au_mtx);
++	CX_LOG("AFE CDC_SLIMBUS_SLAVE_CFG (ea %08x %04x, tx offset 0, rx offset %u) -> %d\n", c.ea_lsw, c.ea_msw, CX_RX_PORT, r);
++	return r;
++}
+ static int8_t cx_ear_db;
+ static uint8_t cx_ear_pa = 4;
+ 
+@@ -3748,6 +3773,7 @@ cx_stage_ear(void)
+ 		}
+ 	}
+ 	if (!cx.ear_up) {
++		(void)cx_afe_slave_cfg();
+ 		cx.if_page = -1;
+ 		if (cx_if_wr((uint16_t)(0x140 + 4 * CX_RX_PORT), 0x01) ||        /* RX_PORT_MULTI_CHNL_0: RX0 */
+ 		    cx_if_wr((uint16_t)(0x30 + CX_RX_PORT), (2u << 1) | 1u)) {   /* RX_PORT_CFG: water mark, enable */
+@@ -4259,8 +4285,8 @@ cx_sysctl SYSCTL_HANDLER_ARGS
+ 		if (err) {
+ 			return err;
+ 		}
+-		if (n == sizeof(int) && in[0] >= 0 && in[0] < 10) {
+-			memcpy(&v, in, sizeof(int));    /* an int (sweetsys) */
++		if (n == sizeof(int)) {
++			memcpy(&v, in, sizeof(int));    /* an int (sweetsys); 3067d: 10 and up too */
+ 		} else {
+ 			v = in[0] - '0';                /* or text ("1") */
+ 		}
+-- 
+2.54.0 (Apple Git-157)
+
