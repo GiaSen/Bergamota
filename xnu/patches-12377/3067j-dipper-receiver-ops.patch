@@ -1,0 +1,124 @@
+From 22c26e8545f21ead61ecd61077a56ddec59d6f2b Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@wlan-114021.nbw.tue.nl>
+Date: Fri, 6 Nov 2026 11:55:24 +0100
+Subject: [PATCH] 3067j: kern.sweet_audio_play START_SPEAKER / START_EAR /
+ EAR_OFF for SweetSpeaker.driver's Receiver
+
+---
+ bsd/dev/dipper_audio.c | 72 +++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 68 insertions(+), 4 deletions(-)
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 6132d0a..7b40f07 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -2165,7 +2165,11 @@ _Static_assert(PL_ZEROS + PL_PERIOD <= PL_MAP_SIZE, "the player's ring fits its
+ #define PL_IDLE_S               5u              /* seconds of zeros before the amp sleeps */
+ #define TAS_ADDR                0x4cu
+ enum { PL_OFF, PL_PLAYING, PL_DRAINING };
+-enum { PL_OP_START = 1, PL_OP_STOP = 2, PL_OP_DATA = 3, PL_OP_DRAIN = 4 };
++enum { PL_OP_START = 1, PL_OP_STOP = 2, PL_OP_DATA = 3, PL_OP_DRAIN = 4,
++       /* 3067j, for SweetSpeaker.driver (audiomxd is not root): START on the speaker / on the earpiece (its path comes up
++        * first if needed: stages 1-5 + 10, EAGAIN while another codec step runs), the earpiece path off unless the player
++        * plays on it (stage 11, EBUSY then) */
++       PL_OP_START_SPEAKER = 5, PL_OP_START_EAR = 6, PL_OP_EAR_OFF = 7 };
+ _Static_assert(PL_ZEROS + PL_PERIOD <= AU_POOL_SIZE, "the ring and its zeros fit the window");
+ 
+ struct pl_status {
+@@ -2570,6 +2574,9 @@ pl_step(void)
+ 	}
+ }
+ 
++static int ear_on(void);
++static int ear_off_idle(void);
++
+ static int
+ au_play_sysctl SYSCTL_HANDLER_ARGS
+ {
+@@ -2624,16 +2631,25 @@ au_play_sysctl SYSCTL_HANDLER_ARGS
+ 				pl.state = PL_DRAINING;
+ 			}
+ 			lck_mtx_unlock(&au_mtx);
+-		} else if (op == PL_OP_START || op == PL_OP_STOP) {
++		} else if (op == PL_OP_START || op == PL_OP_STOP || op == PL_OP_START_SPEAKER || op == PL_OP_START_EAR) {
++			if (op == PL_OP_START_EAR && (err = ear_on())) {
++				return err;
++			}
++			if (op == PL_OP_START_SPEAKER || op == PL_OP_START_EAR) {
++				au_out = op == PL_OP_START_EAR;  /* the player's next start; a running player keeps its output (EBUSY) */
++			}
++			uint32_t rq = op == PL_OP_STOP ? PL_OP_STOP : PL_OP_START;
+ 			lck_mtx_lock(&au_mtx);
+ 			uint32_t g = pl.gen;
+-			pl.req = op;
++			pl.req = rq;
+ 			lck_mtx_unlock(&au_mtx);
+ 			unsigned w = 0;
+ 			for (; w < 10000 && __atomic_load_n(&pl.gen, __ATOMIC_ACQUIRE) == g; w += 5) {
+ 				au_sleep(5);
+ 			}
+-			err = w >= 10000 ? ETIMEDOUT : op == PL_OP_START ? (int)pl.result : 0;
++			err = w >= 10000 ? ETIMEDOUT : rq == PL_OP_START ? (int)pl.result : 0;
++		} else if (op == PL_OP_EAR_OFF) {
++			err = ear_off_idle();
+ 		} else {
+ 			err = EINVAL;
+ 		}
+@@ -3913,6 +3929,54 @@ cx_stage_ear_off(void)
+ 	return true;
+ }
+ 
++/* 3067j: the earpiece path for kern.sweet_audio_play's START_EAR / EAR_OFF (SweetSpeaker.driver's Receiver device) */
++static int
++ear_on(void)
++{
++	if (cx.ear_up) {
++		return 0;
++	}
++	if (__atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
++		return EAGAIN;
++	}
++	int r = 0;
++	if (!cx.ear_up) {
++		cx.off = 0;
++		cx.log[0] = 0;
++		cx.runs++;
++		CX_LOG("run %u: earpiece on (player)\n", cx.runs);
++		r = cx_codec_chain() && cx_stage_ear() ? 0 : EIO;
++	}
++	__atomic_store_n(&cx.busy, false, __ATOMIC_RELEASE);
++	sweet_log_sync();
++	return r;
++}
++
++static int
++ear_off_idle(void)
++{
++	lck_mtx_lock(&au_mtx);
++	bool on_ear = (pl.state != PL_OFF && pl.out == 1) || pl.req;
++	lck_mtx_unlock(&au_mtx);
++	if (on_ear) {
++		return EBUSY;
++	}
++	if (__atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
++		return EAGAIN;
++	}
++	if (cx.ear_up) {
++		cx.off = 0;
++		cx.log[0] = 0;
++		cx.runs++;
++		CX_LOG("run %u: earpiece off (player)\n", cx.runs);
++		(void)cx_stage_ear_off();
++	}
++	au_out = 0;
++	__atomic_store_n(&cx.busy, false, __ATOMIC_RELEASE);
++	sweet_log_sync();
++	return 0;
++}
++
+ /*
+  * 3067c, for ordering experiments on the earpiece's SLIMbus link (the codec's RX0 port reports overflow continuously):
+  * stage 12 stops AFE SLIMBUS_0_RX, stage 13 configures and starts it, stage 14 redoes the manager's side
+-- 
+2.54.0 (Apple Git-157)
+

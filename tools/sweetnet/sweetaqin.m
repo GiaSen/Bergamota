@@ -1,8 +1,9 @@
 /*
- * sweetaqin SECONDS [FILE.wav] [-m] [-t FREQ DBFS]: record through iOS's audio stack over SSH, the way apps do:
+ * sweetaqin SECONDS [FILE.wav] [-m] [-t FREQ DBFS] [-e]: record through iOS's audio stack over SSH, the way apps do:
  * AVAudioSession category Record (active), then an AudioQueue input at 48 kHz mono 16-bit.
  *   -m  mode Measurement (Apple's input processing off) instead of Default
- *   -t  also play a FREQ Hz sine at DBFS from this process (category PlayAndRecord, default to speaker): a loopback test Prints the session's input route and its errors,
+ *   -t  also play a FREQ Hz sine at DBFS from this process (category PlayAndRecord, default to speaker): a loopback test
+ *   -e  with -t: without DefaultToSpeaker, so iOS plays on the receiver (the earpiece) as in a call Prints the session's input route and its errors,
  * once a second the level of what came in (rms / peak dBFS) and the buffers handed back; writes FILE.wav if given.
  * With SweetSpeaker.driver's "Mic" device the route input should be the built-in microphone (MicrophoneBuiltIn).
  * Entitlements: mic.entitlements (com.apple.private.tcc.allow kTCCServiceMicrophone: no permission prompt over SSH).
@@ -80,6 +81,9 @@ route(AVAudioSession *s)
 	for (AVAudioSessionPortDescription *p in s.availableInputs) {
 		printf("available input: %s \"%s\"\n", p.portType.UTF8String, p.portName.UTF8String);
 	}
+	for (AVAudioSessionPortDescription *p in s.currentRoute.outputs) {
+		printf("route output: %s \"%s\" uid %s\n", p.portType.UTF8String, p.portName.UTF8String, p.UID.UTF8String);
+	}
 }
 
 int
@@ -92,11 +96,13 @@ main(int argc, char **argv)
 		}
 		unsigned secs = (unsigned)atoi(argv[1]);
 		const char *file = NULL;
-		bool measure = false;
+		bool measure = false, earpiece = false;
 		double freq = 0, dbfs = -40;
 		for (int i = 2; i < argc; i++) {
 			if (!strcmp(argv[i], "-m")) {
 				measure = true;
+			} else if (!strcmp(argv[i], "-e")) {
+				earpiece = true;
 			} else if (!strcmp(argv[i], "-t") && i + 2 < argc) {
 				freq = atof(argv[i + 1]);
 				dbfs = atof(argv[i + 2]);
@@ -110,7 +116,7 @@ main(int argc, char **argv)
 		AVAudioSession *s = [AVAudioSession sharedInstance];
 		NSError *err = nil;
 		BOOL ok = freq > 0 ? [s setCategory:AVAudioSessionCategoryPlayAndRecord mode:measure ? AVAudioSessionModeMeasurement :
-		    AVAudioSessionModeDefault options:AVAudioSessionCategoryOptionDefaultToSpeaker error:&err] :
+		    AVAudioSessionModeDefault options:earpiece ? 0 : AVAudioSessionCategoryOptionDefaultToSpeaker error:&err] :
 		    [s setCategory:AVAudioSessionCategoryRecord mode:measure ? AVAudioSessionModeMeasurement : AVAudioSessionModeDefault
 		    options:0 error:&err];
 		printf("setCategory %s, mode %s: %s %s\n", freq > 0 ? "PlayAndRecord" : "Record", measure ? "Measurement" : "Default",
