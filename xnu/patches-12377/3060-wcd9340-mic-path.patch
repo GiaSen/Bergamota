@@ -1,0 +1,385 @@
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 815e9d7..5b65319 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -1023,7 +1023,9 @@ static struct {
+ 	uint8_t rsp_buf[64];
+ 	uint32_t rsp_len;
+ 	vm_offset_t slim, rst;
+-	uint8_t tid, la;
++	uint8_t tid, la, la_if;
++	int page, if_page;
++	bool codec_up, mic_up, port_up;
+ 	uint32_t runs;
+ 	bool busy, powered, regs_ok, ngd_up;
+ 	char log[4096];
+@@ -2981,6 +2983,8 @@ cx_stage_codec(void)
+ 		return false;
+ 	}
+ 	CX_LOG("codec PGD logical address %#x\n", cx.la);
++	cx.la_if = 0xff;
++	cx.codec_up = cx.mic_up = cx.port_up = false;
+ 	uint16_t off = 0x800 + 0x21, ec = (uint16_t)(3 | 0x8 | ((off & 0xf) << 4) | ((off & 0xff0) << 4));   /* 4 bytes */
+ 	uint8_t rq[6] = { 6 | (0 << 5), 0x60, cx.la, 0, (uint8_t)ec, (uint8_t)(ec >> 8) };            /* REQUEST_VALUE */
+ 	cx.tid = (uint8_t)((cx.tid + 1) & 0x3f);
+@@ -2998,8 +3002,336 @@ cx_stage_codec(void)
+ 	return false;
+ }
+ 
++/* ---- 3060: codec registers over SLIMbus (value elements), init, the handset mic path and its SLIMbus channel */
++static const uint8_t cx_ifd_ea[6] = { 0x00, 0x00, 0x50, 0x02, 0x17, 0x02 };
++
++static uint16_t
++cx_ec(uint16_t elem, unsigned len)
++{
++	unsigned sz = len <= 4 ? len - 1 : (len <= 8 ? (len >> 1) + 1 : (len >> 2) + 3);
++	return (uint16_t)(sz | 0x8 | ((elem & 0xf) << 4) | ((elem & 0xff0) << 4));
++}
++
++/* CHANGE_VALUE (core 0x68) of one byte at a value element of device la */
++static int
++cx_ve_wr(uint8_t la, uint16_t elem, uint8_t v)
++{
++	uint16_t ec = cx_ec(elem, 1);
++	uint8_t m[6] = { 6 | (0 << 5), 0x68, la, (uint8_t)ec, (uint8_t)(ec >> 8), v };
++	return cx_tx(m);
++}
++
++/* REQUEST_VALUE (core 0x60) of n (1..4) bytes; 0 and the bytes in out on a REPLY_VALUE */
++static int
++cx_ve_rd(uint8_t la, uint16_t elem, unsigned n, uint8_t *out)
++{
++	uint8_t b[40];
++	uint16_t ec = cx_ec(elem, n);
++	cx.tid = (uint8_t)((cx.tid + 1) & 0x3f);
++	uint8_t m[6] = { 6 | (0 << 5), 0x60, la, cx.tid, (uint8_t)ec, (uint8_t)(ec >> 8) };
++	if (cx_tx(m)) {
++		return EIO;
++	}
++	unsigned got = cx_wait(b, 0, 0x64, cx.tid, 300);
++	if (got < 4 + n) {
++		return ETIMEDOUT;
++	}
++	memcpy(out, b + 4, n);
++	return 0;
++}
++
++/* codec registers: page (reg >> 8) in the page register at element 0x800, the register at 0x800 + (reg & 0xff) */
++static int
++cx_reg_wr(uint16_t reg, uint8_t v)
++{
++	int p = reg >> 8;
++	if (p != cx.page) {
++		if (cx_ve_wr(cx.la, 0x800, (uint8_t)p)) {
++			return EIO;
++		}
++		cx.page = p;
++	}
++	return cx_ve_wr(cx.la, (uint16_t)(0x800 + (reg & 0xff)), v);
++}
++
++static int
++cx_reg_rd(uint16_t reg, uint8_t *v)
++{
++	int p = reg >> 8;
++	if (p != cx.page) {
++		if (cx_ve_wr(cx.la, 0x800, (uint8_t)p)) {
++			return EIO;
++		}
++		cx.page = p;
++	}
++	return cx_ve_rd(cx.la, (uint16_t)(0x800 + (reg & 0xff)), 1, v);
++}
++
++static int
++cx_reg_upd(uint16_t reg, uint8_t mask, uint8_t val)
++{
++	uint8_t v = 0;
++	if (cx_reg_rd(reg, &v)) {
++		return EIO;
++	}
++	return cx_reg_wr(reg, (uint8_t)((v & ~mask) | (val & mask)));
++}
++
++/* interface device (SLIMbus port) registers: page = reg / 0x400 at element 0x800, the register at 0x800 + reg % 0x400 */
++static int
++cx_if_wr(uint16_t reg, uint8_t v)
++{
++	int p = reg / 0x400;
++	if (p != cx.if_page) {
++		if (cx_ve_wr(cx.la_if, 0x800, (uint8_t)p)) {
++			return EIO;
++		}
++		cx.if_page = p;
++	}
++	return cx_ve_wr(cx.la_if, (uint16_t)(0x800 + reg % 0x400), v);
++}
++
++static int
++cx_if_rd(uint16_t reg, uint8_t *v)
++{
++	int p = reg / 0x400;
++	if (p != cx.if_page) {
++		if (cx_ve_wr(cx.la_if, 0x800, (uint8_t)p)) {
++			return EIO;
++		}
++		cx.if_page = p;
++	}
++	return cx_ve_rd(cx.la_if, (uint16_t)(0x800 + reg % 0x400), 1, v);
++}
++
++/* the manager's logical address for an elemental address, 0xff if none */
++static uint8_t
++cx_addr(const uint8_t *ea)
++{
++	uint8_t b[40];
++	for (unsigned k = 0; k < 10; k++) {
++		uint8_t q[10] = { 10 | (2 << 5), 0x0d, 0xff, 0, 0, 0, 0, 0, 0, 0 };   /* ADDR_QUERY */
++		cx.tid = (uint8_t)((cx.tid + 1) & 0x3f);
++		q[3] = cx.tid;
++		memcpy(q + 4, ea, 6);
++		if (cx_tx(q)) {
++			return 0xff;
++		}
++		unsigned n = cx_wait(b, 6, 0x0e, cx.tid, 300);
++		if (n >= 11 && memcmp(b + 4, "\0\0\0\0\0\0", 6)) {
++			return b[10];
++		}
++		au_sleep(100);
++	}
++	return 0xff;
++}
++
++/* a user message to the manager that it answers with GENERIC_ACK (tid at byte 3 of both); 0 = acked with success */
++static int
++cx_mgr_acked(uint8_t mc, uint8_t *pay, unsigned plen, unsigned tid_at)
++{
++	uint8_t m[40], b[40];
++	if (plen + 3 > sizeof(m)) {
++		return EINVAL;
++	}
++	cx.tid = (uint8_t)((cx.tid + 1) & 0x3f);
++	pay[tid_at] = cx.tid;
++	m[0] = (uint8_t)((3 + plen) | (2 << 5));
++	m[1] = mc;
++	m[2] = 0xff;
++	memcpy(m + 3, pay, plen);
++	if (cx_tx(m)) {
++		return EIO;
++	}
++	unsigned n = cx_wait(b, 6, 0x25, cx.tid, 1000);
++	if (n < 5) {
++		CX_LOG("  no GENERIC_ACK for mc %#x\n", mc);
++		return ETIMEDOUT;
++	}
++	if (!(b[4] & 0x20)) {
++		CX_LOG("  mc %#x NACKed: code %#x\n", mc, b[4]);
++		return EIO;
++	}
++	return 0;
++}
++
++#define CX_W(r, v) do { if (cx_reg_wr((r), (v))) { CX_LOG("write %#x failed\n", (r)); return false; } } while (0)
++#define CX_U(r, m, v) do { if (cx_reg_upd((r), (m), (v))) { CX_LOG("update %#x failed\n", (r)); return false; } } while (0)
++
++static void
++cx_dump(const char *what, const uint16_t *regs, unsigned n)
++{
++	CX_LOG("%s:", what);
++	for (unsigned i = 0; i < n; i++) {
++		uint8_t v = 0;
++		int e = cx_reg_rd(regs[i], &v);
++		if (e) {
++			CX_LOG(" %#x=ERR", regs[i]);
++		} else {
++			CX_LOG(" %#x=%02x", regs[i], v);
++		}
++	}
++	CX_LOG("\n");
++}
++
++/*
++ * stage 5: Tavil up (mainline wcd934x_bring_up, set_sysclk 9.6 MHz, hw_init, enable_ana_bias_and_sysclk) and the
++ * handset mic path of Xiaomi's mixer_paths `dmic3`: DMIC2 (clock CPE_SS_DMIC1_CTL, 4.8 MHz = MCLK / 2) -> DMIC MUX7
++ * -> ADC MUX7 (DMIC) -> decimator 7 (48 kHz, HPF 150 Hz, muted while it starts) -> CDC_IF TX7 MUX (DEC7).
++ */
++static bool
++cx_stage_mic(void)
++{
++	if (cx.la == 0xff || !cx.ngd_up) {
++		CX_LOG("stage 5 needs stage 4 first\n");
++		return false;
++	}
++	cx.page = -1;
++	CX_LOG("stage 5: codec init + mic path\n");
++	/* wcd934x_bring_up */
++	CX_W(0x0009, 0x01);                     /* CODEC_RPM_RST_CTL */
++	CX_W(0x071b, 0x19);                     /* SIDO_NEW_VOUT_A_STARTUP */
++	CX_W(0x071c, 0x15);                     /* SIDO_NEW_VOUT_D_STARTUP */
++	au_sleep(2);
++	CX_W(0x0011, 0x05);                     /* CODEC_RPM_PWR_CDC_DIG_HM_CTL */
++	CX_W(0x0011, 0x07);
++	CX_W(0x0009, 0x03);
++	CX_W(0x0009, 0x07);
++	CX_W(0x0011, 0x03);
++	/* set_sysclk: 9.6 MHz (the 19.2 MHz lnbclka2 divided by 2 below) */
++	CX_U(0x0003, 0x03, 0x01);               /* CODEC_RPM_CLK_MCLK_CFG */
++	/* hw_init: DMICs out of reset */
++	CX_U(0x021b, 0x80, 0x00);               /* CPE_SS_DMIC_CFG */
++	/* enable_ana_bias_and_sysclk */
++	CX_U(0x0601, 0x80, 0x80);               /* ANA_BIAS: enable */
++	CX_U(0x0601, 0x40, 0x40);               /* precharge */
++	au_sleep(2);
++	CX_U(0x0601, 0x40, 0x00);
++	CX_U(0x0601, 0x20, 0x00);
++	CX_U(0x0711, 0x80, 0x80);               /* CLK_SYS_MCLK_PRG: external clock buffer */
++	CX_U(0x0711, 0x30, 0x10);               /* divide by 2 */
++	CX_U(0x0711, 0x02, 0x00);               /* MCLK source: external */
++	CX_U(0x0711, 0x01, 0x01);               /* MCLK enable */
++	CX_U(0x0d42, 0x01, 0x01);               /* CDC_CLK_RST_CTRL_FS_CNT_CONTROL */
++	CX_U(0x0d41, 0x01, 0x01);               /* CDC_CLK_RST_CTRL_MCLK_CONTROL */
++	CX_U(0x0002, 0x03, 0x00);               /* CODEC_RPM_CLK_GATE: ungate */
++	au_sleep(1);
++	CX_U(0x0603, 0x80, 0x80);               /* ANA_RCO: bandgap */
++	cx.codec_up = true;
++	static const uint16_t up[] = { 0x0003, 0x0009, 0x0011, 0x0002, 0x0601, 0x0603, 0x0711, 0x0d41, 0x0d42, 0x021b };
++	cx_dump("codec", up, sizeof(up) / sizeof(up[0]));
++
++	/* mic path */
++	CX_U(0x0219, 0x0e, 0x00 << 1);          /* CPE_SS_DMIC1_CTL (DMIC2/3): rate MCLK / 2 = 4.8 MHz */
++	CX_U(0x0219, 0x01, 0x01);               /* DMIC clock on */
++	CX_U(0x0d29, 0x38, 3 << 3);             /* CDC_TX_INP_MUX_ADC_MUX7_CFG0: DMIC MUX7 = DMIC2 */
++	CX_U(0x0d25, 0x0c, 0 << 2);             /* CDC_TX_INP_MUX_ADC_MUX3_CFG1: ADC MUX7 = DMIC */
++	CX_U(0x0d3b, 0xc0, 2 << 6);             /* CDC_IF_ROUTER_TX_MUX_CFG1: CDC_IF TX7 = DEC7 */
++	CX_U(0x0aa1, 0x0f, 0x04);               /* CDC_TX7_TX_PATH_CTL: 48 kHz */
++	CX_U(0x0aa1, 0x10, 0x10);               /* muted while it starts */
++	CX_U(0x0aa1, 0x20, 0x20);               /* decimator clock on (ADC MUX7 power) */
++	CX_U(0x0aa2, 0x60, 2 << 5);             /* CDC_TX7_TX_PATH_CFG0: HPF 150 Hz */
++	CX_U(0x0aa9, 0x02, 0x02);               /* CDC_TX7_TX_PATH_SEC2: cut-off change request */
++	au_sleep(2);
++	CX_U(0x0aa9, 0x02, 0x00);
++	au_sleep(50);
++	CX_U(0x0aa1, 0x10, 0x00);               /* unmute */
++	uint8_t g = 0;
++	if (!cx_reg_rd(0x0aa4, &g)) {           /* CDC_TX7_TX_VOL_CTL: apply the gain after the decimator is up */
++		CX_W(0x0aa4, g);
++	}
++	cx.mic_up = true;
++	static const uint16_t mic[] = { 0x0219, 0x021b, 0x0d29, 0x0d25, 0x0d3b, 0x0aa1, 0x0aa2, 0x0aa4, 0x0aa9 };
++	cx_dump("mic path", mic, sizeof(mic) / sizeof(mic[0]));
++	return true;
++}
++
++/*
++ * stage 6: the codec's SLIMbus TX port 7 (interface device: MULTI_CHNL, port enable with a 12-byte water mark), the
++ * AFE capture port SLIMBUS_0_TX (0x4001) on shared channel 135 (= 128 + port, the machine driver's tx_ch list), then
++ * the channel through the manager: CONNECT_SRC (codec PGD, port 7, channel 135), DEF_ACT_CHAN (16-bit samples, 48 kHz
++ * = coefficient 3 x 2^2 of 4 kHz, hard isochronous, presence rate 0x83), RECONFIG_NOW (slim-msm-ngd.c ngd_allocbw).
++ */
++#define CX_TX_PORT              7u
++#define CX_TX_CHAN              135u
++#define AFE_PARAM_ID_SLIMBUS_CONFIG 0x00010212u
++#define AFE_PORT_SLIMBUS_0_TX   0x4001u
++static bool
++cx_stage_port(void)
++{
++	int r;
++	if (!cx.mic_up) {
++		CX_LOG("stage 6 needs stage 5 first\n");
++		return false;
++	}
++	CX_LOG("stage 6: SLIMbus channel %u from codec TX port %u to the AFE\n", CX_TX_CHAN, CX_TX_PORT);
++	if (cx.la_if == 0xff) {
++		cx.la_if = cx_addr(cx_ifd_ea);
++		CX_LOG("codec interface device logical address %#x\n", cx.la_if);
++		if (cx.la_if == 0xff) {
++			return false;
++		}
++	}
++	cx.if_page = -1;
++	if (cx_if_wr((uint16_t)(0x100 + 4 * CX_TX_PORT), (uint8_t)(1u << CX_TX_PORT)) ||  /* TX_PORT_MULTI_CHNL_0 */
++	    cx_if_wr((uint16_t)(0x101 + 4 * CX_TX_PORT), 0) ||                            /* TX_PORT_MULTI_CHNL_1 */
++	    cx_if_wr((uint16_t)(0x50 + CX_TX_PORT), (2u << 1) | 1u)) {                      /* TX_PORT_CFG: enable */
++		CX_LOG("interface port registers not written\n");
++		return false;
++	}
++	uint8_t a = 0, b = 0, c = 0;
++	(void)cx_if_rd((uint16_t)(0x100 + 4 * CX_TX_PORT), &a);
++	(void)cx_if_rd((uint16_t)(0x101 + 4 * CX_TX_PORT), &b);
++	(void)cx_if_rd((uint16_t)(0x50 + CX_TX_PORT), &c);
++	CX_LOG("interface: TX%u multi-channel %02x %02x, port cfg %02x\n", CX_TX_PORT, a, b, c);
++
++	struct {
++		uint32_t minor;
++		uint16_t dev, bits, fmt, chans;
++		uint8_t map[8];
++		uint32_t rate;
++	} __attribute__((packed)) sb = { 1, 0, 16, 0, 1, { CX_TX_CHAN }, AU_RATE };
++	_Static_assert(sizeof(sb) == 24, "afe_param_id_slimbus_cfg is 24 bytes");
++	lck_mtx_lock(&au_mtx);
++	r = afe_port_param(AFE_PORT_SLIMBUS_0_TX, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SLIMBUS_CONFIG, &sb,
++	    sizeof(sb));
++	int s = r ? -1 : afe_port_cmd(AFE_PORT_SLIMBUS_0_TX, AFE_PORT_CMD_DEVICE_START);
++	lck_mtx_unlock(&au_mtx);
++	CX_LOG("AFE SLIMBUS_0_TX config -> %d, start -> %d\n", r, s);
++	if (r || s) {
++		return false;
++	}
++	cx.port_up = true;
++	uint8_t con[4] = { cx.la, CX_TX_PORT, CX_TX_CHAN, 0 };
++	r = cx_mgr_acked(0x2c, con, sizeof(con), 3);   /* SLIM_USR_MC_CONNECT_SRC: la, port, channel, tid */
++	CX_LOG("CONNECT_SRC -> %d\n", r);
++	if (r) {
++		return false;
++	}
++	uint8_t def[6] = { (uint8_t)(cx.la & 0x1f), (16 >> 2) | (1 << 5), (2 << 4) | 0, 0x83, 0, CX_TX_CHAN };
++	r = cx_mgr_acked(0x21, def, sizeof(def), 4);   /* SLIM_USR_MC_DEF_ACT_CHAN */
++	CX_LOG("DEF_ACT_CHAN -> %d\n", r);
++	if (r) {
++		return false;
++	}
++	uint8_t rec[2] = { 0, cx.la };
++	r = cx_mgr_acked(0x24, rec, sizeof(rec), 0);   /* SLIM_USR_MC_RECONFIG_NOW: tid, la */
++	CX_LOG("RECONFIG_NOW -> %d\n", r);
++	if (r) {
++		return false;
++	}
++	au_sleep(100);
++	uint8_t st0 = 0, st1 = 0, src = 0;
++	(void)cx_if_rd(0x36, &st0);             /* PORT_INT_STATUS_TX_0 */
++	(void)cx_if_rd(0x37, &st1);
++	(void)cx_if_rd((uint16_t)(0x70 + CX_TX_PORT), &src);   /* PORT_INT_TX_SOURCE: overflow/underflow/closed */
++	CX_LOG("codec TX port interrupts: status %02x %02x, port %u source %02x\n", st0, st1, CX_TX_PORT, src);
++	return true;
++}
++
+ /*
+- * kern.sweet_codec: 1 = stage 1 (QMI), 2 = stage 2 (register reads), 3 = stage 3 (NGD), 4 = stage 4 (codec),
++ * kern.sweet_codec: 1 = stage 1 (QMI), 2 = stage 2 (register reads), 3 = stage 3 (NGD), 4 = stage 4 (codec id),
++ * 5 = codec init + mic path, 6 = SLIMbus channel + AFE capture port (3060),
+  * 9 = all in order, stopping at the first failure; 0 = QMI POWER inactive. Read = the last run's log.
+  */
+ static int
+@@ -3041,15 +3373,20 @@ cx_sysctl SYSCTL_HANDLER_ARGS
+ 			(void)cx_stage_ngd();
+ 		} else if (v == 4) {
+ 			(void)cx_stage_codec();
++		} else if (v == 5) {
++			(void)cx_stage_mic();
++		} else if (v == 6) {
++			(void)cx_stage_port();
+ 		} else if (v == 9) {
+-			(void)(cx_stage_qmi() && cx_stage_regs() && cx_stage_ngd() && cx_stage_codec());
++			(void)(cx_stage_qmi() && cx_stage_regs() && cx_stage_ngd() && cx_stage_codec() && cx_stage_mic() &&
++			    cx_stage_port());
+ 		}
+ 		__atomic_store_n(&cx.busy, false, __ATOMIC_RELEASE);
+ 	}
+ 	return SYSCTL_OUT(req, cx.log, strnlen(cx.log, sizeof(cx.log)) + 1);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_codec, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, cx_sysctl, "A",
+-    "Mi 8 WCD9340 bring-up: 1 QMI, 2 register reads, 3 NGD, 4 codec, 9 all, 0 power off; read = last log (3058)");
++    "Mi 8 WCD9340 bring-up: 1 QMI, 2 regs, 3 NGD, 4 codec id, 5 init + mic path, 6 SLIMbus channel + AFE, 9 all, 0 off (3060)");
+ 
+ static void
+ au_thread(void *arg, wait_result_t w)
