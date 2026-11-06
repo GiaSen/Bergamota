@@ -161,6 +161,15 @@ if [ "${IOS18:-1}" = 1 ]; then
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetqmi.c" -o "$out18/sweetqmi"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetqmi"
 	python3 -I "$pacstrip" --sign "$out18/sweetqmi"
+	# sweetorient: CoreMotion orientation test tool; sweetorient.dylib: the backboardd orientation shim (no AOP on the Mi 8)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -fobjc-arc -framework Foundation -framework CoreMotion \
+		"$here/sweetorient.m" -o "$out18/sweetorient"
+	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetorient"
+	python3 -I "$pacstrip" --sign "$out18/sweetorient"
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -fobjc-arc -dynamiclib -framework Foundation \
+		-framework CoreMotion -install_name /usr/local/lib/sweetorient.dylib "$here/sweetorient-shim.m" -o "$out18/sweetorient.dylib"
+	codesign -s - -f "$out18/sweetorient.dylib"
+	python3 -I "$pacstrip" --sign "$out18/sweetorient.dylib"
 	# sweetssc: the sensors behind the SLPI's SNS service (QMI 400) through the kernel pass-through (xnu 3071)
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetssc.c" -o "$out18/sweetssc"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetssc"
