@@ -1,0 +1,926 @@
+From a14791d3d6225b27cc9e0251d439ef9a032ebb0a Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@wlan-114021.nbw.tue.nl>
+Date: Fri, 6 Nov 2026 16:30:28 +0100
+Subject: [PATCH] 3072: SLPI autostart (190 s, when its files are on the root),
+ kernel SNS client, SweetHIDSensor accelerometer / ambient light / proximity
+ services (0xff00/3, /4, /8) following ReportInterval and DetectionMode;
+ proximity Placement 1 (backboardd)
+
+---
+ bsd/dev/dipper_sensors.c          | 535 +++++++++++++++++++++++++++++-
+ bsd/dev/sweet_ufs.c               |   2 +
+ iokit/Kernel/arm/hid/SweetHID.cpp | 246 ++++++++++++++
+ iokit/KernelConfigTables.cpp      |  18 +
+ 4 files changed, 799 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/dipper_sensors.c b/bsd/dev/dipper_sensors.c
+index eeecae8..2bd33ff 100644
+--- a/bsd/dev/dipper_sensors.c
++++ b/bsd/dev/dipper_sensors.c
+@@ -26,6 +26,8 @@
+  *      3070: FastRPC on GLINK fastrpcglink-apps-dsp: attach to the sensors PD and serve its file reads (registry,
+  *      config, socinfo) from /private/var/sweet/qcom on the iOS root (see the FastRPC section); 3071: its registry
+  *      writes too (into that copy), and a QMI pass-through to the SLPI's services: kern.sweet_ssc_qmi, _ind, _services.
++ *   3072: stage 2 runs by itself 190 s after the root is up when the files are there (dipper_sensors_init), and a kernel
++ *      SNS client feeds the SweetHIDSensor services (accelerometer, ambient light, proximity) in SweetHID.cpp.
+  *
+  * Facts from the live DT (dtb/dipper/live.dtb): qcom,ssc@5c00000 pil-tz-generic, qcom,pas-id 12, qcom,smem-id 424,
+  * qcom,signal-aop, vdd_cx = lcx.lvl and vdd_mx = lmx.lvl (rpmh-arc-regulator, level 0x181, keep-proxy-regs-on),
+@@ -636,6 +638,7 @@ qs_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port,
+ }
+ 
+ static void ssq_note(const uint32_t v[5], bool add);
++static void sc_rx(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len);
+ static void ssq_rx(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len);
+ 
+ static const char *
+@@ -822,6 +825,8 @@ qs_rx(const uint8_t *p, uint32_t len)
+ 			nf_rx(snode, sport, pl, size);
+ 		} else if (dport == 0x4020u) {          /* QR_SSQ_PORT: the pass-through (3071) */
+ 			ssq_rx(snode, sport, pl, size);
++		} else if (dport == 0x4021u) {          /* QR_SC_PORT: the kernel's SNS client (3072) */
++			sc_rx(snode, sport, pl, size);
+ 		} else {
+ 			char hex[3 * 48 + 1];
+ 			sg_hex(hex, sizeof(hex), pl, MIN(size, 48u));
+@@ -1719,7 +1724,11 @@ fr_apps_std(uint32_t m, const struct fr_buf *in, unsigned nin, const struct fr_b
+ 			fr.writes++;
+ 			fr.written += f->size;
+ 			fr.write_errors += err != 0;
+-			FR_LOG("apps_std wrote \"%s\": %u bytes%s%d\n", f->name, f->size, err ? ", FAILED errno " : "", err);
++			if (err) {
++				FR_LOG("apps_std wrote \"%s\": %u bytes, FAILED errno %d\n", f->name, f->size, err);
++			} else {
++				FR_LOG("apps_std wrote \"%s\": %u bytes\n", f->name, f->size);
++			}
+ 			fs_free((unsigned)(f - fs));
+ 			return err ? AEE_EFAILED : 0;
+ 		}
+@@ -2446,6 +2455,473 @@ ssq_ind_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ssc_ind, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, ssq_ind_sysctl, "S",
+     "the last 64 QMI indications from the SLPI to the pass-through port (3071)");
+ 
++/*
++ * ---- 3072: the kernel's own SNS client (S4): feeds SweetHIDSensor (iokit/Kernel/arm/hid/SweetHID.cpp). From QRTR port
++ * QR_SC_PORT, same protocol as tools/sweetnet/sweetssc.c (libssc): once the SNS service (400) is up and the PD has had
++ * SC_SETTLE_MS to load its registry, one SUID lookup per kind (default sensor of its data type); then each kind's stream
++ * follows what iOS asks (sweet_ssc_sensor_rate(), from the HID service's ReportInterval): 513 {rate} for streaming
++ * kinds, 514 for on-change ones, 10 to stop. Samples (1025 floats, proximity 769) are converted with integer math only
++ * (no FP in the kernel) and handed to sweet_hid_sensor_sample(): accel in g 16.16 with Apple's sign (gravity at rest
++ * face up = -1 g on z; Android and the SLPI report +9.8 m/s^2), ambient light in lux, proximity near/far.
++ */
++#define QR_SC_PORT              0x4021u
++#define SC_SETTLE_MS            25000u
++#define SC_REQ_TIMEOUT_MS       3000u
++#define SNS_LOOKUP_UID          0xababababababababull
++enum { SC_ACCEL, SC_GYRO, SC_MAG, SC_ALS, SC_PROX, SC_N };
++static const char *const sc_type[SC_N] = { "accel", "gyro", "mag", "ambient_light", "proximity" };
++static const bool sc_on_change[SC_N] = { false, false, false, true, true };
++extern void sweet_hid_sensor_sample(int kind, uint64_t ts, const int32_t *v, int n);
++
++static struct {
++	uint64_t suid_lo[SC_N], suid_hi[SC_N];
++	bool have[SC_N], looked[SC_N];
++	uint32_t want_us[SC_N];         /* what iOS asks: interval in us, 0 = off (written by the HID services) */
++	uint32_t have_us[SC_N];         /* what the SLPI was told */
++	uint32_t node, port;
++	uint16_t txn;
++	bool busy;                      /* a request is out */
++	int busy_kind, busy_what;       /* what it is: 0 lookup, 1 rate */
++	uint32_t busy_us;
++	unsigned sent_ms;
++	bool lookup_answered;
++	unsigned samples[SC_N], requests, errors;
++	bool ts_checked;
++	int64_t ts_skew;                /* mach_absolute_time - SLPI timestamp, first sample */
++} sc;
++
++void sweet_ssc_sensor_rate(int kind, uint32_t interval_us);
++void
++sweet_ssc_sensor_rate(int kind, uint32_t interval_us)
++{
++	if (kind >= 0 && kind < SC_N) {
++		__atomic_store_n(&sc.want_us[kind], interval_us, __ATOMIC_RELEASE);
++	}
++}
++
++/* protobuf, the wire types used here */
++static size_t
++pb_varint(uint8_t *o, uint64_t v)
++{
++	size_t n = 0;
++	do {
++		o[n] = (uint8_t)(v & 0x7f);
++		v >>= 7;
++		o[n++] |= v ? 0x80 : 0;
++	} while (v);
++	return n;
++}
++
++static size_t
++pb_len(uint8_t *o, unsigned field, const void *d, size_t n)
++{
++	size_t k = pb_varint(o, (uint64_t)field << 3 | 2);
++	k += pb_varint(o + k, n);
++	memcpy(o + k, d, n);
++	return k + n;
++}
++
++static size_t
++pb_f64(uint8_t *o, unsigned field, uint64_t v)
++{
++	size_t k = pb_varint(o, (uint64_t)field << 3 | 1);
++	memcpy(o + k, &v, 8);
++	return k + 8;
++}
++
++static size_t
++pb_f32(uint8_t *o, unsigned field, uint32_t v)
++{
++	size_t k = pb_varint(o, (uint64_t)field << 3 | 5);
++	memcpy(o + k, &v, 4);
++	return k + 4;
++}
++
++static size_t
++pb_vi(uint8_t *o, unsigned field, uint64_t v)
++{
++	size_t k = pb_varint(o, (uint64_t)field << 3);
++	return k + pb_varint(o + k, v);
++}
++
++struct pbr {
++	const uint8_t *p, *end;
++};
++struct pbv {
++	unsigned field, wt;
++	uint64_t v;
++	const uint8_t *d;
++	size_t n;
++};
++
++static bool
++pb_rvarint(struct pbr *b, uint64_t *v)
++{
++	*v = 0;
++	for (unsigned s = 0; b->p < b->end && s < 64; s += 7) {
++		uint8_t c = *b->p++;
++		*v |= (uint64_t)(c & 0x7f) << s;
++		if (!(c & 0x80)) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static bool
++pb_rnext(struct pbr *b, struct pbv *f)
++{
++	uint64_t k, n;
++	if (b->p >= b->end || !pb_rvarint(b, &k)) {
++		return false;
++	}
++	f->field = (unsigned)(k >> 3);
++	f->wt = (unsigned)(k & 7);
++	f->v = 0;
++	f->d = NULL;
++	f->n = 0;
++	switch (f->wt) {
++	case 0:
++		return pb_rvarint(b, &f->v);
++	case 1:
++		if (b->end - b->p < 8) {
++			return false;
++		}
++		memcpy(&f->v, b->p, 8);
++		b->p += 8;
++		return true;
++	case 5:
++		if (b->end - b->p < 4) {
++			return false;
++		}
++		memcpy(&f->v, b->p, 4);
++		b->p += 4;
++		return true;
++	case 2:
++		if (!pb_rvarint(b, &n) || n > (uint64_t)(b->end - b->p)) {
++			return false;
++		}
++		f->d = b->p;
++		f->n = (size_t)n;
++		b->p += n;
++		return true;
++	default:
++		return false;
++	}
++}
++
++/* round(float(bits) * k_q16 / 65536), saturated; integer only */
++static int32_t
++f32_scale(uint32_t bits, uint64_t k_q16)
++{
++	uint32_t e = (bits >> 23) & 0xff, m = (bits & 0x7fffff) | 0x800000;
++	bool neg = (bits >> 31) != 0;
++	if (e == 0) {
++		return 0;
++	}
++	if (e == 0xff) {
++		return neg ? INT32_MIN : INT32_MAX;
++	}
++	uint64_t p = (uint64_t)m * k_q16, r;
++	int sh = (int)e - 150 - 16;
++	if (sh >= 0) {
++		r = sh > 8 ? (uint64_t)INT32_MAX : p << sh;
++	} else {
++		sh = -sh;
++		r = sh >= 64 ? 0 : (p + (1ull << (sh - 1))) >> sh;
++	}
++	if (r > (uint64_t)INT32_MAX) {
++		r = INT32_MAX;
++	}
++	return neg ? -(int32_t)r : (int32_t)r;
++}
++
++/* one SNS request (SscClientRequest in QMI msg 0x20, TLV 0x01 + report type TLV 0x10 = large) */
++static bool
++sc_send(uint64_t lo, uint64_t hi, uint32_t msg_id, const uint8_t *payload, size_t plen)
++{
++	uint8_t u[24], cfg[8], body[64], pbm[160], q[200];
++	size_t un = 0, cn = 0, bn = 0, n = 0;
++	if (plen > 48) {
++		return false;
++	}
++	un += pb_f64(u + un, 1, lo);
++	un += pb_f64(u + un, 2, hi);
++	cn += pb_vi(cfg + cn, 1, 1);            /* processor: APSS */
++	cn += pb_vi(cfg + cn, 2, 0);            /* suspend mode: wakeup */
++	if (payload) {
++		bn += pb_len(body + bn, 2, payload, plen);
++	}
++	n += pb_len(pbm + n, 1, u, un);
++	n += pb_f32(pbm + n, 2, msg_id);
++	n += pb_len(pbm + n, 3, cfg, cn);
++	n += pb_len(pbm + n, 4, body, bn);
++	uint16_t msg = 0x20, t1 = (uint16_t)(2 + n), pl = (uint16_t)n, t10 = 1, total = (uint16_t)(3 + t1 + 3 + t10);
++	sc.txn = (uint16_t)(sc.txn + 1 ? sc.txn + 1 : 1);
++	q[0] = 0;
++	memcpy(q + 1, &sc.txn, 2);
++	memcpy(q + 3, &msg, 2);
++	memcpy(q + 5, &total, 2);
++	q[7] = 0x01;
++	memcpy(q + 8, &t1, 2);
++	memcpy(q + 10, &pl, 2);
++	memcpy(q + 12, pbm, n);
++	size_t o = 12 + n;
++	q[o] = 0x10;
++	memcpy(q + o + 1, &t10, 2);
++	q[o + 3] = 1;
++	o += 4;
++	sc.requests++;
++	return qs_send(Q_DATA, QR_SC_PORT, sc.node, sc.port, q, (uint32_t)o);
++}
++
++/* one report from the SNS service (indication 0x21 / 0x22, TLV 0x02 = u16 length + SscClientResponse) */
++static void
++sc_report(const uint8_t *pl, size_t plen)
++{
++	struct pbr b = { pl, pl + plen };
++	struct pbv f;
++	uint64_t lo = 0, hi = 0;
++	/* the uid comes first; the events after it */
++	while (pb_rnext(&b, &f)) {
++		if (f.field == 1 && f.wt == 2) {
++			struct pbr u = { f.d, f.d + f.n };
++			struct pbv g;
++			while (pb_rnext(&u, &g)) {
++				lo = g.field == 1 ? g.v : lo;
++				hi = g.field == 2 ? g.v : hi;
++			}
++			continue;
++		}
++		if (f.field != 2 || f.wt != 2) {
++			continue;
++		}
++		struct pbr e = { f.d, f.d + f.n };
++		struct pbv g;
++		uint32_t id = 0;
++		uint64_t ts = 0;
++		const uint8_t *pd = NULL;
++		size_t pn = 0;
++		while (pb_rnext(&e, &g)) {
++			if (g.field == 1) {
++				id = (uint32_t)g.v;
++			} else if (g.field == 2) {
++				ts = g.v;
++			} else if (g.field == 3 && g.wt == 2) {
++				pd = g.d;
++				pn = g.n;
++			}
++		}
++		if (lo == SNS_LOOKUP_UID && hi == SNS_LOOKUP_UID && id == 768 && pd) {      /* SUID event */
++			struct pbr s = { pd, pd + pn };
++			struct pbv h;
++			char type[32];
++			memset(type, 0, sizeof(type));
++			uint64_t flo = 0, fhi = 0;
++			bool found = false;
++			while (pb_rnext(&s, &h)) {
++				if (h.field == 1 && h.wt == 2) {
++					memcpy(type, h.d, MIN(h.n, sizeof(type) - 1));
++				} else if (h.field == 2 && h.wt == 2 && !found) {
++					struct pbr u = { h.d, h.d + h.n };
++					struct pbv x;
++					while (pb_rnext(&u, &x)) {
++						flo = x.field == 1 ? x.v : flo;
++						fhi = x.field == 2 ? x.v : fhi;
++					}
++					found = true;
++				}
++			}
++			for (int k = 0; k < SC_N; k++) {
++				if (strcmp(type, sc_type[k]) == 0) {
++					sc.have[k] = found;
++					sc.looked[k] = true;
++					sc.suid_lo[k] = flo;
++					sc.suid_hi[k] = fhi;
++					sc.lookup_answered = true;
++					SG_LOG("sensors: %s -> %s %016llx%016llx\n", type, found ? "SUID" : "none", fhi, flo);
++				}
++			}
++			continue;
++		}
++		int k;
++		for (k = 0; k < SC_N; k++) {
++			if (sc.have[k] && sc.suid_lo[k] == lo && sc.suid_hi[k] == hi) {
++				break;
++			}
++		}
++		if (k == SC_N || !pd || !sc.have_us[k]) {
++			continue;
++		}
++		int32_t v[4] = { 0, 0, 0, 0 };
++		int nv = 0;
++		struct pbr s = { pd, pd + pn };
++		struct pbv h;
++		if (id == 1025) {               /* sns_std_sensor_event: repeated float (packed) data = 1, status = 2 */
++			/* accel m/s^2 -> g 16.16 (2^32 / 9.80665); gyro rad/s and mag uT -> 16.16; light lux -> integer */
++			uint64_t kq = k == SC_ACCEL ? 437964779ull : k == SC_GYRO || k == SC_MAG ? 4294967296ull : 65536ull;
++			while (pb_rnext(&s, &h)) {
++				if (h.field == 1 && h.wt == 2) {
++					for (size_t o = 0; o + 4 <= h.n && nv < 4; o += 4) {
++						uint32_t bits;
++						memcpy(&bits, h.d + o, 4);
++						v[nv++] = f32_scale(bits, kq);
++					}
++				} else if (h.field == 1 && h.wt == 5 && nv < 4) {
++					v[nv++] = f32_scale((uint32_t)h.v, kq);
++				}
++			}
++			if (k == SC_ACCEL) {    /* Apple's sign: the gravity vector, not the reaction */
++				for (int i = 0; i < nv; i++) {
++					v[i] = -v[i];
++				}
++			}
++		} else if (id == 769) {         /* proximity: near = 1, distance = 2 */
++			while (pb_rnext(&s, &h)) {
++				if (h.field == 1 && h.wt == 0) {
++					v[0] = (int32_t)h.v;
++				} else if (h.field == 2 && h.wt == 0) {
++					v[1] = (int32_t)h.v;
++				}
++			}
++			nv = 2;
++		} else {
++			continue;               /* config events (768) and others */
++		}
++		uint64_t now = mach_absolute_time();
++		if (!sc.ts_checked) {
++			sc.ts_checked = true;
++			sc.ts_skew = (int64_t)(now - ts);
++			SG_LOG("sensors: first %s sample: SLPI timestamp %llu, mach_absolute_time %llu (difference %lld)\n",
++			    sc_type[k], ts, now, sc.ts_skew);
++		}
++		/* the SLPI's QTimer and xnu's timebase: the SLPI time when they agree within 1 s, else now */
++		uint64_t at = ts && (int64_t)(now - ts) >= 0 && now - ts < 19200000ull ? ts : now;
++		sc.samples[k]++;
++		sweet_hid_sensor_sample(k, at, v, nv);
++	}
++}
++
++/* QMI from the SNS service to our client port */
++static void
++sc_rx(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len)
++{
++	uint16_t txn, msg, mlen, vl = 0;
++	if (len < 7) {
++		return;
++	}
++	memcpy(&txn, p + 1, 2);
++	memcpy(&msg, p + 3, 2);
++	memcpy(&mlen, p + 5, 2);
++	const uint8_t *t = p + 7, *v;
++	uint32_t tl = MIN((uint32_t)mlen, len - 7);
++	(void)node;
++	(void)port;
++	if (p[0] == 2 && sc.busy && txn == sc.txn) {
++		uint16_t res = 0xffff, err = 0xffff;
++		if ((v = qs_tlv(t, tl, 2, &vl)) && vl >= 4) {
++			memcpy(&res, v, 2);
++			memcpy(&err, v + 2, 2);
++		}
++		if (res) {
++			sc.errors++;
++			SG_LOG("sensors: %s %s refused: QMI result %u error %u\n", sc.busy_what ? "rate of" : "lookup of",
++			    sc_type[sc.busy_kind], res, err);
++			if (sc.busy_what == 0) {
++				sc.looked[sc.busy_kind] = true;         /* no retry */
++			} else {
++				sc.have_us[sc.busy_kind] = sc.busy_us;  /* no retry until iOS asks something else */
++			}
++			sc.busy = false;
++		} else if (sc.busy_what == 1) {
++			sc.have_us[sc.busy_kind] = sc.busy_us;
++			SG_LOG("sensors: %s %s\n", sc_type[sc.busy_kind], sc.busy_us ? "on" : "off");
++			sc.busy = false;
++		}
++		/* an accepted lookup stays busy until its SUID event (sc_step) */
++		return;
++	}
++	if (p[0] == 4 && (msg == 0x21 || msg == 0x22) && (v = qs_tlv(t, tl, 2, &vl)) && vl >= 2) {
++		uint16_t pl;
++		memcpy(&pl, v, 2);
++		if (pl <= vl - 2) {
++			sc_report(v + 2, pl);
++		}
++	}
++}
++
++/* the thread's step: lookups once, then each kind's stream to what iOS asks */
++static void
++sc_step(void)
++{
++	if (!sg.sns_port || sg.fatal || fr.state != FR_NEXT2 || sg_ms() < SC_SETTLE_MS) {
++		return;
++	}
++	sc.node = sg.sns_node;
++	sc.port = sg.sns_port;
++	if (sc.busy) {
++		if (sc.busy_what == 0 && sc.looked[sc.busy_kind]) {
++			sc.busy = false;
++		} else if (sg_ms() - sc.sent_ms > SC_REQ_TIMEOUT_MS) {
++			SG_LOG("sensors: no answer to the %s of %s in %u ms\n", sc.busy_what ? "rate" : "lookup", sc_type[sc.busy_kind],
++			    SC_REQ_TIMEOUT_MS);
++			sc.errors++;
++			if (sc.busy_what == 0) {
++				sc.looked[sc.busy_kind] = true;         /* no retry */
++			}
++			sc.busy = false;
++		}
++		if (sc.busy) {
++			return;
++		}
++	}
++	for (int k = 0; k < SC_N; k++) {
++		if (!sc.looked[k]) {
++			uint8_t req[48];
++			size_t n = pb_len(req, 1, sc_type[k], strlen(sc_type[k]));
++			n += pb_vi(req + n, 2, 0);
++			n += pb_vi(req + n, 3, 1);
++			sc.busy = sc_send(SNS_LOOKUP_UID, SNS_LOOKUP_UID, 512, req, n);
++			sc.busy_kind = k;
++			sc.busy_what = 0;
++			sc.sent_ms = sg_ms();
++			if (!sc.busy) {
++				sc.looked[k] = true;
++			}
++			return;
++		}
++	}
++	for (int k = 0; k < SC_N; k++) {
++		uint32_t want = __atomic_load_n(&sc.want_us[k], __ATOMIC_ACQUIRE);
++		if (!sc.have[k] || want == sc.have_us[k]) {
++			continue;
++		}
++		uint8_t req[8];
++		size_t n = 0;
++		uint32_t msg;
++		if (!want) {
++			msg = 10;
++		} else if (sc_on_change[k]) {
++			msg = 514;
++		} else {
++			uint32_t hz = MAX(1u, MIN(200u, 1000000u / MAX(want, 1u)));     /* integer Hz as an IEEE float */
++			uint32_t e = 127 + 31 - (uint32_t)__builtin_clz(hz), bits = (e << 23) | ((hz << (23 - (e - 127))) & 0x7fffff);
++			n = pb_f32(req, 1, bits);
++			msg = 513;
++			SG_LOG("sensors: %s at %u Hz (interval %u us asked)\n", sc_type[k], hz, want);
++		}
++		sc.busy = sc_send(sc.suid_lo[k], sc.suid_hi[k], msg, n ? req : NULL, n);
++		sc.busy_kind = k;
++		sc.busy_what = 1;
++		sc.busy_us = want;
++		sc.sent_ms = sg_ms();
++		if (!sc.busy) {
++			sc.have_us[k] = want;   /* not sent: do not retry in a loop */
++		}
++		return;
++	}
++}
++
+ /* the SLPI from ready on: GLINK polled every 5 ms (20 ms after 2 min), its bits watched; ends on fatal */
+ static void
+ ss_thread(void *arg, wait_result_t w)
+@@ -2458,6 +2934,7 @@ ss_thread(void *arg, wait_result_t w)
+ 		sg_poll();
+ 		fr_step();
+ 		ssq_pump();
++		sc_step();
+ 		uint32_t bits = 0;
+ 		if (ss_smp2p_in(&bits) && bits != last) {
+ 			SG_LOG("slave-kernel %#x (fatal %u ready %u handover %u stop-ack %u)\n", bits, bits & 1, (bits >> 1) & 1,
+@@ -2479,10 +2956,15 @@ ss_thread(void *arg, wait_result_t w)
+ 			SG_LOG("status: fastrpc %s, %u calls, %u reverse calls (%u not served), %u quiet opens, %llu bytes served, "
+ 			    "%u files written (%llu bytes, %u failed)\n", fr.va ? fr_state_name[fr.state] : "off", fr.calls, fr.reverse,
+ 			    fr.unsupported, fr.quiet_opens, fr.bytes, fr.writes, fr.written, fr.write_errors);
++			SG_LOG("status: sensors %u requests %u errors; samples accel %u gyro %u mag %u light %u prox %u; on: %s%s%s%s%s\n",
++			    sc.requests, sc.errors, sc.samples[SC_ACCEL], sc.samples[SC_GYRO], sc.samples[SC_MAG], sc.samples[SC_ALS],
++			    sc.samples[SC_PROX], sc.have_us[SC_ACCEL] ? "accel " : "", sc.have_us[SC_GYRO] ? "gyro " : "",
++			    sc.have_us[SC_MAG] ? "mag " : "", sc.have_us[SC_ALS] ? "light " : "", sc.have_us[SC_PROX] ? "prox" : "");
+ 			sweet_log_sync();
+ 			next_note = t < 60000 ? t + 5000 : t + 60000;
+ 		}
+-		delay(t < 120000 ? 5000 : 20000);
++		bool streaming = sc.have_us[SC_ACCEL] || sc.have_us[SC_GYRO] || sc.have_us[SC_MAG];
++		delay(t < 120000 || streaming ? 5000 : 20000);
+ 	}
+ 	sweet_log_sync();
+ 	sg.thread_done = true;
+@@ -2664,6 +3146,55 @@ ss_sysctl SYSCTL_HANDLER_ARGS
+ 	}
+ 	return SYSCTL_OUT(req, ss.log, strnlen(ss.log, sizeof(ss.log)) + 1);
+ }
++/*
++ * 3072: the SLPI boots by itself on the Mi 8, SS_AUTO_DELAY_S after the root file system is up (after the audio DSP,
++ * which shares the modem partition's FAT reader), when its files are on the iOS root (tools/dipper-sensor-files.sh);
++ * without them it would crash anyway (USER-PD DOG). kern.sweet_ssc can still run it by hand. No boot-arg: the field is full.
++ */
++#define SS_AUTO_DELAY_S         190u
++static void
++ss_auto_thread(void *arg, wait_result_t w)
++{
++	(void)arg;
++	(void)w;
++	delay((uint64_t)SS_AUTO_DELAY_S * 1000000ull);
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(SS_FILES "/vendor/etc/sensors/sns_reg_config", 0, &vp, vfs_context_kernel()) != 0 || vp == NULLVP) {
++		printf("SWEET SSC: autostart: no sensor files under " SS_FILES " (tools/dipper-sensor-files.sh), SLPI not started\n");
++		(void)thread_terminate(current_thread());
++		return;
++	}
++	vnode_put(vp);
++	if (__atomic_exchange_n(&ss.busy, true, __ATOMIC_ACQUIRE)) {
++		printf("SWEET SSC: autostart: a kern.sweet_ssc run is going on, skipped\n");
++	} else {
++		ss.off = 0;
++		ss.log[0] = 0;
++		ss.runs++;
++		SS_LOG("run %u, autostart %u s after the root\n", ss.runs, SS_AUTO_DELAY_S);
++		if (ss_probe()) {
++			(void)ss_boot();
++		}
++		sweet_log_sync();
++		__atomic_store_n(&ss.busy, false, __ATOMIC_RELEASE);
++	}
++	(void)thread_terminate(current_thread());
++}
++
++void dipper_sensors_init(void);
++void
++dipper_sensors_init(void)
++{
++	thread_t th;
++	if (!sweet_board_is("xiaomi,dipper")) {
++		return;
++	}
++	if (kernel_thread_start(ss_auto_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_set_thread_name(th, "sweet ssc auto");
++		thread_deallocate(th);
++	}
++}
++
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ssc, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, ss_sysctl, "A",
+     "Mi 8 sensor DSP (SLPI) bring-up: 1 read-only probe, 2 probe + boot + GLINK/QRTR + FastRPC file server (3070)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 5c86fa6..0e854aa 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -74,6 +74,7 @@ extern void sweet_touch_init(void);
+ extern void beryllium_wlan_init(void);
+ extern void dipper_audio_init(void);
+ extern void dipper_haptics_init(void);
++extern void dipper_sensors_init(void);
+ extern void sweet80211_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_cpufreq_max(void);
+@@ -1184,6 +1185,7 @@ sweet_ufs_init(void)
+ 	sweet80211_init();          /* boot-arg sweet80211=N (iOS 26 Wi-Fi stand-in), off by default */
+ 	dipper_audio_init();        /* boot-arg sweetaudio=N (Mi 8 audio DSP, 3040), off by default */
+ 	dipper_haptics_init();      /* boot-arg sweethap=1 (Mi 8 vibration motor, 3049), off by default */
++	dipper_sensors_init();      /* Mi 8 sensor DSP (3072): by itself when its files are on the root, see dipper_sensors.c */
+ 	return 0;
+ }
+ 
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index ee57e88..0ef748a 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -11,6 +11,7 @@
+  *
+  *   SweetHIDButtons  consumer-control keys (power, volume, home)
+  *   SweetHIDTouch    the built-in touch screen (digitizer collections)
++ *   SweetHIDSensor   motion / light / proximity sensors (3072, Mi 8: fed by bsd/dev/dipper_sensors.c)
+  *
+  * Hardware drivers feed them through the C entry points sweet_hid_key()
+  * and sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
+@@ -727,3 +728,248 @@ sweet_hid_touch(int finger, int down, int x, int y)
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+ }
++
++/*
++ * 3072: sensors (Mi 8: behind the SLPI, bsd/dev/dipper_sensors.c), with the iPhone's usage pairs: n104 ADT
++ * /arm-io/aop/iop-aop-nub accel 0xff00/3 and prox 0xff00/8; ambient light 0xff00/4 (IOHIDFamily
++ * kHIDUsage_AppleVendor_AmbientLightSensor; the n104 ADT has no als node there). locationd's CLAccelerometer::openHidDevice
++ * matches 0xff00/3 + Built-In (+ LocationID only when its IMULocationID setting exists, not by default) and sets
++ * ReportInterval (us): the SLPI stream follows it (sweet_ssc_sensor_rate, 0 = off). Ambient light streams while a client
++ * has it open (on-change events, cheap); proximity only while a client asked for it through a property. Every property a
++ * client sets is logged (the first 24 per service), to learn what iOS sends. One instance per kind (SweetSensorKind in
++ * the personality), started on the Mi 8 only.
++ */
++enum { kSweetSensorAccel = 0, kSweetSensorGyro = 1, kSweetSensorMag = 2, kSweetSensorALS = 3, kSweetSensorProx = 4,
++       kSweetSensorN = 5 };
++extern "C" void sweet_ssc_sensor_rate(int kind, uint32_t interval_us);
++
++class SweetHIDSensor : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDSensor);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	void sample(uint64_t ts, const int32_t *v, int n);
++
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return 0xff00; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE;
++	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE;
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 0x5300 + (UInt32)fKind; }
++	virtual bool handleOpen(IOService *client, IOOptionBits options, void *argument) APPLE_KEXT_OVERRIDE;
++	virtual void handleClose(IOService *client, IOOptionBits options) APPLE_KEXT_OVERRIDE;
++
++private:
++	void apply(void);
++	int fKind;
++	UInt32 fSeq;
++	unsigned fPropLogs, fSampleLogs;
++	UInt32 fInterval;               /* ReportInterval from a client, us; 0 = not asked */
++	bool fAsked;                    /* proximity: a client asked for detection */
++	UInt32 fMode;                   /* proximity: backboardd's DetectionMode (IOHIDProximityDetectionMask bits), 3072c */
++	unsigned fOpen;
++};
++
++OSDefineMetaClassAndStructors(SweetHIDSensor, IOHIDEventService);
++
++static SweetHIDSensor *gSweetSensors[kSweetSensorN];
++static const char *const sweet_sensor_names[kSweetSensorN] = { "accelerometer", "gyro", "compass", "ambient light",
++	                                                       "proximity" };
++
++UInt32
++SweetHIDSensor::getPrimaryUsage()
++{
++	static const UInt32 usage[kSweetSensorN] = { 3, 9, 10, 4, 8 };
++	return fKind >= 0 && fKind < kSweetSensorN ? usage[fKind] : 0;
++}
++
++OSString *
++SweetHIDSensor::getProduct()
++{
++	char name[48];
++	snprintf(name, sizeof(name), "Sweet %s", fKind >= 0 && fKind < kSweetSensorN ? sweet_sensor_names[fKind] : "sensor");
++	return OSString::withCString(name);
++}
++
++bool
++SweetHIDSensor::start(IOService *provider)
++{
++	OSNumber *k = OSDynamicCast(OSNumber, getProperty("SweetSensorKind"));
++	DTEntry root;
++	void const *prop;
++	unsigned int size;
++	bool dipper = false;
++
++	fKind = k ? (int)k->unsigned32BitValue() : -1;
++	if (fKind < 0 || fKind >= kSweetSensorN) {
++		return false;
++	}
++	/* Mi 8 only: its compatible list starts with the iPhone identity, then xiaomi,dipper */
++	if (SecureDTLookupEntry(NULL, "/", &root) == kSuccess && SecureDTGetProperty(root, "compatible", &prop, &size) == kSuccess) {
++		const char *c = (const char *)prop;
++		for (unsigned int o = 0; o < size && !dipper;) {
++			dipper = strncmp(c + o, "xiaomi,dipper", size - o) == 0;
++			o += (unsigned int)strnlen(c + o, size - o) + 1;
++		}
++	}
++	if (!dipper) {
++		return false;
++	}
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	if (fKind == kSweetSensorProx) {
++		/*
++		 * 3072b: backboardd wraps a proximity service only when its "Placement" is 1 ("discrete prox service %llX top
++		 * placement"); any other value is ignored and leaves an NSNull in its wrapper list, and backboardd then aborts on
++		 * -[NSNull applyUIMode:] (image 115, a crash loop until the phone rebooted). The Mi 8's sensor is at the top.
++		 */
++		setProperty("Placement", 1ULL, 32);
++	}
++	gSweetSensors[fKind] = this;
++	registerService();
++	IOLog("SWEET HID: %s sensor registered (usage 0xff00/%u)\n", sweet_sensor_names[fKind], (unsigned)getPrimaryUsage());
++	return true;
++}
++
++/* what the SLPI should do for this kind now */
++void
++SweetHIDSensor::apply(void)
++{
++	UInt32 us = 0;
++	if (fKind == kSweetSensorALS) {
++		us = fOpen ? 100000 : 0;                /* on change: any non-zero value turns it on */
++	} else if (fKind == kSweetSensorProx) {
++		us = fAsked ? 100000 : 0;
++	} else {
++		us = fInterval;
++	}
++	sweet_ssc_sensor_rate(fKind, us);
++}
++
++bool
++SweetHIDSensor::handleOpen(IOService *client, IOOptionBits options, void *argument)
++{
++	bool ok = IOHIDEventService::handleOpen(client, options, argument);
++	if (ok) {
++		fOpen++;
++		apply();
++	}
++	return ok;
++}
++
++void
++SweetHIDSensor::handleClose(IOService *client, IOOptionBits options)
++{
++	bool was = handleIsOpen(client);
++	IOHIDEventService::handleClose(client, options);
++	if (was && fOpen) {
++		fOpen--;
++		if (!fOpen) {
++			fInterval = 0;
++			fAsked = false;
++		}
++		IOLog("SWEET HID: %s sensor closed by %s (%u open)\n", sweet_sensor_names[fKind], client ? client->getName() : "?", fOpen);
++		apply();
++	}
++}
++
++IOReturn
++SweetHIDSensor::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (!d) {
++		return kIOReturnBadArgument;
++	}
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++	OSSymbol *key;
++	while (it && (key = OSDynamicCast(OSSymbol, it->getNextObject()))) {
++		OSObject *val = d->getObject(key);
++		OSNumber *num = OSDynamicCast(OSNumber, val);
++		OSBoolean *b = OSDynamicCast(OSBoolean, val);
++		if (fPropLogs < 24) {
++			fPropLogs++;
++			if (num) {
++				IOLog("SWEET HID: %s sensor property %s = %llu\n", sweet_sensor_names[fKind], key->getCStringNoCopy(),
++				    num->unsigned64BitValue());
++			} else if (b) {
++				IOLog("SWEET HID: %s sensor property %s = %s\n", sweet_sensor_names[fKind], key->getCStringNoCopy(),
++				    b->getValue() ? "true" : "false");
++			} else {
++				IOLog("SWEET HID: %s sensor property %s (%s)\n", sweet_sensor_names[fKind], key->getCStringNoCopy(),
++				    val ? val->getMetaClass()->getClassName() : "null");
++			}
++		}
++		if (key->isEqualTo(kIOHIDReportIntervalKey) && num) {
++			fInterval = num->unsigned32BitValue();
++			setProperty(kIOHIDReportIntervalKey, fInterval, 32);
++		}
++		bool prox_key = false;
++		for (const char *c = key->getCStringNoCopy(); *c && !prox_key; c++) {      /* the kernel has no strstr */
++			prox_key = strncmp(c, "Proximity", 9) == 0;
++		}
++		if (fKind == kSweetSensorProx && key->isEqualTo("DetectionMode") && num) {
++			/* 3072c: backboardd switches detection with DetectionMode (0 off; image 116 saw 0 and 1) */
++			fMode = num->unsigned32BitValue();
++			fAsked = fMode != 0;
++			IOLog("SWEET HID: proximity detection mode %#x (%s)\n", (unsigned)fMode, fAsked ? "on" : "off");
++		}
++		if (fKind == kSweetSensorProx && prox_key && (num || b)) {
++			fAsked = num ? num->unsigned64BitValue() != 0 : b->getValue();
++		}
++		if (fKind == kSweetSensorProx && key->isEqualTo(kIOHIDReportIntervalKey) && num) {
++			fAsked = fInterval != 0;
++		}
++	}
++	OSSafeReleaseNULL(it);
++	apply();
++	return kIOReturnSuccess;
++}
++
++void
++SweetHIDSensor::sample(uint64_t ts, const int32_t *v, int n)
++{
++	IOHIDEvent *e = NULL;
++	if (fSampleLogs < 3) {
++		fSampleLogs++;
++		IOLog("SWEET HID: %s sample %d %d %d (%d values, %u clients)\n", sweet_sensor_names[fKind], n > 0 ? v[0] : 0,
++		    n > 1 ? v[1] : 0, n > 2 ? v[2] : 0, n, _clients ? _clients->getCount() : 0);
++	}
++	switch (fKind) {
++	case kSweetSensorAccel:
++		e = n >= 3 ? IOHIDEvent::accelerometerEvent(ts, v[0], v[1], v[2], 0, 0, fSeq++) : NULL;
++		break;
++	case kSweetSensorGyro:
++		e = n >= 3 ? IOHIDEvent::gyroEvent(ts, v[0], v[1], v[2], 0, 0, fSeq++) : NULL;
++		break;
++	case kSweetSensorMag:
++		e = n >= 3 ? IOHIDEvent::compassEvent(ts, v[0], v[1], v[2], 0, 0, fSeq++) : NULL;
++		break;
++	case kSweetSensorALS:
++		e = n >= 1 ? IOHIDEvent::ambientLightSensorEvent(ts, (UInt32)(v[0] < 0 ? 0 : v[0])) : NULL;
++		break;
++	case kSweetSensorProx:
++		if (n >= 1 && fAsked) {
++			/* near: the detection kinds backboardd asked for (its DetectionMode), far: none */
++			IOHIDProximityDetectionMask m = v[0] ? (IOHIDProximityDetectionMask)(fMode ? fMode :
++			    (kIOHIDProximityDetectionReceiver | kIOHIDProximityDetectionLargeBodyContact)) : (IOHIDProximityDetectionMask)0;
++			e = IOHIDEvent::proximityEvent(ts, m, v[0] ? 1 : 0);
++			IOLog("SWEET HID: proximity %s (mask %#x)\n", v[0] ? "NEAR" : "far", (unsigned)m);
++		}
++		break;
++	default:
++		break;
++	}
++	if (e) {
++		dispatchEvent(e);
++		e->release();
++	}
++}
++
++extern "C" void sweet_hid_sensor_sample(int kind, uint64_t ts, const int32_t *v, int n);
++void
++sweet_hid_sensor_sample(int kind, uint64_t ts, const int32_t *v, int n)
++{
++	if (kind >= 0 && kind < kSweetSensorN && gSweetSensors[kind]) {
++		gSweetSensors[kind]->sample(ts, v, n);
++	}
++}
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index c4fdd55..69dd625 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -78,6 +78,24 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetHIDSensor;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDSensorAccel;"
++    "     'SweetSensorKind' = 0:32;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDSensor;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDSensorALS;"
++    "     'SweetSensorKind' = 3:32;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDSensor;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDSensorProx;"
++    "     'SweetSensorKind' = 4:32;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+-- 
+2.54.0 (Apple Git-157)
+
