@@ -1,0 +1,83 @@
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index ffe10fb..1313c71 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -2774,11 +2774,13 @@ cx_rx(uint8_t *b, unsigned ms)
+ 			cx_wr(CX_NGD + NGD_INT_CLR, NGD_INT_RX_RCVD);
+ 			len = MIN(len, 40u);
+ 			memcpy(b, w, len);
+-			CX_LOG("rx mt %u mc %#x len %u:", (b[0] >> 5) & 7, b[1], len);
+-			for (unsigned i = 0; i < len; i++) {
+-				CX_LOG(" %02x", b[i]);
++			if (b[1] != 0x64) {             /* REPLY_VALUE: the register reads, logged by their callers */
++				CX_LOG("rx mt %u mc %#x len %u:", (b[0] >> 5) & 7, b[1], len);
++				for (unsigned i = 0; i < len; i++) {
++					CX_LOG(" %02x", b[i]);
++				}
++				CX_LOG("\n");
+ 			}
+-			CX_LOG("\n");
+ 			return len;
+ 		}
+ 		au_sleep(1);
+@@ -3574,6 +3576,42 @@ cx_stage_capture(unsigned seconds)
+ 	return ok;
+ }
+ 
++/*
++ * stage 8 (3062): the analog mic instead of DMIC2 (stage 7 read only zeros from DMIC2: Xiaomi's own handset paths,
++ * handset-dmic-dual-adc / main-mic, use AMIC ADC1..ADC4, and its DT routes AMIC3 <- MIC BIAS1 and AMIC1 <- MIC BIAS4).
++ * Qualcomm's order (wcd934x.c tavil_codec_enable_adc / tavil_tx_hpf_corner_freq_callback, micbias_control): MIC BIAS1
++ * at 2.7 V (DT qcom,cdc-micbias1-mv 2700: (2700 - 1000) / 50 = 0x22) enabled; TX hold of AMIC3 (ANA_AMIC4 bit 6);
++ * ADC3 on with gain 20 (Xiaomi's "ADC3 Volume" 20); ADC MUX7 = AMIC, AMIC MUX7 = ADC3, DMIC MUX7 = ZERO; after
++ * 300 ms the hold released, the HPF re-latched, the decimator unmuted. Then a 2 s capture (stage 7).
++ */
++static bool
++cx_stage_amic(void)
++{
++	if (!cx.port_up) {
++		CX_LOG("stage 8 needs stage 6 first\n");
++		return false;
++	}
++	CX_LOG("stage 8: decimator 7 from AMIC3 (ADC3, MIC BIAS1)\n");
++	CX_U(0x0aa1, 0x10, 0x10);               /* TX7 muted while it switches */
++	CX_U(0x0219, 0x01, 0x00);               /* DMIC2/3 clock off */
++	CX_U(0x0622, 0xff, 0x40 | 0x22);        /* ANA_MICB1: enable, 2.7 V */
++	CX_U(0x0611, 0x40, 0x40);               /* ANA_AMIC4 bit 6: TX hold of AMIC3 */
++	CX_U(0x0610, 0x9f, 0x80 | 20);          /* ANA_AMIC3: ADC3 on, gain 20 */
++	CX_U(0x0d29, 0x3f, 0x03);               /* ADC_MUX7_CFG0: DMIC MUX7 = ZERO, AMIC MUX7 = ADC3 */
++	CX_U(0x0d25, 0x0c, 1 << 2);             /* ADC_MUX3_CFG1: ADC MUX7 = AMIC */
++	au_sleep(300);
++	CX_U(0x0611, 0x40, 0x00);               /* hold released */
++	CX_U(0x0aa2, 0x60, 2 << 5);             /* HPF 150 Hz */
++	CX_U(0x0aa9, 0x02, 0x02);               /* latch it */
++	au_sleep(2);
++	CX_U(0x0aa9, 0x02, 0x00);
++	au_sleep(50);
++	CX_U(0x0aa1, 0x10, 0x00);               /* unmute */
++	static const uint16_t am[] = { 0x0622, 0x0610, 0x0611, 0x0d29, 0x0d25, 0x0aa1, 0x0aa2 };
++	cx_dump("analog mic", am, sizeof(am) / sizeof(am[0]));
++	return cx_stage_capture(2);
++}
++
+ /*
+  * kern.sweet_codec: 1 = stage 1 (QMI), 2 = stage 2 (register reads), 3 = stage 3 (NGD), 4 = stage 4 (codec id),
+  * 5 = codec init + mic path, 6 = SLIMbus channel + AFE capture port (3060),
+@@ -3624,6 +3662,8 @@ cx_sysctl SYSCTL_HANDLER_ARGS
+ 			(void)cx_stage_port();
+ 		} else if (v == 7) {
+ 			(void)cx_stage_capture(2);
++		} else if (v == 8) {
++			(void)cx_stage_amic();
+ 		} else if (v == 9) {
+ 			(void)(cx_stage_qmi() && cx_stage_regs() && cx_stage_ngd() && cx_stage_codec() && cx_stage_mic() &&
+ 			    cx_stage_port());
+@@ -3633,7 +3673,7 @@ cx_sysctl SYSCTL_HANDLER_ARGS
+ 	return SYSCTL_OUT(req, cx.log, strnlen(cx.log, sizeof(cx.log)) + 1);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_codec, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, cx_sysctl, "A",
+-    "Mi 8 WCD9340 bring-up: 1 QMI, 2 regs, 3 NGD, 4 codec id, 5 init + mic path, 6 SLIMbus channel + AFE, 7 capture 2 s, 9 all, 0 off (3061)");
++    "Mi 8 WCD9340 bring-up: 1 QMI, 2 regs, 3 NGD, 4 codec id, 5 init + mic path, 6 SLIMbus channel + AFE, 7 capture 2 s, 8 analog mic + capture, 9 all, 0 off (3062)");
+ 
+ static void
+ au_thread(void *arg, wait_result_t w)

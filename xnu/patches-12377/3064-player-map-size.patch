@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 711bb26..80422d4 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -2150,6 +2150,8 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_i2c, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLF
+ #define PL_PERIOD               3840u           /* 20 ms of 16-bit stereo at 48 kHz */
+ #define PL_RING                 (273u * PL_PERIOD)      /* 5.46 s at offset 0 of the window */
+ #define PL_ZEROS                PL_RING         /* one period of zeros after it */
++#define PL_MAP_SIZE             0x180000u       /* 3064: the player maps only the first 1.5 MiB; the capture (stage 7) maps the rest */
++_Static_assert(PL_ZEROS + PL_PERIOD <= PL_MAP_SIZE, "the player's ring fits its map");
+ #define PL_DEPTH                4u              /* writes queued in the DSP: 80 ms */
+ #define PL_STALL_MS             1000u
+ #define PL_IDLE_S               5u              /* seconds of zeros before the amp sleeps */
+@@ -2384,7 +2386,7 @@ pl_start(void)
+ 	struct {
+ 		uint16_t pool, regions;
+ 		uint32_t flags, lsw, msw, size;
+-	} __attribute__((packed)) m = { 3, 1, 0, (uint32_t)AU_POOL_PA, AU_POOL_MSW, AU_POOL_SIZE };
++	} __attribute__((packed)) m = { 3, 1, 0, (uint32_t)AU_POOL_PA, AU_POOL_MSW, PL_MAP_SIZE };
+ 	step = "memory map";
+ 	if (apr_request_port(APR_SVC_ASM, 0, 0, ASM_SESSION << 8, ASM_CMD_SHARED_MEM_MAP_REGIONS, &m, sizeof(m),
+ 	    ASM_CMDRSP_SHARED_MEM_MAP_REGIONS, 2000) != 0 || gl.apr_opcode != ASM_CMDRSP_SHARED_MEM_MAP_REGIONS || gl.apr_pl_len < 4) {
