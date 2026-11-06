@@ -1,0 +1,117 @@
+From 25c008fae22432981d1c01b3148c9f544cbd80ad Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@Giammarcos-Air.home>
+Date: Fri, 6 Nov 2026 03:53:24 +0100
+Subject: [PATCH] 3067e: stage 15, a DSP-side loopback of the earpiece's
+ SLIMbus channel (SLIMBUS_1_TX as a second sink on 144)
+
+---
+ bsd/dev/dipper_audio.c | 48 ++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 42 insertions(+), 6 deletions(-)
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 0be0d79..de4433f 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -3324,6 +3324,8 @@ cx_stage_mic(void)
+ #define CX_TX_CHAN              135u
+ #define AFE_PARAM_ID_SLIMBUS_CONFIG 0x00010212u
+ #define AFE_PORT_SLIMBUS_0_TX   0x4001u
++#define AFE_PORT_SLIMBUS_1_TX   0x4003u
++static uint16_t cx_cap_port = AFE_PORT_SLIMBUS_0_TX;  /* 3067e: stage 15 captures from SLIMBUS_1_TX */
+ static bool
+ cx_stage_port(void)
+ {
+@@ -3476,8 +3478,8 @@ cx_cap_open(void)
+ 		uint16_t channels, bits;
+ 		uint32_t rate;
+ 		uint8_t map[8];
+-	} __attribute__((packed)) a = { 0, 2, AFE_PORT_SLIMBUS_0_TX, 0xffff, ADM_NULL_COPP_TOPOLOGY, 1, 16, AU_RATE, { 3 } };
+-	if (apr_request_port(APR_SVC_ADM, AFE_PORT_SLIMBUS_0_TX, AFE_PORT_SLIMBUS_0_TX, 0, ADM_CMD_DEVICE_OPEN_V5, &a,
++	} __attribute__((packed)) a = { 0, 2, cx_cap_port, 0xffff, ADM_NULL_COPP_TOPOLOGY, 1, 16, AU_RATE, { 3 } };
++	if (apr_request_port(APR_SVC_ADM, cx_cap_port, cx_cap_port, 0, ADM_CMD_DEVICE_OPEN_V5, &a,
+ 	    sizeof(a), ADM_CMDRSP_DEVICE_OPEN_V5, 2000) != 0 || gl.apr_opcode != ADM_CMDRSP_DEVICE_OPEN_V5 || gl.apr_pl_len < 8) {
+ 		CX_LOG("capture: COPP open failed (opcode %#x status %#x)\n", gl.apr_opcode, gl.apr_status);
+ 		return false;
+@@ -3519,7 +3521,7 @@ cx_cap_close(void)
+ 		    APR_BASIC_RSP_RESULT, 1000);
+ 	}
+ 	if (cap.copp_open) {
+-		st[2] = apr_request_port(APR_SVC_ADM, AFE_PORT_SLIMBUS_0_TX, (uint16_t)cap.copp, 0, ADM_CMD_DEVICE_CLOSE_V5, NULL,
++		st[2] = apr_request_port(APR_SVC_ADM, cx_cap_port, (uint16_t)cap.copp, 0, ADM_CMD_DEVICE_CLOSE_V5, NULL,
+ 		    0, APR_BASIC_RSP_RESULT, 1000);
+ 	}
+ 	if (cap.mapped) {
+@@ -3566,11 +3568,11 @@ cx_cap_read(unsigned k, uint32_t seq)
+ static bool
+ cx_stage_capture(unsigned seconds)
+ {
+-	if (!cx.port_up) {
++	if (!cx.port_up && cx_cap_port == AFE_PORT_SLIMBUS_0_TX) {
+ 		CX_LOG("stage 7 needs stage 6 first\n");
+ 		return false;
+ 	}
+-	CX_LOG("stage 7: %u s of capture from SLIMBUS_0_TX\n", seconds);
++	CX_LOG("stage 7: %u s of capture from AFE port %#x\n", seconds, cx_cap_port);
+ 	lck_mtx_lock(&au_mtx);
+ 	bool ok = cx_cap_open();
+ 	uint64_t sum2 = 0, n = 0;
+@@ -3926,6 +3928,38 @@ cx_stage_rx_mgr(void)
+ 	return r == 0;
+ }
+ 
++/*
++ * 3067e, stage 15: a DSP-side loopback of the earpiece's channel. AFE SLIMBUS_1_TX (0x4003) joins shared channel 144 as
++ * a second sink, stage 7's capture measures 2 s from it (RMS, peak, 1 kHz), then the port stops. With the earpiece
++ * stream playing, a tone here says the DSP puts it on the bus (the codec's RX side is the problem), silence the opposite.
++ */
++static bool
++cx_stage_rx_loop(void)
++{
++	struct {
++		uint32_t minor;
++		uint16_t dev, bits, fmt, chans;
++		uint8_t map[8];
++		uint32_t rate;
++	} __attribute__((packed)) sb = { 1, 0, 16, 0, 1, { CX_RX_CHAN }, AU_RATE };
++	lck_mtx_lock(&au_mtx);
++	int r = afe_port_param(AFE_PORT_SLIMBUS_1_TX, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SLIMBUS_CONFIG, &sb, sizeof(sb));
++	int st = r ? -1 : afe_port_cmd(AFE_PORT_SLIMBUS_1_TX, AFE_PORT_CMD_DEVICE_START);
++	lck_mtx_unlock(&au_mtx);
++	CX_LOG("stage 15: AFE SLIMBUS_1_TX on channel %u: config %d, start %d\n", CX_RX_CHAN, r, st);
++	if (r || st) {
++		return false;
++	}
++	cx_cap_port = AFE_PORT_SLIMBUS_1_TX;
++	bool ok = cx_stage_capture(2);
++	cx_cap_port = AFE_PORT_SLIMBUS_0_TX;
++	lck_mtx_lock(&au_mtx);
++	st = afe_port_cmd(AFE_PORT_SLIMBUS_1_TX, AFE_PORT_CMD_DEVICE_STOP);
++	lck_mtx_unlock(&au_mtx);
++	CX_LOG("stage 15: SLIMBUS_1_TX stop %d\n", st);
++	return ok;
++}
++
+ /* kern.sweet_audio_out: 0 the speaker, 1 the earpiece (brings its path up); the player's next start uses it */
+ static int
+ au_out_sysctl SYSCTL_HANDLER_ARGS
+@@ -4290,7 +4324,7 @@ cx_sysctl SYSCTL_HANDLER_ARGS
+ 		} else {
+ 			v = in[0] - '0';                /* or text ("1") */
+ 		}
+-		if (v < 0 || v > 14) {
++		if (v < 0 || v > 15) {
+ 			return EINVAL;
+ 		}
+ 		if (__atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
+@@ -4330,6 +4364,8 @@ cx_sysctl SYSCTL_HANDLER_ARGS
+ 			(void)cx_stage_rx_afe(true);
+ 		} else if (v == 14) {
+ 			(void)cx_stage_rx_mgr();
++		} else if (v == 15) {
++			(void)cx_stage_rx_loop();
+ 		} else if (v == 9) {
+ 			(void)(cx_stage_qmi() && cx_stage_regs() && cx_stage_ngd() && cx_stage_codec() && cx_stage_mic() &&
+ 			    cx_stage_port());
+-- 
+2.54.0 (Apple Git-157)
+

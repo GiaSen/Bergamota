@@ -1,0 +1,98 @@
+From 667be52d643377f31d375a6f0d72393ff4a69481 Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@Giammarcos-Air.home>
+Date: Fri, 6 Nov 2026 03:59:26 +0100
+Subject: [PATCH] 3067f: kern.sweet_ear_rx (the earpiece's codec RX index n:
+ port 16+n, channel 144+n)
+
+---
+ bsd/dev/dipper_audio.c | 33 ++++++++++++++++++++++++++-------
+ 1 file changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index de4433f..fc3cbe1 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -3715,8 +3715,9 @@ cx_amic_off(void)
+  * Gains: kern.sweet_ear_gain = (PA index << 8) | (uint8_t)RX0 dB; PA index 0 = +6 dB ... 4 = 0 dB, 5 = -2.5, 7 = -12;
+  * RX0 volume signed dB (-84..+40). Default 0 dB / 0 dB.
+  */
+-#define CX_RX_PORT              16u
+-#define CX_RX_CHAN              144u
++static unsigned cx_rx_n;                        /* 3067f: the earpiece's codec RX index n: port 16 + n, channel 144 + n */
++#define CX_RX_PORT              (16u + cx_rx_n)
++#define CX_RX_CHAN              (144u + cx_rx_n)
+ #define AFE_MODULE_CDC_DEV_CFG  0x00010234u
+ #define AFE_PARAM_ID_CDC_SLIMBUS_SLAVE_CFG 0x00010235u
+ 
+@@ -3732,14 +3733,14 @@ cx_afe_slave_cfg(void)
+ 	struct {
+ 		uint32_t minor, ea_lsw, ea_msw;
+ 		uint16_t tx_off, rx_off;
+-	} __attribute__((packed)) c = { 1, 0, 0, 0, CX_RX_PORT };
++	} __attribute__((packed)) c = { 1, 0, 0, 0, 16 };   /* RX ports start at 16 */
+ 	_Static_assert(sizeof(c) == 16, "afe_param_cdc_slimbus_slave_cfg is 16 bytes");
+ 	memcpy(&c.ea_lsw, cx_pgd_ea, 4);
+ 	memcpy(&c.ea_msw, cx_pgd_ea + 4, 2);
+ 	lck_mtx_lock(&au_mtx);
+ 	int r = afe_svc_param(AFE_MODULE_CDC_DEV_CFG, AFE_PARAM_ID_CDC_SLIMBUS_SLAVE_CFG, &c, sizeof(c));
+ 	lck_mtx_unlock(&au_mtx);
+-	CX_LOG("AFE CDC_SLIMBUS_SLAVE_CFG (ea %08x %04x, tx offset 0, rx offset %u) -> %d\n", c.ea_lsw, c.ea_msw, CX_RX_PORT, r);
++	CX_LOG("AFE CDC_SLIMBUS_SLAVE_CFG (ea %08x %04x, tx offset 0, rx offset 16) -> %d\n", c.ea_lsw, c.ea_msw, r);
+ 	return r;
+ }
+ static int8_t cx_ear_db;
+@@ -3777,7 +3778,7 @@ cx_stage_ear(void)
+ 	if (!cx.ear_up) {
+ 		(void)cx_afe_slave_cfg();
+ 		cx.if_page = -1;
+-		if (cx_if_wr((uint16_t)(0x140 + 4 * CX_RX_PORT), 0x01) ||        /* RX_PORT_MULTI_CHNL_0: RX0 */
++		if (cx_if_wr((uint16_t)(0x140 + 4 * CX_RX_PORT), (uint8_t)(1u << cx_rx_n)) ||  /* RX_PORT_MULTI_CHNL_0: RX n */
+ 		    cx_if_wr((uint16_t)(0x30 + CX_RX_PORT), (2u << 1) | 1u)) {   /* RX_PORT_CFG: water mark, enable */
+ 			CX_LOG("interface RX port registers not written\n");
+ 			return false;
+@@ -3821,7 +3822,7 @@ cx_stage_ear(void)
+ 		}
+ 	}
+ 	/* RX INT0 */
+-	CX_U(0x0d01, 0x0f, 0x05);               /* CDC_RX_INP_MUX_RX_INT0_CFG0: INP0 = RX0 */
++	CX_U(0x0d01, 0x0f, (uint8_t)(0x05 + cx_rx_n));  /* CDC_RX_INP_MUX_RX_INT0_CFG0: INP0 = RX n (RX0 = 5) */
+ 	CX_U(0x0b41, 0x0f, 0x04);               /* CDC_RX0_RX_PATH_CTL: 48 kHz */
+ 	CX_U(0x0b41, 0x10, 0x10);               /* PGA muted while it starts */
+ 	CX_U(0x0b41, 0x20, 0x20);               /* interpolator clock */
+@@ -3850,7 +3851,7 @@ cx_stage_ear(void)
+ 	uint8_t s0 = 0, s1 = 0, src = 0;
+ 	(void)cx_if_rd(0x34, &s0);              /* PORT_INT_STATUS_RX_0 */
+ 	(void)cx_if_rd(0x35, &s1);
+-	(void)cx_if_rd(0x60, &src);             /* PORT_INT_RX_SOURCE of RX0 */
++	(void)cx_if_rd((uint16_t)(0x60 + cx_rx_n), &src);   /* PORT_INT_RX_SOURCE of RX n */
+ 	CX_LOG("codec RX port interrupts: status %02x %02x, RX0 source %02x\n", s0, s1, src);
+ 	static const uint16_t ear[] = { 0x0d01, 0x0b41, 0x0b42, 0x0b45, 0x0b49, 0x0b53, 0x0608, 0x060a, 0x06c7, 0x073a, 0x0c01 };
+ 	cx_dump("earpiece", ear, sizeof(ear) / sizeof(ear[0]));
+@@ -3960,6 +3961,24 @@ cx_stage_rx_loop(void)
+ 	return ok;
+ }
+ 
++/* kern.sweet_ear_rx: the codec RX index the earpiece path uses (0-7), before kern.sweet_audio_out=1 (3067f) */
++static int
++ear_rx_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = (int)cx_rx_n, err = sysctl_handle_int(oidp, &v, 0, req);
++	if (err || !req->newptr) {
++		return err;
++	}
++	if (v < 0 || v > 7 || cx.ear_up) {
++		return EINVAL;
++	}
++	cx_rx_n = (unsigned)v;
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ear_rx, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, ear_rx_sysctl, "I",
++    "Mi 8 earpiece: codec RX index n (port 16 + n, channel 144 + n), set before the path comes up (3067f)");
++
+ /* kern.sweet_audio_out: 0 the speaker, 1 the earpiece (brings its path up); the player's next start uses it */
+ static int
+ au_out_sysctl SYSCTL_HANDLER_ARGS
+-- 
+2.54.0 (Apple Git-157)
+
