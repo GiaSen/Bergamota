@@ -1,0 +1,73 @@
+From d19a7b3d0cb8b410434376be9d79bab6f0e1a0c9 Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@Giammarcos-Air.home>
+Date: Fri, 6 Nov 2026 03:21:15 +0100
+Subject: [PATCH] 3067b: kern.sweet_codec_reg (codec / interface register
+ peek-poke for bring-up)
+
+---
+ bsd/dev/dipper_audio.c | 49 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 49 insertions(+)
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 7cbf058..d623ab1 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -3917,6 +3917,55 @@ ear_gain_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ear_gain, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, ear_gain_sysctl, "I",
+     "Mi 8 earpiece gains: (EAR PA index 0 +6 dB .. 4 0 dB, 5 -2.5, 7 -12) << 8 | RX0 digital dB (3067)");
+ 
++/*
++ * 3067b: kern.sweet_codec_reg, a codec register peek/poke for bring-up (root): in {u16 reg, u8 val, u8 op} with op 0 read
++ * a codec register, 1 write it, 2 read an interface-device register, 3 write it; out {u8 val, u8 err} (the register read
++ * back). Under cx.busy; EBUSY while a stage runs.
++ */
++static int
++cx_reg_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	struct {
++		uint16_t reg;
++		uint8_t val, op;
++	} in = { 0, 0, 0 };
++	uint8_t out[2] = { 0, 0 };
++	int err;
++	if (!req->newptr || req->newlen < sizeof(in)) {
++		return EINVAL;
++	}
++	if ((err = SYSCTL_IN(req, &in, sizeof(in)))) {
++		return err;
++	}
++	if (in.op > 3 || !cx.ngd_up || cx.la == 0xff || (in.op >= 2 && cx.la_if == 0xff)) {
++		return ENXIO;
++	}
++	if (__atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int e = 0;
++	if (in.op == 1) {
++		e = cx_reg_wr(in.reg, in.val);
++	} else if (in.op == 3) {
++		cx.if_page = -1;
++		e = cx_if_wr(in.reg, in.val);
++	}
++	if (!e) {
++		if (in.op < 2) {
++			e = cx_reg_rd(in.reg, &out[0]);
++		} else {
++			cx.if_page = -1;
++			e = cx_if_rd(in.reg, &out[0]);
++		}
++	}
++	__atomic_store_n(&cx.busy, false, __ATOMIC_RELEASE);
++	out[1] = (uint8_t)(e ? 1 : 0);
++	return SYSCTL_OUT(req, out, sizeof(out));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_codec_reg, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, cx_reg_sysctl, "S",
++    "Mi 8 WCD9340 register peek/poke: in {u16 reg, u8 val, u8 op 0 rd 1 wr 2 if-rd 3 if-wr}, out {u8 val, u8 err} (3067b)");
++
+ /*
+  * ---- 3065: continuous capture for user space (kern.sweet_audio_rec): the handset mic as 16-bit mono at 48 kHz.
+  * Start brings the codec chain up if needed (stages 1-6 + the analog mic of stage 8), opens the record stream
+-- 
+2.54.0 (Apple Git-157)
+

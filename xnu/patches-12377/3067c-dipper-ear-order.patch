@@ -1,0 +1,94 @@
+From 4b493879cfb407bda1a68fa8df526f1407d265e5 Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@Giammarcos-Air.home>
+Date: Fri, 6 Nov 2026 03:33:20 +0100
+Subject: [PATCH] 3067c: stages 12-14 (AFE SLIMBUS_0_RX stop/start, the manager
+ side redone) for the earpiece's RX port overflow
+
+---
+ bsd/dev/dipper_audio.c | 56 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index d623ab1..6d49bc5 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -3852,6 +3852,54 @@ cx_stage_ear_off(void)
+ 	return true;
+ }
+ 
++/*
++ * 3067c, for ordering experiments on the earpiece's SLIMbus link (the codec's RX0 port reports overflow continuously):
++ * stage 12 stops AFE SLIMBUS_0_RX, stage 13 configures and starts it, stage 14 redoes the manager's side
++ * (DISCONNECT_PORT of codec port 16, CONNECT_SINK, DEF_ACT_CHAN with the full logical address as mainline sends it,
++ * RECONFIG_NOW).
++ */
++static bool
++cx_stage_rx_afe(bool start)
++{
++	int r = 0, st;
++	lck_mtx_lock(&au_mtx);
++	if (start) {
++		struct {
++			uint32_t minor;
++			uint16_t dev, bits, fmt, chans;
++			uint8_t map[8];
++			uint32_t rate;
++		} __attribute__((packed)) sb = { 1, 0, 16, 0, 1, { CX_RX_CHAN }, AU_RATE };
++		r = afe_port_param(AFE_PORT_SLIMBUS_0_RX, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SLIMBUS_CONFIG, &sb,
++		    sizeof(sb));
++		st = r ? -1 : afe_port_cmd(AFE_PORT_SLIMBUS_0_RX, AFE_PORT_CMD_DEVICE_START);
++	} else {
++		st = afe_port_cmd(AFE_PORT_SLIMBUS_0_RX, AFE_PORT_CMD_DEVICE_STOP);
++	}
++	lck_mtx_unlock(&au_mtx);
++	CX_LOG("stage %u: AFE SLIMBUS_0_RX %s -> config %d, command %d\n", start ? 13u : 12u, start ? "start" : "stop", r, st);
++	return r == 0 && st == 0;
++}
++
++static bool
++cx_stage_rx_mgr(void)
++{
++	int r;
++	uint8_t dis[3] = { cx.la, CX_RX_PORT, 0 };
++	r = cx_mgr_acked(0x2e, dis, sizeof(dis), 2);   /* SLIM_USR_MC_DISCONNECT_PORT: la, port, tid */
++	CX_LOG("stage 14: DISCONNECT_PORT -> %d\n", r);
++	uint8_t con[4] = { cx.la, CX_RX_PORT, CX_RX_CHAN, 0 };
++	r = cx_mgr_acked(0x2d, con, sizeof(con), 3);
++	CX_LOG("CONNECT_SINK -> %d\n", r);
++	uint8_t def[6] = { cx.la, (16 >> 2) | (1 << 5), (2 << 4) | 0, 0x83, 0, CX_RX_CHAN };
++	r = cx_mgr_acked(0x21, def, sizeof(def), 4);
++	CX_LOG("DEF_ACT_CHAN (full la) -> %d\n", r);
++	uint8_t rec[2] = { 0, cx.la };
++	r = cx_mgr_acked(0x24, rec, sizeof(rec), 0);
++	CX_LOG("RECONFIG_NOW -> %d\n", r);
++	return r == 0;
++}
++
+ /* kern.sweet_audio_out: 0 the speaker, 1 the earpiece (brings its path up); the player's next start uses it */
+ static int
+ au_out_sysctl SYSCTL_HANDLER_ARGS
+@@ -4216,7 +4264,7 @@ cx_sysctl SYSCTL_HANDLER_ARGS
+ 		} else {
+ 			v = in[0] - '0';                /* or text ("1") */
+ 		}
+-		if (v < 0 || v > 11) {
++		if (v < 0 || v > 14) {
+ 			return EINVAL;
+ 		}
+ 		if (__atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
+@@ -4250,6 +4298,12 @@ cx_sysctl SYSCTL_HANDLER_ARGS
+ 			(void)cx_stage_ear();
+ 		} else if (v == 11) {
+ 			(void)cx_stage_ear_off();
++		} else if (v == 12) {
++			(void)cx_stage_rx_afe(false);
++		} else if (v == 13) {
++			(void)cx_stage_rx_afe(true);
++		} else if (v == 14) {
++			(void)cx_stage_rx_mgr();
+ 		} else if (v == 9) {
+ 			(void)(cx_stage_qmi() && cx_stage_regs() && cx_stage_ngd() && cx_stage_codec() && cx_stage_mic() &&
+ 			    cx_stage_port());
+-- 
+2.54.0 (Apple Git-157)
+

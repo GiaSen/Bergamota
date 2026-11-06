@@ -1,0 +1,451 @@
+From 1dc1181147bfc464bccfb514da19facc9bca1ebf Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@Giammarcos-Air.home>
+Date: Fri, 6 Nov 2026 03:14:25 +0100
+Subject: [PATCH] 3067: the earpiece (WCD9340 EAR via SLIMBUS_0_RX, RX INT0,
+ class-H, EAR PA): stage 10/11, kern.sweet_audio_out, kern.sweet_ear_gain; the
+ player plays on either port
+
+---
+ bsd/dev/dipper_audio.c | 316 +++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 286 insertions(+), 30 deletions(-)
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 5956960..7cbf058 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -118,6 +118,7 @@ enum { G_VERSION = 0, G_VERSION_ACK = 1, G_OPEN = 2, G_CLOSE = 3, G_OPEN_ACK = 4
+ #define AFE_MODULE_CLOCK_SET    0x0001028fu
+ #define AFE_PARAM_ID_CLOCK_SET  0x00010290u
+ #define AFE_PORT_QUAT_MI2S_RX   0x1006u
++#define AFE_PORT_SLIMBUS_0_RX   0x4000u         /* 3067: the WCD9340's SLIMbus RX (the earpiece) */
+ #define AFE_CLK_QUAD_MI2S_IBIT  0x106u          /* Q6AFE_LPASS_CLK_ID_QUAD_MI2S_IBIT */
+ #define AFE_CLK_TOKEN           1024u
+ #define AU_RATE                 48000u
+@@ -1035,7 +1036,7 @@ static struct {
+ 	vm_offset_t slim, rst;
+ 	uint8_t tid, la, la_if;
+ 	int page, if_page;
+-	bool codec_up, mic_up, port_up, amic;
++	bool codec_up, mic_up, port_up, amic, ear_up;
+ 	uint32_t runs;
+ 	bool busy, powered, regs_ok, ngd_up;
+ 	char log[4096];
+@@ -2196,8 +2197,21 @@ static struct {
+ 	uint32_t sleeps, wakes;
+ 	uint8_t *amp[3];                        /* [0] off, [1] on, [2] wake */
+ 	uint32_t amp_len[3];
++	uint32_t out;                           /* 3067: where this run plays: 0 the speaker, 1 the earpiece */
+ } pl;
+ 
++/*
++ * 3067: where the next player start plays (kern.sweet_audio_out): 0 the speaker (QUAT_MI2S_RX -> TAS2557), 1 the
++ * earpiece (SLIMBUS_0_RX -> WCD9340 RX0 -> RX INT0 -> EAR PA; the codec side is brought up by the sysctl, stage 10).
++ */
++static uint32_t au_out;
++
++static uint16_t
++pl_port(void)
++{
++	return pl.out ? AFE_PORT_SLIMBUS_0_RX : AFE_PORT_QUAT_MI2S_RX;
++}
++
+ /* from gl_apr_rx: the oldest queued write is done */
+ static void
+ pl_write_done(uint32_t token, uint32_t status)
+@@ -2311,7 +2325,7 @@ pl_teardown(const char *why, bool amp, bool stream, bool copp, bool mapped, bool
+ {
+ 	pl.state = PL_OFF;
+ 	bool a = amp ? pl_amp(0, true) : true;
+-	if (!amp && ai.rst) {
++	if (!amp && ai.rst && pl.out == 0) {
+ 		ai_reset_pin(false);
+ 	}
+ 	int st[6] = { -2, -2, -2, -2, -2, -2 };
+@@ -2321,7 +2335,7 @@ pl_teardown(const char *why, bool amp, bool stream, bool copp, bool mapped, bool
+ 	}
+ 	if (copp) {
+ 		/* q6adm.c adm_close: src port the AFE port, dest port the COPP */
+-		st[2] = apr_request_port(APR_SVC_ADM, AFE_PORT_QUAT_MI2S_RX, (uint16_t)pl.copp, 0, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0,
++		st[2] = apr_request_port(APR_SVC_ADM, pl_port(), (uint16_t)pl.copp, 0, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0,
+ 		    APR_BASIC_RSP_RESULT, 1000);
+ 	}
+ 	if (mapped) {
+@@ -2330,10 +2344,12 @@ pl_teardown(const char *why, bool amp, bool stream, bool copp, bool mapped, bool
+ 		    APR_BASIC_RSP_RESULT, 1000);
+ 	}
+ 	if (port) {
+-		st[4] = afe_port_cmd(AFE_PORT_QUAT_MI2S_RX, AFE_PORT_CMD_DEVICE_STOP);
++		st[4] = afe_port_cmd(pl_port(), AFE_PORT_CMD_DEVICE_STOP);
++	}
++	if (pl.out == 0) {                      /* the earpiece's port, channel and codec stay up (stage 10) */
++		st[5] = afe_mi2s_clock(0);
++		(void)ap_pins(false);
+ 	}
+-	st[5] = afe_mi2s_clock(0);
+-	(void)ap_pins(false);
+ 	pl.qn = 0;
+ 	printf("SWEET AUDIO: player off (%s): amp off %s, pause %d, close %d, COPP close %d, unmap %d, port stop %d, clock off %d; "
+ 	    "%llu bytes played of %llu, %u writes, %u periods of zeros (%u after data), %u errors, %u amp checks, amp slept %u "
+@@ -2358,6 +2374,11 @@ pl_start(void)
+ 	pl.amp_used = false;
+ 	pl.amp_idle = pl.amp_wake = false;
+ 	pl.sleeps = pl.wakes = 0;
++	pl.out = au_out;
++	if (pl.out == 1 && !cx.ear_up) {
++		printf("SWEET AUDIO: player: the earpiece path is not up (kern.sweet_audio_out=1 brings it up)\n");
++		return ENXIO;
++	}
+ 	int st = sweet_smmu_map_sid(AU_SID);
+ 	if (st != 0) {
+ 		printf("SWEET AUDIO: player: apps_smmu sid %#x not mapped (%d)\n", AU_SID, st);
+@@ -2366,24 +2387,26 @@ pl_start(void)
+ 	const char *step = "pins";
+ 	bool port = false, mapped = false, stream = false, copp = false;
+ 	uint32_t r[2];
+-	if (!ap_pins(true)) {
+-		goto fail;
+-	}
+-	step = "clock";
+-	if (afe_mi2s_clock(AU_BCLK) != 0) {
+-		goto fail;
+-	}
+-	step = "I2S config";
+-	if (afe_quat_i2s_config() != 0) {
+-		goto fail;
+-	}
+-	step = "port start";
+-	if (afe_port_cmd(AFE_PORT_QUAT_MI2S_RX, AFE_PORT_CMD_DEVICE_START) != 0) {
+-		goto fail;
++	if (pl.out == 0) {
++		if (!ap_pins(true)) {
++			goto fail;
++		}
++		step = "clock";
++		if (afe_mi2s_clock(AU_BCLK) != 0) {
++			goto fail;
++		}
++		step = "I2S config";
++		if (afe_quat_i2s_config() != 0) {
++			goto fail;
++		}
++		step = "port start";
++		if (afe_port_cmd(AFE_PORT_QUAT_MI2S_RX, AFE_PORT_CMD_DEVICE_START) != 0) {
++			goto fail;
++		}
++		port = true;
+ 	}
+-	port = true;
+ 	step = "amp on";
+-	if (pl.amp[1]) {
++	if (pl.out == 0 && pl.amp[1]) {
+ 		pl.amp_used = true;
+ 		if (!pl_amp(1, false)) {
+ 			goto fail;
+@@ -2413,16 +2436,23 @@ pl_start(void)
+ 		goto fail;
+ 	}
+ 	stream = true;
+-	/* ADM_CMD_DEVICE_OPEN_V5: RX, endpoint the port, NULL_COPP_TOPOLOGY, 2 ch 16 bit 48 kHz FL FR -> {status, COPP} */
++	/*
++	 * ADM_CMD_DEVICE_OPEN_V5: RX, endpoint the port, NULL_COPP_TOPOLOGY, 16 bit 48 kHz, the speaker 2 ch FL FR, the
++	 * earpiece 1 ch FL (the stream's left channel) -> {status, COPP}
++	 */
+ 	struct {
+ 		uint16_t flags, mode, ep1, ep2;
+ 		uint32_t topology;
+ 		uint16_t channels, bits;
+ 		uint32_t rate;
+ 		uint8_t map[8];
+-	} __attribute__((packed)) a = { 0, 1, AFE_PORT_QUAT_MI2S_RX, 0xffff, ADM_NULL_COPP_TOPOLOGY, 2, 16, AU_RATE, { 1, 2 } };
++	} __attribute__((packed)) a = { 0, 1, pl_port(), 0xffff, ADM_NULL_COPP_TOPOLOGY, (uint16_t)(pl.out ? 1 : 2), 16, AU_RATE,
++		                        { 1, 2 } };
++	if (pl.out) {
++		a.map[1] = 0;
++	}
+ 	step = "COPP open";
+-	if (apr_request_port(APR_SVC_ADM, AFE_PORT_QUAT_MI2S_RX, AFE_PORT_QUAT_MI2S_RX, 0, ADM_CMD_DEVICE_OPEN_V5, &a, sizeof(a),
++	if (apr_request_port(APR_SVC_ADM, pl_port(), pl_port(), 0, ADM_CMD_DEVICE_OPEN_V5, &a, sizeof(a),
+ 	    ADM_CMDRSP_DEVICE_OPEN_V5, 2000) != 0 || gl.apr_opcode != ADM_CMDRSP_DEVICE_OPEN_V5 || gl.apr_pl_len < 8) {
+ 		goto fail;
+ 	}
+@@ -2463,8 +2493,9 @@ pl_start(void)
+ 	pl.state = PL_PLAYING;
+ 	pl.last_done = pl.last_check = pl.last_sound = mach_absolute_time();
+ 	pl_submit();
+-	printf("SWEET AUDIO: player on: mem map handle %#x, COPP %u, amp %s, %u writes of %u bytes queued, ring %u bytes\n",
+-	    pl.handle, pl.copp, pl.amp_used ? "on" : "not scripted (silent)", pl.qn, PL_PERIOD, PL_RING);
++	printf("SWEET AUDIO: player on (%s): mem map handle %#x, COPP %u, amp %s, %u writes of %u bytes queued, ring %u bytes\n",
++	    pl.out ? "earpiece" : "speaker", pl.handle, pl.copp, pl.out ? "not used" : pl.amp_used ? "on" : "not scripted (silent)",
++	    pl.qn, PL_PERIOD, PL_RING);
+ 	return 0;
+ fail:
+ 	printf("SWEET AUDIO: player: %s failed (last APR opcode %#x status %#x)\n", step, gl.apr_opcode, gl.apr_status);
+@@ -2494,7 +2525,7 @@ pl_step(void)
+ 		pl.amp_pending = false;
+ 		return;
+ 	}
+-	if (pl.amp_pending) {
++	if (pl.amp_pending && pl.out == 0) {
+ 		pl.amp_pending = false;
+ 		pl.amp_used = true;                     /* the off script runs at teardown even if this fails half way */
+ 		if (!pl_amp(1, false)) {
+@@ -3021,7 +3052,7 @@ cx_stage_codec(void)
+ 	}
+ 	CX_LOG("codec PGD logical address %#x\n", cx.la);
+ 	cx.la_if = 0xff;
+-	cx.codec_up = cx.mic_up = cx.port_up = false;
++	cx.codec_up = cx.mic_up = cx.port_up = cx.ear_up = cx.amic = false;
+ 	uint16_t off = 0x800 + 0x21, ec = (uint16_t)(3 | 0x8 | ((off & 0xf) << 4) | ((off & 0xff0) << 4));   /* 4 bytes */
+ 	uint8_t rq[6] = { 6 | (0 << 5), 0x60, cx.la, 0, (uint8_t)ec, (uint8_t)(ec >> 8) };            /* REQUEST_VALUE */
+ 	cx.tid = (uint8_t)((cx.tid + 1) & 0x3f);
+@@ -3665,6 +3696,227 @@ cx_amic_off(void)
+ 	return true;
+ }
+ 
++/*
++ * ---- 3067: the earpiece. Xiaomi's mixer_paths_overlay_static.xml (vendor /etc) redefines `handset` for the Mi 8:
++ * SLIM RX0 (AIF1_PB) -> CDC_IF RX0 -> RX INT0_1 MIX1 INP0 = RX0 -> RX INT0 DEM MUX = CLSH_DSM_OUT -> EAR PA; the HAL
++ * plays `handset` on SLIMBUS_0_RX (no backend entry). So the earpiece hangs on the WCD9340's EAR output.
++ * Stage 10 (thread context, cx.busy held, codec up through stage 5):
++ *   Android's defaults for this path (tavil_codec_reg_defaults / reg_init_common_val): RX0 DSMDEM_CTL bit 0, RX0 SEC0
++ *   bit 3 clear, CLSH_DECAY_CTRL 0, CLSH_K2 0x060;
++ *   SLIMbus: codec RX port 16 (RX0 = WCD934X_RX_START + 0: RX_PORT_MULTI_CHNL_0 0x180 = bit 0, RX_PORT_CFG 0x40 = 12-byte
++ *   water mark + enable), AFE SLIMBUS_0_RX (0x4000) on shared channel 144 (= 144 + RX n, the machine driver's rx_ch),
++ *   DEVICE_START, then the manager: CONNECT_SINK (0x2d: codec PGD, port 16, channel 144), DEF_ACT_CHAN, RECONFIG_NOW;
++ *   RX INT0 (wcd934x.c / tavil): input RX0, 48 kHz, PGA muted, clock on, DEM = class-H DSM out (+ look-ahead delay),
++ *   digital volume; RX bias; the EAR DAC's class-H (wcd-clsh-v2 state EAR, CLS_H_NORMAL): autochop timer off, CLSH
++ *   CRC clock, RX0 class-H enable, VPOS/VNEG power level default, flyback on, flyback current 0xaa, buck on; EAR PA gain
++ *   and enable, 5 ms, PGA unmuted, volume re-latched.
++ * Gains: kern.sweet_ear_gain = (PA index << 8) | (uint8_t)RX0 dB; PA index 0 = +6 dB ... 4 = 0 dB, 5 = -2.5, 7 = -12;
++ * RX0 volume signed dB (-84..+40). Default 0 dB / 0 dB.
++ */
++#define CX_RX_PORT              16u
++#define CX_RX_CHAN              144u
++static int8_t cx_ear_db;
++static uint8_t cx_ear_pa = 4;
++
++static bool
++cx_codec_chain(void)
++{
++	return (cx.powered || cx_stage_qmi()) && (cx.regs_ok || cx_stage_regs()) && (cx.ngd_up || cx_stage_ngd()) &&
++	       (cx.la != 0xff && cx.la != 0 ? true : cx_stage_codec()) && (cx.mic_up || cx_stage_mic());
++}
++
++static bool
++cx_stage_ear(void)
++{
++	int r;
++	if (!cx.mic_up) {
++		CX_LOG("stage 10 needs stage 5 first\n");
++		return false;
++	}
++	CX_LOG("stage 10: earpiece: AFE SLIMBUS_0_RX -> channel %u -> codec RX0 (port %u) -> RX INT0 -> class-H -> EAR PA\n",
++	    CX_RX_CHAN, CX_RX_PORT);
++	CX_U(0x0b53, 0x01, 0x01);               /* CDC_RX0_RX_PATH_DSMDEM_CTL */
++	CX_U(0x0b49, 0x08, 0x00);               /* CDC_RX0_RX_PATH_SEC0 bit 3 */
++	CX_U(0x0c03, 0x03, 0x00);               /* CDC_CLSH_DECAY_CTRL */
++	CX_U(0x0c0a, 0x0f, 0x00);               /* CDC_CLSH_K2_MSB */
++	CX_W(0x0c0b, 0x60);                     /* CDC_CLSH_K2_LSB */
++	if (cx.la_if == 0xff) {
++		cx.la_if = cx_addr(cx_ifd_ea);
++		CX_LOG("codec interface device logical address %#x\n", cx.la_if);
++		if (cx.la_if == 0xff) {
++			return false;
++		}
++	}
++	if (!cx.ear_up) {
++		cx.if_page = -1;
++		if (cx_if_wr((uint16_t)(0x140 + 4 * CX_RX_PORT), 0x01) ||        /* RX_PORT_MULTI_CHNL_0: RX0 */
++		    cx_if_wr((uint16_t)(0x30 + CX_RX_PORT), (2u << 1) | 1u)) {   /* RX_PORT_CFG: water mark, enable */
++			CX_LOG("interface RX port registers not written\n");
++			return false;
++		}
++		uint8_t a = 0, c = 0;
++		(void)cx_if_rd((uint16_t)(0x140 + 4 * CX_RX_PORT), &a);
++		(void)cx_if_rd((uint16_t)(0x30 + CX_RX_PORT), &c);
++		CX_LOG("interface: RX port %u multi-channel %02x, port cfg %02x\n", CX_RX_PORT, a, c);
++		struct {
++			uint32_t minor;
++			uint16_t dev, bits, fmt, chans;
++			uint8_t map[8];
++			uint32_t rate;
++		} __attribute__((packed)) sb = { 1, 0, 16, 0, 1, { CX_RX_CHAN }, AU_RATE };
++		lck_mtx_lock(&au_mtx);
++		r = afe_port_param(AFE_PORT_SLIMBUS_0_RX, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SLIMBUS_CONFIG, &sb,
++		    sizeof(sb));
++		int st = r ? -1 : afe_port_cmd(AFE_PORT_SLIMBUS_0_RX, AFE_PORT_CMD_DEVICE_START);
++		lck_mtx_unlock(&au_mtx);
++		CX_LOG("AFE SLIMBUS_0_RX config -> %d, start -> %d\n", r, st);
++		if (r || st) {
++			return false;
++		}
++		uint8_t con[4] = { cx.la, CX_RX_PORT, CX_RX_CHAN, 0 };
++		r = cx_mgr_acked(0x2d, con, sizeof(con), 3);   /* SLIM_USR_MC_CONNECT_SINK: la, port, channel, tid */
++		CX_LOG("CONNECT_SINK -> %d\n", r);
++		if (r) {
++			return false;
++		}
++		uint8_t def[6] = { (uint8_t)(cx.la & 0x1f), (16 >> 2) | (1 << 5), (2 << 4) | 0, 0x83, 0, CX_RX_CHAN };
++		r = cx_mgr_acked(0x21, def, sizeof(def), 4);   /* SLIM_USR_MC_DEF_ACT_CHAN */
++		CX_LOG("DEF_ACT_CHAN -> %d\n", r);
++		if (r) {
++			return false;
++		}
++		uint8_t rec[2] = { 0, cx.la };
++		r = cx_mgr_acked(0x24, rec, sizeof(rec), 0);   /* SLIM_USR_MC_RECONFIG_NOW */
++		CX_LOG("RECONFIG_NOW -> %d\n", r);
++		if (r) {
++			return false;
++		}
++	}
++	/* RX INT0 */
++	CX_U(0x0d01, 0x0f, 0x05);               /* CDC_RX_INP_MUX_RX_INT0_CFG0: INP0 = RX0 */
++	CX_U(0x0b41, 0x0f, 0x04);               /* CDC_RX0_RX_PATH_CTL: 48 kHz */
++	CX_U(0x0b41, 0x10, 0x10);               /* PGA muted while it starts */
++	CX_U(0x0b41, 0x20, 0x20);               /* interpolator clock */
++	CX_U(0x0b42, 0x08, 0x08);               /* CDC_RX0_RX_PATH_CFG0: look-ahead delay (DEM = class-H) */
++	CX_U(0x0b49, 0x01, 0x01);               /* CDC_RX0_RX_PATH_SEC0: DEM = CLSH_DSM_OUT */
++	CX_W(0x0b45, (uint8_t)cx_ear_db);       /* CDC_RX0_RX_VOL_CTL */
++	CX_U(0x0608, 0x01, 0x01);               /* ANA_RX_SUPPLIES: RX bias */
++	/* EAR DAC: class-H for the EAR */
++	CX_U(0x073a, 0x02, 0x00);               /* HPH_NEW_INT_HPH_TIMER1: autochop timer off */
++	CX_U(0x0c01, 0x01, 0x01);               /* CDC_CLSH_CRC: clock */
++	CX_U(0x0b42, 0x40, 0x40);               /* RX0 class-H enable */
++	CX_U(0x0608, 0x0c, 0x00);               /* VPOS / VNEG power level default (not HIFI) */
++	CX_U(0x0608, 0x40, 0x40);               /* flyback (VNEG) on */
++	au_sleep(1);
++	CX_U(0x06c7, 0xff, 0xaa);               /* RX_BIAS_FLYB_BUFF: 0xa / 0xa */
++	CX_U(0x0608, 0x80, 0x80);               /* buck (VPOS) on */
++	au_sleep(1);
++	/* EAR PA */
++	CX_U(0x060a, 0x70, (uint8_t)((cx_ear_pa & 7) << 4));
++	CX_U(0x060a, 0x80, 0x80);               /* ANA_EAR: PA on */
++	au_sleep(6);
++	CX_U(0x0b41, 0x10, 0x00);               /* PGA unmuted */
++	CX_W(0x0b45, (uint8_t)cx_ear_db);       /* volume applied after the clock */
++	cx.ear_up = true;
++	au_sleep(50);
++	uint8_t s0 = 0, s1 = 0, src = 0;
++	(void)cx_if_rd(0x34, &s0);              /* PORT_INT_STATUS_RX_0 */
++	(void)cx_if_rd(0x35, &s1);
++	(void)cx_if_rd(0x60, &src);             /* PORT_INT_RX_SOURCE of RX0 */
++	CX_LOG("codec RX port interrupts: status %02x %02x, RX0 source %02x\n", s0, s1, src);
++	static const uint16_t ear[] = { 0x0d01, 0x0b41, 0x0b42, 0x0b45, 0x0b49, 0x0b53, 0x0608, 0x060a, 0x06c7, 0x073a, 0x0c01 };
++	cx_dump("earpiece", ear, sizeof(ear) / sizeof(ear[0]));
++	return true;
++}
++
++/* stage 11: the earpiece's analog side off (PA, class-H, bias, interpolator); the SLIMbus channel and AFE port stay */
++static bool
++cx_stage_ear_off(void)
++{
++	CX_LOG("stage 11: earpiece off\n");
++	cx.ear_up = false;
++	CX_U(0x0b41, 0x10, 0x10);               /* PGA muted */
++	CX_U(0x060a, 0x80, 0x00);               /* EAR PA off */
++	au_sleep(6);
++	CX_U(0x0b42, 0x40, 0x00);               /* class-H off */
++	CX_U(0x0c01, 0x01, 0x00);
++	CX_U(0x0608, 0x80, 0x00);               /* buck off */
++	au_sleep(1);
++	CX_U(0x0608, 0x40, 0x00);               /* flyback off */
++	CX_U(0x0608, 0x01, 0x00);               /* RX bias off */
++	CX_U(0x0b41, 0x20, 0x00);               /* interpolator clock off, reset, 48 kHz */
++	CX_U(0x0b41, 0x40, 0x40);
++	CX_U(0x0b41, 0x40, 0x00);
++	static const uint16_t ear[] = { 0x0b41, 0x0b42, 0x0608, 0x060a, 0x0c01 };
++	cx_dump("earpiece off", ear, sizeof(ear) / sizeof(ear[0]));
++	return true;
++}
++
++/* kern.sweet_audio_out: 0 the speaker, 1 the earpiece (brings its path up); the player's next start uses it */
++static int
++au_out_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = (int)au_out, err = sysctl_handle_int(oidp, &v, 0, req);
++	if (err || !req->newptr) {
++		return err;
++	}
++	if (v != 0 && v != 1) {
++		return EINVAL;
++	}
++	if (v == 1 && !cx.ear_up) {
++		if (!au_live) {
++			return ENXIO;
++		}
++		if (__atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
++			return EBUSY;
++		}
++		cx.off = 0;
++		cx.log[0] = 0;
++		cx.runs++;
++		CX_LOG("run %u: earpiece on\n", cx.runs);
++		bool ok = cx_codec_chain() && cx_stage_ear();
++		__atomic_store_n(&cx.busy, false, __ATOMIC_RELEASE);
++		sweet_log_sync();
++		if (!ok) {
++			return EIO;
++		}
++	}
++	au_out = (uint32_t)v;
++	printf("SWEET AUDIO: output %s from the next player start\n", v ? "earpiece" : "speaker");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_out, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, au_out_sysctl, "I",
++    "Mi 8 player output: 0 speaker, 1 earpiece (WCD9340 EAR; brings the path up) (3067)");
++
++/* kern.sweet_ear_gain: (EAR PA index << 8) | (uint8_t)RX0 digital dB, applied at once when the earpiece is up */
++static int
++ear_gain_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = (cx_ear_pa << 8) | (uint8_t)cx_ear_db, err = sysctl_handle_int(oidp, &v, 0, req);
++	if (err || !req->newptr) {
++		return err;
++	}
++	int8_t db = (int8_t)(v & 0xff);
++	unsigned pa = ((unsigned)v >> 8) & 0xffu;
++	if (pa > 7 || pa == 6 || db < -84 || db > 40) {
++		return EINVAL;
++	}
++	cx_ear_db = db;
++	cx_ear_pa = (uint8_t)pa;
++	if (cx.ear_up && !__atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
++		int e1 = cx_reg_wr(0x0b45, (uint8_t)db), e2 = cx_reg_upd(0x060a, 0x70, (uint8_t)(pa << 4));
++		__atomic_store_n(&cx.busy, false, __ATOMIC_RELEASE);
++		if (e1 || e2) {
++			return EIO;
++		}
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ear_gain, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, ear_gain_sysctl, "I",
++    "Mi 8 earpiece gains: (EAR PA index 0 +6 dB .. 4 0 dB, 5 -2.5, 7 -12) << 8 | RX0 digital dB (3067)");
++
+ /*
+  * ---- 3065: continuous capture for user space (kern.sweet_audio_rec): the handset mic as 16-bit mono at 48 kHz.
+  * Start brings the codec chain up if needed (stages 1-6 + the analog mic of stage 8), opens the record stream
+@@ -3915,7 +4167,7 @@ cx_sysctl SYSCTL_HANDLER_ARGS
+ 		} else {
+ 			v = in[0] - '0';                /* or text ("1") */
+ 		}
+-		if (v < 0 || v > 9) {
++		if (v < 0 || v > 11) {
+ 			return EINVAL;
+ 		}
+ 		if (__atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
+@@ -3945,6 +4197,10 @@ cx_sysctl SYSCTL_HANDLER_ARGS
+ 			(void)cx_stage_capture(2);
+ 		} else if (v == 8) {
+ 			(void)cx_stage_amic();
++		} else if (v == 10) {
++			(void)cx_stage_ear();
++		} else if (v == 11) {
++			(void)cx_stage_ear_off();
+ 		} else if (v == 9) {
+ 			(void)(cx_stage_qmi() && cx_stage_regs() && cx_stage_ngd() && cx_stage_codec() && cx_stage_mic() &&
+ 			    cx_stage_port());
+-- 
+2.54.0 (Apple Git-157)
+

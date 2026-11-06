@@ -141,6 +141,14 @@ if [ "${IOS18:-1}" = 1 ]; then
 		-framework AVFAudio -framework AudioToolbox "$here/sweetaqin.m" -o "$out18/sweetaqin"
 	codesign -s - -f --entitlements "$here/mic.entitlements" "$out18/sweetaqin"
 	python3 -I "$pacstrip" --sign "$out18/sweetaqin"
+	# sweetcx: a kern.sweet_codec stage 0-14 as one character (the 3060-3067c handler reads ints only below 10)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetcx.c" -o "$out18/sweetcx"
+	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetcx"
+	python3 -I "$pacstrip" --sign "$out18/sweetcx"
+	# sweetreg: WCD9340 registers through kern.sweet_codec_reg (xnu 3067b)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetreg.c" -o "$out18/sweetreg"
+	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetreg"
+	python3 -I "$pacstrip" --sign "$out18/sweetreg"
 	# sweetrec: the handset mic through kern.sweet_audio_rec (xnu 3065)
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetrec.c" -o "$out18/sweetrec"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetrec"
