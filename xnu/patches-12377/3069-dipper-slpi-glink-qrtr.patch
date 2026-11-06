@@ -1,0 +1,880 @@
+From c3d6beca5c069c1b7e8020df45111c384ca9e8e2 Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@wlan-114021.nbw.tue.nl>
+Date: Fri, 6 Nov 2026 15:06:47 +0100
+Subject: [PATCH] 3069: kern.sweet_ssc stage 2 brings up GLINK on the SLPI's
+ dsps edge and QRTR on IPCRTR (pd-mapper, servreg listener for
+ msm/slpi/sensor_pd) in the thread sweet ssc
+
+---
+ bsd/dev/dipper_sensors.c | 806 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 790 insertions(+), 16 deletions(-)
+
+diff --git a/bsd/dev/dipper_sensors.c b/bsd/dev/dipper_sensors.c
+index 92b9d73..0261163 100644
+--- a/bsd/dev/dipper_sensors.c
++++ b/bsd/dev/dipper_sensors.c
+@@ -21,6 +21,8 @@
+  *      segments + AUTH_AND_RESET, then the SLPI's SMP2P item (481, "slave-kernel": bit 0 fatal, 1 ready, 2 handover,
+  *      3 stop ack) until ready, then (3068b) the same bits for 60 s more, with the crash reason (item 424) on fatal.
+  *      The SLPI keeps running; there is no stop path yet. Stage 1 prints the crash reason too when item 424 exists.
++ *      3069: from ready on, GLINK on the "dsps" edge and QRTR on its IPCRTR channel (pd-mapper answers, servreg
++ *      listener for msm/slpi/sensor_pd), in the thread "sweet ssc"; the sysctl waits 60 s and logs a summary.
+  *
+  * Facts from the live DT (dtb/dipper/live.dtb): qcom,ssc@5c00000 pil-tz-generic, qcom,pas-id 12, qcom,smem-id 424,
+  * qcom,signal-aop, vdd_cx = lcx.lvl and vdd_mx = lmx.lvl (rpmh-arc-regulator, level 0x181, keep-proxy-regs-on),
+@@ -38,6 +40,7 @@
+ #include <sys/sysctl.h>
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
++#include <kern/thread.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <vm/pmap.h>
+@@ -49,6 +52,8 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
+ extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
+ extern void sweet_log_sync(void);
++extern void thread_set_thread_name(thread_t th, const char *name);
++extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_arc_vote(const char *res, bool max);
+ extern int sweet_scm_pas(uint32_t pas_id, uint32_t cmd, uint32_t arginfo, uint64_t arg1, uint64_t arg2);
+ extern uint32_t sweet_smem_rd(uint32_t off);
+@@ -334,29 +339,797 @@ ss_probe(void)
+ }
+ 
+ /*
+- * 3068b: after ready, keep watching the SLPI's bits for SS_WATCH_MS (boot 110: ready at +30 ms, then fatal + handover
+- * by +30 s with nothing on our side of GLINK). Logs each change with its time and the crash reason on fatal.
++ * ---- 3069: GLINK on the "dsps" SMEM edge (descriptor 478, our FIFO 479, the SLPI's 480, doorbell bit 24) and QRTR on its
++ * IPCRTR channel: a copy of dipper_audio.c's lpass-edge code (which works with the audio DSP; qcom_glink_smem.c,
++ * qcom_glink_native.c, af_qrtr.c, ns.c), with any channel the SLPI opens accepted and logged. QRTR answers HELLO,
++ * offers the service locator (pd-mapper, QMI 0x40: sweet_pdm_answer's sdm845 table has msm/slpi/root_pd and
++ * msm/slpi/sensor_pd, instance 90) and logs the SLPI's servers, lookups and data; a servreg listener follows
++ * msm/slpi/sensor_pd once the SLPI offers its notifier (0x42, instance 90). Runs in the thread "sweet ssc" from ready on.
+  */
+-#define SS_WATCH_MS             60000u
++#define SG_DESC                 478u
++#define SG_TX_ITEM              479u            /* XPRT_FIFO_0: ours */
++#define SG_RX_ITEM              480u            /* XPRT_FIFO_1: the SLPI's */
++#define SG_TX_SIZE              0x4000u
++#define SG_DOORBELL             24u             /* glink-smem-native-xprt-dsps qcom,irq-mask = <0x1000000> */
++#define SG_FEATURE_REUSE        1u
++#define SG_INTENTS              5u
++#define SG_INTENT_SIZE          4096u
++#define SG_MAX_CH               8u
++#define SG_MAX_LI               16u
++#define SG_MAX_RI               64u
++#define SG_TX_MAX               0x2000u
++enum { G_VERSION = 0, G_VERSION_ACK = 1, G_OPEN = 2, G_CLOSE = 3, G_OPEN_ACK = 4, G_INTENT = 5, G_RX_DONE = 6,
++       G_RX_INTENT_REQ = 7, G_RX_INTENT_REQ_ACK = 8, G_TX_DATA = 9, G_CLOSE_ACK = 11, G_TX_DATA_CONT = 12,
++       G_READ_NOTIF = 13, G_RX_DONE_W_REUSE = 14, G_SIGNALS = 15 };
++#define QR_NODE_LOCAL           1u
++#define QR_PORT_CTRL            0xfffffffeu
++#define QR_PDM_PORT             0x4002u
++#define QR_PDM_SERVICE          0x40u
++#define QR_PDM_INSTANCE         0x101u          /* qmi_add_server: version 0x101 | instance 0 << 8 */
++#define QR_NOTIF_SERVICE        0x42u
++#define QR_NOTIF_PORT           0x4010u
++#define QR_SNS_SERVICE          400u            /* SNS client (libssc, the sensors' QMI front end) */
++#define SS_QMI_INSTANCE         90u             /* the SLPI's QMI instance (SLPIR.JSN, pd-mapper) */
++#define SERVREG_REGISTER_LISTENER 0x20u
++#define SERVREG_STATE_UPDATED   0x22u
++#define SERVREG_SET_ACK         0x23u
++enum { Q_DATA = 1, Q_HELLO = 2, Q_BYE = 3, Q_NEW_SERVER = 4, Q_DEL_SERVER = 5, Q_DEL_CLIENT = 6, Q_RESUME_TX = 7,
++       Q_NEW_LOOKUP = 10, Q_DEL_LOOKUP = 11 };
++extern uint32_t sweet_pdm_answer(const uint8_t *req, uint32_t len, uint8_t *r);
++static const char sg_pd_path[] = "msm/slpi/sensor_pd";
++
++struct sg_ch {
++	char name[33];
++	uint32_t rcid;                  /* the SLPI's id for the channel */
++	bool open_acked;
++	unsigned pkts;
++	struct {
++		uint32_t id, size, off;
++		uint8_t *buf;
++		bool bad;
++	} li[SG_MAX_LI];
++	struct {
++		uint32_t id, size;
++		bool valid, used;
++	} ri[SG_MAX_RI];
++};
++static struct {
++	uint32_t desc, tx, tx_len, rx, rx_len, features, next_liid;
++	bool up, version_acked, bad;
++	struct sg_ch ch[SG_MAX_CH];
++	unsigned nch;
++	int qrtr;                       /* the IPCRTR channel, -1 = not opened */
++	unsigned opens, closes, rx_pkts;
++	uint32_t qnode;
++	unsigned hellos, servers, lookups, pdm_reqs, data_other;
++	uint32_t sns_node, sns_port;
++	struct {
++		uint32_t node, port, state;
++		uint16_t txn;
++		bool asked, answered;
++	} nf;
++	uint32_t bits;                  /* the SLPI's slave-kernel bits, as the thread last saw them */
++	bool fatal, thread_done;
++	unsigned fatal_ms;
++} sg = { .qrtr = -1 };
++
++static uint64_t sg_t0;
++
++static unsigned
++sg_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - sg_t0, &ns);
++	return (unsigned)(ns / 1000000ull);
++}
++
++#define SG_LOG(fmt, ...) printf("SWEET SSC: +%u ms: " fmt, sg_ms(), ##__VA_ARGS__)
++
++static void
++sg_hex(char *out, size_t cap, const uint8_t *p, uint32_t n)
++{
++	size_t o = 0;
++	out[0] = 0;
++	for (uint32_t i = 0; i < n && o + 4 < cap; i++) {
++		o += (size_t)snprintf(out + o, cap - o, "%02x%s", p[i], (i & 3) == 3 ? " " : "");
++	}
++}
++
++static uint32_t
++sg_rx_avail(void)
++{
++	if (!sg.rx) {
++		uint32_t sz = 0, it = sweet_smem_item(SS_HOST, SG_RX_ITEM, &sz);
++		if (!it || sz < 64 || (sz & 7)) {
++			return 0;
++		}
++		sg.rx = it;
++		sg.rx_len = sz;
++		SG_LOG("the SLPI's GLINK FIFO (item %u) at +%#x, %u bytes\n", SG_RX_ITEM, it, sz);
++	}
++	uint32_t head = sweet_smem_rd(sg.desc + 12), tail = sweet_smem_rd(sg.desc + 8);
++	if (head >= sg.rx_len || tail >= sg.rx_len) {
++		return 0;
++	}
++	return head >= tail ? head - tail : sg.rx_len - tail + head;
++}
++
++static void
++sg_rx_peek(uint32_t offset, void *dst, uint32_t count)
++{
++	uint8_t *d = dst;
++	uint32_t pos = sweet_smem_rd(sg.desc + 8) + offset;
++	while (count) {
++		while (pos >= sg.rx_len) {
++			pos -= sg.rx_len;
++		}
++		uint32_t w = sweet_smem_rd(sg.rx + (pos & ~3u)), b = pos & 3u, n = MIN(4u - b, count);
++		memcpy(d, (uint8_t *)&w + b, n);
++		d += n;
++		count -= n;
++		pos += n;
++	}
++}
++
++static void
++sg_rx_advance(uint32_t count)
++{
++	uint32_t tail = sweet_smem_rd(sg.desc + 8) + count;
++	while (tail >= sg.rx_len) {
++		tail -= sg.rx_len;
++	}
++	sweet_smem_wr(sg.desc + 8, tail);
++}
++
++static uint32_t
++sg_tx_avail(void)
++{
++	uint32_t head = sweet_smem_rd(sg.desc + 4), tail = sweet_smem_rd(sg.desc + 0);
++	uint32_t avail = tail <= head ? sg.tx_len - head + tail : tail - head;
++	return avail < 16 ? 0 : avail - 16;
++}
++
+ static bool
+-ss_watch(unsigned t0, uint32_t last)
++sg_tx(const void *hdr, uint32_t hlen, const void *data, uint32_t dlen)
+ {
+-	uint32_t bits = 0;
+-	for (unsigned t = t0; t < t0 + SS_WATCH_MS; t += 10) {
++	static uint8_t buf[SG_TX_MAX + 64];
++	uint32_t tlen = hlen + dlen, total = (tlen + 7u) & ~7u;
++	if (total > sizeof(buf) || tlen >= sg.tx_len) {
++		return false;
++	}
++	for (unsigned i = 0; sg_tx_avail() < tlen; i++) {
++		if (i == 1000) {
++			SG_LOG("GLINK TX FIFO full for 1 s\n");
++			return false;
++		}
++		delay(1000);
++	}
++	memcpy(buf, hdr, hlen);
++	if (dlen) {
++		memcpy(buf + hlen, data, dlen);
++	}
++	bzero(buf + tlen, total - tlen);
++	uint32_t head = sweet_smem_rd(sg.desc + 4);
++	for (uint32_t i = 0; i < total; i += 4) {
++		uint32_t w, p = head + i;
++		memcpy(&w, buf + i, 4);
++		if (p >= sg.tx_len) {
++			p -= sg.tx_len;
++		}
++		sweet_smem_wr(sg.tx + p, w);
++	}
++	head += total;
++	if (head >= sg.tx_len) {
++		head -= sg.tx_len;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	sweet_smem_wr(sg.desc + 4, head);
++	sweet_apcs_kick(SG_DOORBELL);
++	return true;
++}
++
++static bool
++sg_tx_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	uint8_t m[8];
++	memcpy(m, &cmd, 2);
++	memcpy(m + 2, &p1, 2);
++	memcpy(m + 4, &p2, 4);
++	return sg_tx(m, 8, NULL, 0);
++}
++
++/* our channel ids are the index + 1 */
++static uint16_t
++sg_lcid(unsigned c)
++{
++	return (uint16_t)(c + 1);
++}
++
++static bool
++sg_add_intent(unsigned c, uint32_t size)
++{
++	struct sg_ch *ch = &sg.ch[c];
++	for (unsigned k = 0; k < SG_MAX_LI; k++) {
++		if (ch->li[k].buf) {
++			continue;
++		}
++		if (!(ch->li[k].buf = kalloc_data(size, Z_WAITOK | Z_ZERO))) {
++			return false;
++		}
++		ch->li[k].id = ++sg.next_liid;
++		ch->li[k].size = size;
++		ch->li[k].off = 0;
++		struct {
++			uint16_t cmd, lcid;
++			uint32_t count, size, id;
++		} __attribute__((packed)) m = { G_INTENT, sg_lcid(c), 1, size, ch->li[k].id };
++		return sg_tx(&m, (uint32_t)sizeof(m), NULL, 0);
++	}
++	return false;
++}
++
++static int
++sg_by_rcid(uint32_t rcid)
++{
++	for (unsigned c = 0; c < sg.nch; c++) {
++		if (sg.ch[c].rcid == rcid) {
++			return (int)c;
++		}
++	}
++	return -1;
++}
++
++/* one packet on channel c into the smallest free intent of the SLPI that fits */
++static bool
++sg_send(unsigned c, const void *data, uint32_t len)
++{
++	struct sg_ch *ch = &sg.ch[c];
++	unsigned best = SG_MAX_RI;
++	for (unsigned j = 0; j < SG_MAX_RI; j++) {
++		if (ch->ri[j].valid && !ch->ri[j].used && ch->ri[j].size >= len && (best == SG_MAX_RI || ch->ri[j].size < ch->ri[best].size)) {
++			best = j;
++		}
++	}
++	if (!ch->open_acked || best == SG_MAX_RI || len > SG_TX_MAX) {
++		return false;
++	}
++	ch->ri[best].used = true;
++	struct {
++		uint16_t cmd, lcid;
++		uint32_t iid, chunk, left;
++	} __attribute__((packed)) h = { G_TX_DATA, sg_lcid(c), ch->ri[best].id, len, 0 };
++	if (!sg_tx(&h, (uint32_t)sizeof(h), data, len)) {
++		ch->ri[best].used = false;
++		return false;
++	}
++	return true;
++}
++
++static bool
++qs_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *pl, uint32_t size)
++{
++	static uint8_t pkt[32 + 600];
++	uint32_t h[8] = { 1, type, QR_NODE_LOCAL, src_port, 0, size, dst_node, dst_port };
++	uint32_t padded = (size + 3u) & ~3u;
++	if (sg.qrtr < 0 || padded > sizeof(pkt) - 32) {
++		return false;
++	}
++	memcpy(pkt, h, 32);
++	memcpy(pkt + 32, pl, size);
++	bzero(pkt + 32 + size, padded - size);
++	return sg_send((unsigned)sg.qrtr, pkt, 32 + padded);
++}
++
++static const char *
++nf_state_name(uint32_t st)
++{
++	switch (st) {
++	case 0x0fffffffu: return "DOWN";
++	case 0x1fffffffu: return "UP";
++	case 0x2fffffffu: return "EARLY_DOWN";
++	case 0x7fffffffu: return "UNINIT";
++	default: return "?";
++	}
++}
++
++static const uint8_t *
++qs_tlv(const uint8_t *t, uint32_t len, uint8_t type, uint16_t *vlen)
++{
++	for (uint32_t o = 0; o + 3 <= len;) {
++		uint16_t l;
++		memcpy(&l, t + o + 1, 2);
++		if (o + 3 + l > len) {
++			return NULL;
++		}
++		if (t[o] == type) {
++			*vlen = l;
++			return t + o + 3;
++		}
++		o += 3 + l;
++	}
++	return NULL;
++}
++
++/* pdr_register_listener(): enable (TLV 1, u8 1) + service path (TLV 2, the string without NUL) */
++static void
++nf_register(void)
++{
++	uint8_t q[7 + 4 + 3 + sizeof(sg_pd_path)];
++	uint16_t plen = (uint16_t)(sizeof(sg_pd_path) - 1), one = 1, mlen, msg = SERVREG_REGISTER_LISTENER;
++	uint32_t n = 7;
++	q[0] = 0;
++	sg.nf.txn++;
++	memcpy(q + 1, &sg.nf.txn, 2);
++	memcpy(q + 3, &msg, 2);
++	q[n] = 1;
++	memcpy(q + n + 1, &one, 2);
++	q[n + 3] = 1;
++	n += 4;
++	q[n] = 2;
++	memcpy(q + n + 1, &plen, 2);
++	memcpy(q + n + 3, sg_pd_path, plen);
++	n += 3 + plen;
++	mlen = (uint16_t)(n - 7);
++	memcpy(q + 5, &mlen, 2);
++	sg.nf.asked = qs_send(Q_DATA, QR_NOTIF_PORT, sg.nf.node, sg.nf.port, q, n);
++	SG_LOG("servreg: register listener for %s at %u:%#x %s\n", sg_pd_path, sg.nf.node, sg.nf.port,
++	    sg.nf.asked ? "sent" : "NOT SENT");
++}
++
++static void
++nf_rx(uint32_t snode, uint32_t sport, const uint8_t *p, uint32_t len)
++{
++	if (len < 7) {
++		return;
++	}
++	uint16_t msg, mlen, vl = 0;
++	memcpy(&msg, p + 3, 2);
++	memcpy(&mlen, p + 5, 2);
++	const uint8_t *t = p + 7, *v;
++	uint32_t tl = MIN((uint32_t)mlen, len - 7);
++	if (p[0] == 2 && msg == SERVREG_REGISTER_LISTENER) {
++		uint16_t res = 0xffff, err = 0xffff;
++		if ((v = qs_tlv(t, tl, 2, &vl)) && vl >= 4) {
++			memcpy(&res, v, 2);
++			memcpy(&err, v + 2, 2);
++		}
++		uint32_t st = 0;
++		bool have = (v = qs_tlv(t, tl, 0x10, &vl)) && vl >= 4;
++		if (have) {
++			memcpy(&st, v, 4);
++			sg.nf.state = st;
++		}
++		sg.nf.answered = true;
++		SG_LOG("servreg: listener registered: result %u error %u, %s state %#x (%s)\n", res, err, sg_pd_path, st,
++		    have ? nf_state_name(st) : "not given");
++	} else if (p[0] == 4 && msg == SERVREG_STATE_UPDATED) {
++		uint32_t st = 0;
++		uint16_t tid = 0;
++		if ((v = qs_tlv(t, tl, 1, &vl)) && vl >= 4) {
++			memcpy(&st, v, 4);
++		}
++		if ((v = qs_tlv(t, tl, 3, &vl)) && vl >= 2) {
++			memcpy(&tid, v, 2);
++		}
++		sg.nf.state = st;
++		SG_LOG("servreg: %s is now %#x (%s), transaction %u -> ack\n", sg_pd_path, st, nf_state_name(st), tid);
++		uint8_t q[7 + 3 + sizeof(sg_pd_path) + 5];
++		uint16_t plen = (uint16_t)(sizeof(sg_pd_path) - 1), two = 2, m = SERVREG_SET_ACK, ml;
++		uint32_t n = 7;
++		q[0] = 0;
++		sg.nf.txn++;
++		memcpy(q + 1, &sg.nf.txn, 2);
++		memcpy(q + 3, &m, 2);
++		q[n] = 1;
++		memcpy(q + n + 1, &plen, 2);
++		memcpy(q + n + 3, sg_pd_path, plen);
++		n += 3 + plen;
++		q[n] = 2;
++		memcpy(q + n + 1, &two, 2);
++		memcpy(q + n + 3, &tid, 2);
++		n += 5;
++		ml = (uint16_t)(n - 7);
++		memcpy(q + 5, &ml, 2);
++		(void)qs_send(Q_DATA, QR_NOTIF_PORT, snode, sport, q, n);
++	} else {
++		SG_LOG("servreg: QMI type %u message %#x (%u bytes)\n", p[0], msg, len);
++	}
++}
++
++static void
++qs_rx(const uint8_t *p, uint32_t len)
++{
++	uint32_t h[8];
++	if (len < 32 || p[0] != 1) {
++		SG_LOG("qrtr: version %u packet of %u bytes ignored\n", len ? p[0] : 0, len);
++		return;
++	}
++	memcpy(h, p, 32);
++	uint32_t type = h[1], snode = h[2], sport = h[3], confirm = h[4], size = h[5], dport = h[7];
++	if (32 + size > len) {
++		return;
++	}
++	const uint8_t *pl = p + 32;
++	sg.qnode = snode;
++	switch (type) {
++	case Q_HELLO: {
++		uint32_t hello[5] = { Q_HELLO, 0, 0, 0, 0 };
++		uint32_t srv[5] = { Q_NEW_SERVER, QR_PDM_SERVICE, QR_PDM_INSTANCE, QR_NODE_LOCAL, QR_PDM_PORT };
++		bool a = qs_send(Q_HELLO, QR_PORT_CTRL, snode, QR_PORT_CTRL, hello, sizeof(hello));
++		bool b = qs_send(Q_NEW_SERVER, QR_PORT_CTRL, snode, QR_PORT_CTRL, srv, sizeof(srv));
++		sg.hellos++;
++		SG_LOG("qrtr: hello from node %u -> hello %s, service locator 0x40 at %u:%#x %s\n", snode, a ? "sent" : "NOT SENT",
++		    QR_NODE_LOCAL, QR_PDM_PORT, b ? "announced" : "NOT ANNOUNCED");
++		break;
++	}
++	case Q_NEW_SERVER:
++	case Q_DEL_SERVER:
++		if (size >= 20) {
++			uint32_t v[5];
++			memcpy(v, pl, 20);
++			sg.servers++;
++			SG_LOG("qrtr: the SLPI %s service %u (%#x) version %u instance %u at %u:%#x\n",
++			    type == Q_NEW_SERVER ? "offers" : "removes", v[1], v[1], v[2] & 0xff, v[2] >> 8, v[3], v[4]);
++			if (v[1] == QR_SNS_SERVICE) {
++				sg.sns_node = type == Q_NEW_SERVER ? v[3] : 0;
++				sg.sns_port = type == Q_NEW_SERVER ? v[4] : 0;
++			}
++			if (type == Q_NEW_SERVER && v[1] == QR_NOTIF_SERVICE && (v[2] >> 8) == SS_QMI_INSTANCE && !sg.nf.asked) {
++				sg.nf.node = v[3];
++				sg.nf.port = v[4];
++				nf_register();
++			}
++		}
++		break;
++	case Q_NEW_LOOKUP:
++	case Q_DEL_LOOKUP:
++		if (size >= 20) {
++			uint32_t v[5];
++			memcpy(v, pl, 20);
++			sg.lookups++;
++			SG_LOG("qrtr: the SLPI %s service %u (%#x) instance %#x (from %u:%#x)\n",
++			    type == Q_NEW_LOOKUP ? "looks up" : "drops its lookup of", v[1], v[1], v[2], snode, sport);
++		}
++		break;
++	case Q_DATA:
++		if (dport == QR_PDM_PORT) {
++			uint8_t r[512];
++			uint32_t n = sweet_pdm_answer(pl, size, r);
++			sg.pdm_reqs++;
++			if (n) {
++				(void)qs_send(Q_DATA, QR_PDM_PORT, snode, sport, r, n);
++			}
++		} else if (dport == QR_NOTIF_PORT) {
++			nf_rx(snode, sport, pl, size);
++		} else {
++			char hex[3 * 48 + 1];
++			sg_hex(hex, sizeof(hex), pl, MIN(size, 48u));
++			sg.data_other++;
++			SG_LOG("qrtr: %u bytes from %u:%#x to our port %#x (no server): %s\n", size, snode, sport, dport, hex);
++		}
++		if (confirm) {
++			uint32_t r[5] = { Q_RESUME_TX, QR_NODE_LOCAL, dport, 0, 0 };
++			(void)qs_send(Q_RESUME_TX, dport, snode, sport, r, sizeof(r));
++		}
++		break;
++	case Q_RESUME_TX:
++		break;
++	default: {
++		char hex[3 * 20 + 1];
++		sg_hex(hex, sizeof(hex), pl, MIN(size, 20u));
++		SG_LOG("qrtr: control %u from %u:%#x (%u bytes): %s\n", type, snode, sport, size, hex);
++		break;
++	}
++	}
++}
++
++static void
++sg_poll(void)
++{
++	for (unsigned guard = 0; guard < 64 && !sg.bad; guard++) {
++		uint32_t avail = sg_rx_avail();
++		if (avail < 8) {
++			return;
++		}
++		uint8_t m[8];
++		sg_rx_peek(0, m, 8);
++		uint16_t cmd, p1;
++		uint32_t p2;
++		memcpy(&cmd, m, 2);
++		memcpy(&p1, m + 2, 2);
++		memcpy(&p2, m + 4, 4);
++		switch (cmd) {
++		case G_VERSION:
++			sg_rx_advance(8);
++			if (p1 == 1) {
++				sg.features &= p2;
++			}
++			SG_LOG("glink version %u features %#x from the SLPI -> ack with %#x\n", p1, p2, sg.features);
++			if (p1 != 0) {
++				(void)sg_tx_cmd(G_VERSION_ACK, 1, sg.features);
++			}
++			break;
++		case G_VERSION_ACK:
++			sg_rx_advance(8);
++			SG_LOG("glink version ack %u features %#x\n", p1, p2);
++			if (p1 == 1 && p2 != sg.features) {
++				sg.features &= p2;
++				(void)sg_tx_cmd(G_VERSION, 1, sg.features);
++			} else if (p1 == 1) {
++				sg.version_acked = true;
++			}
++			break;
++		case G_OPEN: {
++			uint32_t extra = (p2 + 7u) & ~7u;
++			char name[33];
++			if (avail < 8 + extra) {
++				return;
++			}
++			memset(name, 0, sizeof(name));
++			sg_rx_peek(8, name, MIN(p2, 32u));
++			sg_rx_advance(8 + extra);
++			sg.opens++;
++			int c = sg_by_rcid(p1);
++			bool known = c >= 0;
++			if (c < 0 && sg.nch < SG_MAX_CH) {
++				c = (int)sg.nch++;
++				strlcpy(sg.ch[c].name, name, sizeof(sg.ch[c].name));
++				sg.ch[c].rcid = p1;
++			}
++			SG_LOG("glink: the SLPI opens \"%s\" (its id %u)%s\n", name, p1,
++			    c < 0 ? ": no room, ignored" : known ? " again" : " -> opened back");
++			if (c < 0 || known) {
++				break;
++			}
++			if (strcmp(name, "IPCRTR") == 0) {
++				sg.qrtr = c;
++			}
++			struct {
++				uint16_t cmd, lcid;
++				uint32_t len;
++				char name[32];
++			} __attribute__((packed)) req = { G_OPEN, sg_lcid((unsigned)c), (uint32_t)strlen(name) + 1, { 0 } };
++			strlcpy(req.name, name, sizeof(req.name));
++			(void)sg_tx_cmd(G_OPEN_ACK, (uint16_t)p1, 0);
++			(void)sg_tx(&req, 8u + req.len, NULL, 0);
++			break;
++		}
++		case G_OPEN_ACK:
++			sg_rx_advance(8);
++			for (unsigned c = 0; c < sg.nch; c++) {
++				if (p1 == sg_lcid(c) && !sg.ch[c].open_acked) {
++					sg.ch[c].open_acked = true;
++					SG_LOG("glink %s open both ways; %u x %u-byte intents\n", sg.ch[c].name, SG_INTENTS, SG_INTENT_SIZE);
++					for (unsigned k = 0; k < SG_INTENTS; k++) {
++						(void)sg_add_intent(c, SG_INTENT_SIZE);
++					}
++				}
++			}
++			break;
++		case G_CLOSE: {
++			sg_rx_advance(8);
++			int c = sg_by_rcid(p1);
++			sg.closes++;
++			SG_LOG("glink: the SLPI closes its id %u (%s)\n", p1, c >= 0 ? sg.ch[c].name : "?");
++			(void)sg_tx_cmd(G_CLOSE_ACK, p1, 0);
++			break;
++		}
++		case G_INTENT: {
++			uint32_t msglen = 8 + 8 * p2;
++			if (p2 > 64 || avail < msglen) {
++				return;
++			}
++			int c = sg_by_rcid(p1);
++			for (uint32_t k = 0; c >= 0 && k < p2; k++) {
++				uint32_t pair[2];
++				sg_rx_peek(8 + 8 * k, pair, 8);
++				for (unsigned j = 0; j < SG_MAX_RI; j++) {
++					struct sg_ch *ch = &sg.ch[c];
++					if (!ch->ri[j].valid) {
++						ch->ri[j].id = pair[1];
++						ch->ri[j].size = pair[0];
++						ch->ri[j].valid = true;
++						ch->ri[j].used = false;
++						break;
++					}
++				}
++			}
++			sg_rx_advance((msglen + 7u) & ~7u);
++			break;
++		}
++		case G_RX_DONE:
++		case G_RX_DONE_W_REUSE: {
++			sg_rx_advance(8);
++			int c = sg_by_rcid(p1);
++			for (unsigned j = 0; c >= 0 && j < SG_MAX_RI; j++) {
++				struct sg_ch *ch = &sg.ch[c];
++				if (ch->ri[j].valid && ch->ri[j].id == p2) {
++					ch->ri[j].used = false;
++					if (cmd == G_RX_DONE) {
++						ch->ri[j].valid = false;
++					}
++				}
++			}
++			break;
++		}
++		case G_RX_INTENT_REQ: {
++			sg_rx_advance(8);
++			int c = sg_by_rcid(p1);
++			bool ok = c >= 0 && p2 <= 0x10000u && sg_add_intent((unsigned)c, MAX(p2, 1u));
++			SG_LOG("glink: the SLPI asks for a %u-byte intent on %s -> %s\n", p2, c >= 0 ? sg.ch[c].name : "?",
++			    ok ? "given" : "refused");
++			(void)sg_tx_cmd(G_RX_INTENT_REQ_ACK, c >= 0 ? sg_lcid((unsigned)c) : 0, ok);
++			break;
++		}
++		case G_SIGNALS:
++			sg_rx_advance(8);
++			SG_LOG("glink: signals %#x on the SLPI's id %u\n", p2, p1);
++			break;
++		case G_RX_INTENT_REQ_ACK:
++		case G_CLOSE_ACK:
++			sg_rx_advance(8);
++			break;
++		case G_READ_NOTIF:
++			sg_rx_advance(8);
++			sweet_apcs_kick(SG_DOORBELL);
++			break;
++		case G_TX_DATA:
++		case G_TX_DATA_CONT: {
++			if (avail < 16) {
++				return;
++			}
++			uint32_t sizes[2];
++			sg_rx_peek(8, sizes, 8);
++			uint32_t chunk = sizes[0], left = sizes[1];
++			if (chunk > avail - 16) {
++				return;
++			}
++			int c = sg_by_rcid(p1);
++			struct sg_ch *ch = c >= 0 ? &sg.ch[c] : NULL;
++			unsigned k = SG_MAX_LI;
++			for (unsigned x = 0; ch && x < SG_MAX_LI; x++) {
++				if (ch->li[x].buf && ch->li[x].id == p2) {
++					k = x;
++				}
++			}
++			bool ok = k < SG_MAX_LI && ch->li[k].size - ch->li[k].off >= chunk && !ch->li[k].bad;
++			if (ok) {
++				sg_rx_peek(16, ch->li[k].buf + ch->li[k].off, chunk);
++				ch->li[k].off += chunk;
++			} else {
++				SG_LOG("glink data for id %u intent %u (%u bytes) dropped\n", p1, p2, chunk);
++				if (k < SG_MAX_LI) {
++					ch->li[k].bad = true;
++				}
++			}
++			sg_rx_advance((16 + chunk + 7u) & ~7u);
++			if (k < SG_MAX_LI && left == 0) {
++				if (!ch->li[k].bad) {
++					sg.rx_pkts++;
++					ch->pkts++;
++					if (c == sg.qrtr) {
++						qs_rx(ch->li[k].buf, ch->li[k].off);
++					} else if (ch->pkts <= 24) {
++						char hex[3 * 48 + 1];
++						sg_hex(hex, sizeof(hex), ch->li[k].buf, MIN(ch->li[k].off, 48u));
++						SG_LOG("%s: %u bytes from the SLPI: %s\n", ch->name, ch->li[k].off, hex);
++					}
++				}
++				ch->li[k].bad = false;
++				ch->li[k].off = 0;
++				struct {
++					uint16_t cmd, lcid;
++					uint32_t liid;
++				} __attribute__((packed)) done = { G_RX_DONE_W_REUSE, sg_lcid((unsigned)c), ch->li[k].id };
++				(void)sg_tx(&done, (uint32_t)sizeof(done), NULL, 0);
++			}
++			break;
++		}
++		default:
++			SG_LOG("glink: unknown command %u (p1 %u p2 %#x): ring stopped\n", cmd, p1, p2);
++			sg.bad = true;
++			return;
++		}
++	}
++}
++
++static bool
++sg_up(void)
++{
++	uint32_t sz = 0;
++	sg.desc = sweet_smem_alloc(SS_HOST, SG_DESC, 32);
++	if (!sg.desc || sweet_smem_item(SS_HOST, SG_DESC, &sz) != sg.desc || sz != 32) {
++		SS_LOG("glink descriptor not usable (size %u)\n", sz);
++		return false;
++	}
++	sg.tx = sweet_smem_alloc(SS_HOST, SG_TX_ITEM, SG_TX_SIZE);
++	if (!sg.tx || sweet_smem_item(SS_HOST, SG_TX_ITEM, &sz) != sg.tx || sz < 1024 || (sz & 7)) {
++		SS_LOG("glink TX FIFO not usable (size %u)\n", sz);
++		return false;
++	}
++	sg.tx_len = sz;
++	sg.features = SG_FEATURE_REUSE;
++	sweet_smem_wr(sg.desc + 8, 0);          /* *rx_pipe->tail = 0 */
++	sweet_smem_wr(sg.desc + 4, 0);          /* *tx_pipe->head = 0 */
++	bool v = sg_tx_cmd(G_VERSION, 1, sg.features);
++	SS_LOG("glink up on dsps: descriptor +%#x, TX FIFO +%#x (%u bytes), version 1 %s\n", sg.desc, sg.tx, sg.tx_len,
++	    v ? "sent" : "NOT SENT");
++	sg.up = v;
++	return v;
++}
++
++/* the SLPI from ready on: GLINK polled every 5 ms (20 ms after 2 min), its bits watched; ends on fatal */
++static void
++ss_thread(void *arg, wait_result_t w)
++{
++	(void)arg;
++	(void)w;
++	uint32_t last = sg.bits;
++	unsigned next_note = 5000;
++	for (;;) {
++		sg_poll();
++		uint32_t bits = 0;
+ 		if (ss_smp2p_in(&bits) && bits != last) {
+-			SS_LOG("+%u ms: slave-kernel %#x (fatal %u ready %u handover %u stop-ack %u)\n", t, bits, bits & 1,
+-			    (bits >> 1) & 1, (bits >> 2) & 1, (bits >> 3) & 1);
+-			last = bits;
+-			sweet_log_sync();
++			SG_LOG("slave-kernel %#x (fatal %u ready %u handover %u stop-ack %u)\n", bits, bits & 1, (bits >> 1) & 1,
++			    (bits >> 2) & 1, (bits >> 3) & 1);
++			last = sg.bits = bits;
+ 			if (bits & 1) {
++				sg.fatal_ms = sg_ms();
+ 				ss_crash_reason();
+-				return false;
++				sg.fatal = true;
++				sg_poll();      /* whatever it said last */
++				break;
+ 			}
+ 		}
+-		delay(10 * 1000);
++		unsigned t = sg_ms();
++		if (t >= next_note) {
++			SG_LOG("status: %u channels opened by the SLPI, qrtr node %u, %u hellos, %u servers, %u lookups, %u locator "
++			    "requests, %u other data, %s %s\n", sg.nch, sg.qnode, sg.hellos, sg.servers, sg.lookups, sg.pdm_reqs,
++			    sg.data_other, sg_pd_path, sg.nf.answered || sg.nf.state ? nf_state_name(sg.nf.state) : "state unknown");
++			sweet_log_sync();
++			next_note = t < 60000 ? t + 5000 : t + 60000;
++		}
++		delay(t < 120000 ? 5000 : 20000);
+ 	}
+-	SS_LOG("still up %u s after ready (slave-kernel %#x)\n", SS_WATCH_MS / 1000, last);
+-	return true;
++	sweet_log_sync();
++	sg.thread_done = true;
++	(void)thread_terminate(current_thread());
++}
++
++/*
++ * 3069: from ready on, GLINK + QRTR on the dsps edge in the thread "sweet ssc"; this call waits SS_WATCH_MS (or the
++ * SLPI's fatal bit) and logs a summary; the thread goes on after it (its lines are on the console only).
++ */
++#define SS_WATCH_MS             60000u
++static bool
++ss_live(uint32_t bits)
++{
++	sg.bits = bits;
++	if (!sg_up()) {
++		return false;
++	}
++	thread_t th;
++	if (kernel_thread_start(ss_thread, NULL, &th) != KERN_SUCCESS) {
++		SS_LOG("kernel_thread_start failed\n");
++		return false;
++	}
++	thread_set_thread_name(th, "sweet ssc");
++	thread_deallocate(th);
++	unsigned t0 = sg_ms();
++	while (sg_ms() < t0 + SS_WATCH_MS && !sg.fatal) {
++		delay(100 * 1000);
++	}
++	char sum[512];
++	size_t o = (size_t)snprintf(sum, sizeof(sum), "%u channels:", sg.nch);
++	for (unsigned c = 0; c < sg.nch && o < sizeof(sum); c++) {
++		o += (size_t)snprintf(sum + o, sizeof(sum) - o, " %s (%s, %u packets)", sg.ch[c].name,
++		    sg.ch[c].open_acked ? "open" : "half open", sg.ch[c].pkts);
++	}
++	SS_LOG("+%u ms: %s (crash reason above when fatal); %s\n", sg_ms(), sg.fatal ? "SLPI FATAL" : "SLPI still up", sum);
++	SS_LOG("qrtr node %u: %u hellos, %u servers, %u lookups, %u locator requests, %u other data; SNS 400 %s; %s %s\n",
++	    sg.qnode, sg.hellos, sg.servers, sg.lookups, sg.pdm_reqs, sg.data_other, sg.sns_port ? "offered" : "not offered",
++	    sg_pd_path, sg.nf.answered || sg.nf.state ? nf_state_name(sg.nf.state) : "state unknown");
++	return !sg.fatal;
+ }
+ 
+ /* ---- stage 2 */
+@@ -418,6 +1191,7 @@ ss_boot(void)
+ 		r = sweet_scm_pas(SS_PAS_ID, 5, 1, 0, 0);                         /* AUTH_AND_RESET */
+ 		SS_LOG("PAS %u AUTH_AND_RESET: %d\n", SS_PAS_ID, r);
+ 		started = r == 0;
++		sg_t0 = mach_absolute_time();           /* 3069: the thread's log times count from here */
+ 	}
+ 	if (!started) {
+ 		SS_LOG("PAS %u SHUTDOWN: %d\n", SS_PAS_ID, sweet_scm_pas(SS_PAS_ID, 6, 1, 0, 0));
+@@ -442,7 +1216,7 @@ ss_boot(void)
+ 			uint32_t gl = sweet_smem_item(SS_HOST, SS_GLINK_DESC, NULL);
+ 			SS_LOG("SLPI READY after %u ms; glink descriptor %u %s\n", t, SS_GLINK_DESC, gl ? "present" : "not there yet");
+ 			sweet_log_sync();
+-			return ss_watch(t, last);
++			return ss_live(bits);
+ 		}
+ 		delay(10 * 1000);
+ 	}
+@@ -494,5 +1268,5 @@ ss_sysctl SYSCTL_HANDLER_ARGS
+ 	return SYSCTL_OUT(req, ss.log, strnlen(ss.log, sizeof(ss.log)) + 1);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ssc, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, ss_sysctl, "A",
+-    "Mi 8 sensor DSP (SLPI) bring-up: 1 read-only probe, 2 probe + boot (3068)");
++    "Mi 8 sensor DSP (SLPI) bring-up: 1 read-only probe, 2 probe + boot + GLINK/QRTR on dsps (3069)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.54.0 (Apple Git-157)
+
