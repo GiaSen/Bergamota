@@ -1,0 +1,1149 @@
+From de7d751b575a3933d829f3d0a2b1f01120af2b91 Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@wlan-114021.nbw.tue.nl>
+Date: Fri, 6 Nov 2026 15:31:16 +0100
+Subject: [PATCH] 3070: FastRPC to the SLPI's sensors PD in the kernel (attach,
+ adsp_default_listener, adsp_listener next2) serving its apps_std file calls
+ from /private/var/sweet/qcom and SMEM socinfo; sweet_scm_assign() for the
+ shared window
+
+---
+ bsd/dev/beryllium_wlan.c |   16 +-
+ bsd/dev/dipper_sensors.c | 1013 +++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 1026 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 706de3e..04185d1 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -1171,7 +1171,7 @@ ms_assign_list(const char *what, uint64_t pa, uint64_t size, const uint32_t *src
+ 		printf("SWEET MSS: no SCM buffer\n");
+ 		return false;
+ 	}
+-	if (nsrc == 0 || nsrc > 3 || ndst == 0 || ndst > 3) {
++	if (nsrc == 0 || nsrc > 3 || ndst == 0 || ndst > 4) {      /* 3070: 4 destinations (the SLPI's FastRPC pool) */
+ 		return false;
+ 	}
+ 	bzero(buf, PAGE_SIZE);
+@@ -10103,6 +10103,20 @@ sweet_qmp_send(const char *msg)
+ 	return ok;
+ }
+ 
++/*
++ * 3070: qcom_scm_assign_mem() for another driver (the SLPI's FastRPC pool in bsd/dev/dipper_sensors.c): one region from the
++ * source VMIDs to up to 4 destinations; true when the hypervisor accepted it.
++ */
++bool
++sweet_scm_assign(const char *what, uint64_t pa, uint64_t size, const uint32_t *src, unsigned nsrc, const uint32_t *dst,
++    const uint32_t *perm, unsigned ndst)
++{
++	lck_mtx_lock(&sweet_share_lock);
++	bool ok = ms_assign_list(what, pa, (size + 0xfffull) & ~0xfffull, src, nsrc, dst, perm, ndst);
++	lck_mtx_unlock(&sweet_share_lock);
++	return ok;
++}
++
+ /* the service locator's (pd-mapper's) answer to one QMI request from any remote: length in r[512], 0 = none */
+ uint32_t
+ sweet_pdm_answer(const uint8_t *req, uint32_t len, uint8_t *r)
+diff --git a/bsd/dev/dipper_sensors.c b/bsd/dev/dipper_sensors.c
+index 0261163..e028e6b 100644
+--- a/bsd/dev/dipper_sensors.c
++++ b/bsd/dev/dipper_sensors.c
+@@ -23,6 +23,8 @@
+  *      The SLPI keeps running; there is no stop path yet. Stage 1 prints the crash reason too when item 424 exists.
+  *      3069: from ready on, GLINK on the "dsps" edge and QRTR on its IPCRTR channel (pd-mapper answers, servreg
+  *      listener for msm/slpi/sensor_pd), in the thread "sweet ssc"; the sysctl waits 60 s and logs a summary.
++ *      3070: FastRPC on GLINK fastrpcglink-apps-dsp: attach to the sensors PD and serve its file reads (registry,
++ *      config, socinfo) from /private/var/sweet/qcom on the iOS root (see the FastRPC section).
+  *
+  * Facts from the live DT (dtb/dipper/live.dtb): qcom,ssc@5c00000 pil-tz-generic, qcom,pas-id 12, qcom,smem-id 424,
+  * qcom,signal-aop, vdd_cx = lcx.lvl and vdd_mx = lmx.lvl (rpmh-arc-regulator, level 0x181, keep-proxy-regs-on),
+@@ -38,6 +40,13 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <sys/sysctl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/kauth.h>
++#include <sys/uio.h>
++#include <sys/dirent.h>
++#include <sys/stat.h>
++#include <sys/proc.h>
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
+ #include <kern/thread.h>
+@@ -411,7 +420,10 @@ static struct {
+ 	uint32_t bits;                  /* the SLPI's slave-kernel bits, as the thread last saw them */
+ 	bool fatal, thread_done;
+ 	unsigned fatal_ms;
+-} sg = { .qrtr = -1 };
++	int fastrpc;                    /* 3070: the fastrpcglink-apps-dsp channel, -1 = not opened */
++} sg = { .qrtr = -1, .fastrpc = -1 };
++
++static void fr_rx(const uint8_t *p, uint32_t len);
+ 
+ static uint64_t sg_t0;
+ 
+@@ -884,6 +896,9 @@ sg_poll(void)
+ 			if (strcmp(name, "IPCRTR") == 0) {
+ 				sg.qrtr = c;
+ 			}
++			if (strcmp(name, "fastrpcglink-apps-dsp") == 0) {
++				sg.fastrpc = c;
++			}
+ 			struct {
+ 				uint16_t cmd, lcid;
+ 				uint32_t len;
+@@ -920,6 +935,11 @@ sg_poll(void)
+ 				return;
+ 			}
+ 			int c = sg_by_rcid(p1);
++			if (c >= 0 && c == sg.fastrpc) {
++				uint32_t pair0[2];
++				sg_rx_peek(8, pair0, 8);
++				SG_LOG("glink: the SLPI queues %u intent(s) on %s, the first %u bytes\n", p2, sg.ch[c].name, pair0[0]);
++			}
+ 			for (uint32_t k = 0; c >= 0 && k < p2; k++) {
+ 				uint32_t pair[2];
+ 				sg_rx_peek(8 + 8 * k, pair, 8);
+@@ -1009,6 +1029,8 @@ sg_poll(void)
+ 					ch->pkts++;
+ 					if (c == sg.qrtr) {
+ 						qs_rx(ch->li[k].buf, ch->li[k].off);
++					} else if (c == sg.fastrpc) {
++						fr_rx(ch->li[k].buf, ch->li[k].off);
+ 					} else if (ch->pkts <= 24) {
+ 						char hex[3 * 48 + 1];
+ 						sg_hex(hex, sizeof(hex), ch->li[k].buf, MIN(ch->li[k].off, 48u));
+@@ -1058,6 +1080,987 @@ sg_up(void)
+ 	return v;
+ }
+ 
++/*
++ * ---- 3070: FastRPC to the SLPI's sensors PD and the files it reads (S2). With GLINK/QRTR up the sensor PD still stalls
++ * (3069: USER-PD DOG at ~40 s); on Android sscrpcd, on postmarketOS `hexagonrpcd -s`, attach to that PD and serve its
++ * file reads (sensor registry and config). This is that client in the kernel, on the GLINK channel fastrpcglink-apps-dsp:
++ * INIT_ATTACH to the sensors PD (static handle 1, pd 2; Xiaomi adsprpc.c FASTRPC_INIT_ATTACH_SENSORS), remotectl open +
++ * register of "adsp_default_listener", then adsp_listener init2 / next2 (handle 3) answering the PD's reverse calls:
++ * remotectl (handle 0: "apps_std" = 1, "apps_mem" = 2) and apps_std's file calls (hexagonrpcd's set plus fopen, ftell,
++ * flen), read-only, from a copy of the phone's Android files under SS_FILES on the iOS root (vendor/etc/sensors,
++ * mnt/vendor/persist/sensors; device data, never in git) and /sys/devices/soc0 made from SMEM socinfo (item 137).
++ * Invoke buffers use adsprpc.c get_args' layout (remote args, invoke bufs, phy pages, 16 fds, 64 CRCs, copies 128-byte
++ * aligned) in a fixed window of the low DDR bank, shared with the SLPI through the hypervisor like adsprpc's
++ * adsprpc-mem region (HLOS + MSS_MSA + SSC_Q6 + ADSP_Q6): the SLPI has no SMMU context bank, it uses physical addresses.
++ * Nested buffers of a reverse call (hexagonrpcd iobuffer.c): per buffer a u32 size, then, if non-empty, padding to 8 and
++ * the data.
++ */
++#define FR_PA                   0xe1400000ull   /* after the audio PCM window (0xe1000000 + 2 MiB), below 4 GiB */
++#define FR_SIZE                 0x200000u
++#define FR_TGID                 2000u
++#define FR_ALIGN                128u
++#define FR_MAX_ARGS             8u
++#define FR_REQ_CAP              4096u           /* room for the nested input buffers of one reverse call */
++#define FR_REPLY_CAP            0x80000u
++#define FR_META(n)              ((n) * 40u + 16u * 8u + 64u * 4u)
++#define FR_SCALARS(m, i, o)     ((((uint32_t)(m) & 0x1f) << 24) | (((uint32_t)(i) & 0xff) << 16) | (((uint32_t)(o) & 0xff) << 8))
++#define FR_SC_METHOD(sc)        (((sc) >> 24) & 0x1fu)
++#define FR_SC_IN(sc)            (((sc) >> 16) & 0xffu)
++#define FR_SC_OUT(sc)           (((sc) >> 8) & 0xffu)
++#define AEE_EFAILED             1u
++#define AEE_EBADPARM            14u
++#define AEE_EUNSUPPORTED        20u
++#define SCM_VMID_HLOS           3u
++#define SCM_VMID_SSC_Q6         5u
++#define SCM_VMID_ADSP_Q6        6u
++#define SCM_VMID_MSS_MSA        15u
++#define SCM_PERM_RWX            7u
++#define SS_FILES                "/private/var/sweet/qcom"
++#define SS_VENDOR_MTIME         1230768000ll    /* 2009-01-01: every file of the vendor image; persist's sns_reg_config has it */
++#define FS_MAX                  32u
++#define FS_FILE_MAX             0x100000u
++#define FR_LOG_MAX              900u
++extern bool sweet_scm_assign(const char *what, uint64_t pa, uint64_t size, const uint32_t *src, unsigned nsrc,
++    const uint32_t *dst, const uint32_t *perm, unsigned ndst);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++
++enum { FR_WAIT_CH, FR_ATTACH, FR_OPEN, FR_REGISTER, FR_CLOSE, FR_INIT2, FR_NEXT2, FR_FAILED };
++static const char *const fr_state_name[] = { "waiting for the channel", "attach", "open listener", "register",
++	                                     "close", "init2", "listening", "failed" };
++
++struct fr_arg {
++	const void *p;
++	uint32_t len;
++};
++struct fr_buf {
++	const uint8_t *p;
++	uint32_t len;
++};
++
++static struct {
++	vm_offset_t va;
++	unsigned state;
++	bool sent, answered;
++	uint32_t seq;
++	uint64_t ctx;
++	int32_t retval;
++	unsigned sent_ms, intent_ms;
++	uint32_t off[FR_MAX_ARGS], len[FR_MAX_ARGS];
++	unsigned nargs;
++	uint32_t lhandle;
++	uint32_t rctx, result;          /* the last reverse call and what we answer to it */
++	uint8_t *req, *reply;
++	uint32_t reply_len;
++	bool reply_short;
++	unsigned calls, reverse, logged, unsupported;
++	uint64_t bytes;
++} fr;
++
++static struct fs_file {
++	bool used, dir;
++	char name[96];                  /* as the PD named it, for the log */
++	uint8_t *data;                  /* the contents; for a directory its names, each NUL-terminated */
++	uint32_t size, off, cap;
++	uint64_t read;
++} fs[FS_MAX];
++
++#define FR_LOG(fmt, ...) do { \
++	if (fr.logged++ < FR_LOG_MAX) { \
++	        SG_LOG("fastrpc: " fmt, ##__VA_ARGS__); \
++	} \
++} while (0)
++
++/* ---- the files */
++static uint32_t
++ss_socinfo(uint32_t off)
++{
++	uint32_t sz = 0, it = sweet_smem_item(0xfffe, 137, &sz);       /* SMEM_HW_SW_BUILD_ID */
++	return it && off + 4 <= sz ? sweet_smem_rd(it + off) : 0;
++}
++
++/* /sys/devices/soc0/<leaf> as Xiaomi's socinfo.c prints it, from SMEM; false for any other leaf */
++static bool
++fs_soc(const char *leaf, char *b, size_t cap)
++{
++	static const struct {
++		uint32_t id;
++		const char *name;
++	} plat[] = { { 0, "Unknown" }, { 1, "Surf" }, { 2, "FFA" }, { 3, "Fluid" }, { 4, "SVLTE_FFA" }, { 5, "SLVTE_SURF" },
++		     { 7, "MDM_MTP_NO_DISPLAY" }, { 8, "MTP" }, { 9, "Liquid" }, { 10, "Dragon" }, { 11, "QRD" }, { 13, "HRD" },
++		     { 14, "DTV" }, { 21, "RCM" }, { 23, "STP" }, { 24, "SBC" }, { 25, "ADP" }, { 30, "TTP" }, { 31, "HDK" },
++		     { 40, "POLARIS" }, { 50, "DIPPER" }, { 60, "BERYLLIUM" }, { 70, "EQUULEUS" }, { 80, "URSA" }, { 90, "PERSEUS" } };
++	static const char *const sub[] = { "Unknown", "charm", "strange", "strange_2a", "Invalid" };
++	static const char *const qrd[] = { "QRD", "SKUAA", "SKUF", "SKUAB", "SKUG", "INVALID" };
++	uint32_t hw = ss_socinfo(52), st = ss_socinfo(64), v = ss_socinfo(8);
++	if (strcmp(leaf, "soc_id") == 0) {
++		snprintf(b, cap, "%u\n", ss_socinfo(4));
++	} else if (strcmp(leaf, "revision") == 0) {
++		snprintf(b, cap, "%u.%u\n", v >> 16, v & 0xffff);
++	} else if (strcmp(leaf, "hw_platform") == 0) {
++		const char *n = "Unknown";
++		for (unsigned i = 0; i < sizeof(plat) / sizeof(plat[0]); i++) {
++			n = plat[i].id == hw ? plat[i].name : n;
++		}
++		snprintf(b, cap, "%s\n", n);
++	} else if (strcmp(leaf, "platform_version") == 0) {
++		snprintf(b, cap, "%u\n", ss_socinfo(56));
++	} else if (strcmp(leaf, "platform_subtype") == 0) {
++		snprintf(b, cap, "%s\n", hw == 11 ? qrd[MIN(st, 5u)] : sub[MIN(st, 4u)]);
++	} else if (strcmp(leaf, "platform_subtype_id") == 0) {
++		snprintf(b, cap, "%u\n", st);
++	} else {
++		return false;
++	}
++	return true;
++}
++
++/* the PD's absolute path under SS_FILES, with Android's aliases (/system/vendor = /vendor, /persist = /mnt/vendor/persist) */
++static bool
++fs_path(const char *name, char *out, size_t cap)
++{
++	size_t n = strnlen(name, 256);
++	if (name[0] != '/' || n >= 200) {
++		return false;
++	}
++	for (size_t k = 0; k + 2 < n + 1; k++) {        /* no ".." component */
++		if (name[k] == '/' && name[k + 1] == '.' && name[k + 2] == '.' && (name[k + 3] == '/' || name[k + 3] == 0)) {
++			return false;
++		}
++	}
++	if (strncmp(name, "/system/vendor/", 15) == 0) {
++		snprintf(out, cap, SS_FILES "/vendor/%s", name + 15);
++	} else if (strncmp(name, "/persist/", 9) == 0) {
++		snprintf(out, cap, SS_FILES "/mnt/vendor/persist/%s", name + 9);
++	} else {
++		snprintf(out, cap, SS_FILES "%s", name);
++	}
++	return true;
++}
++
++static const char *
++fs_soc_leaf(const char *name)
++{
++	static const char pfx[] = "/sys/devices/soc0";
++	if (strncmp(name, pfx, sizeof(pfx) - 1) != 0) {
++		return NULL;
++	}
++	const char *l = name + sizeof(pfx) - 1;
++	while (*l == '/') {
++		l++;
++	}
++	return l;
++}
++
++static int
++fs_alloc(const char *name)
++{
++	for (unsigned i = 0; i < FS_MAX; i++) {
++		if (!fs[i].used) {
++			bzero(&fs[i], sizeof(fs[i]));
++			fs[i].used = true;
++			strlcpy(fs[i].name, name, sizeof(fs[i].name));
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++static void
++fs_free(unsigned i)
++{
++	if (fs[i].data) {
++		kfree_data(fs[i].data, fs[i].cap);
++	}
++	bzero(&fs[i], sizeof(fs[i]));
++}
++
++/* a directory's names, NUL-separated, without . and .. */
++static int
++fs_list(vnode_t vp, vfs_context_t ctx, struct fs_file *f)
++{
++	const uint32_t bsz = 8192;
++	uint8_t *buf = kalloc_data(bsz, Z_WAITOK | Z_ZERO);
++	f->cap = 16384;
++	f->data = kalloc_data(f->cap, Z_WAITOK | Z_ZERO);
++	uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++	int err = !buf || !f->data || !uio ? ENOMEM : 0, eof = 0;
++	off_t off = 0;
++	for (unsigned rounds = 0; !err && !eof && rounds < 64; rounds++) {
++		int num = 0;
++		uio_reset(uio, off, UIO_SYSSPACE, UIO_READ);
++		uio_addiov(uio, CAST_USER_ADDR_T(buf), bsz);
++		err = VNOP_READDIR(vp, uio, 0, &eof, &num, ctx);
++		uint32_t got = bsz - (uint32_t)uio_resid(uio);
++		if (err || got == 0) {
++			break;
++		}
++		for (uint32_t o = 0; o + __builtin_offsetof(struct dirent, d_name) < got;) {
++			const struct dirent *d = (const struct dirent *)(buf + o);
++			if (d->d_reclen == 0) {
++				break;
++			}
++			uint32_t nl = MIN((uint32_t)d->d_namlen, 255u);
++			bool dot = (nl == 1 && d->d_name[0] == '.') || (nl == 2 && d->d_name[0] == '.' && d->d_name[1] == '.');
++			if (d->d_ino && !dot && f->size + nl + 1 <= f->cap) {
++				memcpy(f->data + f->size, d->d_name, nl);
++				f->data[f->size + nl] = 0;
++				f->size += nl + 1;
++			}
++			o += d->d_reclen;
++		}
++		off = uio_offset(uio);
++	}
++	if (uio) {
++		uio_free(uio);
++	}
++	if (buf) {
++		kfree_data(buf, bsz);
++	}
++	return err;
++}
++
++/* open a file (its whole contents read now) or a directory (its names listed now); fd = index + 3, -errno */
++static int
++fs_open(const char *name, bool dir)
++{
++	char path[256];
++	const char *leaf = fs_soc_leaf(name);
++	int i = fs_alloc(name);
++	if (i < 0) {
++		return -EMFILE;
++	}
++	struct fs_file *f = &fs[i];
++	f->dir = dir;
++	if (leaf) {
++		static const char *const leaves[] = { "hw_platform", "platform_subtype", "platform_subtype_id", "platform_version",
++			                              "soc_id", "revision" };
++		f->cap = 512;
++		f->data = kalloc_data(f->cap, Z_WAITOK | Z_ZERO);
++		if (!f->data) {
++			fs_free((unsigned)i);
++			return -ENOMEM;
++		}
++		if (dir && !*leaf) {
++			for (unsigned k = 0; k < sizeof(leaves) / sizeof(leaves[0]); k++) {
++				size_t l = strlen(leaves[k]) + 1;
++				memcpy(f->data + f->size, leaves[k], l);
++				f->size += (uint32_t)l;
++			}
++			return i + 3;
++		}
++		if (dir || !fs_soc(leaf, (char *)f->data, f->cap)) {
++			fs_free((unsigned)i);
++			return -ENOENT;
++		}
++		f->size = (uint32_t)strlen((char *)f->data);
++		return i + 3;
++	}
++	if (!fs_path(name, path, sizeof(path))) {
++		fs_free((unsigned)i);
++		return -EINVAL;
++	}
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int err = vnode_lookup(path, 0, &vp, ctx);
++	if (err || vp == NULLVP) {
++		fs_free((unsigned)i);
++		return -(err ? err : ENOENT);
++	}
++	if (dir) {
++		err = vnode_vtype(vp) == VDIR ? fs_list(vp, ctx, f) : ENOTDIR;
++	} else if (vnode_vtype(vp) != VREG) {
++		err = EISDIR;
++	} else {
++		off_t size = 0;
++		err = vnode_size(vp, &size, ctx);
++		if (!err && (size < 0 || size > FS_FILE_MAX)) {
++			err = EFBIG;
++		}
++		if (!err) {
++			f->cap = (uint32_t)MAX(size, 1);
++			f->data = kalloc_data(f->cap, Z_WAITOK | Z_ZERO);
++			int resid = 0;
++			err = !f->data ? ENOMEM : size == 0 ? 0 : vn_rdwr(UIO_READ, vp, (caddr_t)f->data, (int)size, 0, UIO_SYSSPACE,
++			    IO_NODELOCKED | IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			f->size = (uint32_t)size;
++			if (!err && resid) {
++				err = EIO;
++			}
++		}
++	}
++	vnode_put(vp);
++	if (err) {
++		fs_free((unsigned)i);
++		return -err;
++	}
++	return i + 3;
++}
++
++static struct fs_file *
++fs_get(uint64_t fd)
++{
++	return fd >= 3 && fd < FS_MAX + 3 && fs[fd - 3].used ? &fs[fd - 3] : NULL;
++}
++
++/* apps_std_stat's answer (96 bytes, hexagonrpcd apps_std.c), -errno */
++static int
++fs_stat(const char *name, uint8_t out[96])
++{
++	char path[256];
++	bzero(out, 96);
++	const char *leaf = fs_soc_leaf(name);
++	uint32_t mode = 0, nlink = 1;
++	uint64_t size = 0, ino = 0;
++	int64_t at = 0, mt = 0, ct = 0;
++	if (leaf) {
++		char b[64];
++		bool d = !*leaf;
++		if (!d && !fs_soc(leaf, b, sizeof(b))) {
++			return -ENOENT;
++		}
++		mode = d ? (S_IFDIR | 0555) : (S_IFREG | 0444);
++		size = d ? 0 : strlen(b);
++	} else {
++		if (!fs_path(name, path, sizeof(path))) {
++			return -EINVAL;
++		}
++		vfs_context_t ctx = vfs_context_kernel();
++		vnode_t vp = NULLVP;
++		int err = vnode_lookup(path, 0, &vp, ctx);
++		if (err || vp == NULLVP) {
++			return -(err ? err : ENOENT);
++		}
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_WANTED(&va, va_data_size);
++		VATTR_WANTED(&va, va_mode);
++		VATTR_WANTED(&va, va_nlink);
++		VATTR_WANTED(&va, va_fileid);
++		VATTR_WANTED(&va, va_access_time);
++		VATTR_WANTED(&va, va_modify_time);
++		VATTR_WANTED(&va, va_change_time);
++		err = vnode_getattr(vp, &va, ctx);
++		bool d = vnode_vtype(vp) == VDIR;
++		vnode_put(vp);
++		if (err) {
++			return -err;
++		}
++		mode = (va.va_mode & 07777) | (d ? S_IFDIR : S_IFREG);
++		nlink = (uint32_t)va.va_nlink;
++		size = va.va_data_size;
++		ino = va.va_fileid;
++		at = va.va_access_time.tv_sec;
++		mt = va.va_modify_time.tv_sec;
++		ct = va.va_change_time.tv_sec;
++		if (strncmp(name, "/vendor/", 8) == 0 || strncmp(name, "/system/vendor/", 15) == 0) {
++			at = mt = ct = SS_VENDOR_MTIME;
++		}
++	}
++	memcpy(out + 16, &ino, 8);
++	memcpy(out + 24, &mode, 4);
++	memcpy(out + 28, &nlink, 4);
++	memcpy(out + 40, &size, 8);
++	memcpy(out + 48, &at, 8);
++	memcpy(out + 64, &mt, 8);
++	memcpy(out + 80, &ct, 8);
++	return 0;
++}
++
++/* ---- the reverse calls */
++static uint32_t
++fr_word(const struct fr_buf *b, unsigned i)
++{
++	uint32_t v = 0;
++	if (b->p && b->len >= 4 * (i + 1)) {
++		memcpy(&v, b->p + 4 * i, 4);
++	}
++	return v;
++}
++
++static uint64_t
++fr_word64(const struct fr_buf *b, unsigned byte_off)
++{
++	uint64_t v = 0;
++	if (b->p && b->len >= byte_off + 8) {
++		memcpy(&v, b->p + byte_off, 8);
++	}
++	return v;
++}
++
++/* a string argument (NUL included) or "" when it is not one */
++static const char *
++fr_str(const struct fr_buf *b)
++{
++	return b->p && b->len && b->len <= 512 && b->p[b->len - 1] == 0 ? (const char *)b->p : "";
++}
++
++/* one output buffer of the reply; data NULL = zeros */
++static uint8_t *
++fr_put(const void *data, uint32_t len)
++{
++	uint32_t o = fr.reply_len;
++	if (o + 16 + len > FR_REPLY_CAP) {
++		fr.reply_short = true;
++		return NULL;
++	}
++	memcpy(fr.reply + o, &len, 4);
++	o += 4;
++	uint8_t *at = fr.reply + o;
++	if (len) {
++		while (o & 7) {
++			fr.reply[o++] = 0;
++		}
++		at = fr.reply + o;
++		if (data) {
++			memcpy(at, data, len);
++		} else {
++			bzero(at, len);
++		}
++		o += len;
++	}
++	fr.reply_len = o;
++	return at;
++}
++
++static unsigned
++fr_decode(const uint8_t *b, uint32_t n, unsigned want, struct fr_buf *out)
++{
++	uint32_t o = 0;
++	unsigned k;
++	for (k = 0; k < want && k < FR_MAX_ARGS; k++) {
++		uint32_t len;
++		if (o + 4 > n) {
++			break;
++		}
++		memcpy(&len, b + o, 4);
++		o += 4;
++		if (len) {
++			o = (o + 7u) & ~7u;
++			if (o + len > n) {
++				break;
++			}
++		}
++		out[k].p = b + o;
++		out[k].len = len;
++		o += len;
++	}
++	return k;
++}
++
++static const char *const apps_std_names[] = { "fopen", "freopen", "fflush", "fclose", "fread", "fwrite", "fgetpos",
++	"fsetpos", "ftell", "fseek", "flen", "rewind", "feof", "ferror", "clearerr", "print_string", "getenv", "setenv",
++	"unsetenv", "fopen_with_env", "fgets", "get_search_paths_with_env", "fileExists", "fsync", "fremove",
++	"fdopen_decrypt", "opendir", "closedir", "readdir", "mkdir", "rmdir", "stat", "ftrunc", "frename" };
++
++/* fopen / fopen_with_env: read-only opens; relative names in the two search paths hexagonrpcd knows */
++static uint32_t
++fr_fopen(const char *env, const char *name, const char *mode, uint32_t *fd)
++{
++	char full[256];
++	if (mode[0] != 'r' || strchr(mode, '+')) {
++		FR_LOG("apps_std open \"%s\" mode \"%s\": writing is not served -> EUNSUPPORTED\n", name, mode);
++		return AEE_EUNSUPPORTED;
++	}
++	if (name[0] != '/') {
++		const char *dir = strcmp(env, "ADSP_AVS_CFG_PATH") == 0 ? "/vendor/etc/acdbdata/" : "/usr/lib/qcom/adsp/";
++		snprintf(full, sizeof(full), "%s%s", dir, name);
++		name = full;
++	}
++	int r = fs_open(name, false);
++	FR_LOG("apps_std open %s%s%s\"%s\" -> %s%d (%u bytes)\n", *env ? "$" : "", env, *env ? " " : "", name,
++	    r < 0 ? "errno " : "fd ", r < 0 ? -r : r, r < 0 ? 0 : fs[r - 3].size);
++	if (r < 0) {
++		return AEE_EFAILED;
++	}
++	*fd = (uint32_t)r;
++	return 0;
++}
++
++static uint32_t
++fr_apps_std(uint32_t m, const struct fr_buf *in, unsigned nin, const struct fr_buf *prim)
++{
++	struct fs_file *f;
++	uint32_t fd = 0;
++	switch (m) {
++	case 0:                 /* fopen(name, mode) -> fd */
++		if (nin < 3) {
++			return AEE_EBADPARM;
++		}
++		{
++			uint32_t r = fr_fopen("", fr_str(&in[1]), fr_str(&in[2]), &fd);
++			fr_put(&fd, 4);
++			return r;
++		}
++	case 19:                /* fopen_with_env(env, delim, name, mode) -> fd */
++		if (nin < 5) {
++			return AEE_EBADPARM;
++		}
++		{
++			uint32_t r = fr_fopen(fr_str(&in[1]), fr_str(&in[3]), fr_str(&in[4]), &fd);
++			fr_put(&fd, 4);
++			return r;
++		}
++	case 2:                 /* fflush(fd) */
++		return 0;
++	case 3:                 /* fclose(fd) */
++	case 27:                /* closedir(u64 dir) */
++		f = fs_get(m == 3 ? fr_word(prim, 0) : fr_word64(prim, 0));
++		if (!f) {
++			FR_LOG("apps_std %s of an unknown fd %u\n", apps_std_names[m], fr_word(prim, 0));
++			return AEE_EFAILED;
++		}
++		FR_LOG("apps_std %s \"%s\" (%llu bytes read)\n", apps_std_names[m], f->name, f->read);
++		fs_free((unsigned)(f - fs));
++		return 0;
++	case 4: {               /* fread(fd, size) -> written, eof, data */
++		uint32_t want = fr_word(prim, 1), out[2] = { 0, 1 };
++		f = fs_get(fr_word(prim, 0));
++		if (!f || f->dir) {
++			fr_put(out, 8);
++			fr_put(NULL, want);
++			return AEE_EFAILED;
++		}
++		uint32_t n = f->off < f->size ? MIN(want, f->size - f->off) : 0;
++		out[0] = n;
++		out[1] = n < want;
++		fr_put(out, 8);
++		uint8_t *d = fr_put(NULL, want);
++		if (d && n) {
++			memcpy(d, f->data + f->off, n);
++		}
++		f->off += n;
++		f->read += n;
++		fr.bytes += n;
++		return d || !want ? 0 : AEE_EFAILED;
++	}
++	case 8: {               /* ftell(fd) -> pos */
++		f = fs_get(fr_word(prim, 0));
++		uint32_t pos = f ? f->off : 0;
++		fr_put(&pos, 4);
++		return f ? 0 : AEE_EFAILED;
++	}
++	case 9: {               /* fseek(fd, offset, whence 0 set / 1 cur / 2 end) */
++		f = fs_get(fr_word(prim, 0));
++		int32_t off = (int32_t)fr_word(prim, 1);
++		uint32_t wh = fr_word(prim, 2);
++		if (!f || wh > 2) {
++			return AEE_EFAILED;
++		}
++		int64_t base = wh == 0 ? 0 : wh == 1 ? (int64_t)f->off : (int64_t)f->size, pos = base + off;
++		if (pos < 0 || pos > (int64_t)f->size) {
++			return AEE_EFAILED;
++		}
++		f->off = (uint32_t)pos;
++		return 0;
++	}
++	case 10: {              /* flen(fd) -> u64 */
++		f = fs_get(fr_word(prim, 0));
++		uint64_t len = f ? f->size : 0;
++		fr_put(&len, 8);
++		return f ? 0 : AEE_EFAILED;
++	}
++	case 26: {              /* opendir(name) -> u64 dir */
++		const char *name = nin >= 2 ? fr_str(&in[1]) : "";
++		int r = fs_open(name, true);
++		uint64_t dir = r < 0 ? 0 : (uint64_t)r;
++		FR_LOG("apps_std opendir \"%s\" -> %s%d\n", name, r < 0 ? "errno " : "dir ", r < 0 ? -r : r);
++		fr_put(&dir, 8);
++		return r < 0 ? AEE_EFAILED : 0;
++	}
++	case 28: {              /* readdir(u64 dir) -> inode, name[256], eof */
++		uint8_t out[264];
++		bzero(out, sizeof(out));
++		f = fs_get(fr_word64(prim, 0));
++		if (!f || !f->dir) {
++			fr_put(out, sizeof(out));
++			return AEE_EFAILED;
++		}
++		uint32_t eof = f->off >= f->size;
++		if (!eof) {
++			const char *nm = (const char *)f->data + f->off;
++			size_t l = strnlen(nm, f->size - f->off);
++			memcpy(out + 4, nm, MIN(l, 255ul));
++			f->off += (uint32_t)l + 1;
++		}
++		memcpy(out + 260, &eof, 4);
++		fr_put(out, sizeof(out));
++		return 0;
++	}
++	case 31: {              /* stat(name) -> 96 bytes */
++		uint8_t out[96];
++		const char *name = nin >= 2 ? fr_str(&in[1]) : "";
++		int r = fs_stat(name, out);
++		uint64_t sz;
++		memcpy(&sz, out + 40, 8);
++		FR_LOG("apps_std stat \"%s\" -> %s%d, %llu bytes\n", name, r < 0 ? "errno " : "", r < 0 ? -r : 0, r < 0 ? 0 : sz);
++		fr_put(out, sizeof(out));
++		return r < 0 ? AEE_EFAILED : 0;
++	}
++	default:
++		fr.unsupported++;
++		FR_LOG("apps_std method %u (%s) not served -> EUNSUPPORTED\n", m, m < sizeof(apps_std_names) / sizeof(apps_std_names[0]) ?
++		    apps_std_names[m] : "?");
++		return AEE_EUNSUPPORTED;
++	}
++}
++
++/* one reverse call: fr.req holds its nested input buffers; the answer goes to fr.result and fr.reply */
++static void
++fr_serve(uint32_t handle, uint32_t sc, uint32_t inlen)
++{
++	struct fr_buf in[FR_MAX_ARGS];
++	bzero(in, sizeof(in));
++	unsigned want = FR_SC_IN(sc), nin = fr_decode(fr.req, inlen, want, in);
++	uint32_t m = FR_SC_METHOD(sc), nout = FR_SC_OUT(sc);
++	struct fr_buf prim = nin ? in[0] : (struct fr_buf){ NULL, 0 };
++	fr.reply_len = 0;
++	fr.reply_short = false;
++	fr.reverse++;
++	if (nin < want) {
++		FR_LOG("reverse call handle %u sc %#x: %u of %u input buffers decoded from %u bytes\n", handle, sc, nin, want, inlen);
++	}
++	if (m == 31 && prim.len >= 4) {       /* extended method id in the first word */
++		memcpy(&m, prim.p, 4);
++		prim.p += 4;
++		prim.len -= 4;
++	}
++	if ((sc & 0xff) != 0) {
++		FR_LOG("reverse call handle %u sc %#x with handles: not served\n", handle, sc);
++		fr.result = AEE_EBADPARM;
++	} else if (handle == 0 && m == 0) {     /* remotectl open(name) -> handle, dlerr; error text buffer */
++		const char *name = nin >= 2 ? fr_str(&in[1]) : "";
++		uint32_t errlen = fr_word(&prim, 1), out[2] = { 0, 0 };
++		if (strcmp(name, "apps_std") == 0) {
++			out[0] = 1;
++		} else if (strcmp(name, "apps_mem") == 0) {
++			out[0] = 2;
++		} else {
++			out[1] = (uint32_t)-5;
++		}
++		fr.result = out[1];
++		FR_LOG("remotectl open \"%s\" -> %s %u\n", name, out[1] ? "not found, error" : "handle", out[1] ? 5u : out[0]);
++		fr_put(out, 8);
++		fr_put(NULL, MIN(errlen, 4096u));
++	} else if (handle == 0 && m == 1) {     /* remotectl close(handle) -> dlerr length; error text buffer */
++		uint32_t zero = 0;
++		FR_LOG("remotectl close %u\n", fr_word(&prim, 0));
++		fr.result = 0;
++		fr_put(&zero, 4);
++		fr_put(NULL, MIN(fr_word(&prim, 1), 4096u));
++	} else if (handle == 1) {
++		fr.result = fr_apps_std(m, in, nin, &prim);
++	} else {
++		fr.unsupported++;
++		FR_LOG("reverse call handle %u (%s) method %u sc %#x not served -> EUNSUPPORTED\n", handle,
++		    handle == 2 ? "apps_mem" : "?", m, sc);
++		fr.result = AEE_EUNSUPPORTED;
++	}
++	if (fr.reply_short) {
++		FR_LOG("reverse call handle %u method %u: answer over %u bytes, dropped\n", handle, m, FR_REPLY_CAP);
++		fr.reply_len = 0;
++		fr.result = AEE_EFAILED;
++	}
++	/* an error answer carries no buffers; a success the method's own, which should be the count the PD asked for */
++	if (fr.result != 0) {
++		fr.reply_len = 0;
++	} else {
++		unsigned n = 0;
++		for (uint32_t o = 0; o + 4 <= fr.reply_len; n++) {
++			uint32_t l;
++			memcpy(&l, fr.reply + o, 4);
++			o += 4;
++			o = l ? ((o + 7u) & ~7u) + l : o;
++		}
++		if (n != nout) {
++			FR_LOG("reverse call handle %u method %u: %u output buffers for %u asked\n", handle, m, n, nout);
++		}
++	}
++}
++
++/* ---- the calls to the PD */
++static bool
++fr_remote_intent(unsigned c, uint32_t len)
++{
++	for (unsigned j = 0; j < SG_MAX_RI; j++) {
++		if (sg.ch[c].ri[j].valid && !sg.ch[c].ri[j].used && sg.ch[c].ri[j].size >= len) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* lay one invoke out in the window and send it (adsprpc.c get_args + fastrpc_invoke_send); false: try again later */
++static bool
++fr_send(uint32_t pid, uint32_t handle, uint32_t method, const struct fr_arg *in, unsigned nin, const uint32_t *outlen,
++    unsigned nout)
++{
++	unsigned n = nin + nout, c = (unsigned)sg.fastrpc;
++	if (sg.fastrpc < 0 || n > FR_MAX_ARGS) {
++		return false;
++	}
++	if (!fr_remote_intent(c, 40)) {
++		if (sg_ms() - fr.intent_ms > 1000) {
++			fr.intent_ms = sg_ms();
++			(void)sg_tx_cmd(G_RX_INTENT_REQ, sg_lcid(c), 64);
++			FR_LOG("no free intent from the SLPI on %s: asked for one\n", sg.ch[c].name);
++		}
++		return false;
++	}
++	uint32_t meta = FR_META(n), o = meta;
++	for (unsigned i = 0; i < n; i++) {
++		fr.len[i] = i < nin ? in[i].len : outlen[i - nin];
++		fr.off[i] = 0;
++		if (fr.len[i]) {
++			o = (o + FR_ALIGN - 1) & ~(FR_ALIGN - 1);
++			fr.off[i] = o;
++			o += fr.len[i];
++		}
++	}
++	if (o > FR_SIZE) {
++		FR_LOG("a call of %u bytes does not fit the window\n", o);
++		return false;
++	}
++	uint8_t *b = (uint8_t *)fr.va;
++	bzero(b, meta);
++	for (unsigned i = 0; i < n; i++) {
++		uint64_t pv = fr.len[i] ? (uint64_t)(fr.va + fr.off[i]) : 0, len = fr.len[i];
++		uint32_t num = fr.len[i] ? 1 : 0, pgidx = i;
++		memcpy(b + 16 * i, &pv, 8);
++		memcpy(b + 16 * i + 8, &len, 8);
++		memcpy(b + 16 * n + 8 * i, &num, 4);
++		memcpy(b + 16 * n + 8 * i + 4, &pgidx, 4);
++		if (fr.len[i]) {
++			uint64_t pa = FR_PA + fr.off[i], pg = pa & ~0xfffull;
++			uint64_t size = (((pa + fr.len[i] - 1) >> 12) - (pa >> 12) + 1) << 12;
++			memcpy(b + 24 * n + 16 * i, &pg, 8);
++			memcpy(b + 24 * n + 16 * i + 8, &size, 8);
++			if (i < nin) {
++				memcpy(b + fr.off[i], in[i].p, fr.len[i]);
++			}
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fr.seq = fr.seq % 255 + 1;
++	fr.ctx = ((uint64_t)fr.seq << 4) | 2u;          /* context index, pd 2 = the sensors PD */
++	struct {
++		uint32_t pid, tid;
++		uint64_t ctx;
++		uint32_t handle, sc;
++		uint64_t addr, size;
++	} msg = { pid, FR_TGID, fr.ctx, handle, FR_SCALARS(method, nin, nout), FR_PA, ((uint64_t)o + 0xfff) & ~0xfffull };
++	_Static_assert(sizeof(msg) == 40, "smq_msg is 40 bytes");
++	fr.nargs = n;
++	fr.answered = false;
++	if (!sg_send(c, &msg, sizeof(msg))) {
++		return false;
++	}
++	fr.sent = true;
++	fr.sent_ms = sg_ms();
++	fr.calls++;
++	return true;
++}
++
++/* output i of the answered call, with the length the PD wrote back */
++static const uint8_t *
++fr_out(unsigned i, uint32_t *len)
++{
++	uint64_t l = 0;
++	memcpy(&l, (const uint8_t *)fr.va + 16 * i + 8, 8);
++	*len = (uint32_t)MIN(l, (uint64_t)fr.len[i]);
++	return (const uint8_t *)fr.va + fr.off[i];
++}
++
++static void
++fr_rx(const uint8_t *p, uint32_t n)
++{
++	uint64_t ctx;
++	int32_t rv;
++	if (n < 12) {
++		FR_LOG("%u-byte packet ignored\n", n);
++		return;
++	}
++	memcpy(&ctx, p, 8);
++	memcpy(&rv, p + 8, 4);
++	if (!fr.sent || fr.answered || (ctx & ~3ull) != (fr.ctx & ~3ull)) {
++		FR_LOG("answer for context %#llx (ours %#llx) retval %d ignored\n", ctx, fr.ctx, rv);
++		return;
++	}
++	fr.retval = rv;
++	fr.answered = true;
++}
++
++static void
++fr_fail(const char *why)
++{
++	SG_LOG("fastrpc: %s (step %s, retval %d): stopped\n", why, fr_state_name[fr.state], fr.retval);
++	fr.state = FR_FAILED;
++}
++
++/* the window mapped and shared with the SLPI, before the thread starts */
++static bool
++fr_setup(void)
++{
++	if (fr.va) {
++		return true;
++	}
++	vm_offset_t va = ml_io_map_unmappable((vm_offset_t)FR_PA, FR_SIZE, VM_WIMG_WCOMB);
++	fr.req = kalloc_data(FR_REQ_CAP, Z_WAITOK | Z_ZERO);
++	fr.reply = kalloc_data(FR_REPLY_CAP, Z_WAITOK | Z_ZERO);
++	if (!va || !fr.req || !fr.reply) {
++		SS_LOG("fastrpc window %#llx+%#x not mapped\n", FR_PA, FR_SIZE);
++		return false;
++	}
++	bzero((void *)va, FR_SIZE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	const uint32_t src = SCM_VMID_HLOS;
++	const uint32_t dst[4] = { SCM_VMID_HLOS, SCM_VMID_MSS_MSA, SCM_VMID_SSC_Q6, SCM_VMID_ADSP_Q6 };
++	const uint32_t perm[4] = { SCM_PERM_RWX, SCM_PERM_RWX, SCM_PERM_RWX, SCM_PERM_RWX };
++	bool ok = sweet_scm_assign("slpi fastrpc", FR_PA, FR_SIZE, &src, 1, dst, perm, 4);
++	SS_LOG("fastrpc window %#llx+%#x: hyp-assign HLOS -> HLOS + MSS_MSA + SSC_Q6 + ADSP_Q6 %s\n", FR_PA, FR_SIZE,
++	    ok ? "done" : "REFUSED");
++	if (ok) {
++		fr.va = va;
++	}
++	return ok;
++}
++
++/* one step of the client, from the thread's loop */
++static void
++fr_step(void)
++{
++	if (!fr.va || fr.state == FR_FAILED) {
++		return;
++	}
++	if (fr.sent && !fr.answered) {
++		if (fr.state != FR_NEXT2 && sg_ms() - fr.sent_ms > 5000) {
++			fr_fail("no answer in 5 s");
++		}
++		return;
++	}
++	if (fr.sent) {                  /* the answer to the current step */
++		fr.sent = false;
++		uint32_t l0 = 0, l1 = 0;
++		const uint8_t *o0, *o1;
++		switch (fr.state) {
++		case FR_ATTACH:
++			SG_LOG("fastrpc: INIT_ATTACH to the sensors PD -> %d\n", fr.retval);
++			if (fr.retval) {
++				fr_fail("attach refused");
++				return;
++			}
++			fr.state = FR_OPEN;
++			break;
++		case FR_OPEN: {
++			uint32_t w[2] = { 0, 0 };
++			o0 = fr_out(2, &l0);
++			o1 = fr_out(3, &l1);
++			memcpy(w, o0, MIN(l0, 8u));
++			char err[64];
++			memset(err, 0, sizeof(err));
++			memcpy(err, o1, MIN(l1, 63u));
++			SG_LOG("fastrpc: remotectl open adsp_default_listener -> %d, handle %u, dlerr %d \"%s\"\n", fr.retval, w[0],
++			    (int32_t)w[1], err);
++			if (fr.retval || w[1]) {
++				fr_fail("adsp_default_listener not opened");
++				return;
++			}
++			fr.lhandle = w[0];
++			fr.state = FR_REGISTER;
++			break;
++		}
++		case FR_REGISTER:
++			SG_LOG("fastrpc: adsp_default_listener register -> %d\n", fr.retval);
++			if (fr.retval) {
++				fr_fail("listener not registered");
++				return;
++			}
++			fr.state = FR_CLOSE;
++			break;
++		case FR_CLOSE:
++			SG_LOG("fastrpc: remotectl close %u -> %d\n", fr.lhandle, fr.retval);
++			fr.state = FR_INIT2;
++			break;
++		case FR_INIT2:
++			SG_LOG("fastrpc: adsp_listener init2 -> %d; serving the PD's file calls from " SS_FILES "\n", fr.retval);
++			if (fr.retval) {
++				fr_fail("listener init refused");
++				return;
++			}
++			fr.state = FR_NEXT2;
++			fr.rctx = 0;
++			fr.result = 0xffffffffu;
++			fr.reply_len = 0;
++			break;
++		case FR_NEXT2: {
++			uint32_t w[4] = { 0, 0, 0, 0 };
++			if (fr.retval) {
++				fr_fail("adsp_listener next2 failed");
++				return;
++			}
++			o0 = fr_out(2, &l0);
++			memcpy(w, o0, MIN(l0, 16u));
++			uint32_t inlen = MIN(w[3], FR_REQ_CAP);
++			o1 = fr_out(3, &l1);
++			memcpy(fr.req, o1, MIN(inlen, l1));
++			fr.rctx = w[0];
++			if (w[3] > FR_REQ_CAP) {
++				FR_LOG("reverse call of %u input bytes, over %u: cut\n", w[3], FR_REQ_CAP);
++			}
++			fr_serve(w[1], w[2], MIN(inlen, l1));
++			break;
++		}
++		default:
++			break;
++		}
++	}
++	/* send the current step's call */
++	bool ok = false;
++	switch (fr.state) {
++	case FR_WAIT_CH:
++		if (sg.fastrpc < 0 || !sg.ch[sg.fastrpc].open_acked) {
++			return;
++		}
++		fr.state = FR_ATTACH;
++		OS_FALLTHROUGH;
++	case FR_ATTACH: {
++		int32_t tgid = FR_TGID;
++		struct fr_arg a = { &tgid, 4 };
++		ok = fr_send(0, 1, 0, &a, 1, NULL, 0);          /* kernel call: pid 0; handle 1 = process group, method 0 */
++		break;
++	}
++	case FR_OPEN: {
++		static const char nm[] = "adsp_default_listener";
++		uint32_t prim[2] = { sizeof(nm), 256 }, outl[2] = { 8, 256 };
++		struct fr_arg a[2] = { { prim, 8 }, { nm, sizeof(nm) } };
++		ok = fr_send(FR_TGID, 0, 0, a, 2, outl, 2);
++		break;
++	}
++	case FR_REGISTER:
++		ok = fr_send(FR_TGID, fr.lhandle, 0, NULL, 0, NULL, 0);
++		break;
++	case FR_CLOSE: {
++		uint32_t prim[2] = { fr.lhandle, 0 }, outl[2] = { 4, 0 };
++		struct fr_arg a = { prim, 8 };
++		ok = fr_send(FR_TGID, 0, 1, &a, 1, outl, 2);
++		break;
++	}
++	case FR_INIT2:
++		ok = fr_send(FR_TGID, 3, 3, NULL, 0, NULL, 0);
++		break;
++	case FR_NEXT2: {
++		uint32_t prim[4] = { fr.rctx, fr.result, fr.reply_len, FR_REQ_CAP }, outl[2] = { 16, FR_REQ_CAP };
++		struct fr_arg a[2] = { { prim, 16 }, { fr.reply, fr.reply_len } };
++		ok = fr_send(FR_TGID, 3, 4, a, 2, outl, 2);
++		break;
++	}
++	default:
++		return;
++	}
++	if (ok && fr.state != FR_NEXT2) {
++		SG_LOG("fastrpc: %s sent\n", fr_state_name[fr.state]);
++	}
++}
++
+ /* the SLPI from ready on: GLINK polled every 5 ms (20 ms after 2 min), its bits watched; ends on fatal */
+ static void
+ ss_thread(void *arg, wait_result_t w)
+@@ -1068,6 +2071,7 @@ ss_thread(void *arg, wait_result_t w)
+ 	unsigned next_note = 5000;
+ 	for (;;) {
+ 		sg_poll();
++		fr_step();
+ 		uint32_t bits = 0;
+ 		if (ss_smp2p_in(&bits) && bits != last) {
+ 			SG_LOG("slave-kernel %#x (fatal %u ready %u handover %u stop-ack %u)\n", bits, bits & 1, (bits >> 1) & 1,
+@@ -1086,6 +2090,8 @@ ss_thread(void *arg, wait_result_t w)
+ 			SG_LOG("status: %u channels opened by the SLPI, qrtr node %u, %u hellos, %u servers, %u lookups, %u locator "
+ 			    "requests, %u other data, %s %s\n", sg.nch, sg.qnode, sg.hellos, sg.servers, sg.lookups, sg.pdm_reqs,
+ 			    sg.data_other, sg_pd_path, sg.nf.answered || sg.nf.state ? nf_state_name(sg.nf.state) : "state unknown");
++			SG_LOG("status: fastrpc %s, %u calls, %u reverse calls (%u not served), %llu file bytes served\n",
++			    fr.va ? fr_state_name[fr.state] : "off", fr.calls, fr.reverse, fr.unsupported, fr.bytes);
+ 			sweet_log_sync();
+ 			next_note = t < 60000 ? t + 5000 : t + 60000;
+ 		}
+@@ -1108,6 +2114,7 @@ ss_live(uint32_t bits)
+ 	if (!sg_up()) {
+ 		return false;
+ 	}
++	(void)fr_setup();               /* 3070: FastRPC from the thread once the SLPI opens its channel */
+ 	thread_t th;
+ 	if (kernel_thread_start(ss_thread, NULL, &th) != KERN_SUCCESS) {
+ 		SS_LOG("kernel_thread_start failed\n");
+@@ -1129,6 +2136,8 @@ ss_live(uint32_t bits)
+ 	SS_LOG("qrtr node %u: %u hellos, %u servers, %u lookups, %u locator requests, %u other data; SNS 400 %s; %s %s\n",
+ 	    sg.qnode, sg.hellos, sg.servers, sg.lookups, sg.pdm_reqs, sg.data_other, sg.sns_port ? "offered" : "not offered",
+ 	    sg_pd_path, sg.nf.answered || sg.nf.state ? nf_state_name(sg.nf.state) : "state unknown");
++	SS_LOG("fastrpc %s: %u calls, %u reverse calls (%u not served), %llu file bytes served\n",
++	    fr.va ? fr_state_name[fr.state] : "off", fr.calls, fr.reverse, fr.unsupported, fr.bytes);
+ 	return !sg.fatal;
+ }
+ 
+@@ -1268,5 +2277,5 @@ ss_sysctl SYSCTL_HANDLER_ARGS
+ 	return SYSCTL_OUT(req, ss.log, strnlen(ss.log, sizeof(ss.log)) + 1);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ssc, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, ss_sysctl, "A",
+-    "Mi 8 sensor DSP (SLPI) bring-up: 1 read-only probe, 2 probe + boot + GLINK/QRTR on dsps (3069)");
++    "Mi 8 sensor DSP (SLPI) bring-up: 1 read-only probe, 2 probe + boot + GLINK/QRTR + FastRPC file server (3070)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.54.0 (Apple Git-157)
+
