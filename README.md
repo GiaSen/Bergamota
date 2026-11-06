@@ -70,9 +70,9 @@ Qualcomm ABL (stock, unlocked)
 | Flashlight | Both rear LEDs from Control Center's button, through `sweettorch.dylib` in cameracaptured and the PMI8998 flash LED driver |
 | USB | CDC-ECM Ethernet: SSH at `root@192.168.7.2`, live kernel log on UDP 5140, internet shared from the Mac; iOS sees a cable at once |
 | Battery | Real fuel gauge and charger state, charging capped at 1.7 A (0.5 C); Bergamota fastboot charges too. The storage link sleeps when idle (UFS auto-hibernate, xnu 3054): ~110 mA less with the screen off, measured at ~235 mA screen off under iOS background load. With the screen off, cores 1–7 power down when idle (xnu 3055/3056): ~20 mA less, about 140 → 120 mA on a quiet disk. Music keeps playing with the screen locked |
-| Sensors | Not working yet; work started. All of them (TDK ICM-206xx accelerometer and gyro, AKM compass, an AMS TMD2725 light and proximity sensor or an ADI ADUX1050 in its place (not known which), Bosch BMP285 barometer) sit behind the Snapdragon's sensor DSP (SLPI), which the kernel can now start from SSH on a test kernel (xnu 3070, image 113): the SLPI boots, talks to the kernel (GLINK/QRTR) and reads its sensor settings files from the iOS disk over FastRPC; with those it stays up (before, its watchdog stopped it after about 40 seconds). Whether the sensors themselves work is not checked yet, and iOS does not see them yet |
-| Kernel | Heartwood on **xnu-12377.121.6**, Mi 8 patches 3001–3067j, all in the default boot (image 109). 3057 and later: modem QMI, codec, microphone, earpiece. 3068–3070 (sensor DSP) only on test images 110–113 |
-| Next candidates | Deeper sleep (the whole CPU cluster and its cache off); calls (needs a SIM; the modem answers on a test kernel); sensors (rotation, auto-brightness, proximity at the ear): next, ask the sensor DSP for its sensors and their readings |
+| Sensors | Not working yet; work started. All of them (TDK ICM-206xx accelerometer and gyro, AKM compass, an AMS TMD2725 light and proximity sensor or an ADI ADUX1050 in its place (not known which), Bosch BMP285 barometer) sit behind the Snapdragon's sensor DSP (SLPI), which the kernel can now start from SSH on a test kernel (xnu 3071, image 114): it reads its settings files from the iOS disk over FastRPC and stays up, and every sensor answers a command-line probe (`sweetssc`) with live readings: gravity on the accelerometer, a still gyro, air pressure, light and proximity events. The light/proximity chip is the TMD2725. iOS does not see the sensors yet (no rotation, auto-brightness or proximity) |
+| Kernel | Heartwood on **xnu-12377.121.6**, Mi 8 patches 3001–3067j, all in the default boot (image 109). 3057 and later: modem QMI, codec, microphone, earpiece. 3068–3071 (sensor DSP) only on test images 110–114 |
+| Next candidates | Deeper sleep (the whole CPU cluster and its cache off); calls (needs a SIM; the modem answers on a test kernel); sensors (rotation, auto-brightness, proximity at the ear): next, hand the sensor readings to iOS (rotation first) |
 | Not working | Cellular (the modem runs and answers QMI queries on a test kernel, xnu 3057; no SIM seen, radio off), camera, sensors (rotation, auto-brightness, proximity), fingerprint, SEP / Face ID. App Store and Weather stop at FairPlay. The Files app shows no locations: iOS 26's file provider only runs on APFS and our root is HFS+ |
 
 Every boot, crash and decision is in [`NOTES.md`](NOTES.md); the newest Mi 8 results are at the top of its Mi 8 section.
@@ -105,6 +105,7 @@ fastboot -s bergamota0001 boot research/ios26/enxerto-boot-dipper-ios26-NN.img
 # sensors (test kernels 3070+): the sensor DSP's settings files from the backups to the phone, then start it over SSH
 tools/dipper-sensor-files.sh
 ssh root@192.168.7.2 '/var/root/sweetsys kern.sweet_ssc=2'
+ssh root@192.168.7.2 '/var/root/sweetssc lookup; /var/root/sweetssc stream accel 50 3'   # tools/sweetnet/sweetssc.c
 ```
 
 ## Getting started (Poco F1, upstream)
