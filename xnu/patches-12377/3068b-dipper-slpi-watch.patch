@@ -1,0 +1,104 @@
+From 47cd8bb4db81b9749ff22ddf8f6fd9e9eadde998 Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@wlan-114021.nbw.tue.nl>
+Date: Fri, 6 Nov 2026 13:35:33 +0100
+Subject: [PATCH] 3068b: kern.sweet_ssc prints the SLPI's crash reason (SMEM
+ 424) in the probe, and stage 2 watches its bits 60 s after ready
+
+---
+ bsd/dev/dipper_sensors.c | 48 +++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 42 insertions(+), 6 deletions(-)
+
+diff --git a/bsd/dev/dipper_sensors.c b/bsd/dev/dipper_sensors.c
+index 3ea1a1a..92b9d73 100644
+--- a/bsd/dev/dipper_sensors.c
++++ b/bsd/dev/dipper_sensors.c
+@@ -19,7 +19,8 @@
+  *   2  boot: AOSS QMP load_state slpi on, RPMh lcx + lmx votes (the SLPI's vdd_cx / vdd_mx proxies), our SMP2P item
+  *      (430, "master-kernel", doorbell bit 26), PAS id 12 INIT_IMAGE (the .mdt) + MEM_SETUP (the carve-out) +
+  *      segments + AUTH_AND_RESET, then the SLPI's SMP2P item (481, "slave-kernel": bit 0 fatal, 1 ready, 2 handover,
+- *      3 stop ack) until ready. The SLPI keeps running; there is no stop path yet.
++ *      3 stop ack) until ready, then (3068b) the same bits for 60 s more, with the crash reason (item 424) on fatal.
++ *      The SLPI keeps running; there is no stop path yet. Stage 1 prints the crash reason too when item 424 exists.
+  *
+  * Facts from the live DT (dtb/dipper/live.dtb): qcom,ssc@5c00000 pil-tz-generic, qcom,pas-id 12, qcom,smem-id 424,
+  * qcom,signal-aop, vdd_cx = lcx.lvl and vdd_mx = lmx.lvl (rpmh-arc-regulator, level 0x181, keep-proxy-regs-on),
+@@ -290,13 +291,19 @@ ss_crash_reason(void)
+ 		SS_LOG("no crash reason in SMEM (item %u)\n", SS_CRASH_ITEM);
+ 		return;
+ 	}
+-	char msg[129];
+-	uint32_t n = MIN(sz, 128u);
++	/* 3068b: the whole item (256 bytes on the phone), up to its NUL, anything unprintable as '.' */
++	char msg[257];
++	uint32_t n = MIN(sz, 256u);
+ 	for (uint32_t k = 0; k < n; k += 4) {
+ 		uint32_t w = sweet_smem_rd(it + k);
+ 		memcpy(msg + k, &w, MIN(4u, n - k));
+ 	}
+ 	msg[n] = 0;
++	for (uint32_t k = 0; k < n && msg[k]; k++) {
++		if (msg[k] < 0x20 || msg[k] > 0x7e) {
++			msg[k] = '.';
++		}
++	}
+ 	SS_LOG("SLPI crash reason (item %u, %u bytes): \"%s\"\n", SS_CRASH_ITEM, sz, msg);
+ }
+ 
+@@ -315,14 +322,43 @@ ss_probe(void)
+ 	    "at +%#x (%u bytes); crash item %u at +%#x (%u bytes)\n", SS_HOST, SS_SMP2P_IN, in, in_sz,
+ 	    have ? "" : " (no slave-kernel)", SS_SMP2P_OUT, out, out_sz, SS_GLINK_DESC, gl, gl_sz, SS_CRASH_ITEM, cr, cr_sz);
+ 	if (have) {
+-		SS_LOG("slave-kernel %#x already there: the SLPI ran before (bits fatal %u ready %u)\n", bits, bits & 1,
+-		    (bits >> 1) & 1);
++		SS_LOG("slave-kernel %#x already there: the SLPI ran before (bits fatal %u ready %u handover %u)\n", bits,
++		    bits & 1, (bits >> 1) & 1, (bits >> 2) & 1);
++	}
++	if (cr && cr_sz) {
++		ss_crash_reason();      /* 3068b */
+ 	}
+ 	SS_LOG("probe %s\n", ok ? "OK: firmware complete and fits" : "FAILED");
+ 	sweet_log_sync();
+ 	return ok;
+ }
+ 
++/*
++ * 3068b: after ready, keep watching the SLPI's bits for SS_WATCH_MS (boot 110: ready at +30 ms, then fatal + handover
++ * by +30 s with nothing on our side of GLINK). Logs each change with its time and the crash reason on fatal.
++ */
++#define SS_WATCH_MS             60000u
++static bool
++ss_watch(unsigned t0, uint32_t last)
++{
++	uint32_t bits = 0;
++	for (unsigned t = t0; t < t0 + SS_WATCH_MS; t += 10) {
++		if (ss_smp2p_in(&bits) && bits != last) {
++			SS_LOG("+%u ms: slave-kernel %#x (fatal %u ready %u handover %u stop-ack %u)\n", t, bits, bits & 1,
++			    (bits >> 1) & 1, (bits >> 2) & 1, (bits >> 3) & 1);
++			last = bits;
++			sweet_log_sync();
++			if (bits & 1) {
++				ss_crash_reason();
++				return false;
++			}
++		}
++		delay(10 * 1000);
++	}
++	SS_LOG("still up %u s after ready (slave-kernel %#x)\n", SS_WATCH_MS / 1000, last);
++	return true;
++}
++
+ /* ---- stage 2 */
+ static bool
+ ss_boot(void)
+@@ -406,7 +442,7 @@ ss_boot(void)
+ 			uint32_t gl = sweet_smem_item(SS_HOST, SS_GLINK_DESC, NULL);
+ 			SS_LOG("SLPI READY after %u ms; glink descriptor %u %s\n", t, SS_GLINK_DESC, gl ? "present" : "not there yet");
+ 			sweet_log_sync();
+-			return true;
++			return ss_watch(t, last);
+ 		}
+ 		delay(10 * 1000);
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+
