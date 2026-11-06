@@ -136,6 +136,11 @@ if [ "${IOS18:-1}" = 1 ]; then
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetax.c" -lAccessibility -o "$out18/sweetax"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetax"
 	python3 -I "$pacstrip" --sign "$out18/sweetax"
+	# sweetaqin: record through AVAudioSession + an AudioQueue input (SweetSpeaker.driver's "Mic" device)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -fobjc-arc -framework Foundation \
+		-framework AVFAudio -framework AudioToolbox "$here/sweetaqin.m" -o "$out18/sweetaqin"
+	codesign -s - -f --entitlements "$here/mic.entitlements" "$out18/sweetaqin"
+	python3 -I "$pacstrip" --sign "$out18/sweetaqin"
 	# sweetrec: the handset mic through kern.sweet_audio_rec (xnu 3065)
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetrec.c" -o "$out18/sweetrec"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetrec"
