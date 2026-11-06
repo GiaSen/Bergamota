@@ -65,13 +65,13 @@ Qualcomm ABL (stock, unlocked)
 | Bluetooth | The controller runs next to Wi-Fi and bluetoothd stays up; nearby devices show in Settings. Pairing and Bluetooth audio not tried yet |
 | Speaker | TAS2557 amp through the audio DSP. iOS plays through `SweetSpeaker.driver` with a speaker guard (high-pass, power and peak limits); the amp sleeps during silence |
 | Microphone | The handset's analog mic through the WCD9340 codec and the audio DSP. iOS sees it as its built-in microphone through `SweetSpeaker.driver`; a command-line recorder using iOS's audio session records it (10 minutes without a gap), and Voice Memos records fine |
-| Earpiece | On a test kernel (xnu 3067i, image 108): the WCD9340 codec's earpiece output plays from iOS when selected by hand (`kern.sweet_audio_out=1`); a quiet test tone was heard. iOS does not offer it as a route yet (receiver, calls) |
+| Earpiece | On a test kernel (xnu 3067j, image 109): iOS sees the WCD9340 codec's earpiece as its receiver ("Built-In Receiver") and plays there by itself for call-style audio; the kernel switches the earpiece on and off. A test tone was heard. Real calls not tried (no SIM); the proximity sensor is not supported |
 | Vibration | The PMI8998 haptics motor: CoreHaptics patterns, the keyboard and the system vibrations |
 | Flashlight | Both rear LEDs from Control Center's button, through `sweettorch.dylib` in cameracaptured and the PMI8998 flash LED driver |
 | USB | CDC-ECM Ethernet: SSH at `root@192.168.7.2`, live kernel log on UDP 5140, internet shared from the Mac; iOS sees a cable at once |
 | Battery | Real fuel gauge and charger state, charging capped at 1.7 A (0.5 C); Bergamota fastboot charges too. The storage link sleeps when idle (UFS auto-hibernate, xnu 3054): ~110 mA less with the screen off, measured at ~235 mA screen off under iOS background load. With the screen off, cores 1–7 power down when idle (xnu 3055/3056): ~20 mA less, about 140 → 120 mA on a quiet disk. Music keeps playing with the screen locked |
-| Kernel | Heartwood on **xnu-12377.121.6**, Mi 8 patches 3001–3067i; the default boot (image 106) has them up to 3067g. 3057 and later: modem QMI, codec, microphone, earpiece |
-| Next candidates | Deeper sleep (the whole CPU cluster and its cache off); the earpiece as an iOS route (receiver, calls); sensors (rotation, auto-brightness) |
+| Kernel | Heartwood on **xnu-12377.121.6**, Mi 8 patches 3001–3067j; the default boot (image 106) has them up to 3067g. 3057 and later: modem QMI, codec, microphone, earpiece |
+| Next candidates | Deeper sleep (the whole CPU cluster and its cache off); calls (needs a SIM; the modem answers on a test kernel); the proximity sensor; sensors (rotation, auto-brightness) |
 | Not working | Cellular (the modem runs and answers QMI queries on a test kernel, xnu 3057; no SIM seen, radio off), camera, sensors (rotation, auto-brightness), fingerprint, SEP / Face ID. App Store and Weather stop at FairPlay. The Files app shows no locations: iOS 26's file provider only runs on APFS and our root is HFS+ |
 
 Every boot, crash and decision is in [`NOTES.md`](NOTES.md); the newest Mi 8 results are at the top of its Mi 8 section.
