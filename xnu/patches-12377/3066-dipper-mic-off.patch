@@ -1,0 +1,105 @@
+From e8374150e5d52ca5b32eb83237fbfa83f3b8f8c7 Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@Giammarcos-Air.home>
+Date: Fri, 6 Nov 2026 03:00:24 +0100
+Subject: [PATCH] 3066: the analog mic (MIC BIAS1, ADC3) off between captures;
+ switched on again at the next start
+
+---
+ bsd/dev/dipper_audio.c | 39 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index 52f2599..5956960 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -3648,6 +3648,23 @@ cx_stage_amic(void)
+ 	return cx_amic_switch() && cx_stage_capture(2);
+ }
+ 
++/*
++ * 3066: the analog mic off between captures (cx.busy held by the caller): TX7 muted, ADC3 off (its gain kept), MIC BIAS1
++ * disabled (ANA_MICB1 bits 7:6 = 0). cx.amic false, so the next capture start runs cx_amic_switch again (~350 ms). The
++ * rest of the codec, its MCLK vote and the SLIMbus channel stay up.
++ */
++static bool
++cx_amic_off(void)
++{
++	cx.amic = false;                        /* first: even a partial switch-off gets the full switch-on next time */
++	CX_U(0x0aa1, 0x10, 0x10);               /* TX7 muted */
++	CX_U(0x0610, 0x80, 0x00);               /* ANA_AMIC3: ADC3 off */
++	CX_U(0x0622, 0xc0, 0x00);               /* ANA_MICB1: MIC BIAS1 off */
++	static const uint16_t am[] = { 0x0622, 0x0610, 0x0aa1 };
++	cx_dump("analog mic off", am, sizeof(am) / sizeof(am[0]));
++	return true;
++}
++
+ /*
+  * ---- 3065: continuous capture for user space (kern.sweet_audio_rec): the handset mic as 16-bit mono at 48 kHz.
+  * Start brings the codec chain up if needed (stages 1-6 + the analog mic of stage 8), opens the record stream
+@@ -3667,6 +3684,7 @@ static struct {
+ 	int16_t *ring;
+ 	uint64_t wpos, reads, done, errors, last_read;
+ 	uint32_t busy_mask, seq;
++	bool mic_off_pending;                   /* 3066: stopped on the audio thread; the mic goes off outside au_mtx */
+ } rec;
+ 
+ /* audio thread or a GLINK poller, au_mtx held: one READ_DONE of the continuous capture */
+@@ -3721,6 +3739,7 @@ rec_step(void)
+ 	if (now - rec.last_read > idle) {
+ 		rec.state = REC_OFF;
+ 		cx_cap_close();
++		rec.mic_off_pending = true;
+ 		printf("SWEET AUDIO: capture stopped: nobody read for %u s (%llu samples, %llu reads, %llu errors)\n", REC_IDLE_S,
+ 		    rec.wpos, rec.reads, rec.errors);
+ 		return;
+@@ -3746,6 +3765,20 @@ rec_step(void)
+ 	}
+ }
+ 
++/* thread context, au_mtx not held: the analog mic off once no capture runs (skipped while a codec stage runs) */
++static void
++rec_mic_off(void)
++{
++	rec.mic_off_pending = false;
++	if (rec.state == REC_RUNNING || !cx.amic || __atomic_exchange_n(&cx.busy, true, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	if (rec.state != REC_RUNNING) {
++		(void)cx_amic_off();
++	}
++	__atomic_store_n(&cx.busy, false, __ATOMIC_RELEASE);
++}
++
+ /* thread context, no locks held: the codec chain up (if needed) and the stream running */
+ static int
+ rec_start(void)
+@@ -3822,6 +3855,7 @@ rec_sysctl SYSCTL_HANDLER_ARGS
+ 			cx_cap_close();
+ 		}
+ 		lck_mtx_unlock(&au_mtx);
++		rec_mic_off();
+ 	}
+ 	uint32_t max = MIN(in.max, 9600u);              /* 200 ms per call */
+ 	int16_t *out = max ? kalloc_data(max * sizeof(int16_t), Z_WAITOK) : NULL;
+@@ -3857,7 +3891,7 @@ rec_sysctl SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_audio_rec, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
+     rec_sysctl, "S", "Mi 8 handset mic: in {u32 op 1 start/2 stop/3 read, u32 max, u64 pos}, out {u64 wpos, u64 from, "
+-    "u32 n, u32 state} + 16-bit mono 48 kHz samples (3065)");
++    "u32 n, u32 state} + 16-bit mono 48 kHz samples (3065; 3066: the mic bias and ADC off between captures)");
+ 
+ /*
+  * kern.sweet_codec: 1 = stage 1 (QMI), 2 = stage 2 (register reads), 3 = stage 3 (NGD), 4 = stage 4 (codec id),
+@@ -3943,6 +3977,9 @@ au_thread(void *arg, wait_result_t w)
+ 			rec_step();
+ 			bool playing = pl.state != PL_OFF || pl.req || rec.state == REC_RUNNING;
+ 			lck_mtx_unlock(&au_mtx);
++			if (rec.mic_off_pending) {
++				rec_mic_off();
++			}
+ 			au_sleep(playing ? 2 : 20);
+ 		}
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+
