@@ -1,0 +1,31 @@
+From 7c0ce9c9d25ba2b3357afa2b44a8741e06d3e91d Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@wlan-114021.nbw.tue.nl>
+Date: Fri, 6 Nov 2026 16:58:02 +0100
+Subject: [PATCH] 3072d: SweetHIDSensor gyro (0xff00/9): locationd's
+ orientation detection needs a gyro (CLOrientationNotifier::startDetection:
+ "No gyro; not detecting orientation!")
+
+---
+ iokit/KernelConfigTables.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 69dd625..a56fcb6 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -86,6 +86,12 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetHIDSensor;"
+     "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDSensorGyro;"
++    "     'SweetSensorKind' = 1:32;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDSensor;"
++    "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDSensorALS;"
+     "     'SweetSensorKind' = 3:32;"
+     "   },"
+-- 
+2.54.0 (Apple Git-157)
+
