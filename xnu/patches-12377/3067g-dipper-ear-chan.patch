@@ -1,0 +1,65 @@
+From 46128cd9ddc6825e74f5ba8b631fa76d6cdd5f4c Mon Sep 17 00:00:00 2001
+From: Giammarco Senatore <giamma@Giammarcos-Air.home>
+Date: Fri, 6 Nov 2026 04:06:04 +0100
+Subject: [PATCH] 3067g: kern.sweet_ear_chan (the earpiece channel's protocol
+ and presence byte, for the RX overflow)
+
+---
+ bsd/dev/dipper_audio.c | 26 ++++++++++++++++++++++++--
+ 1 file changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/dev/dipper_audio.c b/bsd/dev/dipper_audio.c
+index fc3cbe1..f335372 100644
+--- a/bsd/dev/dipper_audio.c
++++ b/bsd/dev/dipper_audio.c
+@@ -3716,6 +3716,8 @@ cx_amic_off(void)
+  * RX0 volume signed dB (-84..+40). Default 0 dB / 0 dB.
+  */
+ static unsigned cx_rx_n;                        /* 3067f: the earpiece's codec RX index n: port 16 + n, channel 144 + n */
++static uint8_t cx_rx_prate = 0x83;              /* 3067g: DEF_ACT_CHAN presence-rate byte (bit 7 = frequency locked) */
++static uint8_t cx_rx_prot;                      /* 3067g: DEF_ACT_CHAN protocol (0 hard isochronous, 2 push, 3 pull) */
+ #define CX_RX_PORT              (16u + cx_rx_n)
+ #define CX_RX_CHAN              (144u + cx_rx_n)
+ #define AFE_MODULE_CDC_DEV_CFG  0x00010234u
+@@ -3808,9 +3810,10 @@ cx_stage_ear(void)
+ 		if (r) {
+ 			return false;
+ 		}
+-		uint8_t def[6] = { (uint8_t)(cx.la & 0x1f), (16 >> 2) | (1 << 5), (2 << 4) | 0, 0x83, 0, CX_RX_CHAN };
++		uint8_t def[6] = { (uint8_t)(cx.la & 0x1f), (16 >> 2) | (1 << 5), (uint8_t)((2 << 4) | cx_rx_prot), cx_rx_prate, 0,
++			           (uint8_t)CX_RX_CHAN };
+ 		r = cx_mgr_acked(0x21, def, sizeof(def), 4);   /* SLIM_USR_MC_DEF_ACT_CHAN */
+-		CX_LOG("DEF_ACT_CHAN -> %d\n", r);
++		CX_LOG("DEF_ACT_CHAN (prot %u, presence %#x) -> %d\n", cx_rx_prot, cx_rx_prate, r);
+ 		if (r) {
+ 			return false;
+ 		}
+@@ -3979,6 +3982,25 @@ ear_rx_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ear_rx, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, ear_rx_sysctl, "I",
+     "Mi 8 earpiece: codec RX index n (port 16 + n, channel 144 + n), set before the path comes up (3067f)");
+ 
++/* kern.sweet_ear_chan: (protocol << 8) | presence-rate byte of the earpiece channel, before the path comes up (3067g) */
++static int
++ear_chan_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = (cx_rx_prot << 8) | cx_rx_prate, err = sysctl_handle_int(oidp, &v, 0, req);
++	if (err || !req->newptr) {
++		return err;
++	}
++	if (v < 0 || v > 0x3ff || cx.ear_up) {
++		return EINVAL;
++	}
++	cx_rx_prate = (uint8_t)(v & 0xff);
++	cx_rx_prot = (uint8_t)(v >> 8);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ear_chan, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, ear_chan_sysctl, "I",
++    "Mi 8 earpiece channel: (protocol << 8) | presence byte (0x83 = 48 kHz frequency locked), before the path is up (3067g)");
++
+ /* kern.sweet_audio_out: 0 the speaker, 1 the earpiece (brings its path up); the player's next start uses it */
+ static int
+ au_out_sysctl SYSCTL_HANDLER_ARGS
+-- 
+2.54.0 (Apple Git-157)
+
