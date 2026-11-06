@@ -136,6 +136,10 @@ if [ "${IOS18:-1}" = 1 ]; then
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetax.c" -lAccessibility -o "$out18/sweetax"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetax"
 	python3 -I "$pacstrip" --sign "$out18/sweetax"
+	# sweetrec: the handset mic through kern.sweet_audio_rec (xnu 3065)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetrec.c" -o "$out18/sweetrec"
+	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetrec"
+	python3 -I "$pacstrip" --sign "$out18/sweetrec"
 	# sweetdump: a sysctl's raw value to stdout (kern.sweet_log_prev, 3058d)
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetdump.c" -o "$out18/sweetdump"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetdump"
