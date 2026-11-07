@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Put sweetcelld in CommCenter's place in the phone's launchd.plist.
+
+  launchd-sweetcelld.py IN.plist OUT.plist
+
+IN is /System/Library/xpc/launchd.plist (read by launchd as booted with launchd_unsecure_cache=1). The job labelled
+com.apple.CommCenter (on the Mi 8 the Wi-Fi-only com.apple.CommCenter-noncellular.plist, which launchd picked without a
+baseband) is taken out; a job for /usr/local/bin/sweetcelld is put in with the two Mach services CoreTelephony's clients
+use (com.apple.commcenter.coretelephony.xpc, com.apple.commcenter.xpc), as IOS-26-Hot's make-ios26-overlay.py does for
+its cellulard. Nothing else changes. Undo: put the saved IN back.
+"""
+import plistlib, sys
+
+JOB_PATH = '/System/Library/LaunchDaemons/org.bergamota.sweetcelld.plist'
+JOB = {
+    'Label': 'org.bergamota.sweetcelld',
+    'ProgramArguments': ['/usr/local/bin/sweetcelld'],
+    'MachServices': {
+        'com.apple.commcenter.coretelephony.xpc': True,
+        'com.apple.commcenter.xpc': True,
+    },
+    'KeepAlive': True,
+    'RunAtLoad': True,
+    'UserName': 'root',
+    'POSIXSpawnType': 'Interactive',
+    'StandardOutPath': '/private/var/sweetcell/sweetcelld.stdout',
+    'StandardErrorPath': '/private/var/sweetcell/sweetcelld.stdout',
+    'ThrottleInterval': 10,
+}
+
+
+def main():
+    src, dst = sys.argv[1], sys.argv[2]
+    with open(src, 'rb') as f:
+        plist = plistlib.load(f)
+    daemons = plist['LaunchDaemons']
+    gone = [path for path, job in daemons.items() if job.get('Label') == 'com.apple.CommCenter']
+    for path in gone:
+        del daemons[path]
+    taken = {s for job in daemons.values() for s in job.get('MachServices', {})} & set(JOB['MachServices'])
+    if taken:
+        sys.exit(f'another job still has {sorted(taken)}')
+    daemons[JOB_PATH] = JOB
+    with open(dst, 'wb') as f:
+        plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
+    print(f'{dst}: removed {gone or "no CommCenter job"}, added {JOB["Label"]}')
+
+
+if __name__ == '__main__':
+    main()
