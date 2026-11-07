@@ -17,7 +17,8 @@
  * Test switch: /private/var/tmp/sweetorient.force (one digit 1-6) forces that orientation while it exists.
  * Does nothing (logs why) when /private/var/root/sweetorient.off exists, outside backboardd (unless
  * SWEETORIENT_ANY=1, for tools/sweetnet/sweetorient), or when a class or method it wraps is missing.
- * Built by tools/sweetnet/build.sh (arm64e, pacstrip --sign); installed by tools/sweetnet/sweetorient-install.sh.
+ * Built by tools/sweetnet/build.sh (arm64e, pacstrip --sign); in a root image with RENEGADE_ORIENT=1 (root_tweaks18.orient),
+ * on a running phone by hand (tools/renegade/link_weak.py on backboardd, NOTES "SENSORS" 2026-11-06).
  */
 #import <Foundation/Foundation.h>
 #import <CoreMotion/CoreMotion.h>
