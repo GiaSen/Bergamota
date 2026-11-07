@@ -58,7 +58,7 @@ Qualcomm ABL (stock, unlocked)
 | --- | --- |
 | iOS | 26.6.2 (23G90) to **SpringBoard and the home screen**, with Settings, Safari and the other stock apps. Safari plays video (MP4 and HLS); YouTube plays with sound |
 | CPU | All 8 cores (4× A55 + 4× A75). Instead of pointer authentication, the code is rewritten by Renegade |
-| GPU | Adreno 630 with the Mi 8's own firmware. iOS composites on it through Chlorophyll (backboardd, SpringBoard, the icon renderer). By hand: "decent", not as smooth as a real iPhone |
+| GPU | Adreno 630 with the Mi 8's own firmware. iOS composites on it through Chlorophyll (backboardd, SpringBoard, the icon renderer). By hand: "decent", not as smooth as a real iPhone. Measured 2026-11-07 on the home screen: drags 53–60 fps, flicks 48–55 (CoreAnimation runs the end of each flick at 30 fps by itself). The App Library and Today view frames are limited by the GPU (about 14 ms each, half of it Liquid Glass); Chlorophyll no longer stores or clears CoreAnimation's memoryless attachments, which took about 1 ms off those frames (by hand: "Looks clean") |
 | Display | Samsung EA8074 AMOLED, 1080×2248 with the notch, command mode at 60 Hz. iOS draws an 828×1792 @2x canvas that the display engine scales up. The brightness slider drives the panel |
 | Touch / buttons | ST FTS touch controller at ~125 reports/s, fast typing without lost taps (xnu 3052); power and volume keys |
 | Wi-Fi | WCN3990: WPA2 join and internet, rejoins after a reboot, power save, the Settings switch works |
