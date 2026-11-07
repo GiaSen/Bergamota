@@ -311,6 +311,8 @@ def main():
             metal = rt.chlorophyll(mnt)
         elif os.environ.get('RENEGADE_NO_BGMTL') != '1' and os.environ.get('RENEGADE_BGMTL') != '0':
             metal = rt.bgmtl(mnt)
+        if os.environ.get('RENEGADE_ORIENT') == '1':     # the backboardd orientation shim, after chlorophyll (root_tweaks18.orient)
+            rt.orient(mnt)
         rt.firstboot(mnt, appreg=feats['appreg'], jb=feats['jb'], wallpaper=feats['wallpaper'], metal=metal)
         rt.hide_apps(mnt)
         rt.test_tools(mnt)

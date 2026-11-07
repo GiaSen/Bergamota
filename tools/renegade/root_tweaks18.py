@@ -1333,6 +1333,86 @@ def chlorophyll(root):
     return True
 
 
+def weak_link_file(src, dylib, out, tag):
+    """A copy of the Mach-O src at out that weak-links one more dylib (addlc.py --weak --make-room), re-signed ad hoc the
+    way chlorophyll_link does it: the same identifier, CS flags and entitlements, checked afterwards (SystemExit naming tag
+    otherwise). Returns (identity, entitlements). Also used by tools/renegade/link_weak.py (the by-hand install)."""
+    import subprocess, tempfile
+    sys.path.insert(0, HERE)
+    import pacstrip
+    tmpd = tempfile.mkdtemp(prefix='renegade-weak-')
+    try:
+        tmp = os.path.join(tmpd, os.path.basename(src))
+        shutil.copyfile(src, tmp)
+        os.chmod(tmp, 0o755)
+        ents, ident = entitlements_of(tmp) or {}, pacstrip.cs_identity(tmp)
+        if not ident:
+            sys.exit('%s: %s has no code signature identity' % (tag, src))
+        subprocess.run([sys.executable, '-I', ADDLC, '--weak', '--make-room', tmp, dylib], check=True)
+        rplat.adhoc_sign(tmp, ident[0], ident[2], plistlib.dumps(ents) if ents else None)
+        new = pacstrip.cs_identity(tmp)
+        if not new or new[:2] != ident[:2] or (ident[2] & ~new[2]) & ~pacstrip.CS_FLAG_IGNORED:
+            sys.exit('%s: identity or CS flags changed by the re-sign of %s: %s -> %s' % (tag, src, ident, new))
+        if (entitlements_of(tmp) or {}) != ents:
+            sys.exit('%s: entitlements of %s changed by the re-sign' % (tag, src))
+        if not macho_has_dylib(tmp, dylib):
+            sys.exit('%s: LC_LOAD_WEAK_DYLIB %s missing after addlc.py' % (tag, dylib))
+        shutil.copyfile(tmp, out)
+        return ident, ents
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# orient (opt-in, RENEGADE_ORIENT=1): screen rotation on a phone without Apple's motion coprocessor (the Mi 8, NOTES "SENSORS",
+# 2026-11-06/07). iOS 26's CoreMotion asks the AOP for the device orientation, which backboardd rotates the screen with; the
+# shim tools/sweetnet/sweetorient-shim.m (tools/sweetnet/build.sh -> research/sweetnet/ios18/sweetorient.dylib) computes it
+# from the accelerometer instead. /usr/local/lib/sweetorient.dylib, and backboardd gets ONE more LC_LOAD_WEAK_DYLIB of it,
+# re-signed ad hoc keeping identifier, CS flags and entitlements (weak_link_file: the build stops if any changes). Runs after
+# chlorophyll(), so backboardd keeps its /usr/local/bgi.dylib link; the backboardd it found goes to
+# /private/var/root/sweetorient-orig/backboardd (once). The same as the by-hand install on the phone (2026-11-06, link_weak.py).
+# Needs a kernel that gives iOS the accelerometer (xnu 3072c+; with an older one the shim gets no samples and the orientation
+# stays Apple's "unknown": expected, not tried). Off switches: /private/var/root/sweetorient.off (the shim does nothing, logs
+# why), boot-arg sweetdenypath=sweetorient.dylib (kernel 1016: backboardd starts without it; recovery image 118r).
+# Test switch (live): /private/var/tmp/sweetorient.force with one digit 1-6 forces that orientation while it exists.
+ORIENT_DYLIB = '/usr/local/lib/sweetorient.dylib'
+ORIENT_ORIG = 'private/var/root/sweetorient-orig'
+ORIENT_TARGET = 'usr/libexec/backboardd'
+
+
+def orient(root):
+    src = find_sweetnet('ios18/sweetorient.dylib')
+    if not src:
+        print('orient: sweetorient.dylib not built (tools/sweetnet/build.sh): skipped')
+        note_skip('orient', not_built())
+        return False
+    binp = os.path.join(root, ORIENT_TARGET)
+    if not os.path.exists(binp):
+        print('orient: no', ORIENT_TARGET, 'in the image: skipped')
+        note_skip('orient', 'no ' + ORIENT_TARGET)
+        return False
+    install_file(src, os.path.join(root, ORIENT_DYLIB.lstrip('/')), 0o755)   # first: backboardd never names a missing dylib
+    print('orient: %s installed (%s)' % (ORIENT_DYLIB, os.path.relpath(src, REPO) if src.startswith(REPO) else src))
+    if macho_has_dylib(binp, ORIENT_DYLIB):
+        print('orient: backboardd already links', ORIENT_DYLIB)
+        return True
+    mode = os.stat(binp).st_mode & 0o7777
+    orig = os.path.join(root, ORIENT_ORIG, 'backboardd')
+    if not os.path.exists(orig):
+        install_file(binp, orig, mode)
+    import tempfile
+    tmpd = tempfile.mkdtemp(prefix='renegade-orient-')
+    try:
+        out = os.path.join(tmpd, 'backboardd')
+        ident, ents = weak_link_file(binp, ORIENT_DYLIB, out, 'orient')
+        install_file(out, binp, mode)
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+    print('orient: backboardd weak-links %s (re-signed ad hoc as %s, flags %#x, %d entitlements; original in /%s)' % (
+        ORIENT_DYLIB, ident[0], ident[2], len(ents), ORIENT_ORIG))
+    return True
+
+
 def icon_metal_cache(root):
     """Metal keeps the functions MTLCompilerService specialises for a process in <cache dir>/<bundle id>/com.apple.metal. The
     cache dir comes from the process's data container, and when that lookup fails (containermanagerd refuses every one on
@@ -1897,6 +1977,8 @@ def auto(root):
         metal = chlorophyll(root)
     elif os.environ.get('RENEGADE_NO_BGMTL') != '1' and os.environ.get('RENEGADE_BGMTL') != '0':
         metal = bgmtl(root)
+    if os.environ.get('RENEGADE_ORIENT') == '1':         # after chlorophyll(): backboardd keeps its bgi.dylib link
+        orient(root)
     firstboot(root, appreg=enabled('appreg'), jb=enabled('jb'), wallpaper=enabled('wallpaper'), metal=metal)
     hide_apps(root)
     test_tools(root)
