@@ -1,0 +1,76 @@
+diff --git a/bsd/dev/dipper_ipa.c.inc b/bsd/dev/dipper_ipa.c.inc
+index 7b6abc5..7e0d4dc 100644
+--- a/bsd/dev/dipper_ipa.c.inc
++++ b/bsd/dev/dipper_ipa.c.inc
+@@ -205,6 +205,8 @@ static struct {
+ static const uint8_t ipa_mac[ETHER_ADDR_LEN] = { 0x02, 0x53, 0x57, 0x49, 0x50, 0x41 };     /* rmnet0: "SWIPA" */
+ static const uint8_t ipa_gw_mac[ETHER_ADDR_LEN] = { 0x02, 0x53, 0x57, 0x49, 0x50, 0x01 };  /* the made-up router */
+ static int ipa_rx_chan;
++/* 3073b: where stage 3 asks TrustZone to put ipa_fws, and how much (0: the image's extent rounded up to 4 KB) */
++static uint32_t ipa_fw_pa = IPA_FW_PA, ipa_fw_size;
+ 
+ static inline uint32_t
+ ipa_rd(uint32_t off)
+@@ -417,8 +419,12 @@ ipa_stage_firmware(void)
+ 			hi = MAX(hi, ph[i].paddr + ph[i].memsz);
+ 		}
+ 	}
+-	if (lo == ~0u || hi - lo > IPA_FW_SIZE) {
+-		ipa_fail("ipa_fws: segments %#x..%#x do not fit %#x bytes", lo, hi, IPA_FW_SIZE);
++	/* the downstream DT's two regions: ips_fw_region 0x8c400000 (64 KB, qcom,ipa_fws's memory-region), ipa_gsi_region
++	 * 0x8c410000 (20 KB, where HakiOS's OnePlus 6T port had TrustZone take it) */
++	uint32_t room = ipa_fw_pa == 0x8c400000u ? 0x10000u : ipa_fw_pa == 0x8c410000u ? 0x5000u : 0;
++	uint32_t size = ipa_fw_size ? ipa_fw_size : ((hi - lo + 0xfffu) & ~0xfffu);
++	if (lo == ~0u || hi - lo > size || size > room) {
++		ipa_fail("ipa_fws: segments %#x..%#x, size %#x, region %#x with %#x bytes: no", lo, hi, size, ipa_fw_pa, room);
+ 		goto out;
+ 	}
+ 	for (uint32_t i = 0; i < phnum; i++) {
+@@ -450,7 +456,6 @@ ipa_stage_firmware(void)
+ 	sweet_dma_sync_va((const void *)kva, msize);
+ 	pmap_set_cache_attributes(pn, VM_WIMG_WCOMB);
+ 	sweet_dma_sync_va((const void *)kva, msize);
+-	uint32_t size = hi - lo;                        /* as qcom_mdt_load() sets up a relocatable image */
+ 	int r = sweet_scm_pas(IPA_PAS_ID, 1, 0x82, ptoa_64(pn), 0);         /* INIT_IMAGE */
+ 	printf("SWEET IPA: 3: ipa_fws.mdt %zu bytes, %u segments to load (%#x bytes); PAS %u INIT_IMAGE: %d\n", mdt_len, nload,
+ 	    size, IPA_PAS_ID, r);
+@@ -458,14 +463,14 @@ ipa_stage_firmware(void)
+ 		ipa_fail("TrustZone does not take ipa_fws's metadata (%d)", r);
+ 		goto out;
+ 	}
+-	r = sweet_scm_pas(IPA_PAS_ID, 2, 3, IPA_FW_PA, size);              /* MEM_SETUP */
+-	printf("SWEET IPA: 3: PAS %u MEM_SETUP %#x+%#x: %d\n", IPA_PAS_ID, IPA_FW_PA, size, r);
++	r = sweet_scm_pas(IPA_PAS_ID, 2, 3, ipa_fw_pa, size);              /* MEM_SETUP */
++	printf("SWEET IPA: 3: PAS %u MEM_SETUP %#x+%#x: %d\n", IPA_PAS_ID, ipa_fw_pa, size, r);
+ 	if (r != 0) {
+ 		ipa_fail("TrustZone does not take ipa_fws's place (%d)", r);
+ 		(void)sweet_scm_pas(IPA_PAS_ID, 6, 1, 0, 0);
+ 		goto out;
+ 	}
+-	vm_offset_t region = ml_io_map(IPA_FW_PA, IPA_FW_SIZE);
++	vm_offset_t region = ml_io_map(ipa_fw_pa, size);
+ 	if (!region) {
+ 		ipa_fail("the firmware's region is not mapped");
+ 		(void)sweet_scm_pas(IPA_PAS_ID, 6, 1, 0, 0);
+@@ -1659,6 +1664,9 @@ ipa_stage_qmi(void)
+ 		ipa_fail("stage 5 needs the data path (stage 4)");
+ 		return false;
+ 	}
++	/* again: INIT_DRIVER sent anew (the modem's answer and our indication with it); the service stays announced */
++	ipa.init_sent = ipa.driver_ready = ipa.ind_sent = ipa.smp2p_set = false;
++	ipa.init_result = ipa.init_error = 0;
+ 	ipa.qmi_go = true;
+ 	thread_wakeup(&wl.sleep_chan);
+ 	for (unsigned t = 0; t < 30 && !(ipa.announced && ipa.init_sent && ipa.smp2p_set); t++) {
+@@ -1725,6 +1733,11 @@ sweet_ipa_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sweet_ipa_sysctl, "I",
+     "IPA bring-up stage: 1 power 2 config 3 firmware 4 channels 5 qmi 6 netif, 9 all, 10 free the channels (3073)");
+ 
++SYSCTL_UINT(_kern, OID_AUTO, sweet_ipa_fw_pa, CTLFLAG_RW | CTLFLAG_LOCKED, &ipa_fw_pa, 0,
++    "IPA stage 3: ipa_fws's region, 0x8c400000 (ips_fw_region) or 0x8c410000 (ipa_gsi_region) (3073b)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_ipa_fw_size, CTLFLAG_RW | CTLFLAG_LOCKED, &ipa_fw_size, 0,
++    "IPA stage 3: MEM_SETUP size, 0 = the image rounded up to 4 KB (3073b)");
++
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_ipa_opt, CTLFLAG_RW | CTLFLAG_LOCKED, &ipa.opt, 0,
+     "IPA options: 1 6T scratch, 2 TX deaggr, 4 plain QMAP, 8 early INIT_COMPLETE, 16 trace, 32 no skip_uc TLV (3073)");
+ 
