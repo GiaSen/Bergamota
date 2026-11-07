@@ -1,6 +1,7 @@
 /*
  * sweetsys: read string or int sysctls, set int ones (there is no sysctl command on the phone).
  * Usage: sweetsys NAME... (a string, or an int if the value is 4 bytes) | sweetsys NAME=VALUE... | sweetsys NAME=A,B,C...
+ *        | sweetsys NAME:=STRING... (set a string one; VALUE may be hex, 0x...)
  * Build: tools/sweetnet/build.sh (arm64e, then `renegade strip --sign`).
  */
 #include <stdio.h>
@@ -16,6 +17,14 @@ main(int argc, char **argv)
 	for (int i = 1; i < argc; i++) {
 		char *eq = strchr(argv[i], '=');
 		char *comma = eq ? strchr(eq, ',') : NULL;
+		if (eq && eq > argv[i] && eq[-1] == ':') {     /* NAME:=STRING: a string sysctl (kern.sweet_ipa_session) */
+			eq[-1] = 0;
+			if (sysctlbyname(argv[i], NULL, NULL, eq + 1, strlen(eq + 1))) {
+				perror(argv[i]);
+				status = 1;
+			}
+			continue;
+		}
 		if (comma) {            /* NAME=a,b,c: an int32 array (kern.sweet_touch_drag) */
 			int v[16], n = 0;
 			*eq = 0;
@@ -30,7 +39,7 @@ main(int argc, char **argv)
 		}
 		size_t n = sizeof(b) - 1;
 		if (eq) {
-			int v = atoi(eq + 1);
+			int v = (int)strtoul(eq + 1, NULL, 0);
 			*eq = 0;
 			if (sysctlbyname(argv[i], NULL, NULL, &v, sizeof(v))) {
 				perror(argv[i]);
