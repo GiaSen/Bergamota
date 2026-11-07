@@ -40,6 +40,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
 
 #include "qmi_cellular.h"
 
@@ -961,6 +964,7 @@ static NSSet<Class> *build_allowed_ct_classes(void)
 
 static void save_settings(void);
 static void follow_switches(void);
+static bool modem_settled(void);
 
 @interface HotCellularXPCService : NSObject
 @property (nonatomic, weak) HotXPCConnectionSPI *connection;
@@ -1291,6 +1295,19 @@ static void trigger_qmi_radio_power(bool online);
 	follow_switches();
 	if (completion)
 		completion(nil);
+}
+
+/* iOS 26's names (CTXPCServiceDataInterface): the Data Roaming switch */
+- (void)getInternationalDataAccess:(id)ctx completion:(void (^)(BOOL, NSError *))completion
+{
+	(void)ctx;
+	if (completion)
+		completion(g_data_roaming, nil);
+}
+
+- (void)setInternationalDataAccess:(id)ctx status:(BOOL)roam completion:(void (^)(NSError *))completion
+{
+	[self setInternationalDataAccessStatus:ctx status:roam completion:completion];
 }
 
 - (void)getDataSettings:(void (^)(id, NSError *))completion
@@ -2225,11 +2242,81 @@ static void log_legacy_message(hot_xpc_t msg)
 	char *d = fn_copy_desc(msg);
 	if (!d)
 		return;
+	if (!strstr(d, "kPacket")) {    /* (only the packet-data requests: the rest are whois/registrations) */
+		free(d);
+		return;
+	}
 	if (!strstr(d, "Number") && !strstr(d, "number"))
 		clog("CTServerConnection message: %.600s", d);
 	else
 		clog("CTServerConnection message with a number in it (not logged)");
 	free(d);
+}
+
+/*
+ * (sweetcelld) the data switches over CTServerConnection, as Settings uses them on iOS 26 (seen in its messages): a
+ * kPacketGetProperty request names the properties it wants (kEnableCellularData, kCellularDataEnabled,
+ * kCellularDataCapable, kAirplaneMode, each with a placeholder value); a kPacketSet... request carries the new value.
+ * True if the message was one of those (the reply then has the properties).
+ */
+static const char * const g_data_keys[] = { "kEnableCellularData", "kCellularDataEnabled" };
+static const char * const g_roam_keys[] = { "kEnableDataRoaming", "kDataRoamingEnabled", "kInternationalDataRoaming",
+					     "kInternationalDataAccess" };
+
+static bool legacy_packet_property(hot_xpc_t msg, hot_xpc_t reply, const char *req)
+{
+	static bool (*fn_get_bool)(hot_xpc_t, const char *);
+	static int64_t (*fn_get_int64)(hot_xpc_t, const char *);
+	if (!fn_get_bool)
+		fn_get_bool = dlsym(RTLD_DEFAULT, "xpc_dictionary_get_bool");
+	if (!fn_get_int64)
+		fn_get_int64 = dlsym(RTLD_DEFAULT, "xpc_dictionary_get_int64");
+	if (!req || strncmp(req, "kPacket", 7) != 0 || !fn_xpc_dict_get_value || !fn_get_bool || !fn_get_int64)
+		return false;
+	bool set = strstr(req, "Set") != NULL;
+	bool changed = false;
+	for (size_t i = 0; i < sizeof(g_data_keys) / sizeof(g_data_keys[0]); i++) {
+		if (!fn_xpc_dict_get_value(msg, g_data_keys[i]))
+			continue;
+		if (set) {
+			bool v = fn_get_bool(msg, g_data_keys[i]) || fn_get_int64(msg, g_data_keys[i]) != 0;
+			if (v != g_cellular_data_enabled) {
+				g_cellular_data_enabled = v;
+				changed = true;
+				clog("Settings toggled Cellular Data -> %d (%s)", v ? 1 : 0, req);
+			}
+		}
+		/* kEnableCellularData as Settings sends it (int64), kCellularDataEnabled as a bool (GetCellularDataSettings) */
+		if (i == 0)
+			fn_xpc_dict_set_int64(reply, g_data_keys[i], g_cellular_data_enabled ? 1 : 0);
+		else
+			fn_xpc_dict_set_bool(reply, g_data_keys[i], g_cellular_data_enabled);
+	}
+	for (size_t i = 0; i < sizeof(g_roam_keys) / sizeof(g_roam_keys[0]); i++) {
+		if (!fn_xpc_dict_get_value(msg, g_roam_keys[i]))
+			continue;
+		if (set) {
+			bool v = fn_get_bool(msg, g_roam_keys[i]) || fn_get_int64(msg, g_roam_keys[i]) != 0;
+			if (v != g_data_roaming) {
+				g_data_roaming = v;
+				changed = true;
+				clog("Settings toggled Data Roaming -> %d (%s)", v ? 1 : 0, req);
+			}
+		}
+		fn_xpc_dict_set_bool(reply, g_roam_keys[i], g_data_roaming);
+	}
+	if (fn_xpc_dict_get_value(msg, "kCellularDataCapable"))
+		fn_xpc_dict_set_bool(reply, "kCellularDataCapable", true);
+	if (fn_xpc_dict_get_value(msg, "kAirplaneMode"))
+		fn_xpc_dict_set_bool(reply, "kAirplaneMode", g_airplane_mode);
+	if (set && !changed)
+		clog("CTServerConnection %s: nothing changed (Cellular Data %d, Data Roaming %d)", req, g_cellular_data_enabled ? 1 : 0,
+		     g_data_roaming ? 1 : 0);
+	if (changed) {
+		save_settings();
+		follow_switches();
+	}
+	return true;
 }
 
 static void handle_legacy_xpc_dict(hot_xpc_t peer, hot_xpc_t msg)
@@ -2249,6 +2336,7 @@ static void handle_legacy_xpc_dict(hot_xpc_t peer, hot_xpc_t msg)
 	struct cellular_state st = snapshot_state();
 	fn_xpc_dict_set_int64(reply, "kPosixError", 0);
 	fn_xpc_dict_set_int64(reply, "kMachError", 0);
+	(void)legacy_packet_property(msg, reply, fn_xpc_dict_get_string ? fn_xpc_dict_get_string(msg, "kRequest") : NULL);
 	fn_xpc_dict_set_string(reply, "kCTSIMSupportSIMStatus", [sim_status_string(&st) UTF8String]);
 	fn_xpc_dict_set_string(reply, "kCTRegistrationStatus", [reg_status_string(&st) UTF8String]);
 	if (st.operator_name[0])
@@ -2565,9 +2653,37 @@ static void sc_load(void)
 		clog("SCDynamicStore unavailable: rmnet0 will not be published to configd");
 }
 
-/* rmnet0 as a configd service (as sweetnetcfg does for ue0), with no PrimaryRank: Wi-Fi, in the service order, comes first */
+/*
+ * rmnet0 as a configd service (as sweetnetcfg does for ue0). While Wi-Fi has an IPv4 address: no PrimaryRank, and Wi-Fi,
+ * in the service order, comes first (seen: en0 primary, rmnet0 scoped). Without Wi-Fi: PrimaryRank First, so that the USB
+ * link's service (ue0, routed through the Mac in development) does not carry the phone's traffic instead of cellular.
+ */
+static char g_pub_addr[20], g_pub_mask[20], g_pub_router[20], g_pub_dns1[20], g_pub_dns2[20];
+static int g_pub_first = -1;            /* the rank published: -1 none, 0 default, 1 First */
+
+static bool wifi_has_ipv4(void)
+{
+	struct ifaddrs *ifa = NULL;
+	bool up = false;
+	if (getifaddrs(&ifa) != 0)
+		return true;            /* (unknown: as if Wi-Fi were there) */
+	for (struct ifaddrs *i = ifa; i; i = i->ifa_next) {
+		if (i->ifa_name && !strcmp(i->ifa_name, "en0") && i->ifa_addr && i->ifa_addr->sa_family == AF_INET &&
+		    (i->ifa_flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING))
+			up = true;
+	}
+	freeifaddrs(ifa);
+	return up;
+}
+
 static void configd_publish(const char *addr, const char *mask, const char *router, const char *dns1, const char *dns2)
 {
+	snprintf(g_pub_addr, sizeof(g_pub_addr), "%s", addr);
+	snprintf(g_pub_mask, sizeof(g_pub_mask), "%s", mask);
+	snprintf(g_pub_router, sizeof(g_pub_router), "%s", router);
+	snprintf(g_pub_dns1, sizeof(g_pub_dns1), "%s", dns1 ? dns1 : "");
+	snprintf(g_pub_dns2, sizeof(g_pub_dns2), "%s", dns2 ? dns2 : "");
+	bool first = !wifi_has_ipv4();
 	sc_load();
 	if (!g_sc)
 		return;
@@ -2577,7 +2693,7 @@ static void configd_publish(const char *addr, const char *mask, const char *rout
 		[dns addObject:@(dns1)];
 	if (dns2 && dns2[0])
 		[dns addObject:@(dns2)];
-	NSDictionary *svc = @{ @"InterfaceName": @"rmnet0" };
+	NSDictionary *svc = first ? @{ @"InterfaceName": @"rmnet0", @"PrimaryRank": @"First" } : @{ @"InterfaceName": @"rmnet0" };
 	NSDictionary *v4 = @{ @"Addresses": @[ @(addr) ], @"SubnetMasks": @[ @(mask) ], @"Router": @(router),
 			      @"InterfaceName": @"rmnet0" };
 	NSDictionary *d = @{ @"ServerAddresses": dns };
@@ -2586,7 +2702,19 @@ static void configd_publish(const char *addr, const char *mask, const char *rout
 					       (__bridge CFPropertyListRef)v4) &&
 		     fn_SCDynamicStoreSetValue(g_sc, (__bridge CFStringRef)[base stringByAppendingString:@"/DNS"],
 					       (__bridge CFPropertyListRef)d);
-	clog("configd: rmnet0 service %s (%lu DNS servers)", ok ? "published" : "NOT published", (unsigned long)dns.count);
+	clog("configd: rmnet0 service %s (%lu DNS servers, %s)", ok ? "published" : "NOT published", (unsigned long)dns.count,
+	     first ? "primary: no Wi-Fi" : "below Wi-Fi");
+	g_pub_first = ok ? (first ? 1 : 0) : -1;
+}
+
+/* Wi-Fi came or went: the rank follows (from the QMI queue, every poll and every indication tick) */
+static void configd_follow_wifi(void)
+{
+	if (g_pub_first < 0 || !g_pub_addr[0])
+		return;
+	int want = wifi_has_ipv4() ? 0 : 1;
+	if (want != g_pub_first)
+		configd_publish(g_pub_addr, g_pub_mask, g_pub_router, g_pub_dns1, g_pub_dns2);
 }
 
 static void configd_remove(void)
@@ -2598,6 +2726,8 @@ static void configd_remove(void)
 	fn_SCDynamicStoreRemoveValue(g_sc, (__bridge CFStringRef)[base stringByAppendingString:@"/IPv4"]);
 	fn_SCDynamicStoreRemoveValue(g_sc, (__bridge CFStringRef)[base stringByAppendingString:@"/DNS"]);
 	fn_SCDynamicStoreRemoveValue(g_sc, (__bridge CFStringRef)base);
+	g_pub_first = -1;
+	g_pub_addr[0] = '\0';
 }
 
 /* the IPA's stages (xnu 3073) up to 6 (rmnet0), from where they stand */
@@ -2866,6 +2996,8 @@ static void data_reconcile(struct cellular_state *st)
 		    "no service");
 		return;
 	}
+	if (g_data_up)
+		configd_follow_wifi();
 	if (want && !g_data_up) {
 		uint64_t now = cell_mono_ms();
 		if (now < g_data_next_try_ms)
@@ -2888,10 +3020,36 @@ static void follow_switches(void)
 	dispatch_async(g_qmi_queue, ^{
 		struct cellular_state cur = snapshot_state();
 		g_data_next_try_ms = 0;
-		if (g_qmi.fd >= 0)
+		if (g_qmi.fd >= 0 && modem_settled())
 			data_reconcile(&cur);
 		commit_and_publish(&cur, false);
 	});
+}
+
+/*
+ * Whether the modem may be switched online and the data path set up. On 2026-11-07 (119c) the modem crashed ("SFR Init:
+ * wdog or kernel error suspected") 1 s after the Wi-Fi firmware's service (WLFW, in the modem) appeared, while its memory
+ * was being handed over, with this daemon already sending DMS ONLINE: so not before WLFW has been there 30 s (or, with no
+ * Wi-Fi firmware at all, 3 minutes after this daemon started). Read-only queries go on before.
+ */
+static uint64_t g_start_ms;
+
+static bool modem_settled(void)
+{
+	static uint64_t wlfw_since;
+	static bool said;
+	uint64_t now = cell_mono_ms();
+	if (!wlfw_since && qmi_has_service(&g_qmi, QMI_SVC_WLFW))
+		wlfw_since = now;
+	bool ok = (wlfw_since && now - wlfw_since >= 30000) || now - g_start_ms >= 180000;
+	if (!ok && !said) {
+		said = true;
+		clog("waiting for the Wi-Fi firmware to settle before switching the radio on");
+	} else if (ok && said) {
+		said = false;
+		clog("the Wi-Fi firmware has settled: radio and data allowed");
+	}
+	return ok;
 }
 
 static void try_connect_and_sync(void)
@@ -2928,8 +3086,10 @@ static void try_connect_and_sync(void)
 		(void)qmi_poll_fast(&g_qmi, &cur);
 	}
 
-	/* Ensure DMS operating mode reaches ONLINE when AirplaneMode is off */
-	ensure_dms_online_if_needed(&cur);
+	/* Ensure DMS operating mode reaches ONLINE when AirplaneMode is off (once the Wi-Fi firmware has settled) */
+	bool settled = modem_settled();
+	if (settled)
+		ensure_dms_online_if_needed(&cur);
 
 	/* Re-run indication registration in case new services appeared during poll */
 	new_ind = qmi_register_indications(&g_qmi);
@@ -2938,7 +3098,8 @@ static void try_connect_and_sync(void)
 
 	if (just_connected)
 		data_adopt_or_clean();
-	data_reconcile(&cur);
+	if (settled)
+		data_reconcile(&cur);
 
 	commit_and_publish(&cur, just_connected);
 	if (just_connected && fn_notify_post)
@@ -3011,6 +3172,7 @@ int main(int argc, char **argv)
 			}
 			g_logf = fopen(CELLULARD_LOG, "a");
 		}
+		g_start_ms = cell_mono_ms();
 		clog("sweetcelld starting (pid %d)%s", (int)getpid(), g_no_xpc ? ", --no-xpc: no listeners, no status publisher" : "");
 		(void)dlopen("/System/Library/Frameworks/CoreTelephony.framework/CoreTelephony", RTLD_NOW);
 		(void)[CTTelephonyNetworkInfo class];
@@ -3075,6 +3237,8 @@ int main(int argc, char **argv)
 			if (g_qmi.fd < 0)
 				return;
 			bool was = snapshot_state().data_connected;
+			if (g_data_up)
+				configd_follow_wifi();
 			(void)qmi_drain_rx(&g_qmi, 0);
 			if (was && !snapshot_state().data_connected) {
 				struct cellular_state cur = snapshot_state();

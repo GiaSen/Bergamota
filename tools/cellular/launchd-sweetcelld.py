@@ -11,9 +11,12 @@ its cellulard. Nothing else changes. Undo: put the saved IN back.
 """
 import plistlib, sys
 
-JOB_PATH = '/System/Library/LaunchDaemons/org.bergamota.sweetcelld.plist'
+# The label is CommCenter's: the jetsam limits are per label (com.apple.jetsamproperties.N104.plist gives com.apple.CommCenter
+# 36 MB active / 27 MB inactive, priority 190); under a label of its own sweetcelld got the small default and was killed for
+# its memory (jetsam reason 7, per-process limit) 10 s after a restart, 2026-11-07.
+JOB_PATH = '/System/Library/LaunchDaemons/com.apple.CommCenter-sweetcelld.plist'
 JOB = {
-    'Label': 'org.bergamota.sweetcelld',
+    'Label': 'com.apple.CommCenter',
     'ProgramArguments': ['/usr/local/bin/sweetcelld'],
     'MachServices': {
         'com.apple.commcenter.coretelephony.xpc': True,
@@ -43,7 +46,7 @@ def main():
     daemons[JOB_PATH] = JOB
     with open(dst, 'wb') as f:
         plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
-    print(f'{dst}: removed {gone or "no CommCenter job"}, added {JOB["Label"]}')
+    print(f'{dst}: removed {gone or "no CommCenter job"}, added sweetcelld as {JOB["Label"]}')
 
 
 if __name__ == '__main__':

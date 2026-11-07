@@ -1,0 +1,314 @@
+diff --git a/bsd/dev/dipper_ipa.c.inc b/bsd/dev/dipper_ipa.c.inc
+index 7e0d4dc..d3430a0 100644
+--- a/bsd/dev/dipper_ipa.c.inc
++++ b/bsd/dev/dipper_ipa.c.inc
+@@ -50,6 +50,8 @@
+ extern int sweet_rpmh_bcm_vote(const char *res, uint32_t vote);
+ extern int sweet_smmu_map_block(uint64_t pa);
+ extern int sweet_smmu_bank_fault(uint32_t *fsr, uint64_t *far, bool clear);
++extern int sweet_smmu_map_sid_ipa(unsigned sid);
++extern int sweet_smmu_ipa_fault(uint32_t *fsr, uint64_t *far, uint32_t *fsynr0, bool clear);
+ extern int sweet_scm_pas(uint32_t pas_id, uint32_t cmd, uint32_t arginfo, uint64_t arg1, uint64_t arg2);
+ extern void sweet_a630_fw_put(void *buf, size_t len);
+ 
+@@ -201,6 +203,8 @@ static struct {
+ 	bool            if_up;
+ 	uint32_t        addr, mask, gw, mtu;
+ 	uint64_t        tx_ip, tx_arp, tx_other, rx_ip, rx_drop, arp_replies;
++	uint32_t        smmu_faults, last_fsr, last_fsynr;     /* 3073c: the IPA's SMMU bank, watched every second */
++	uint64_t        last_far;
+ } ipa;
+ static const uint8_t ipa_mac[ETHER_ADDR_LEN] = { 0x02, 0x53, 0x57, 0x49, 0x50, 0x41 };     /* rmnet0: "SWIPA" */
+ static const uint8_t ipa_gw_mac[ETHER_ADDR_LEN] = { 0x02, 0x53, 0x57, 0x49, 0x50, 0x01 };  /* the made-up router */
+@@ -289,7 +293,8 @@ ipa_stage_power(void)
+ 	}
+ 	ipa.clock = true;
+ 	delay(200);
+-	int s0 = sweet_smmu_map_sid(IPA_SID_AP), s1 = sweet_smmu_map_sid(IPA_SID_UC);
++	/* 3073c: on a bank of their own (sweet_smmu.c: a fault there no longer stops USB and Wi-Fi) */
++	int s0 = sweet_smmu_map_sid_ipa(IPA_SID_AP), s1 = sweet_smmu_map_sid_ipa(IPA_SID_UC);
+ 	int s2 = s0 == 0 ? sweet_smmu_map_block(IPA_IMEM_PA) : -1;
+ 	printf("SWEET IPA: 1: clock on; SMMU streams %#x -> %d, %#x -> %d, IMEM %#x -> %d\n", IPA_SID_AP, s0, IPA_SID_UC, s1,
+ 	    IPA_IMEM_PA, s2);
+@@ -989,9 +994,9 @@ ipa_stage_channels(void)
+ 		return false;
+ 	}
+ 	ipa.ready = true;
+-	uint32_t fsr = 0;
++	uint32_t fsr = 0, fsynr = 0;
+ 	uint64_t far = 0;
+-	int bank = sweet_smmu_bank_fault(&fsr, &far, true);
++	int bank = sweet_smmu_ipa_fault(&fsr, &far, &fsynr, true);
+ 	printf("SWEET IPA: 4: THE DATA PATH IS UP: channels %u/%u/%u/%u in states %u/%u/%u/%u; SMMU bank %d fault status %#x "
+ 	    "address %#llx\n", ipa_cmd_ch.id, ipa_lan_ch.id, ipa_tx_ch.id, ipa_rx_ch.id, ipa_ch_state(&ipa_cmd_ch),
+ 	    ipa_ch_state(&ipa_lan_ch), ipa_ch_state(&ipa_tx_ch), ipa_ch_state(&ipa_rx_ch), bank, fsr, far);
+@@ -1264,12 +1269,39 @@ ipa_if_detach(ifnet_t ifp __unused)
+ {
+ }
+ 
++/* 3073c: a fault of the IPA's SMMU bank, logged (the first ten, then every hundredth) and cleared */
++static void
++ipa_smmu_watch(void)
++{
++	uint32_t fsr = 0, fsynr = 0;
++	uint64_t far = 0;
++	if (sweet_smmu_ipa_fault(&fsr, &far, &fsynr, true) < 0 || !(fsr & 0xc00001feu)) {
++		return;
++	}
++	ipa.smmu_faults++;
++	ipa.last_fsr = fsr;
++	ipa.last_far = far;
++	ipa.last_fsynr = fsynr;
++	if (ipa.smmu_faults <= 10 || ipa.smmu_faults % 100 == 0) {
++		printf("SWEET IPA: SMMU FAULT %u on the IPA's bank: FSR %#x (%s%s%s) FAR %#llx FSYNR0 %#x (%s)\n", ipa.smmu_faults, fsr,
++		    fsr & 2 ? "translation " : "", fsr & 8 ? "permission " : "", fsr & 0x80000000u ? "multi" : "", far, fsynr,
++		    fsynr & 0x10 ? "write" : "read");
++	}
++}
++
+ static void
+ ipa_rx_thread(__unused void *arg, __unused wait_result_t wr)
+ {
++	uint64_t next_watch = 0;
+ 	thread_set_thread_name(current_thread(), "sweet ipa rx");
+ 	for (;;) {
+ 		unsigned n = 0;
++		if (mach_absolute_time() >= next_watch) {
++			uint64_t iv;
++			nanoseconds_to_absolutetime(NSEC_PER_SEC, &iv);
++			next_watch = mach_absolute_time() + iv;
++			ipa_smmu_watch();
++		}
+ 		if (ipa.ready) {
+ 			struct ipa_rx_ctx rc = { NULL, NULL, 0 };
+ 			lck_mtx_lock(&ipa_dlock);
+@@ -1790,6 +1822,8 @@ sweet_ipa_status_sysctl SYSCTL_HANDLER_ARGS
+ 	    "ind_wanted %d ind_sent %d requests %u; smp2p ours %d, modem's %#x (seen %u)\n", ipa.qmi_go, ipa.announced, ipa.init_sent,
+ 	    ipa.driver_ready, ipa.init_result, ipa.init_error, ipa.uc_ready, ipa.ind_wanted, ipa.ind_sent, ipa.requests, ipa.smp2p_set,
+ 	    ipa.smp2p_in, ipa.smp2p_in_seen);
++	n += snprintf(b + n, 1536 - n, "SMMU (the IPA's bank): %u faults, last FSR %#x FAR %#llx FSYNR0 %#x\n", ipa.smmu_faults,
++	    ipa.last_fsr, ipa.last_far, ipa.last_fsynr);
+ 	n += snprintf(b + n, 1536 - n, "rmnet0: %s %s MTU %u; out: IPv4 %llu ARP %llu other %llu (ARP answered %llu); in: IP %llu "
+ 	    "dropped %llu\n", ipa.ifp ? "attached" : "absent", ipa.if_up ? "up" : "down", ipa.mtu, ipa.tx_ip, ipa.tx_arp,
+ 	    ipa.tx_other, ipa.arp_replies, ipa.rx_ip, ipa.rx_drop);
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index af72191..163aa5c 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -46,6 +46,8 @@ int sweet_smmu_probe_sid(unsigned sid, unsigned level);
+ static vm_offset_t smmu_base;
+ static vm_offset_t smmu_l1v, smmu_l2v;  /* 3073: the bank's level-1 table, and a level-2 one for GiB 0 (sweet_smmu_map_block) */
+ static int smmu_cb = -1;                /* shared translating context bank */
++static int smmu_cb2 = -1;               /* 3073c: the IPA's own bank (same tables, its own fault state, HUPCF) */
++static uint64_t smmu_l1_pa;
+ static unsigned smmu_nsmr;
+ static int smmu_next_smr;               /* first free SMR to try next */
+ static volatile uint32_t smmu_lock;
+@@ -120,6 +122,7 @@ smmu_bank_create(void)
+ 	uint64_t l1_pa = ptoa_64(pn);
+ 	volatile uint64_t *l1 = (volatile uint64_t *)l1v;
+ 	smmu_l1v = l1v;
++	smmu_l1_pa = l1_pa;
+ 	for (unsigned i = 2; i < 10; i++) {
+ 		l1[i] = (uint64_t)i << 30 | 1u << 10 | 2u << 8 | 1u << 6 | 1;
+ 	}
+@@ -158,6 +161,66 @@ smmu_bank_create(void)
+ 	return 0;
+ }
+ 
++/*
++ * 3073c: a second translating bank on the same identity tables, for the IPA. Its own fault state: with SCTLR.HUPCF 0 an
++ * outstanding context fault terminates every later transaction of the bank until the FSR is cleared, and the shared bank
++ * also carries USB (0x740) and the Wi-Fi copy engine (0x40/0x41): on 2026-11-07 (boot 119b, sweetcelld) USB receive and
++ * Wi-Fi died together while the IPA ran. Here HUPCF 1 as well (later transactions go on), CFIE/CFRE kept.
++ */
++static int
++smmu_bank2_create(void)
++{
++	uint32_t id1 = smmu_rd(0x24);
++	unsigned pgshift = (id1 >> 31) ? 16 : 12;
++	unsigned ncb = id1 & 0xff, ns2cb = (id1 >> 16) & 0xff;
++	uint32_t gr1 = 1u << pgshift;
++	uint32_t cb0 = (1u << (((id1 >> 28) & 7) + 1)) << pgshift;
++	uint32_t used[8] = { 0 };
++	if (smmu_cb < 0 || smmu_l1_pa == 0) {
++		return ENODEV;
++	}
++	for (unsigned i = 0; i < smmu_nsmr && i < 128; i++) {
++		uint32_t smr = smmu_rd(0x800 + 4 * i), s2cr = smmu_rd(0xc00 + 4 * i);
++		if ((smr & (1u << 31)) && ((s2cr >> 16) & 3) == 0) {
++			used[(s2cr & 0xff) / 32] |= 1u << ((s2cr & 0xff) % 32);
++		}
++	}
++	for (unsigned c = ns2cb; c < ncb && smmu_cb2 < 0; c++) {
++		if ((int)c != smmu_cb && !(used[c / 32] & (1u << (c % 32))) && !(smmu_rd(cb0 + (c << pgshift)) & 1)) {
++			smmu_cb2 = (int)c;
++		}
++	}
++	if (smmu_cb2 < 0) {
++		printf("SWEET SMMU: no second free context bank\n");
++		return ENODEV;
++	}
++	uint32_t cb = cb0 + ((uint32_t)smmu_cb2 << pgshift);
++	unsigned asid = (unsigned)smmu_cb2;
++	smmu_wr(cb + 0x0, 0);
++	smmu_wr(cb + 0x58, 0xffffffffu);
++	smmu_wr(gr1 + 0x800 + 4 * (unsigned)smmu_cb2, 1);
++	smmu_wr(gr1 + 4 * (unsigned)smmu_cb2, 1u << 16 | 0xfu << 12 | 3u << 8);
++	smmu_wr(cb + 0x10, 7u << 15 | 2);
++	smmu_wr(cb + 0x30, 25 | 1u << 23);
++	smmu_wr(cb + 0x34, asid);
++	smmu_wr64(cb + 0x20, smmu_l1_pa | (uint64_t)asid << 48);
++	smmu_wr64(cb + 0x28, 0);
++	smmu_wr(cb + 0x38, 0x44);
++	smmu_wr(cb + 0x618, 0);
++	smmu_wr(cb + 0x7f0, 0);
++	for (int t = 0; t < 100000 && (smmu_rd(cb + 0x7f4) & 1); t++) {
++		delay(1);
++	}
++	smmu_wr(cb + 0x0, 1u << 8 | 1u << 6 | 1u << 5 | 1u << 2 | 1u << 1 | 1);   /* HUPCF CFIE CFRE AFE TRE M */
++	if (!(smmu_rd(cb + 0x0) & 1)) {
++		printf("SWEET SMMU: context bank %d did not enable\n", smmu_cb2);
++		smmu_cb2 = -1;
++		return EIO;
++	}
++	printf("SWEET SMMU: context bank %d (the IPA's), the same identity map, HUPCF\n", smmu_cb2);
++	return 0;
++}
++
+ /*
+  * 3073: one 2 MiB block of the first GiB (below DRAM) identity-mapped into the shared bank, Normal NC, RW: the IPA's
+  * IMEM (Linux ipa_imem_init(): sdm845 0x146bd000 + 0x2000, mapped 1:1 into the IPA's domain; the downstream DT's
+@@ -204,11 +267,17 @@ sweet_smmu_map_block(uint64_t pa)
+ 	{
+ 		uint32_t id1 = smmu_rd(0x24);
+ 		unsigned pgshift = (id1 >> 31) ? 16 : 12;
+-		uint32_t cb = ((1u << (((id1 >> 28) & 7) + 1)) << pgshift) + ((uint32_t)smmu_cb << pgshift);
+-		smmu_wr(cb + 0x618, 0);                         /* TLBIALL */
+-		smmu_wr(cb + 0x7f0, 0);                         /* TLBSYNC */
+-		for (int t = 0; t < 100000 && (smmu_rd(cb + 0x7f4) & 1); t++) {
+-			delay(1);
++		for (int b = 0; b < 2; b++) {
++			int bank = b ? smmu_cb2 : smmu_cb;
++			if (bank < 0) {
++				continue;
++			}
++			uint32_t cb = ((1u << (((id1 >> 28) & 7) + 1)) << pgshift) + ((uint32_t)bank << pgshift);
++			smmu_wr(cb + 0x618, 0);                 /* TLBIALL */
++			smmu_wr(cb + 0x7f0, 0);                 /* TLBSYNC */
++			for (int t = 0; t < 100000 && (smmu_rd(cb + 0x7f4) & 1); t++) {
++				delay(1);
++			}
+ 		}
+ 	}
+ 	printf("SWEET SMMU: bank %d: 2 MiB block %#llx mapped 1:1\n", smmu_cb, block);
+@@ -237,11 +306,11 @@ sweet_smmu_bank_fault(uint32_t *fsr, uint64_t *far, bool clear)
+ 	return smmu_cb;
+ }
+ 
+-/* Map one stream ID to the shared translating bank. Idempotent per SID. */
+-int
+-sweet_smmu_map_sid(unsigned sid)
++/* Map one stream ID to the shared translating bank (or, ipa, to the IPA's own). Idempotent per SID. */
++static int
++smmu_map_sid_bank(unsigned sid, bool ipa)
+ {
+-	int error = EIO;
++	int error = EIO, target;
+ 
+ 	if (__atomic_exchange_n(&smmu_lock, 1, __ATOMIC_ACQUIRE)) {
+ 		return EBUSY;
+@@ -259,6 +328,13 @@ sweet_smmu_map_sid(unsigned sid)
+ 			goto out;
+ 		}
+ 	}
++	if (ipa && smmu_cb2 < 0) {
++		error = smmu_bank2_create();
++		if (error) {
++			goto out;
++		}
++	}
++	target = ipa ? smmu_cb2 : smmu_cb;
+ 
+ 	/*
+ 	 * Look for a valid SMR that already matches sid (id compared under its
+@@ -285,7 +361,7 @@ sweet_smmu_map_sid(unsigned sid)
+ 		uint32_t s2cr = smmu_rd(0xc00 + 4 * (unsigned)match);
+ 		printf("SWEET SMMU: sid 0x%x already matched by smr %d (smr 0x%x s2cr 0x%x)\n",
+ 		    sid, match, smr, s2cr);
+-		if ((s2cr & 0xff) == (uint32_t)smmu_cb && ((s2cr >> 16) & 3) == 0) {
++		if ((s2cr & 0xff) == (uint32_t)target && ((s2cr >> 16) & 3) == 0) {
+ 			error = 0;      /* an earlier call mapped it */
+ 			goto out;
+ 		}
+@@ -296,11 +372,11 @@ sweet_smmu_map_sid(unsigned sid)
+ 			goto out;
+ 		}
+ 		/* exact entry: point its S2CR at our bank instead of adding a duplicate */
+-		smmu_wr(0xc00 + 4 * (unsigned)match, (uint32_t)smmu_cb);
++		smmu_wr(0xc00 + 4 * (unsigned)match, (uint32_t)target);
+ 		s2cr = smmu_rd(0xc00 + 4 * (unsigned)match);
+ 		printf("SWEET SMMU: sid 0x%x smr %d s2cr now 0x%x (%s)\n", sid, match, s2cr,
+-		    (((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == (uint32_t)smmu_cb) ? "translate" : "REFUSED");
+-		error = (((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == (uint32_t)smmu_cb) ? 0 : EIO;
++		    (((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == (uint32_t)target) ? "translate" : "REFUSED");
++		error = (((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == (uint32_t)target) ? 0 : EIO;
+ 		goto out;
+ 	}
+ 	if (free_smr < 0) {
+@@ -308,18 +384,52 @@ sweet_smmu_map_sid(unsigned sid)
+ 		error = ENOSPC;
+ 		goto out;
+ 	}
+-	smmu_wr(0xc00 + 4 * (unsigned)free_smr, (uint32_t)smmu_cb);  /* S2CR translate -> cb */
++	smmu_wr(0xc00 + 4 * (unsigned)free_smr, (uint32_t)target);  /* S2CR translate -> cb */
+ 	smmu_wr(0x800 + 4 * (unsigned)free_smr, 1u << 31 | (sid & 0x7fff)); /* SMR valid, mask 0 */
+ 	smmu_next_smr = free_smr + 1;
+ 	uint32_t s2cr = smmu_rd(0xc00 + 4 * (unsigned)free_smr);
+ 	printf("SWEET SMMU: sid 0x%x -> smr %d s2cr 0x%x (%s)\n", sid, free_smr, s2cr,
+-	    (((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == (uint32_t)smmu_cb) ? "translate" : "REFUSED");
+-	error = (((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == (uint32_t)smmu_cb) ? 0 : EIO;
++	    (((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == (uint32_t)target) ? "translate" : "REFUSED");
++	error = (((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == (uint32_t)target) ? 0 : EIO;
+ out:
+ 	__atomic_store_n(&smmu_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
+ 
++int
++sweet_smmu_map_sid(unsigned sid)
++{
++	return smmu_map_sid_bank(sid, false);
++}
++
++/* 3073c: the IPA's streams to the IPA's own bank */
++int sweet_smmu_map_sid_ipa(unsigned sid);
++int
++sweet_smmu_map_sid_ipa(unsigned sid)
++{
++	return smmu_map_sid_bank(sid, true);
++}
++
++/* 3073c: the IPA's bank's fault status (FSR, FAR, FSYNR0), cleared if asked; -1 without that bank */
++int sweet_smmu_ipa_fault(uint32_t *fsr, uint64_t *far, uint32_t *fsynr0, bool clear);
++int
++sweet_smmu_ipa_fault(uint32_t *fsr, uint64_t *far, uint32_t *fsynr0, bool clear)
++{
++	if (smmu_cb2 < 0 || !smmu_base) {
++		return -1;
++	}
++	uint32_t id1 = smmu_rd(0x24);
++	unsigned pgshift = (id1 >> 31) ? 16 : 12;
++	uint32_t cb = ((1u << (((id1 >> 28) & 7) + 1)) << pgshift) + ((uint32_t)smmu_cb2 << pgshift);
++	*fsr = smmu_rd(cb + 0x58);
++	*far = (uint64_t)smmu_rd(cb + 0x60) | (uint64_t)smmu_rd(cb + 0x64) << 32;
++	*fsynr0 = smmu_rd(cb + 0x68);
++	if (clear && (*fsr & 0xc00001feu)) {
++		smmu_wr(cb + 0x58, *fsr);
++	}
++	return smmu_cb2;
++}
++
+ /*
+  * READ ONLY. What does apps_smmu do with stream id sid right now? Logs every
+  * stream match register that matches it (SMR under its mask), the S2CR it
