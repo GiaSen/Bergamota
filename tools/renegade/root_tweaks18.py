@@ -1413,6 +1413,65 @@ def orient(root):
     return True
 
 
+# cellular (opt-in, RENEGADE_CELL=1): mobile data on the Mi 8 (NOTES "sweetcelld"; xnu 3073 and later: the IPA and the
+# QMI pass-through). /usr/local/bin/sweetcelld (tools/cellular/sweetcelld/build.sh -> research/sweetnet/ios18/sweetcelld)
+# takes the job labelled com.apple.CommCenter in the launchd.plist cache (tools/cellular/launchd-sweetcelld.py's JOB: the
+# label keeps CommCenter's jetsam limits); the cache as it was goes to /private/var/root/launchd.plist.before-sweetcelld
+# (once), as tools/cellular/sweetcelld-install.sh keeps it. RENEGADE_IPA_FW=DIR (tools/dipper-ipa-fw.sh --out DIR, from the
+# phone's own vendor partition, never in git): ipa_fws.mdt + .b00-.b04 into /usr/local/share/firmware, where the kernel's
+# stage 3 reads them; without it the daemon runs but the data path stops at stage 3. MobileGestalt's cellular-data answer
+# (Settings' Cellular pane) is not set here: the cache is written at the first boot, and sweetcelld adds the override
+# itself. With a kernel without the IPA (before 3073) sweetcelld still answers CoreTelephony, with no data.
+CELL_BIN = '/usr/local/bin/sweetcelld'
+CELL_LAUNCHD_ORIG = 'private/var/root/launchd.plist.before-sweetcelld'
+IPA_FW_FILES = ('ipa_fws.mdt', 'ipa_fws.b00', 'ipa_fws.b01', 'ipa_fws.b02', 'ipa_fws.b03', 'ipa_fws.b04')
+
+
+def cellular(root):
+    src = find_sweetnet('ios18/sweetcelld')
+    if not src:
+        print('cellular: sweetcelld not built (tools/cellular/sweetcelld/build.sh): skipped')
+        note_skip('cellular', not_built('tools/cellular/sweetcelld/build.sh'))
+        return False
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('launchd_sweetcelld', os.path.join(REPO, 'tools', 'cellular',
+                                                                                      'launchd-sweetcelld.py'))
+    lsc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lsc)
+    install_file(src, os.path.join(root, CELL_BIN.lstrip('/')), 0o755)
+    lpath = os.path.join(root, 'System/Library/xpc/launchd.plist')
+    st = os.stat(lpath)
+    orig = os.path.join(root, CELL_LAUNCHD_ORIG)
+    if not os.path.exists(orig):
+        install_file(lpath, orig, 0o644)
+    plist = load(lpath)
+    daemons = plist['LaunchDaemons']
+    gone = [path for path, job in daemons.items() if job.get('Label') == lsc.JOB['Label'] and path != lsc.JOB_PATH]
+    for path in gone:
+        del daemons[path]
+    taken = {sv for path, job in daemons.items() if path != lsc.JOB_PATH for sv in job.get('MachServices', {})}
+    taken &= set(lsc.JOB['MachServices'])
+    if taken:
+        raise SystemExit('cellular: another job still has %s' % sorted(taken))
+    daemons[lsc.JOB_PATH] = dict(lsc.JOB)
+    save(lpath, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    fw = os.environ.get('RENEGADE_IPA_FW')
+    nfw = 0
+    if fw:
+        missing = [f for f in IPA_FW_FILES if not os.path.isfile(os.path.join(fw, f))]
+        if missing:
+            raise SystemExit('cellular: RENEGADE_IPA_FW=%s lacks %s (tools/dipper-ipa-fw.sh --out DIR)' % (fw, missing))
+        for f in IPA_FW_FILES:
+            install_file(os.path.join(fw, f), os.path.join(root, 'usr/local/share/firmware', f), 0o644)
+            nfw += 1
+    else:
+        print('cellular: RENEGADE_IPA_FW not set: no IPA firmware in the root (mobile data stops at the IPA\'s stage 3)')
+    print('cellular: %s installed (%s), job %s in place of %s, %d IPA firmware files' % (
+        CELL_BIN, os.path.relpath(src, REPO) if src.startswith(REPO) else src, lsc.JOB['Label'], gone or 'no CommCenter job',
+        nfw))
+    return True
+
+
 def icon_metal_cache(root):
     """Metal keeps the functions MTLCompilerService specialises for a process in <cache dir>/<bundle id>/com.apple.metal. The
     cache dir comes from the process's data container, and when that lookup fails (containermanagerd refuses every one on
@@ -1979,6 +2038,8 @@ def auto(root):
         metal = bgmtl(root)
     if os.environ.get('RENEGADE_ORIENT') == '1':         # after chlorophyll(): backboardd keeps its bgi.dylib link
         orient(root)
+    if os.environ.get('RENEGADE_CELL') == '1':           # sweetcelld in CommCenter's place, the IPA firmware
+        cellular(root)
     firstboot(root, appreg=enabled('appreg'), jb=enabled('jb'), wallpaper=enabled('wallpaper'), metal=metal)
     hide_apps(root)
     test_tools(root)

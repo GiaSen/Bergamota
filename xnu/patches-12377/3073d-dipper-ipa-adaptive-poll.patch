@@ -1,0 +1,144 @@
+diff --git a/bsd/dev/dipper_ipa.c.inc b/bsd/dev/dipper_ipa.c.inc
+index d3430a0..258ee7f 100644
+--- a/bsd/dev/dipper_ipa.c.inc
++++ b/bsd/dev/dipper_ipa.c.inc
+@@ -25,6 +25,9 @@
+  *   DRIVER_INIT_COMPLETE, 16 a log line per packet, 32 no TLV 0x18 (skip_uc_load) in INIT_DRIVER
+  * kern.sweet_ipa_session (string, write): "ADDR MASK GATEWAY MTU" gives rmnet0 the data session's address; "down".
+  * kern.sweet_ipa_status (string): where it stands.
++ * kern.sweet_ipa_idle_ms (3073d): the receive thread's longest poll interval while rmnet0 is up and quiet (default 16 ms):
++ *   1 ms for 100 ms after a packet came in or went out (an LTE round trip), then doubling up to this; a packet sent wakes
++ *   it at once. With rmnet0 down: every second.
+  *
+  * Sources: Linux drivers/net/ipa (ipa_data-v3.5.1.c, reg/ipa_reg-v3.1.c, reg/gsi_reg-v3.1.c, gsi.c, ipa_endpoint.c,
+  * ipa_table.c, ipa_mem.c, ipa_qmi.c, ipa_qmi_msg.c, ipa_smp2p.c) for the layout and the values; HakiOS's OnePlus 6T port
+@@ -209,6 +212,12 @@ static struct {
+ static const uint8_t ipa_mac[ETHER_ADDR_LEN] = { 0x02, 0x53, 0x57, 0x49, 0x50, 0x41 };     /* rmnet0: "SWIPA" */
+ static const uint8_t ipa_gw_mac[ETHER_ADDR_LEN] = { 0x02, 0x53, 0x57, 0x49, 0x50, 0x01 };  /* the made-up router */
+ static int ipa_rx_chan;
++/* 3073d: the receive thread's poll interval (adaptive: there is no interrupt here, every driver of this port polls) */
++static uint32_t ipa_idle_max_ms = 16;           /* kern.sweet_ipa_idle_ms */
++static volatile uint32_t ipa_rx_wait_ms;        /* the thread's current interval */
++static volatile uint32_t ipa_rx_kick;           /* a packet was sent: poll again at once */
++static uint64_t ipa_rx_wakeups;
++#define IPA_RX_FAST_MS          100u            /* 1 ms polls this long after the last packet in or out */
+ /* 3073b: where stage 3 asks TrustZone to put ipa_fws, and how much (0: the image's extent rounded up to 4 KB) */
+ static uint32_t ipa_fw_pa = IPA_FW_PA, ipa_fw_size;
+ 
+@@ -1219,6 +1228,11 @@ ipa_if_output(ifnet_t ifp, mbuf_t m)
+ 			bool ok = ipa_transmit(m, ETHER_HDR_LEN, len - ETHER_HDR_LEN);
+ 			ifnet_stat_increment_out(ifp, ok ? 1 : 0, ok ? (uint32_t)len : 0, ok ? 0 : 1);
+ 			ipa.tx_ip++;
++			/* 3073d: the answer comes soon: poll at 1 ms again (wake the thread only if it sleeps longer) */
++			__atomic_store_n(&ipa_rx_kick, 1, __ATOMIC_RELEASE);
++			if (ipa_rx_wait_ms > 1) {
++				thread_wakeup(&ipa_rx_chan);
++			}
+ 		} else if (type == ETHERTYPE_ARP) {
+ 			ipa.tx_arp++;
+ 			ipa_arp_answer(m);
+@@ -1292,7 +1306,8 @@ ipa_smmu_watch(void)
+ static void
+ ipa_rx_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	uint64_t next_watch = 0;
++	uint64_t next_watch = 0, last_active = 0, fast_window;
++	nanoseconds_to_absolutetime((uint64_t)IPA_RX_FAST_MS * NSEC_PER_MSEC, &fast_window);
+ 	thread_set_thread_name(current_thread(), "sweet ipa rx");
+ 	for (;;) {
+ 		unsigned n = 0;
+@@ -1315,10 +1330,37 @@ ipa_rx_thread(__unused void *arg, __unused wait_result_t wr)
+ 				ipa_input(rc.head);
+ 			}
+ 		}
++		/*
++		 * 3073d: until 3073c it polled every 2 ms whenever rmnet0 was up (about 500 wake-ups a second with data idle) and
++		 * every 50 ms when down. Now: 1 ms for IPA_RX_FAST_MS after the last packet in or out (so an answer is not held
++		 * back), then doubling while quiet up to kern.sweet_ipa_idle_ms (16), every second while rmnet0 is down (the SMMU
++		 * watch only).
++		 */
++		bool kicked = __atomic_exchange_n(&ipa_rx_kick, 0, __ATOMIC_ACQ_REL) != 0;
++		uint32_t wait_ms = ipa_rx_wait_ms;
++		uint64_t now = mach_absolute_time();
++		if (n || kicked) {
++			last_active = now;
++		}
++		if (!ipa.if_up) {
++			wait_ms = 1000;
++		} else if (now - last_active < fast_window) {
++			wait_ms = 1;
++		} else {
++			uint32_t mx = ipa_idle_max_ms ? ipa_idle_max_ms : 1;
++			mx = mx > 1000 ? 1000 : mx;
++			wait_ms = (wait_ms == 0 || wait_ms >= mx) ? mx : (wait_ms * 2 > mx ? mx : wait_ms * 2);
++		}
++		ipa_rx_wait_ms = wait_ms;
+ 		uint64_t deadline;
+-		clock_interval_to_deadline(n ? 1 : (ipa.if_up ? 2 : 50), NSEC_PER_MSEC, &deadline);
++		clock_interval_to_deadline(wait_ms, NSEC_PER_MSEC, &deadline);
+ 		(void)assert_wait_deadline((event_t)&ipa_rx_chan, THREAD_UNINT, deadline);
+-		thread_block(THREAD_CONTINUE_NULL);
++		if (__atomic_load_n(&ipa_rx_kick, __ATOMIC_ACQUIRE)) {
++			clear_wait(current_thread(), THREAD_AWAKENED);  /* sent while we were getting ready to sleep */
++		} else {
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++		ipa_rx_wakeups++;
+ 	}
+ }
+ 
+@@ -1770,6 +1812,8 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_ipa_fw_pa, CTLFLAG_RW | CTLFLAG_LOCKED, &ipa_
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_ipa_fw_size, CTLFLAG_RW | CTLFLAG_LOCKED, &ipa_fw_size, 0,
+     "IPA stage 3: MEM_SETUP size, 0 = the image rounded up to 4 KB (3073b)");
+ 
++SYSCTL_UINT(_kern, OID_AUTO, sweet_ipa_idle_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &ipa_idle_max_ms, 0,
++    "3073d: the IPA receive thread's longest poll interval with rmnet0 up and quiet (ms)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_ipa_opt, CTLFLAG_RW | CTLFLAG_LOCKED, &ipa.opt, 0,
+     "IPA options: 1 6T scratch, 2 TX deaggr, 4 plain QMAP, 8 early INIT_COMPLETE, 16 trace, 32 no skip_uc TLV (3073)");
+ 
+@@ -1800,35 +1844,37 @@ static int
+ sweet_ipa_status_sysctl SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	char *b = kalloc_data(1536, Z_WAITOK | Z_ZERO);
++	char *b = kalloc_data(2048, Z_WAITOK | Z_ZERO);
+ 	if (!b) {
+ 		return ENOMEM;
+ 	}
+ 	size_t n = 0;
+-	n += snprintf(b + n, 1536 - n, "stage %u opt %#x clock %d smmu %d configured %d fw %d ready %d %s; last error: %s\n",
++	n += snprintf(b + n, 2048 - n, "stage %u opt %#x clock %d smmu %d configured %d fw %d ready %d %s; last error: %s\n",
+ 	    ipa.stage, ipa.opt, ipa.clock, ipa.smmu, ipa.configured, ipa.fw, ipa.ready, ipa.qmap4 ? "QMAPv4" : "QMAP",
+ 	    ipa.err[0] ? ipa.err : "none");
+ 	if (ipa.regs && ipa.clock) {
+-		n += snprintf(b + n, 1536 - n, "GSI status %#x, error log %#x, IPA route %#x\n", gsi_rd(GSI_STATUS), gsi_rd(GSI_ERROR_LOG),
++		n += snprintf(b + n, 2048 - n, "GSI status %#x, error log %#x, IPA route %#x\n", gsi_rd(GSI_STATUS), gsi_rd(GSI_ERROR_LOG),
+ 		    ipa_rd(IPA_ROUTE));
+ 	}
+ 	for (unsigned k = 0; k < 4; k++) {
+ 		struct ipa_ch *ch = ipa_chs[k];
+-		n += snprintf(b + n, 1536 - n, "%s: ch %u ep %u state %d; next %u done %u events %u; packets %llu bytes %llu dropped %llu "
++		n += snprintf(b + n, 2048 - n, "%s: ch %u ep %u state %d; next %u done %u events %u; packets %llu bytes %llu dropped %llu "
+ 		    "errors %llu\n", ch->name, ch->id, ch->ep, ipa.regs && ipa.clock && ipa.fw ? (int)ipa_ch_state(ch) : -1, ch->next,
+ 		    ch->done, ch->events, ch->packets, ch->bytes, ch->dropped, ch->errors);
+ 	}
+-	n += snprintf(b + n, 1536 - n, "qmi: go %d announced %d init_sent %d driver_ready %d (result %d error %d) uc_ready %d "
++	n += snprintf(b + n, 2048 - n, "qmi: go %d announced %d init_sent %d driver_ready %d (result %d error %d) uc_ready %d "
+ 	    "ind_wanted %d ind_sent %d requests %u; smp2p ours %d, modem's %#x (seen %u)\n", ipa.qmi_go, ipa.announced, ipa.init_sent,
+ 	    ipa.driver_ready, ipa.init_result, ipa.init_error, ipa.uc_ready, ipa.ind_wanted, ipa.ind_sent, ipa.requests, ipa.smp2p_set,
+ 	    ipa.smp2p_in, ipa.smp2p_in_seen);
+-	n += snprintf(b + n, 1536 - n, "SMMU (the IPA's bank): %u faults, last FSR %#x FAR %#llx FSYNR0 %#x\n", ipa.smmu_faults,
++	n += snprintf(b + n, 2048 - n, "SMMU (the IPA's bank): %u faults, last FSR %#x FAR %#llx FSYNR0 %#x\n", ipa.smmu_faults,
+ 	    ipa.last_fsr, ipa.last_far, ipa.last_fsynr);
+-	n += snprintf(b + n, 1536 - n, "rmnet0: %s %s MTU %u; out: IPv4 %llu ARP %llu other %llu (ARP answered %llu); in: IP %llu "
++	n += snprintf(b + n, 2048 - n, "rmnet0: %s %s MTU %u; out: IPv4 %llu ARP %llu other %llu (ARP answered %llu); in: IP %llu "
+ 	    "dropped %llu\n", ipa.ifp ? "attached" : "absent", ipa.if_up ? "up" : "down", ipa.mtu, ipa.tx_ip, ipa.tx_arp,
+ 	    ipa.tx_other, ipa.arp_replies, ipa.rx_ip, ipa.rx_drop);
++	n += snprintf(b + n, 2048 - n, "receive thread: %llu wake-ups, polling every %u ms now (at most %u while up and quiet)\n",
++	    ipa_rx_wakeups, ipa_rx_wait_ms, ipa_idle_max_ms);
+ 	int error = SYSCTL_OUT(req, b, n + 1);
+-	kfree_data(b, 1536);
++	kfree_data(b, 2048);
+ 	return error;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_status, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_ipa_status_sysctl,
