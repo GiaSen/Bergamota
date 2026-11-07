@@ -12,7 +12,10 @@
  * CallKit, voice and the control socket left out (no calls yet: the capabilities say so); a data controller of our own:
  * the Cellular Data and Data Roaming switches (persisted in /private/var/sweetcell/settings) start and stop the data
  * session (IPA stages, DPM/WDA/WDS, rmnet0's address, a configd service for rmnet0 below Wi-Fi); logs keep the
- * operator, the country code and the addresses out.
+ * operator, the country code and the addresses out. A switch change is pushed to CoreTelephony's clients
+ * (dataSettingsChanged:, which Settings' data cache waits for); airplane mode is followed through RadiosPreferences (the
+ * modem to low power and back); MobileGestalt's cellular-data override (Settings' Cellular pane) is put back whenever
+ * its cache is rewritten. /private/var/sweetcell/debug (present at start): Settings' CTServerConnection requests logged.
  *
  * PRIVACY: Never requests, stores, logs, or returns IMEI, IMEISV, IMSI, ICCID,
  * or subscriber phone numbers (MSISDN).
@@ -393,6 +396,10 @@
 - (void)displayStatusChanged:(id)ctx status:(id)status;
 - (void)dataStatus:(id)ctx dataStatusInfo:(id)dataStatus;
 - (void)servingNetworkChanged:(id)ctx;
+/* (sweetcelld) CoreTelephonyClientDataDelegateInternal: Settings' PSUICoreTelephonyDataCache reads the Cellular Data
+ * switch once (_CTServerConnectionGetCellularDataIsEnabled), keeps it, and only takes a new value from these */
+- (void)dataSettingsChanged:(id)settings;
+- (void)dataRoamingSettingsChanged:(id)ctx status:(BOOL)status;
 @end
 
 /* ---- Logging & runtime C symbol resolution (libxpc + notify + blocks) ---- */
@@ -403,6 +410,7 @@ static struct cellular_state g_state;
 static bool g_cellular_data_enabled = true;
 static bool g_data_roaming = true;      /* Settings > Cellular > Cellular Data Options > Data Roaming */
 static bool g_no_xpc;                   /* --no-xpc: next to CommCenter, for tests (no listeners, no status publisher) */
+static bool g_debug_log;                /* /private/var/sweetcell/debug exists: log Settings' CTServerConnection packet requests */
 static bool g_airplane_mode = false;
 static bool g_enable_wds_data = false;
 static bool g_publish_system_status = true;
@@ -965,11 +973,23 @@ static NSSet<Class> *build_allowed_ct_classes(void)
 static void save_settings(void);
 static void follow_switches(void);
 static bool modem_settled(void);
+static void broadcast_data_settings(bool roaming_changed);
 
 @interface HotCellularXPCService : NSObject
 @property (nonatomic, weak) HotXPCConnectionSPI *connection;
 @property (nonatomic, assign) BOOL registeredNotifications;
 @end
+
+/* (sweetcelld) the CTDataSettings object CoreTelephony clients get and are pushed (dataSettingsChanged:) */
+static id build_data_settings(void)
+{
+	Class cls = NSClassFromString(@"CTDataSettings");
+	id ds = cls ? [[cls alloc] init] : nil;
+	ct_set(ds, @"cellularDataEnabled", @(g_cellular_data_enabled));
+	ct_set(ds, @"airplaneModeEnabled", @(g_airplane_mode));
+	ct_set(ds, @"cellularDataCapable", @(YES));
+	return ds;
+}
 
 static os_unfair_lock g_clients_lock = OS_UNFAIR_LOCK_INIT;
 static NSMutableArray<HotCellularXPCService *> *g_xpc_clients;
@@ -1292,6 +1312,7 @@ static void trigger_qmi_radio_power(bool online);
 	g_cellular_data_enabled = enabled;
 	clog("Settings toggled Cellular Data -> %d", enabled ? 1 : 0);
 	save_settings();
+	broadcast_data_settings(false);
 	follow_switches();
 	if (completion)
 		completion(nil);
@@ -1312,13 +1333,8 @@ static void trigger_qmi_radio_power(bool online);
 
 - (void)getDataSettings:(void (^)(id, NSError *))completion
 {
-	Class cls = NSClassFromString(@"CTDataSettings");
-	id ds = cls ? [[cls alloc] init] : nil;
-	ct_set(ds, @"cellularDataEnabled", @(g_cellular_data_enabled));
-	ct_set(ds, @"airplaneModeEnabled", @(g_airplane_mode));
-	ct_set(ds, @"cellularDataCapable", @(YES));
 	if (completion)
-		completion(ds, nil);
+		completion(build_data_settings(), nil);
 }
 
 - (void)getSupports5G:(void (^)(BOOL, NSError *))completion
@@ -1347,6 +1363,7 @@ static void trigger_qmi_radio_power(bool online);
 	g_data_roaming = roam;
 	clog("Settings toggled Data Roaming -> %d", roam ? 1 : 0);
 	save_settings();
+	broadcast_data_settings(true);
 	follow_switches();
 	if (completion)
 		completion(nil);
@@ -2227,17 +2244,57 @@ static void broadcast_ct_notifications(const struct cellular_state *st, bool sim
 	}
 }
 
+/*
+ * (sweetcelld) the switches changed (Settings, or airplane mode): tell the registered CoreTelephony clients, as
+ * CommCenter does. Settings' PSUICoreTelephonyDataCache keeps the value it read once and changes it only on these
+ * (seen in SettingsCellularUI: fetchCellularDataEnabled returns early once cellularDataSettingInitialized is set), so
+ * without them the switch drew the old value the next time the pane opened.
+ */
+static void broadcast_data_settings(bool roaming_changed)
+{
+	NSArray<HotCellularXPCService *> *clients = nil;
+	os_unfair_lock_lock(&g_clients_lock);
+	clients = [g_xpc_clients copy];
+	os_unfair_lock_unlock(&g_clients_lock);
+	struct cellular_state st = snapshot_state();
+	id ds = build_data_settings();
+	id ctx1 = roaming_changed ? build_slot1_context(&st) : nil;
+	unsigned told = 0;
+	for (HotCellularXPCService *svc in clients) {
+		if (!svc.registeredNotifications || !svc.connection)
+			continue;
+		@try {
+			HotCTDelegateProxy *proxy = [svc.connection remoteObjectProxyWithErrorHandler:^(NSError *e) {
+				(void)e;
+			}];
+			if (!proxy)
+				continue;
+			if (ds)
+				[proxy dataSettingsChanged:ds];
+			if (ctx1)
+				[proxy dataRoamingSettingsChanged:ctx1 status:g_data_roaming];
+			told++;
+		} @catch (id exc) {
+			(void)exc;
+		}
+	}
+	clog("switches sent to %u client(s): Cellular Data %d, Data Roaming %d%s", told, g_cellular_data_enabled ? 1 : 0,
+	     g_data_roaming ? 1 : 0, ctx1 ? "" : (roaming_changed ? " (no SIM context for roaming)" : ""));
+}
+
 /* ---- Legacy com.apple.commcenter.xpc (CTServerConnection) Listener ---- */
 
 static hot_xpc_t g_legacy_listener;
 
-/* (sweetcelld) what a CTServerConnection message carries, for the log: its keys and short values, numbers' keys skipped */
+/* (sweetcelld) what a CTServerConnection packet request carries, for the log (only while /private/var/sweetcell/debug exists) */
 static void log_legacy_message(hot_xpc_t msg)
 {
 	static char *(*fn_copy_desc)(hot_xpc_t);
 	if (!fn_copy_desc)
 		fn_copy_desc = dlsym(RTLD_DEFAULT, "xpc_copy_description");
 	if (!fn_copy_desc)
+		return;
+	if (!g_debug_log)
 		return;
 	char *d = fn_copy_desc(msg);
 	if (!d)
@@ -2274,7 +2331,7 @@ static bool legacy_packet_property(hot_xpc_t msg, hot_xpc_t reply, const char *r
 	if (!req || strncmp(req, "kPacket", 7) != 0 || !fn_xpc_dict_get_value || !fn_get_bool || !fn_get_int64)
 		return false;
 	bool set = strstr(req, "Set") != NULL;
-	bool changed = false;
+	bool changed = false, roam_changed = false;
 	for (size_t i = 0; i < sizeof(g_data_keys) / sizeof(g_data_keys[0]); i++) {
 		if (!fn_xpc_dict_get_value(msg, g_data_keys[i]))
 			continue;
@@ -2299,7 +2356,7 @@ static bool legacy_packet_property(hot_xpc_t msg, hot_xpc_t reply, const char *r
 			bool v = fn_get_bool(msg, g_roam_keys[i]) || fn_get_int64(msg, g_roam_keys[i]) != 0;
 			if (v != g_data_roaming) {
 				g_data_roaming = v;
-				changed = true;
+				changed = roam_changed = true;
 				clog("Settings toggled Data Roaming -> %d (%s)", v ? 1 : 0, req);
 			}
 		}
@@ -2314,6 +2371,7 @@ static bool legacy_packet_property(hot_xpc_t msg, hot_xpc_t reply, const char *r
 		     g_data_roaming ? 1 : 0);
 	if (changed) {
 		save_settings();
+		broadcast_data_settings(roam_changed);
 		follow_switches();
 	}
 	return true;
@@ -3052,9 +3110,60 @@ static bool modem_settled(void)
 	return ok;
 }
 
+/*
+ * (sweetcelld) Settings shows its Cellular pane only when MobileGestalt answers cellular-data = yes, which it does not on a
+ * device tree without a baseband. The answer is kept in MobileGestalt's cache, where a CacheExtra entry keyed
+ * base64(md5("MGCopyAnswer" + question))[:22] overrides it (tools/cellular/mg-override.py did it by hand). That cache is
+ * written by MobileGestalt itself (on a fresh root, at the first boot; again when it decides it is stale), so a root image
+ * cannot carry the entry: put it back whenever the file changes. Apps that read the cache before see it after a restart.
+ */
+#define MG_CACHE		"/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/" \
+				"Caches/com.apple.MobileGestalt.plist"
+#define MG_CELLULAR_DATA	"L5al7b+7JATD/izSJeH0aQ"        /* base64(md5("MGCopyAnswercellular-data"))[:22] */
+
+static void mg_ensure_cellular_data(void)
+{
+	static struct timespec seen;
+	struct stat sb;
+	if (stat(MG_CACHE, &sb) != 0)
+		return;                 /* not written yet: the next poll looks again */
+	if (sb.st_mtimespec.tv_sec == seen.tv_sec && sb.st_mtimespec.tv_nsec == seen.tv_nsec)
+		return;
+	seen = sb.st_mtimespec;
+	NSData *d = [NSData dataWithContentsOfFile:@MG_CACHE];
+	NSPropertyListFormat fmt = NSPropertyListBinaryFormat_v1_0;
+	NSMutableDictionary *mg = d ? [NSPropertyListSerialization propertyListWithData:d
+			options:NSPropertyListMutableContainersAndLeaves format:&fmt error:nil] : nil;
+	if (![mg isKindOfClass:[NSMutableDictionary class]]) {
+		clog("MobileGestalt cache unreadable: cellular-data not set");
+		return;
+	}
+	NSMutableDictionary *extra = mg[@"CacheExtra"];
+	if (![extra isKindOfClass:[NSMutableDictionary class]]) {
+		extra = [NSMutableDictionary dictionary];
+		mg[@"CacheExtra"] = extra;
+	}
+	if ([extra[@MG_CELLULAR_DATA] isEqual:@YES])
+		return;
+	extra[@MG_CELLULAR_DATA] = @YES;
+	NSData *out = [NSPropertyListSerialization dataWithPropertyList:mg format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
+	NSString *tmp = @MG_CACHE ".sweetcelld";
+	if (!out || ![out writeToFile:tmp atomically:NO] || chown(tmp.UTF8String, sb.st_uid, sb.st_gid) != 0 ||
+	    chmod(tmp.UTF8String, sb.st_mode & 07777) != 0 || rename(tmp.UTF8String, MG_CACHE) != 0) {
+		clog("MobileGestalt cache: cellular-data NOT set (%s)", strerror(errno));
+		unlink(tmp.UTF8String);
+		return;
+	}
+	if (stat(MG_CACHE, &sb) == 0)
+		seen = sb.st_mtimespec;
+	clog("MobileGestalt cache: cellular-data set to yes (Settings' Cellular pane; apps already running see it after a restart)");
+}
+
 static void try_connect_and_sync(void)
 {
 	bool just_connected = false;
+	if (!g_no_xpc)
+		mg_ensure_cellular_data();
 	if (g_qmi.fd < 0) {
 		g_qmi.ind_cb = on_qmi_indication;
 		if (qmi_open(&g_qmi, NULL) < 0)
@@ -3106,6 +3215,58 @@ static void try_connect_and_sync(void)
 		fn_notify_post("kCTDaemonReadyLocalNotification");
 }
 
+/*
+ * (sweetcelld) airplane mode: RadiosPreferences (AppSupport, as Control Center and Settings use it) on the QMI queue,
+ * with a delegate whose airplaneModeChanged is called when another process changes it. On a change: the modem to low
+ * power or back online, the data session follows (data_reconcile), and the CoreTelephony clients are told.
+ */
+@interface HotRadiosWatcher : NSObject
+@end
+
+static id g_radios;
+static HotRadiosWatcher *g_radios_watcher;
+
+static bool radios_airplane_mode(void)
+{
+	if (!g_radios)
+		return g_airplane_mode;
+	if ([g_radios respondsToSelector:@selector(refresh)])
+		[g_radios performSelector:@selector(refresh)];
+	return ((BOOL (*)(id, SEL))objc_msgSend)(g_radios, sel_registerName("airplaneMode"));
+}
+
+@implementation HotRadiosWatcher
+- (void)airplaneModeChanged
+{
+	bool now = radios_airplane_mode();
+	if (now == g_airplane_mode)
+		return;
+	g_airplane_mode = now;
+	clog("AirplaneMode changed -> %d", now ? 1 : 0);
+	trigger_qmi_radio_power(!now);
+	broadcast_data_settings(false);
+}
+@end
+
+static void radios_watch(void)
+{
+	(void)dlopen("/System/Library/PrivateFrameworks/AppSupport.framework/AppSupport", RTLD_NOW);
+	Class rc = NSClassFromString(@"RadiosPreferences");
+	if (!rc || ![rc instancesRespondToSelector:@selector(initWithQueue:)]) {
+		clog("RadiosPreferences not found: airplane mode not followed");
+		return;
+	}
+	g_radios = ((id (*)(id, SEL, dispatch_queue_t))objc_msgSend)([rc alloc], @selector(initWithQueue:), g_qmi_queue);
+	g_radios_watcher = [HotRadiosWatcher new];
+	((void (*)(id, SEL, id))objc_msgSend)(g_radios, sel_registerName("setDelegate:"), g_radios_watcher);
+	dispatch_async(g_qmi_queue, ^{
+		bool now = radios_airplane_mode();
+		clog("airplane mode %d at start (RadiosPreferences)", now ? 1 : 0);
+		if (now != g_airplane_mode)
+			[g_radios_watcher airplaneModeChanged];
+	});
+}
+
 static void trigger_qmi_radio_power(bool online)
 {
 	dispatch_async(g_qmi_queue, ^{
@@ -3113,11 +3274,18 @@ static void trigger_qmi_radio_power(bool online)
 		g_last_online_try_ms = 0;
 		g_last_logged_dms_mode = 0xfe;
 		if (g_qmi.fd >= 0 && qmi_has_service(&g_qmi, QMI_SVC_DMS)) {
+			struct cellular_state cur = snapshot_state();
+			if (online && !modem_settled()) {
+				/* (sweetcelld) the poll brings it online once the modem has settled (WLFW hand-over) */
+				clog("AirplaneMode off: radio goes online once the modem has settled");
+				return;
+			}
+			if (!online && cur.data_connected)
+				data_down(&cur, "airplane mode");
 			uint16_t qerr = 0;
 			int mrc = qmi_dms_set_operating_mode_ex(&g_qmi, online ? 0x00 : 0x01, &qerr);
 			clog("AirplaneMode radio power -> %s: rc=%d qmi_err=0x%04x",
 			     online ? "ONLINE" : "LOW_POWER", mrc, qerr);
-			struct cellular_state cur = snapshot_state();
 			(void)qmi_poll_all(&g_qmi, &cur, !cur.modem_rev[0]);
 			commit_and_publish(&cur, false);
 		}
@@ -3185,6 +3353,7 @@ int main(int argc, char **argv)
 
 		load_config();
 		load_settings();
+		g_debug_log = access(SWEETCELL_DIR "/debug", F_OK) == 0;
 		clog("switches: Cellular Data %d, Data Roaming %d", g_cellular_data_enabled ? 1 : 0, g_data_roaming ? 1 : 0);
 		g_qmi.rat_mode_pref = g_rat_mode_pref;
 		if (g_no_xpc)
@@ -3248,21 +3417,9 @@ int main(int argc, char **argv)
 		});
 		dispatch_resume(ind_timer);
 
-		/* Watch AirplaneMode Darwin notification so radio tracks Control Center toggle! */
-		int (*fn_notify_reg)(const char *, int *, dispatch_queue_t, void (^)(int)) =
-			dlsym(RTLD_DEFAULT, "notify_register_dispatch");
-		if (fn_notify_reg) {
-			int tok = 0;
-			fn_notify_reg("com.apple.radios.prefs", &tok, g_qmi_queue, ^(int t) {
-				(void)t;
-				bool prev = g_airplane_mode;
-				load_config();
-				if (prev != g_airplane_mode) {
-					clog("AirplaneMode changed -> %d", g_airplane_mode ? 1 : 0);
-					trigger_qmi_radio_power(!g_airplane_mode);
-				}
-			});
-		}
+		/* (sweetcelld) airplane mode as Control Center sets it: AppSupport's RadiosPreferences and its delegate (iOS 26
+		 * posts no "com.apple.radios.prefs" notification; the earlier watch never fired) */
+		radios_watch();
 
 		dispatch_main();
 	}

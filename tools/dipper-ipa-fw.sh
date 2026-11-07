@@ -3,8 +3,14 @@
 # where xnu 3073's kern.sweet_ipa stage 3 reads it: /usr/local/share/firmware (as tools/gpu-fw-push.sh does for the
 # GPU's zap shader). Taken from the vendor partition backup with e2fsprogs' debugfs; never committed to git.
 #   tools/dipper-ipa-fw.sh [VENDOR_IMG]      default backup/dipper/vendor.img
+#   tools/dipper-ipa-fw.sh --out DIR [VENDOR_IMG]   only extract into DIR (for the root image: RENEGADE_IPA_FW=DIR)
 # Needs the phone booted with SSH up (root@192.168.7.2; SWEET_HOST overrides) and `brew install e2fsprogs`.
 set -eu
+out=
+if [ "${1:-}" = --out ]; then
+	case "$2" in /*) out=$2 ;; *) out=$PWD/$2 ;; esac
+	shift 2
+fi
 cd "$(dirname "$0")/.."
 img=${1:-backup/dipper/vendor.img}
 host=${SWEET_HOST:-root@192.168.7.2}
@@ -16,6 +22,12 @@ for f in ipa_fws.mdt ipa_fws.b00 ipa_fws.b01 ipa_fws.b02 ipa_fws.b03 ipa_fws.b04
 	"$debugfs" -R "dump /firmware/$f $tmp/$f" "$img" >/dev/null 2>&1
 	[ -s "$tmp/$f" ] || { echo "$f not in $img" >&2; exit 1; }
 done
+if [ -n "$out" ]; then
+	mkdir -p "$out"
+	cp "$tmp"/ipa_fws.* "$out"/
+	ls -l "$out"/ipa_fws.*
+	exit 0
+fi
 dest=/usr/local/share/firmware
 ssh "$host" "mkdir -p $dest"
 for f in "$tmp"/ipa_fws.*; do

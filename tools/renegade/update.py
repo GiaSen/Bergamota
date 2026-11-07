@@ -313,6 +313,8 @@ def main():
             metal = rt.bgmtl(mnt)
         if os.environ.get('RENEGADE_ORIENT') == '1':     # the backboardd orientation shim, after chlorophyll (root_tweaks18.orient)
             rt.orient(mnt)
+        if os.environ.get('RENEGADE_CELL') == '1':       # sweetcelld in CommCenter's place, the IPA firmware (root_tweaks18.cellular)
+            rt.cellular(mnt)
         rt.firstboot(mnt, appreg=feats['appreg'], jb=feats['jb'], wallpaper=feats['wallpaper'], metal=metal)
         rt.hide_apps(mnt)
         rt.test_tools(mnt)
