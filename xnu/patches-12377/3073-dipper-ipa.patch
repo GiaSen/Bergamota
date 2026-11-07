@@ -1,0 +1,1980 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 04185d1..9fca46a 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -5529,6 +5529,9 @@ wf_teardown(void)
+  * to a ring (kern.sweet_qmi_ind). What a request does is up to the caller: this code only carries bytes.
+  */
+ #define QRTR_QMI_PORT           0x4004u
++/* 3073: the IPA (dipper_ipa.c.inc, included at the end of this file) */
++static bool ipa_qrtr_rx(uint32_t dport, uint32_t node, uint32_t port, const uint8_t *m, uint32_t len);
++static void ipa_pump(void);
+ #define QSVC_MAX                96u
+ #define QP_REQ_MAX              1024u
+ #define QP_RSP_MAX              8192u
+@@ -5863,6 +5866,8 @@ ipc_qrtr_rx(const uint8_t *p, uint32_t len)
+ 			wf_rx(snode, sport, pl, size);
+ 		} else if (dport == QRTR_QMI_PORT) {
+ 			qp_rx(snode, sport, pl, size);
++		} else if (ipa_qrtr_rx(dport, snode, sport, pl, size)) {
++			/* 3073: the IPA's QMI service and client */
+ 		} else if (tftp_rx(dport, snode, sport, pl, size)) {
+ 			/* TFTP server or one of its transfers */
+ 		} else {
+@@ -7614,6 +7619,7 @@ ms_ipc_run(unsigned hold_s)
+ 		tftp_pump();
+ 		wf_poll();
+ 		qp_pump();
++		ipa_pump();
+ 		if (ipc.open_acked && !ipc.announced && ms_now_ms() > ipc.open_ms + 3000) {
+ 			printf("SWEET IPC: qrtr: no hello from the modem 3 s after IPCRTR opened: sending ours\n");
+ 			ipc_qrtr_announce();
+@@ -10152,5 +10158,7 @@ sweet_modem_file_read(uint32_t cluster, uint64_t off, void *dst, uint64_t len)
+ 	return err;
+ }
+ 
++#include "dipper_ipa.c.inc"
++
+ #endif /* !WLAN_HOST_TEST */
+ #endif /* WLAN_HOST_TEST || ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/dipper_ipa.c.inc b/bsd/dev/dipper_ipa.c.inc
+new file mode 100644
+index 0000000..7b6abc5
+--- /dev/null
++++ b/bsd/dev/dipper_ipa.c.inc
+@@ -0,0 +1,1788 @@
++/*
++ * ---- 3073: the IPA (Qualcomm's IP accelerator: IPA 3.5.1 with GSI 1.3 on the SDM845), for mobile data.
++ * Included at the end of beryllium_wlan.c: QMI goes through that file's service thread (QRTR over GLINK), SMP2P through
++ * its modem item; the data path has a receive thread of its own.
++ *
++ * Brought up by stages from kern.sweet_ipa (root), each logged as "SWEET IPA:", so a step that fails can be looked at
++ * before the next one is tried; nothing runs at boot:
++ *   1  power: the IPA's clock (RPMh BCM "IP0"), its SMMU streams 0x720 (AP) and 0x722 (uC) and its IMEM (0x146bd000)
++ *      through the shared bank, then its version and shared-memory registers read (never before the clock)
++ *   2  config: the hardware as Linux's ipa_hardware_config(), ipa_mem_config() and ipa_resource_config() leave an IPA
++ *      v3.5.1 (ipa_data-v3.5.1.c): BCR, QSB limits, aggregation granularity, resource groups, the default route to the
++ *      LAN endpoint, the modem's processing contexts' base; the local memory zeroed and its canaries written
++ *   3  firmware: ipa_fws (.mdt + .b02..b04, the phone's /vendor/firmware, pushed to /usr/local/share/firmware) through
++ *      TrustZone PAS 15 at 0x8c400000 (the downstream DT's qcom,ipa_fws memory-region; mainline's ipa_fw_mem: Android-
++ *      firmware SDM845 phones load it from the AP, qcom,gsi-loader = "self"); then the GSI's "enabled" status
++ *   4  channels: this processor's four GSI channels (command 4 / endpoint 5, LAN in 5/9, to the modem 3/2, from the modem
++ *      6/10), their endpoints and the IPA's route, filter and header tables (gsi_setup(), ipa_endpoint_program(),
++ *      ipa_table_setup(), ipa_mem_setup())
++ *   5  qmi: our IPA QMI service (0x31 instance 1) announced, INIT_DRIVER (0x21) to the modem's (0x31 instance 2) with the
++ *      3.5.1 layout, the SMP2P "ipa" entry set to valid + clock on (ipa_smp2p.c), the modem's requests answered
++ *   6  netif: rmnet0, an Ethernet-framed interface on QMAP mux 1 (ARP answered here), and the receive thread
++ *   9  stages 1-6 in a row, stopping at the first failure; 10: our channels stopped and freed (to retry stage 4)
++ * kern.sweet_ipa_opt (bits, read by the stages): 1 the 6T port's GPI scratch words (0/1 instead of 2/3), 2 deaggregation
++ *   on the modem TX endpoint (the 6T's), 4 plain QMAP instead of QMAPv4, 8 INIT_COMPLETE without waiting for the modem's
++ *   DRIVER_INIT_COMPLETE, 16 a log line per packet, 32 no TLV 0x18 (skip_uc_load) in INIT_DRIVER
++ * kern.sweet_ipa_session (string, write): "ADDR MASK GATEWAY MTU" gives rmnet0 the data session's address; "down".
++ * kern.sweet_ipa_status (string): where it stands.
++ *
++ * Sources: Linux drivers/net/ipa (ipa_data-v3.5.1.c, reg/ipa_reg-v3.1.c, reg/gsi_reg-v3.1.c, gsi.c, ipa_endpoint.c,
++ * ipa_table.c, ipa_mem.c, ipa_qmi.c, ipa_qmi_msg.c, ipa_smp2p.c) for the layout and the values; HakiOS's OnePlus 6T port
++ * (github.com/xreactx/hakios-xnu-kernel, branch oneplus-6t-upstream, drivers/modem/hakios.ipa.c and hakios.mpss.c, APSL
++ * 2.0), whose IPA 3.5.1 data path and QMI handshake this follows; Android's gsi.h for the GPI scratch layout.
++ */
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/sockio.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <netinet/in.h>
++#include <net/if_media.h>
++#include <net/dlil.h>
++#include <net/bpf.h>
++#include <sys/kern_event.h>
++
++extern int sweet_rpmh_bcm_vote(const char *res, uint32_t vote);
++extern int sweet_smmu_map_block(uint64_t pa);
++extern int sweet_smmu_bank_fault(uint32_t *fsr, uint64_t *far, bool clear);
++extern int sweet_scm_pas(uint32_t pas_id, uint32_t cmd, uint32_t arginfo, uint64_t arg1, uint64_t arg2);
++extern void sweet_a630_fw_put(void *buf, size_t len);
++
++#define IPA_REG_PA              0x01e40000u     /* mainline sdm845.dtsi: "ipa-reg" */
++#define IPA_REG_SIZE            0x7000u
++#define IPA_SHARED_PA           0x01e47000u     /* "ipa-shared": the IPA's local memory */
++#define IPA_SHARED_SIZE         0x2000u
++#define IPA_GSI_PA              0x01e04000u     /* "gsi" */
++#define IPA_GSI_FROM            0xc000u         /* mapped from the inter-EE masks to the EE's scratch (gsi_reg-v3.1.c) */
++#define IPA_GSI_SIZE            0x14000u
++#define IPA_FW_PA               0x8c400000u
++#define IPA_FW_SIZE             0x10000u
++#define IPA_PAS_ID              15u
++#define IPA_SID_AP              0x720u          /* downstream DT ipa_smmu_ap / mainline iommus */
++#define IPA_SID_UC              0x722u          /* ipa_smmu_uc */
++#define IPA_IMEM_PA             0x146bd000u     /* ipa_data-v3.5.1.c imem_addr, 0x2000 bytes */
++
++/* the IPA's registers (reg/ipa_reg-v3.1.c, downstream ipa_reg.h) */
++#define IPA_COMP_HW_VERSION     0x030
++#define IPA_VERSION_REG         0x034
++#define IPA_ENABLED_PIPES       0x038
++#define IPA_ROUTE               0x048
++#define IPA_SHARED_MEM_SIZE     0x054
++#define IPA_QSB_MAX_WRITES      0x074
++#define IPA_QSB_MAX_READS       0x078
++#define IPA_FILT_ROUT_HASH_FLUSH 0x090
++#define IPA_BCR                 0x1d0
++#define IPA_LOCAL_PKT_PROC_CNTXT 0x1e8
++#define IPA_COUNTER_CFG         0x1f0
++#define IPA_FLAVOR_0            0x210
++#define IPA_SRC_RSRC_GRP_01(t)  (0x400 + 0x20 * (t))
++#define IPA_SRC_RSRC_GRP_23(t)  (0x404 + 0x20 * (t))
++#define IPA_DST_RSRC_GRP_01(t)  (0x500 + 0x20 * (t))
++#define IPA_DST_RSRC_GRP_23(t)  (0x504 + 0x20 * (t))
++#define IPA_ENDP_INIT_CTRL(e)   (0x800 + 0x70 * (e))
++#define IPA_ENDP_INIT_CFG(e)    (0x808 + 0x70 * (e))
++#define IPA_ENDP_INIT_NAT(e)    (0x80c + 0x70 * (e))
++#define IPA_ENDP_INIT_HDR(e)    (0x810 + 0x70 * (e))
++#define IPA_ENDP_INIT_HDR_EXT(e) (0x814 + 0x70 * (e))
++#define IPA_ENDP_INIT_HDR_MD_MASK(e) (0x818 + 0x70 * (e))
++#define IPA_ENDP_INIT_MODE(e)   (0x820 + 0x70 * (e))
++#define IPA_ENDP_INIT_AGGR(e)   (0x824 + 0x70 * (e))
++#define IPA_ENDP_INIT_HOL_EN(e) (0x82c + 0x70 * (e))
++#define IPA_ENDP_INIT_DEAGGR(e) (0x834 + 0x70 * (e))
++#define IPA_ENDP_INIT_RSRC_GRP(e) (0x838 + 0x70 * (e))
++#define IPA_ENDP_INIT_SEQ(e)    (0x83c + 0x70 * (e))
++#define IPA_ENDP_STATUS(e)      (0x840 + 0x70 * (e))
++#define IPA_RSRC(xmin, xmax, ymin, ymax) ((uint32_t)(xmin) | (uint32_t)(xmax) << 8 | (uint32_t)(ymin) << 16 | (uint32_t)(ymax) << 24)
++
++/* the GSI's registers for EE 0 (gsi_reg-v3.1.c: an EE's own registers 0xd000 above GSI 2.x's) */
++#define GSI_INTER_EE_CH_MSK     0x0c020
++#define GSI_INTER_EE_EV_MSK     0x0c024
++#define GSI_CH_CNTXT(c, n)      (0x1c000 + 0x80 * (c) + 4 * (n))
++#define GSI_CH_QOS(c)           (0x1c05c + 0x80 * (c))
++#define GSI_CH_SCRATCH(c, n)    (0x1c060 + 0x80 * (c) + 4 * (n))
++#define GSI_EV_CNTXT(e, n)      (0x1d000 + 0x80 * (e) + 4 * (n))
++#define GSI_CH_DOORBELL(c)      (0x1e000 + 8 * (c))
++#define GSI_EV_DOORBELL(e)      (0x1e100 + 8 * (e))
++#define GSI_STATUS              0x1f000
++#define GSI_CH_CMD              0x1f008
++#define GSI_EV_CH_CMD           0x1f010
++#define GSI_TYPE_IRQ_MSK        0x1f088
++#define GSI_SRC_CH_IRQ_MSK      0x1f098
++#define GSI_SRC_EV_CH_IRQ_MSK   0x1f09c
++#define GSI_SRC_CH_IRQ_CLR      0x1f0a0
++#define GSI_SRC_EV_CH_IRQ_CLR   0x1f0a4
++#define GSI_SRC_IEOB_IRQ_MSK    0x1f0b8
++#define GSI_GLOB_IRQ_STTS       0x1f100
++#define GSI_GLOB_IRQ_EN         0x1f108
++#define GSI_GSI_IRQ_STTS        0x1f118
++#define GSI_GSI_IRQ_EN          0x1f120
++#define GSI_INTSET              0x1f180
++#define GSI_ERROR_LOG           0x1f200
++#define GSI_ERROR_LOG_CLR       0x1f210
++
++#define GSI_CH_ALLOCATE         0x0     /* CH_CMD / EV_CH_CMD opcodes (bits 31:24) */
++#define GSI_CH_START            0x1
++#define GSI_CH_STOP             0x2
++#define GSI_CH_RESET            0x9
++#define GSI_CH_DE_ALLOC         0xa
++#define GSI_ST_NOT_ALLOCATED    0       /* CNTXT_0 bits 23:20 */
++#define GSI_ST_ALLOCATED        1
++#define GSI_ST_STARTED          2
++#define GSI_ST_STOPPED          3
++#define GSI_GPI                 2       /* channel type: GPI */
++#define GSI_ELEMENT             16u
++
++#define IPA_OPT_6T_SCRATCH      1u
++#define IPA_OPT_TX_DEAGGR       2u
++#define IPA_OPT_QMAP1           4u
++#define IPA_OPT_EARLY_COMPLETE  8u
++#define IPA_OPT_TRACE           16u
++#define IPA_OPT_NO_SKIP_UC      32u
++
++#define IPA_RX_BUF              16384u          /* a page: the IPA aggregates into it */
++#define IPA_AGGR_KB             12u             /* closes a receive buffer at 12 KB (a 4 KB packet still fits) */
++#define IPA_MUX                 1u              /* the QMAP mux id rmnet0 carries (WDS Bind Mux Data Port) */
++
++struct ipa_ch {
++	const char      *name;
++	uint8_t         id, ring, ep;                   /* GSI channel, its event ring, the IPA endpoint */
++	bool            tx, command, qmap, aggr, close_eof;
++	uint32_t        slots;                          /* TREs (and buffers) in the ring: a power of two */
++	uint32_t        tlv;                            /* ipa_data-v3.5.1.c tlv_count */
++	uint32_t        bufsize;
++	vm_offset_t     ring_va, ev_va;
++	uint64_t        ring_pa, ev_pa;
++	vm_offset_t     *buf_va;
++	uint64_t        *buf_pa;
++	uint32_t        npages;
++	uint32_t        next, done, events;
++	bool            setup, started;
++	uint64_t        packets, bytes, dropped, errors;
++};
++static struct ipa_ch ipa_cmd_ch = { .name = "command", .id = 4, .ring = 0, .ep = 5, .tx = true, .command = true, .slots = 16,
++	                            .tlv = 20, .bufsize = 64 };
++static struct ipa_ch ipa_lan_ch = { .name = "lan-rx", .id = 5, .ring = 1, .ep = 9, .aggr = true, .slots = 16, .tlv = 8,
++	                            .bufsize = IPA_RX_BUF };
++static struct ipa_ch ipa_tx_ch = { .name = "modem-tx", .id = 3, .ring = 2, .ep = 2, .tx = true, .qmap = true, .slots = 64,
++	                           .tlv = 16, .bufsize = 2048 };
++static struct ipa_ch ipa_rx_ch = { .name = "modem-rx", .id = 6, .ring = 3, .ep = 10, .qmap = true, .aggr = true,
++	                           .close_eof = true, .slots = 64, .tlv = 8, .bufsize = IPA_RX_BUF };
++static struct ipa_ch *const ipa_chs[] = { &ipa_cmd_ch, &ipa_lan_ch, &ipa_tx_ch, &ipa_rx_ch };
++
++#define IPA_HOST_PORT           0x4005u         /* our IPA QMI service (0x31 instance 1) */
++#define IPA_CLIENT_PORT         0x4006u         /* our client of the modem's (0x31 instance 2) */
++#define IPA_QMI_SERVICE         0x31u
++
++static LCK_GRP_DECLARE(ipa_grp, "sweet_ipa");
++static LCK_MTX_DECLARE(ipa_lock, &ipa_grp);          /* the stages */
++static LCK_MTX_DECLARE(ipa_dlock, &ipa_grp);         /* the data path */
++static struct {
++	vm_offset_t     regs, shared, gsi;
++	uint32_t        opt, stage, mem_offset, gsi_status;
++	bool            clock, smmu, configured, fw, ready, qmap4;
++	vm_offset_t     table_va, zero_va;
++	uint64_t        table_pa, zero_pa;
++	char            err[96];
++	/* QMI, in the service thread */
++	bool            qmi_go, announced, init_sent, driver_ready, uc_ready, ind_wanted, ind_sent, smp2p_set;
++	uint32_t        reg_node, reg_port, modem_node, modem_port;
++	uint16_t        txn;
++	int32_t         init_result, init_error;
++	uint32_t        smp2p_in, smp2p_in_seen;
++	uint32_t        requests;
++	/* rmnet0 */
++	ifnet_t         ifp;
++	thread_t        rx_thread;
++	bool            if_up;
++	uint32_t        addr, mask, gw, mtu;
++	uint64_t        tx_ip, tx_arp, tx_other, rx_ip, rx_drop, arp_replies;
++} ipa;
++static const uint8_t ipa_mac[ETHER_ADDR_LEN] = { 0x02, 0x53, 0x57, 0x49, 0x50, 0x41 };     /* rmnet0: "SWIPA" */
++static const uint8_t ipa_gw_mac[ETHER_ADDR_LEN] = { 0x02, 0x53, 0x57, 0x49, 0x50, 0x01 };  /* the made-up router */
++static int ipa_rx_chan;
++
++static inline uint32_t
++ipa_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(ipa.regs + off);
++}
++
++static inline void
++ipa_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(ipa.regs + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline uint32_t
++gsi_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(ipa.gsi + off - IPA_GSI_FROM);
++}
++
++static inline void
++gsi_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(ipa.gsi + off - IPA_GSI_FROM) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline void
++ipa_sram_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(ipa.shared + ipa.mem_offset + off) = v;
++}
++
++static void
++ipa_fail(const char *fmt, ...) __printflike(1, 2);
++static void
++ipa_fail(const char *fmt, ...)
++{
++	va_list ap;
++	va_start(ap, fmt);
++	vsnprintf(ipa.err, sizeof(ipa.err), fmt, ap);
++	va_end(ap);
++	printf("SWEET IPA: FAILED: %s\n", ipa.err);
++}
++
++/* one page, zeroed, physically contiguous, out of the cache; its physical address */
++static bool
++ipa_dma_page(vm_offset_t *va, uint64_t *pa)
++{
++	vm_offset_t v = 0;
++	if (kmem_alloc_contig(kernel_map, &v, PAGE_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)v);
++	if (!pn) {
++		return false;
++	}
++	*va = v;
++	*pa = ptoa_64(pn);
++	sweet_dma_sync_va((const void *)v, PAGE_SIZE);
++	return true;
++}
++
++/* ---- stage 1: power ------------------------------------------------------------------------------------------- */
++
++static bool
++ipa_stage_power(void)
++{
++	int e = EBUSY;
++	for (unsigned t = 0; t < 50 && e == EBUSY; t++) {
++		e = sweet_rpmh_bcm_vote("IP0", 0x3fff);
++		if (e == EBUSY) {
++			delay(2000);
++		}
++	}
++	if (e) {
++		ipa_fail("the IPA's clock (BCM IP0) is not voted on (%d)", e);
++		return false;
++	}
++	ipa.clock = true;
++	delay(200);
++	int s0 = sweet_smmu_map_sid(IPA_SID_AP), s1 = sweet_smmu_map_sid(IPA_SID_UC);
++	int s2 = s0 == 0 ? sweet_smmu_map_block(IPA_IMEM_PA) : -1;
++	printf("SWEET IPA: 1: clock on; SMMU streams %#x -> %d, %#x -> %d, IMEM %#x -> %d\n", IPA_SID_AP, s0, IPA_SID_UC, s1,
++	    IPA_IMEM_PA, s2);
++	if (s0 || s1) {
++		ipa_fail("the IPA's SMMU streams are not mapped (%d, %d)", s0, s1);
++		return false;
++	}
++	ipa.smmu = true;
++	if (!ipa.regs) {
++		ipa.regs = ml_io_map(IPA_REG_PA, IPA_REG_SIZE);
++		ipa.shared = ml_io_map(IPA_SHARED_PA, IPA_SHARED_SIZE);
++		ipa.gsi = ml_io_map(IPA_GSI_PA + IPA_GSI_FROM, IPA_GSI_SIZE);
++	}
++	if (!ipa.regs || !ipa.shared || !ipa.gsi) {
++		ipa_fail("the IPA's registers are not mapped");
++		return false;
++	}
++	uint32_t shared = ipa_rd(IPA_SHARED_MEM_SIZE);
++	ipa.mem_offset = 8 * (shared >> 16);
++	ipa.gsi_status = gsi_rd(GSI_STATUS);
++	printf("SWEET IPA: 1: COMP_HW_VERSION %#x VERSION %#x ENABLED_PIPES %#x FLAVOR_0 %#x ROUTE %#x SHARED_MEM_SIZE %#x "
++	    "(local memory %u bytes at offset %#x), GSI_STATUS %#x\n", ipa_rd(IPA_COMP_HW_VERSION), ipa_rd(IPA_VERSION_REG),
++	    ipa_rd(IPA_ENABLED_PIPES), ipa_rd(IPA_FLAVOR_0), ipa_rd(IPA_ROUTE), shared, 8 * (shared & 0xffff), ipa.mem_offset,
++	    ipa.gsi_status);
++	if (ipa.mem_offset + 0x2000 > IPA_SHARED_SIZE) {
++		ipa_fail("the local memory at offset %#x is beyond the mapped 0x2000 bytes", ipa.mem_offset);
++		return false;
++	}
++	return true;
++}
++
++/* ---- stage 2: config ------------------------------------------------------------------------------------------ */
++
++static bool
++ipa_stage_config(void)
++{
++	/* ipa_data-v3.5.1.c's memory map: offsets of the regions with canaries before them, and how many */
++	static const uint16_t canaries[][2] = {
++		{ 0x0288, 2 }, { 0x0308, 2 }, { 0x0388, 2 }, { 0x0408, 2 }, { 0x0488, 2 }, { 0x0508, 2 }, { 0x0588, 2 }, { 0x0608, 2 },
++		{ 0x0688, 2 }, { 0x07d0, 2 }, { 0x1c00, 1 },
++	};
++	/* resource limits per type, groups 0..3 (LWA_DL, UL_DL, MHI_DMA, UC_RX_Q) as min, max (6-bit fields on v3.5.1) */
++	static const uint8_t src[5][4][2] = {
++		{ { 1, 63 }, { 1, 63 }, { 0, 0 }, { 1, 63 } },         /* packet contexts */
++		{ { 10, 10 }, { 10, 10 }, { 0, 0 }, { 8, 8 } },        /* descriptor lists */
++		{ { 12, 12 }, { 14, 14 }, { 0, 0 }, { 8, 8 } },        /* descriptor buffers */
++		{ { 0, 63 }, { 0, 63 }, { 0, 63 }, { 0, 63 } },        /* HPS DMARs */
++		{ { 14, 14 }, { 20, 20 }, { 0, 0 }, { 14, 14 } },      /* ACK entries */
++	};
++	static const uint8_t dst[2][3][2] = {                       /* groups 0..2 (LWA_DL, UL_DL_DPL, unused) */
++		{ { 4, 4 }, { 4, 4 }, { 3, 3 } },                       /* data sectors */
++		{ { 2, 63 }, { 1, 63 }, { 1, 2 } },                     /* DPS DMARs */
++	};
++	if (!ipa.clock || !ipa.regs) {
++		ipa_fail("stage 2 needs stage 1");
++		return false;
++	}
++	/* the local memory from the first table to the end of the modem's region; the uC's areas (0..0x288, 0x1c00..) left */
++	for (uint32_t at = 0x288; at < 0x0bd8 + 0x1024; at += 4) {
++		ipa_sram_wr(at, 0);
++	}
++	for (unsigned r = 0; r < sizeof(canaries) / sizeof(canaries[0]); r++) {
++		for (unsigned c = 1; c <= canaries[r][1]; c++) {
++			ipa_sram_wr(canaries[r][0] - 4 * c, 0xdeadbeef);
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	/* BCR: CMDQ_L_LACK_ONE_ENTRY, TX_NOT_USING_BRESP, SUSPEND_L2_IRQ, HOLB_DROP_L2_IRQ, DUAL_TX */
++	ipa_wr(IPA_BCR, 1u << 0 | 1u << 1 | 1u << 3 | 1u << 4 | 1u << 5);
++	ipa_wr(IPA_QSB_MAX_WRITES, 8 | 4u << 4);        /* DDR master 8, PCIe 4 */
++	ipa_wr(IPA_QSB_MAX_READS, 8 | 12u << 4);        /* DDR 8, PCIe 12 */
++	ipa_wr(IPA_COUNTER_CFG, 15u << 4);              /* AGGR_GRANULARITY: 500 us of 32 kHz, less one */
++	for (unsigned t = 0; t < 5; t++) {
++		ipa_wr(IPA_SRC_RSRC_GRP_01(t), IPA_RSRC(src[t][0][0], src[t][0][1], src[t][1][0], src[t][1][1]));
++		ipa_wr(IPA_SRC_RSRC_GRP_23(t), IPA_RSRC(src[t][2][0], src[t][2][1], src[t][3][0], src[t][3][1]));
++	}
++	for (unsigned t = 0; t < 2; t++) {
++		ipa_wr(IPA_DST_RSRC_GRP_01(t), IPA_RSRC(dst[t][0][0], dst[t][0][1], dst[t][1][0], dst[t][1][1]));
++		ipa_wr(IPA_DST_RSRC_GRP_23(t), IPA_RSRC(dst[t][2][0], dst[t][2][1], 0, 0));
++	}
++	/* the default route: enabled, to the LAN endpoint 9, header table 1, fragments to 9, the header retained */
++	ipa_wr(IPA_ROUTE, 0x1120052);
++	ipa_wr(IPA_LOCAL_PKT_PROC_CNTXT, ipa.mem_offset + 0x07d0);     /* the modem's processing contexts */
++	ipa.configured = true;
++	printf("SWEET IPA: 2: configured: BCR %#x QSB %#x/%#x COUNTER_CFG %#x ROUTE %#x PROC_CNTXT %#x, source group 1 %#x, "
++	    "local memory zeroed 0x288..%#x and canaries written\n", ipa_rd(IPA_BCR), ipa_rd(IPA_QSB_MAX_WRITES),
++	    ipa_rd(IPA_QSB_MAX_READS), ipa_rd(IPA_COUNTER_CFG), ipa_rd(IPA_ROUTE), ipa_rd(IPA_LOCAL_PKT_PROC_CNTXT),
++	    ipa_rd(IPA_SRC_RSRC_GRP_01(0)), 0x0bd8 + 0x1024);
++	return true;
++}
++
++/* ---- stage 3: the GSI's firmware ------------------------------------------------------------------------------- */
++
++static bool
++ipa_stage_firmware(void)
++{
++	void *mdt = NULL, *seg[8] = { NULL };
++	size_t mdt_len = 0, seg_len[8] = { 0 };
++	bool ok = false;
++	uint32_t lo = ~0u, hi = 0, nload = 0;
++
++	if (!ipa.configured) {
++		ipa_fail("stage 3 needs stage 2");
++		return false;
++	}
++	if (gsi_rd(GSI_STATUS) & 1) {
++		printf("SWEET IPA: 3: the GSI is enabled already (status %#x): firmware not loaded again\n", gsi_rd(GSI_STATUS));
++		ipa.fw = true;
++		return true;
++	}
++	if (!sweet_a630_fw_get(NULL, "ipa_fws.mdt", &mdt, &mdt_len) || mdt_len < 52 + 32 || mdt_len > 0x4000) {
++		ipa_fail("ipa_fws.mdt missing (/usr/local/share/firmware) or not of the right size (%zu)", mdt_len);
++		goto out;
++	}
++	const uint8_t *e = mdt;
++	uint32_t phoff = e[28] | e[29] << 8 | e[30] << 16 | (uint32_t)e[31] << 24, phnum = e[44] | e[45] << 8;
++	if (memcmp(e, "\177ELF\1", 5) != 0 || phnum == 0 || phnum > 8 || phoff + 32 * phnum > mdt_len) {
++		ipa_fail("ipa_fws.mdt is not a Qualcomm ELF32 (%u segments)", phnum);
++		goto out;
++	}
++	struct { uint32_t type, off, vaddr, paddr, filesz, memsz, flags, align; } ph[8];
++	for (uint32_t i = 0; i < phnum; i++) {
++		memcpy(&ph[i], e + phoff + 32 * i, 32);
++		bool load = ph[i].type == 1 && ((ph[i].flags >> 24) & 7) != 2 && ph[i].memsz != 0;
++		if (load) {
++			lo = MIN(lo, ph[i].paddr);
++			hi = MAX(hi, ph[i].paddr + ph[i].memsz);
++		}
++	}
++	if (lo == ~0u || hi - lo > IPA_FW_SIZE) {
++		ipa_fail("ipa_fws: segments %#x..%#x do not fit %#x bytes", lo, hi, IPA_FW_SIZE);
++		goto out;
++	}
++	for (uint32_t i = 0; i < phnum; i++) {
++		if (ph[i].type != 1 || ((ph[i].flags >> 24) & 7) == 2 || ph[i].memsz == 0 || ph[i].filesz == 0) {
++			continue;
++		}
++		char name[24];
++		snprintf(name, sizeof(name), "ipa_fws.b%02u", i);
++		if (!sweet_a630_fw_get(NULL, name, &seg[i], &seg_len[i]) || seg_len[i] != ph[i].filesz) {
++			ipa_fail("%s missing or not %#x bytes (%zu)", name, ph[i].filesz, seg_len[i]);
++			goto out;
++		}
++		nload++;
++	}
++	/* the metadata (ELF header, program headers, hash) in contiguous write-combined memory, as the SLPI's */
++	vm_offset_t kva = 0;
++	vm_size_t msize = round_page(mdt_len);
++	if (kmem_alloc_contig(kernel_map, &kva, msize, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		ipa_fail("no memory for the firmware's metadata");
++		goto out;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	if (!pn) {
++		ipa_fail("the metadata has no physical page");
++		goto out;
++	}
++	memcpy((void *)kva, mdt, mdt_len);
++	sweet_dma_sync_va((const void *)kva, msize);
++	pmap_set_cache_attributes(pn, VM_WIMG_WCOMB);
++	sweet_dma_sync_va((const void *)kva, msize);
++	uint32_t size = hi - lo;                        /* as qcom_mdt_load() sets up a relocatable image */
++	int r = sweet_scm_pas(IPA_PAS_ID, 1, 0x82, ptoa_64(pn), 0);         /* INIT_IMAGE */
++	printf("SWEET IPA: 3: ipa_fws.mdt %zu bytes, %u segments to load (%#x bytes); PAS %u INIT_IMAGE: %d\n", mdt_len, nload,
++	    size, IPA_PAS_ID, r);
++	if (r != 0) {
++		ipa_fail("TrustZone does not take ipa_fws's metadata (%d)", r);
++		goto out;
++	}
++	r = sweet_scm_pas(IPA_PAS_ID, 2, 3, IPA_FW_PA, size);              /* MEM_SETUP */
++	printf("SWEET IPA: 3: PAS %u MEM_SETUP %#x+%#x: %d\n", IPA_PAS_ID, IPA_FW_PA, size, r);
++	if (r != 0) {
++		ipa_fail("TrustZone does not take ipa_fws's place (%d)", r);
++		(void)sweet_scm_pas(IPA_PAS_ID, 6, 1, 0, 0);
++		goto out;
++	}
++	vm_offset_t region = ml_io_map(IPA_FW_PA, IPA_FW_SIZE);
++	if (!region) {
++		ipa_fail("the firmware's region is not mapped");
++		(void)sweet_scm_pas(IPA_PAS_ID, 6, 1, 0, 0);
++		goto out;
++	}
++	for (uint32_t i = 0; i < phnum; i++) {
++		if (ph[i].type != 1 || ((ph[i].flags >> 24) & 7) == 2 || ph[i].memsz == 0) {
++			continue;
++		}
++		volatile uint8_t *to = (volatile uint8_t *)(region + (ph[i].paddr - lo));
++		for (uint32_t b = 0; b < ph[i].memsz; b++) {
++			to[b] = b < ph[i].filesz && seg[i] ? ((const uint8_t *)seg[i])[b] : 0;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	r = sweet_scm_pas(IPA_PAS_ID, 5, 1, 0, 0);                         /* AUTH_AND_RESET */
++	printf("SWEET IPA: 3: PAS %u AUTH_AND_RESET: %d\n", IPA_PAS_ID, r);
++	if (r != 0) {
++		ipa_fail("TrustZone does not start ipa_fws (%d)", r);
++		(void)sweet_scm_pas(IPA_PAS_ID, 6, 1, 0, 0);
++		goto out;
++	}
++	for (unsigned t = 0; t < 100 && !(gsi_rd(GSI_STATUS) & 1); t++) {
++		delay(1000);
++	}
++	ipa.gsi_status = gsi_rd(GSI_STATUS);
++	printf("SWEET IPA: 3: ipa_fws started; GSI_STATUS %#x (%s)\n", ipa.gsi_status, ipa.gsi_status & 1 ? "ENABLED" : "not enabled");
++	if (!(ipa.gsi_status & 1)) {
++		ipa_fail("the GSI is not enabled after its firmware (status %#x)", ipa.gsi_status);
++		goto out;
++	}
++	ipa.fw = true;
++	ok = true;
++out:
++	if (mdt) {
++		sweet_a630_fw_put(mdt, mdt_len);
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		if (seg[i]) {
++			sweet_a630_fw_put(seg[i], seg_len[i]);
++		}
++	}
++	return ok;
++}
++
++/* ---- stage 4: our channels, endpoints and tables -------------------------------------------------------------- */
++
++static inline vm_offset_t
++ipa_slot_va(const struct ipa_ch *ch, uint32_t slot)
++{
++	uint64_t at = (uint64_t)slot * ch->bufsize;
++	return ch->buf_va[at / PAGE_SIZE] + at % PAGE_SIZE;
++}
++
++static inline uint64_t
++ipa_slot_pa(const struct ipa_ch *ch, uint32_t slot)
++{
++	uint64_t at = (uint64_t)slot * ch->bufsize;
++	return ch->buf_pa[at / PAGE_SIZE] + at % PAGE_SIZE;
++}
++
++static bool
++ipa_ch_memory(struct ipa_ch *ch)
++{
++	if (ch->buf_va) {
++		return true;
++	}
++	ch->npages = (uint32_t)(((uint64_t)ch->slots * ch->bufsize + PAGE_SIZE - 1) / PAGE_SIZE);
++	ch->buf_va = kalloc_data(ch->npages * sizeof(vm_offset_t), Z_WAITOK | Z_ZERO);
++	ch->buf_pa = kalloc_data(ch->npages * sizeof(uint64_t), Z_WAITOK | Z_ZERO);
++	if (!ch->buf_va || !ch->buf_pa || !ipa_dma_page(&ch->ring_va, &ch->ring_pa) || !ipa_dma_page(&ch->ev_va, &ch->ev_pa)) {
++		return false;
++	}
++	for (uint32_t p = 0; p < ch->npages; p++) {
++		if (!ipa_dma_page(&ch->buf_va[p], &ch->buf_pa[p])) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static inline uint32_t
++ipa_ch_state(const struct ipa_ch *ch)
++{
++	return (gsi_rd(GSI_CH_CNTXT(ch->id, 0)) >> 20) & 0xf;
++}
++
++static inline uint32_t
++ipa_ev_state(const struct ipa_ch *ch)
++{
++	return (gsi_rd(GSI_EV_CNTXT(ch->ring, 0)) >> 20) & 0xf;
++}
++
++static void
++ipa_gsi_error(const char *what)
++{
++	uint32_t log = gsi_rd(GSI_ERROR_LOG);
++	printf("SWEET IPA: %s: GSI status %#x, error log %#x (code %u type %u EE %u index %u args %#x), global %#x, general %#x\n",
++	    what, gsi_rd(GSI_STATUS), log, (log >> 12) & 0xf, (log >> 24) & 0xf, log >> 28, (log >> 19) & 0x1f, log & 0xfff,
++	    gsi_rd(GSI_GLOB_IRQ_STTS), gsi_rd(GSI_GSI_IRQ_STTS));
++	if (log) {
++		gsi_wr(GSI_ERROR_LOG, 0);
++		gsi_wr(GSI_ERROR_LOG_CLR, ~0u);
++	}
++}
++
++/* a channel or event-ring command, polled until the state is `want` (50 ms) */
++static bool
++ipa_gsi_cmd(struct ipa_ch *ch, bool ev, uint32_t op, uint32_t want)
++{
++	uint32_t n = ev ? ch->ring : ch->id, st = ~0u;
++	gsi_wr(ev ? GSI_EV_CH_CMD : GSI_CH_CMD, n | op << 24);
++	for (unsigned us = 0; us < 50000; us += 100) {
++		st = ev ? ipa_ev_state(ch) : ipa_ch_state(ch);
++		if (st == want) {
++			break;
++		}
++		delay(100);
++	}
++	gsi_wr(ev ? GSI_SRC_EV_CH_IRQ_CLR : GSI_SRC_CH_IRQ_CLR, 1u << n);
++	if (st != want) {
++		printf("SWEET IPA: %s: %s command %#x leaves %u in state %u, not %u\n", ch->name, ev ? "event ring" : "channel", op, n,
++		    st, want);
++		ipa_gsi_error(ch->name);
++		return false;
++	}
++	return true;
++}
++
++/* gsi_evt_ring_program() + gsi_channel_program() for the GPI protocol, GSI 1.3 */
++static bool
++ipa_ch_program(struct ipa_ch *ch)
++{
++	uint32_t e = ch->ring, c = ch->id;
++
++	if (!ipa_gsi_cmd(ch, true, GSI_CH_ALLOCATE, GSI_ST_ALLOCATED)) {
++		return false;
++	}
++	gsi_wr(GSI_EV_CNTXT(e, 0), GSI_GPI | 1u << 16 /* INTYPE: IRQ */ | GSI_ELEMENT << 24);
++	gsi_wr(GSI_EV_CNTXT(e, 1), ch->slots * GSI_ELEMENT);
++	gsi_wr(GSI_EV_CNTXT(e, 2), (uint32_t)ch->ev_pa);
++	gsi_wr(GSI_EV_CNTXT(e, 3), (uint32_t)(ch->ev_pa >> 32));
++	gsi_wr(GSI_EV_CNTXT(e, 8), 32);                 /* MODT: 1 ms of 32 kHz */
++	for (unsigned n = 9; n <= 13; n++) {
++		gsi_wr(GSI_EV_CNTXT(e, n), 0);
++	}
++	/* "the last event processed": the ring's last element, nothing having been processed */
++	gsi_wr(GSI_EV_DOORBELL(e), (uint32_t)(ch->ev_pa + (ch->slots - 1) * GSI_ELEMENT));
++
++	if (!ipa_gsi_cmd(ch, false, GSI_CH_ALLOCATE, GSI_ST_ALLOCATED)) {
++		return false;
++	}
++	gsi_wr(GSI_CH_CNTXT(c, 0), GSI_GPI | (ch->tx ? 1u << 3 : 0) | e << 14 | GSI_ELEMENT << 24);
++	gsi_wr(GSI_CH_CNTXT(c, 1), ch->slots * GSI_ELEMENT);
++	gsi_wr(GSI_CH_CNTXT(c, 2), (uint32_t)ch->ring_pa);
++	gsi_wr(GSI_CH_CNTXT(c, 3), (uint32_t)(ch->ring_pa >> 32));
++	/* QOS: the command channel the lowest round-robin weight; one prefetch segment; the doorbell engine */
++	gsi_wr(GSI_CH_QOS(c), (ch->command ? 0xfu : 0) | 1u << 9);
++	uint32_t max_out = ch->tlv * GSI_ELEMENT, threshold = 2 * GSI_ELEMENT;
++	if (ipa.opt & IPA_OPT_6T_SCRATCH) {
++		gsi_wr(GSI_CH_SCRATCH(c, 0), max_out << 16);
++		gsi_wr(GSI_CH_SCRATCH(c, 1), threshold << 16);
++		gsi_wr(GSI_CH_SCRATCH(c, 2), 0);
++		gsi_wr(GSI_CH_SCRATCH(c, 3), gsi_rd(GSI_CH_SCRATCH(c, 3)) & 0xffff);
++	} else {
++		/* Android's struct gsi_gpi_channel_scratch: u64 reserved, then max_outstanding_tre and outstanding_threshold
++		 * in the high halves of words 2 and 3; word 3's low half is preserved (gsi.c) */
++		gsi_wr(GSI_CH_SCRATCH(c, 0), 0);
++		gsi_wr(GSI_CH_SCRATCH(c, 1), 0);
++		gsi_wr(GSI_CH_SCRATCH(c, 2), max_out << 16);
++		gsi_wr(GSI_CH_SCRATCH(c, 3), threshold << 16 | (gsi_rd(GSI_CH_SCRATCH(c, 3)) & 0xffff));
++	}
++	ch->setup = true;
++	return true;
++}
++
++/* ipa_endpoint_program() for IPA v3.5.1 */
++static void
++ipa_ep_program(const struct ipa_ch *ch)
++{
++	uint32_t ep = ch->ep, v;
++	bool q4 = ipa.qmap4;
++
++	ipa_wr(IPA_ENDP_INIT_CTRL(ep), 0);              /* TX DELAY off, RX SUSPEND off */
++	ipa_wr(IPA_ENDP_INIT_CFG(ep), q4 && ch == &ipa_tx_ch ? 0xa : q4 && ch == &ipa_rx_ch ? 0x4 : 0);   /* checksum offload */
++	if (ch->tx) {
++		ipa_wr(IPA_ENDP_INIT_NAT(ep), 0);       /* NAT bypassed */
++	}
++	v = 0;
++	if (ch->qmap) {
++		v = (q4 && ch->tx ? 8 : 4) | 1u << 6;   /* HDR_LEN, HDR_OFST_METADATA_VALID (metadata at 0 for TX) */
++		if (!ch->tx) {
++			v |= 1u << 7 /* OFST_METADATA 1: the mux id */ | 1u << 19 | 2u << 20 /* the length at 2 */;
++		}
++	}
++	ipa_wr(IPA_ENDP_INIT_HDR(ep), v);
++	v = 1;                                          /* HDR_ENDIANNESS: big */
++	if (ch->qmap && !ch->tx) {
++		v |= 1u << 1 /* TOTAL_LEN_OR_PAD_VALID: pad */ | 1u << 3 /* PAYLOAD_LEN_INC_PADDING */;
++	}
++	if (!ch->tx && !ch->qmap) {
++		v |= 2u << 10;                          /* the LAN endpoint: pad to 4 bytes */
++	}
++	ipa_wr(IPA_ENDP_INIT_HDR_EXT(ep), v);
++	if (!ch->tx) {
++		ipa_wr(IPA_ENDP_INIT_HDR_MD_MASK(ep), ch->qmap ? 0xff000000u : 0);
++	} else {
++		ipa_wr(IPA_ENDP_INIT_MODE(ep), ch->command ? 3u | (uint32_t)ipa_lan_ch.ep << 4 : 0);    /* DMA to LAN, or basic */
++	}
++	if (!ch->tx && ch->aggr) {
++		/* generic aggregation, 12 KB, 500 us (1 granule of COUNTER_CFG), SW_EOF_ACTIVE for the modem's */
++		v = 1 | 4u << 2 | IPA_AGGR_KB << 5 | 1u << 10 | (ch->close_eof ? 1u << 21 : 0);
++	} else if (ch->tx && ch->qmap && (ipa.opt & IPA_OPT_TX_DEAGGR)) {
++		v = 2 | 6u << 2;                        /* deaggregate QCMAP */
++	} else {
++		v = 0;
++	}
++	ipa_wr(IPA_ENDP_INIT_AGGR(ep), v);
++	if (!ch->tx) {
++		ipa_wr(IPA_ENDP_INIT_HOL_EN(ep), 0);
++	} else {
++		ipa_wr(IPA_ENDP_INIT_DEAGGR(ep), 0);
++	}
++	ipa_wr(IPA_ENDP_INIT_RSRC_GRP(ep), 1);          /* SRC_UL_DL / DST_UL_DL_DPL */
++	if (ch->tx) {
++		ipa_wr(IPA_ENDP_INIT_SEQ(ep), ch->command ? 0 /* DMA */ : 4 | 8u << 8 /* 2-pass skip last uC, DMA parser */);
++	}
++	/* AP_MODEM_TX: status to the modem's MODEM_AP_RX (12), before the packet, as Linux's */
++	ipa_wr(IPA_ENDP_STATUS(ep), ch == &ipa_tx_ch ? 1u | 12u << 1 : 0);
++}
++
++struct ipa_tre {
++	uint64_t addr;
++	uint16_t len_opcode, reserved;
++	uint32_t flags;
++};
++
++static inline struct ipa_tre *
++ipa_tre(const struct ipa_ch *ch, uint32_t index)
++{
++	return (struct ipa_tre *)(ch->ring_va + (index % ch->slots) * GSI_ELEMENT);
++}
++#define TRE_IEOT        (1u << 9)
++#define TRE_BEI         (1u << 10)
++#define TRE_XFER        (2u << 16)
++#define TRE_CMD         (3u << 16)
++
++static void
++ipa_tre_fill(struct ipa_ch *ch, uint32_t index, uint64_t addr, uint16_t len, uint32_t flags)
++{
++	struct ipa_tre *t = ipa_tre(ch, index);
++	t->addr = addr;
++	t->len_opcode = len;
++	t->reserved = 0;
++	t->flags = flags;
++	sweet_dma_sync_va(t, GSI_ELEMENT);
++}
++
++static inline void
++ipa_doorbell(struct ipa_ch *ch)
++{
++	gsi_wr(GSI_CH_DOORBELL(ch->id), (uint32_t)(ch->ring_pa + (ch->next % ch->slots) * GSI_ELEMENT));
++}
++
++struct ipa_event {
++	uint64_t xfer;
++	uint16_t len;
++	uint8_t reserved1, code;
++	uint16_t reserved2;
++	uint8_t type, chid;
++};
++
++/* the events the GSI has written since the last call, each handed to `each`; the doorbell then makes room */
++static unsigned
++ipa_events(struct ipa_ch *ch, void (*each)(struct ipa_ch *, const struct ipa_event *, void *), void *ctx)
++{
++	uint32_t wp = gsi_rd(GSI_EV_CNTXT(ch->ring, 4)), base = (uint32_t)ch->ev_pa;
++	unsigned n = 0;
++	if (wp < base || wp >= base + ch->slots * GSI_ELEMENT) {
++		if (ch->errors++ == 0) {
++			printf("SWEET IPA: %s: event write pointer %#x outside the ring at %#x\n", ch->name, wp, base);
++		}
++		return 0;
++	}
++	uint32_t index = (wp - base) / GSI_ELEMENT;
++	while (ch->events % ch->slots != index) {
++		struct ipa_event *ev = (struct ipa_event *)(ch->ev_va + (ch->events % ch->slots) * GSI_ELEMENT);
++		sweet_dma_sync_va(ev, sizeof(*ev));
++		each(ch, ev, ctx);
++		ch->events++;
++		n++;
++	}
++	if (n) {
++		gsi_wr(GSI_EV_DOORBELL(ch->ring), (uint32_t)(ch->ev_pa + ((ch->events - 1) % ch->slots) * GSI_ELEMENT));
++	}
++	return n;
++}
++
++struct ipa_cmd_wait {
++	uint64_t tre;
++	bool done;
++	uint8_t code;
++};
++
++static void
++ipa_cmd_event(struct ipa_ch *ch, const struct ipa_event *ev, void *ctx)
++{
++	struct ipa_cmd_wait *w = ctx;
++	if (ev->xfer == w->tre) {
++		w->done = true;
++		w->code = ev->code;
++	}
++	ch->done++;
++}
++
++/* one immediate command, its payload copied into the slot's buffer, waited for (200 ms) */
++static bool
++ipa_command(const char *what, uint8_t opcode, const void *payload, size_t size)
++{
++	struct ipa_ch *ch = &ipa_cmd_ch;
++	uint32_t slot = ch->next % ch->slots;
++	struct ipa_cmd_wait w = { .tre = ch->ring_pa + slot * GSI_ELEMENT };
++
++	if (size > ch->bufsize || ch->next - ch->done >= ch->slots - 1) {
++		return false;
++	}
++	memcpy((void *)ipa_slot_va(ch, slot), payload, size);
++	sweet_dma_sync_va((const void *)ipa_slot_va(ch, slot), size);
++	ipa_tre_fill(ch, ch->next, ipa_slot_pa(ch, slot), opcode, TRE_CMD | TRE_IEOT);
++	ch->next++;
++	ipa_doorbell(ch);
++	for (unsigned us = 0; us < 200000 && !w.done; us += 200) {
++		ipa_events(ch, ipa_cmd_event, &w);
++		if (!w.done) {
++			delay(200);
++		}
++	}
++	if (!w.done) {
++		printf("SWEET IPA: the command %s (opcode %#x) is not answered in 200 ms; channel state %u\n", what, opcode,
++		    ipa_ch_state(ch));
++		ipa_gsi_error(what);
++		return false;
++	}
++	printf("SWEET IPA: 4: %s done (code %u)\n", what, w.code);
++	return true;
++}
++
++/*
++ * ipa_table_init() / ipa_table_setup(): one buffer holds a zero rule (8 zero bytes), the filter bitmap (endpoints 2, 3, 6
++ * filter: ours to the modem and the modem's LAN and AP TX, shifted up one), then 15 entries pointing at the zero rule. A
++ * filter table is the bitmap and 3 entries (from offset 8), a route table the 15 entries (from offset 16).
++ */
++static bool
++ipa_table_init(const char *what, uint8_t opcode, bool filter, uint32_t hashed, uint32_t plain)
++{
++	struct {
++		uint64_t hash_addr, flags, nhash_addr;
++	} p;
++	uint32_t size = (filter ? 4 : 15) * 8;
++	uint64_t source = ipa.table_pa + (filter ? 8 : 16);
++	p.hash_addr = source;
++	p.nhash_addr = source;
++	p.flags = (uint64_t)size | (uint64_t)(ipa.mem_offset + hashed) << 12 | (uint64_t)size << 28 | (uint64_t)(ipa.mem_offset + plain) << 40;
++	return ipa_command(what, opcode, &p, sizeof(p));
++}
++
++static bool
++ipa_tables(void)
++{
++	uint64_t *t = (uint64_t *)ipa.table_va;
++	struct {
++		uint64_t addr;
++		uint32_t flags, reserved;
++	} hdr;
++
++	t[0] = 0;
++	t[1] = (uint64_t)((1u << 2) | (1u << 3) | (1u << 6)) << 1;
++	for (unsigned n = 0; n < 15; n++) {
++		t[2 + n] = ipa.table_pa;
++	}
++	sweet_dma_sync_va(t, 17 * 8);
++	if (!ipa_table_init("IPv4 route table init", 0x7, false, 0x488, 0x508) ||
++	    !ipa_table_init("IPv6 route table init", 0x8, false, 0x588, 0x608) ||
++	    !ipa_table_init("IPv4 filter table init", 0x3, true, 0x288, 0x308) ||
++	    !ipa_table_init("IPv6 filter table init", 0x4, true, 0x388, 0x408)) {
++		return false;
++	}
++	hdr.addr = ipa.zero_pa;
++	hdr.flags = 0x140 | (ipa.mem_offset + 0x688) << 12;     /* the modem's headers (v3.5.1 has no AP header region) */
++	hdr.reserved = 0;
++	if (!ipa_command("header table init", 0x9, &hdr, sizeof(hdr))) {
++		return false;
++	}
++	ipa_wr(IPA_FILT_ROUT_HASH_FLUSH, 0x1111);
++	return true;
++}
++
++static void
++ipa_rx_post(struct ipa_ch *ch, uint32_t slot)
++{
++	ipa_tre_fill(ch, ch->next, ipa_slot_pa(ch, slot), (uint16_t)MIN(ch->bufsize, 0xffffu), TRE_XFER | TRE_IEOT);
++	ch->next++;
++}
++
++/* stage 10: our channels stopped, reset, freed, so that stage 4 can run again */
++static void
++ipa_channels_free(void)
++{
++	if (!ipa.gsi || !ipa.clock || !ipa.fw) {
++		printf("SWEET IPA: 10: no GSI to free channels on\n");
++		return;
++	}
++	lck_mtx_lock(&ipa_dlock);
++	ipa.ready = false;
++	for (unsigned n = 0; n < 4; n++) {
++		struct ipa_ch *ch = ipa_chs[n];
++		uint32_t st = ipa_ch_state(ch);
++		if (st == GSI_ST_STARTED) {
++			(void)ipa_gsi_cmd(ch, false, GSI_CH_STOP, GSI_ST_STOPPED);
++			st = ipa_ch_state(ch);
++		}
++		if (st == GSI_ST_STOPPED || st == GSI_ST_ALLOCATED) {
++			if (st == GSI_ST_STOPPED) {
++				(void)ipa_gsi_cmd(ch, false, GSI_CH_RESET, GSI_ST_ALLOCATED);
++			}
++			(void)ipa_gsi_cmd(ch, false, GSI_CH_DE_ALLOC, GSI_ST_NOT_ALLOCATED);
++		}
++		if (ipa_ev_state(ch) == GSI_ST_ALLOCATED) {
++			(void)ipa_gsi_cmd(ch, true, GSI_CH_RESET, GSI_ST_ALLOCATED);
++			(void)ipa_gsi_cmd(ch, true, GSI_CH_DE_ALLOC, GSI_ST_NOT_ALLOCATED);
++		}
++		ch->setup = ch->started = false;
++		ch->next = ch->done = ch->events = 0;
++		if (ch->ring_va) {
++			bzero((void *)ch->ring_va, PAGE_SIZE);
++			bzero((void *)ch->ev_va, PAGE_SIZE);
++			sweet_dma_sync_va((const void *)ch->ring_va, PAGE_SIZE);
++			sweet_dma_sync_va((const void *)ch->ev_va, PAGE_SIZE);
++		}
++		printf("SWEET IPA: 10: %s: channel %u state %u, event ring %u state %u\n", ch->name, ch->id, ipa_ch_state(ch), ch->ring,
++		    ipa_ev_state(ch));
++	}
++	lck_mtx_unlock(&ipa_dlock);
++}
++
++static bool
++ipa_stage_channels(void)
++{
++	if (!ipa.fw || !(gsi_rd(GSI_STATUS) & 1)) {
++		ipa_fail("stage 4 needs the GSI enabled (stage 3; status %#x)", ipa.regs ? gsi_rd(GSI_STATUS) : 0);
++		return false;
++	}
++	if (ipa.ready) {
++		printf("SWEET IPA: 4: the data path is up already\n");
++		return true;
++	}
++	ipa.qmap4 = !(ipa.opt & IPA_OPT_QMAP1);
++	if ((!ipa.table_va && !ipa_dma_page(&ipa.table_va, &ipa.table_pa)) || (!ipa.zero_va && !ipa_dma_page(&ipa.zero_va, &ipa.zero_pa))) {
++		ipa_fail("no memory for the tables");
++		return false;
++	}
++	for (unsigned n = 0; n < 4; n++) {
++		if (!ipa_ch_memory(ipa_chs[n])) {
++			ipa_fail("no memory for the %s channel", ipa_chs[n]->name);
++			return false;
++		}
++		if (ipa_ch_state(ipa_chs[n]) != GSI_ST_NOT_ALLOCATED || ipa_ev_state(ipa_chs[n]) != GSI_ST_NOT_ALLOCATED) {
++			printf("SWEET IPA: 4: %s: channel %u in state %u, event ring %u in state %u: freed first\n", ipa_chs[n]->name,
++			    ipa_chs[n]->id, ipa_ch_state(ipa_chs[n]), ipa_chs[n]->ring, ipa_ev_state(ipa_chs[n]));
++			ipa_channels_free();
++		}
++	}
++	printf("SWEET IPA: 4: setting up our data path (%s, opt %#x): GSI status %#x, local memory at %#x; rings from %#llx\n",
++	    ipa.qmap4 ? "QMAPv4" : "QMAP", ipa.opt, gsi_rd(GSI_STATUS), ipa.mem_offset, ipa_rx_ch.ring_pa);
++	gsi_wr(GSI_ERROR_LOG, 0);
++	/* gsi_irq_setup(): interrupts, not MSIs, all masked: the rings are polled */
++	gsi_wr(GSI_INTSET, 1);
++	gsi_wr(GSI_TYPE_IRQ_MSK, 0);
++	gsi_wr(GSI_SRC_CH_IRQ_MSK, 0);
++	gsi_wr(GSI_SRC_EV_CH_IRQ_MSK, 0);
++	gsi_wr(GSI_GLOB_IRQ_EN, 0);
++	gsi_wr(GSI_SRC_IEOB_IRQ_MSK, 0);
++	gsi_wr(GSI_INTER_EE_CH_MSK, 0);
++	gsi_wr(GSI_INTER_EE_EV_MSK, 0);
++	gsi_wr(GSI_GSI_IRQ_EN, 0);
++	lck_mtx_lock(&ipa_dlock);
++	for (unsigned n = 0; n < 4; n++) {
++		struct ipa_ch *ch = ipa_chs[n];
++		if (!ipa_ch_program(ch)) {
++			lck_mtx_unlock(&ipa_dlock);
++			ipa_fail("the %s channel (%u, event ring %u) cannot be set up", ch->name, ch->id, ch->ring);
++			return false;
++		}
++		ipa_ep_program(ch);
++	}
++	for (unsigned n = 0; n < 4; n++) {
++		struct ipa_ch *ch = ipa_chs[n];
++		if (!ipa_gsi_cmd(ch, false, GSI_CH_START, GSI_ST_STARTED)) {
++			lck_mtx_unlock(&ipa_dlock);
++			ipa_fail("the %s channel does not start", ch->name);
++			return false;
++		}
++		ch->started = true;
++		if (!ch->tx) {
++			/* one short of the ring: a doorbell level with the read pointer would mean empty */
++			for (uint32_t slot = 0; slot + 1 < ch->slots; slot++) {
++				ipa_rx_post(ch, slot);
++			}
++			ipa_doorbell(ch);
++		}
++	}
++	bool ok = ipa_tables();
++	lck_mtx_unlock(&ipa_dlock);
++	if (!ok) {
++		ipa_fail("the IPA does not take its tables (the channels stay)");
++		return false;
++	}
++	ipa.ready = true;
++	uint32_t fsr = 0;
++	uint64_t far = 0;
++	int bank = sweet_smmu_bank_fault(&fsr, &far, true);
++	printf("SWEET IPA: 4: THE DATA PATH IS UP: channels %u/%u/%u/%u in states %u/%u/%u/%u; SMMU bank %d fault status %#x "
++	    "address %#llx\n", ipa_cmd_ch.id, ipa_lan_ch.id, ipa_tx_ch.id, ipa_rx_ch.id, ipa_ch_state(&ipa_cmd_ch),
++	    ipa_ch_state(&ipa_lan_ch), ipa_ch_state(&ipa_tx_ch), ipa_ch_state(&ipa_rx_ch), bank, fsr, far);
++	return true;
++}
++
++/* ---- the data path ------------------------------------------------------------------------------------------- */
++
++struct ipa_rx_ctx {
++	mbuf_t head, tail;
++	unsigned packets;
++};
++
++static void ipa_if_deliver(struct ipa_rx_ctx *rc, const uint8_t *ip, size_t len);
++
++static void
++ipa_rx_event(struct ipa_ch *ch, const struct ipa_event *ev, void *ctx)
++{
++	struct ipa_rx_ctx *rc = ctx;
++	uint32_t slot = (uint32_t)((ev->xfer - ch->ring_pa) / GSI_ELEMENT), len = ev->len;
++
++	if (ev->xfer < ch->ring_pa || slot >= ch->slots) {
++		if (ch->errors++ < 4) {
++			printf("SWEET IPA: %s: event for TRE %#llx outside the ring at %#llx\n", ch->name, ev->xfer, ch->ring_pa);
++		}
++		return;
++	}
++	if (slot != ch->done % ch->slots && ch->errors++ < 4) {
++		printf("SWEET IPA: %s: slot %u finished, slot %u expected\n", ch->name, slot, ch->done % ch->slots);
++	}
++	ch->done++;
++	const uint8_t *b = (const uint8_t *)ipa_slot_va(ch, slot);
++	len = MIN(len, ch->bufsize);
++	sweet_dma_sync_va(b, len);
++	ch->bytes += len;
++	if (ipa.opt & IPA_OPT_TRACE) {
++		printf("SWEET IPA: %s: slot %u: %u bytes (code %u): %02x %02x %02x %02x %02x %02x %02x %02x\n", ch->name, slot, len,
++		    ev->code, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
++	}
++	if (ch->qmap) {
++		for (uint32_t at = 0; at + 4 <= len;) {
++			uint32_t pad = b[at] & 0x3f, cmd = b[at] & 0x80, mux = b[at + 1];
++			uint32_t plen = (uint32_t)b[at + 2] << 8 | b[at + 3];
++			uint32_t trailer = ipa.qmap4 && !cmd ? 8 : 0;   /* QMAPv4: the downlink checksum trailer, outside the length */
++			if (plen == 0 || at + 4 + plen + trailer > len || pad > plen) {
++				break;
++			}
++			if (!cmd) {
++				ch->packets++;
++				if (mux == IPA_MUX && rc) {
++					ipa_if_deliver(rc, b + at + 4, plen - pad);
++				} else {
++					ch->dropped++;
++				}
++			}
++			at += 4 + plen + trailer;
++		}
++	} else {
++		ch->packets++;                          /* the LAN endpoint: counted, dropped */
++	}
++	sweet_dma_sync_va(b, len);
++	ipa_rx_post(ch, ch->next % ch->slots);
++	ipa_doorbell(ch);
++}
++
++static void
++ipa_tx_event(struct ipa_ch *ch, const struct ipa_event *ev, __unused void *ctx)
++{
++	uint32_t slot = (uint32_t)((ev->xfer - ch->ring_pa) / GSI_ELEMENT);
++	if (slot != ch->done % ch->slots && ch->errors++ < 4) {
++		printf("SWEET IPA: %s: slot %u finished, slot %u expected (code %u)\n", ch->name, slot, ch->done % ch->slots, ev->code);
++	}
++	ch->done++;
++}
++
++/* one IP packet to the modem on mux IPA_MUX, copied out of the mbuf from `off` */
++static bool
++ipa_transmit(mbuf_t m, size_t off, size_t len)
++{
++	struct ipa_ch *ch = &ipa_tx_ch;
++	uint32_t hdr = ipa.qmap4 ? 8 : 4;
++
++	if (!ipa.ready || len == 0 || len + hdr > ch->bufsize) {
++		return false;
++	}
++	lck_mtx_lock(&ipa_dlock);
++	ipa_events(ch, ipa_tx_event, NULL);
++	if (ch->next - ch->done >= ch->slots - 1) {
++		ch->dropped++;
++		lck_mtx_unlock(&ipa_dlock);
++		return false;
++	}
++	uint32_t slot = ch->next % ch->slots;
++	uint8_t *b = (uint8_t *)ipa_slot_va(ch, slot);
++	b[0] = 0;                                       /* no pad, data */
++	b[1] = IPA_MUX;
++	b[2] = (uint8_t)(len >> 8);
++	b[3] = (uint8_t)len;
++	if (hdr == 8) {
++		bzero(b + 4, 4);                        /* QMAPv4 uplink checksum header: no offload asked */
++	}
++	if (mbuf_copydata(m, off, len, b + hdr) != 0) {
++		ch->errors++;
++		lck_mtx_unlock(&ipa_dlock);
++		return false;
++	}
++	sweet_dma_sync_va(b, len + hdr);
++	ipa_tre_fill(ch, ch->next, ipa_slot_pa(ch, slot), (uint16_t)(len + hdr), TRE_XFER | TRE_IEOT | TRE_BEI);
++	ch->next++;
++	ipa_doorbell(ch);
++	ch->packets++;
++	ch->bytes += len;
++	if (ipa.opt & IPA_OPT_TRACE) {
++		printf("SWEET IPA: modem-tx: slot %u: %zu bytes\n", slot, len);
++	}
++	lck_mtx_unlock(&ipa_dlock);
++	return true;
++}
++
++/* ---- rmnet0 --------------------------------------------------------------------------------------------------- */
++
++static mbuf_t
++ipa_frame(const uint8_t *dst, const uint8_t *src, uint16_t type, const uint8_t *payload, size_t len)
++{
++	mbuf_t m = NULL;
++	size_t flen = ETHER_HDR_LEN + len;
++	if (flen > 2048 || mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0) {
++		return NULL;
++	}
++	if (mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < flen) {
++		mbuf_freem(m);
++		return NULL;
++	}
++	uint8_t *p = mbuf_data(m);
++	memcpy(p, dst, ETHER_ADDR_LEN);
++	memcpy(p + 6, src, ETHER_ADDR_LEN);
++	p[12] = (uint8_t)(type >> 8);
++	p[13] = (uint8_t)type;
++	memcpy(p + ETHER_HDR_LEN, payload, len);
++	mbuf_setlen(m, flen);
++	mbuf_pkthdr_setlen(m, flen);
++	mbuf_pkthdr_setrcvif(m, ipa.ifp);
++	mbuf_pkthdr_setheader(m, p);
++	mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++	(void)mbuf_setdata(m, p + ETHER_HDR_LEN, flen - ETHER_HDR_LEN);
++	return m;
++}
++
++/* from the modem: an IP packet framed for rmnet0, queued on the receive context (delivered after the lock) */
++static void
++ipa_if_deliver(struct ipa_rx_ctx *rc, const uint8_t *ip, size_t len)
++{
++	if (!ipa.ifp || !ipa.if_up || len < 20) {
++		ipa.rx_drop++;
++		return;
++	}
++	uint16_t type = (ip[0] >> 4) == 6 ? ETHERTYPE_IPV6 : ETHERTYPE_IP;
++	mbuf_t m = ipa_frame(ipa_mac, ipa_gw_mac, type, ip, len);
++	if (!m) {
++		ipa.rx_drop++;
++		return;
++	}
++	if (rc->tail) {
++		mbuf_setnextpkt(rc->tail, m);
++	} else {
++		rc->head = m;
++	}
++	rc->tail = m;
++	rc->packets++;
++	ipa.rx_ip++;
++}
++
++static void
++ipa_input(mbuf_t head)
++{
++	while (head) {
++		mbuf_t next = mbuf_nextpkt(head);
++		struct ifnet_stat_increment_param st = {};
++		mbuf_setnextpkt(head, NULL);
++		st.packets_in = 1;
++		st.bytes_in = (uint32_t)(mbuf_pkthdr_len(head) + ETHER_HDR_LEN);
++		ifnet_input(ipa.ifp, head, &st);
++		head = next;
++	}
++}
++
++/* every ARP request on rmnet0 but for our own address is answered: the made-up router owns all of them */
++static void
++ipa_arp_answer(mbuf_t m)
++{
++	uint8_t a[28], reply[28];
++	if (mbuf_pkthdr_len(m) < ETHER_HDR_LEN + 28 || mbuf_copydata(m, ETHER_HDR_LEN, 28, a) != 0) {
++		return;
++	}
++	/* Ethernet/IPv4, request, not a probe or announcement of our own address */
++	if (a[0] != 0 || a[1] != 1 || a[2] != 8 || a[3] != 0 || a[7] != 1 || memcmp(a + 24, a + 14, 4) == 0 ||
++	    (ipa.addr && memcmp(a + 24, &ipa.addr, 4) == 0)) {
++		return;
++	}
++	memcpy(reply, a, 8);
++	reply[7] = 2;
++	memcpy(reply + 8, ipa_gw_mac, 6);
++	memcpy(reply + 14, a + 24, 4);
++	memcpy(reply + 18, a + 8, 10);
++	mbuf_t r = ipa_frame(a + 8, ipa_gw_mac, ETHERTYPE_ARP, reply, sizeof(reply));
++	if (r) {
++		ipa.arp_replies++;
++		ipa_input(r);
++	}
++}
++
++static errno_t
++ipa_if_output(ifnet_t ifp, mbuf_t m)
++{
++	uint8_t eh[ETHER_HDR_LEN];
++	size_t len = mbuf_pkthdr_len(m);
++	if (len >= ETHER_HDR_LEN && mbuf_copydata(m, 0, ETHER_HDR_LEN, eh) == 0) {
++		uint16_t type = (uint16_t)(eh[12] << 8 | eh[13]);
++		if (type == ETHERTYPE_IP) {
++			bool ok = ipa_transmit(m, ETHER_HDR_LEN, len - ETHER_HDR_LEN);
++			ifnet_stat_increment_out(ifp, ok ? 1 : 0, ok ? (uint32_t)len : 0, ok ? 0 : 1);
++			ipa.tx_ip++;
++		} else if (type == ETHERTYPE_ARP) {
++			ipa.tx_arp++;
++			ipa_arp_answer(m);
++		} else {
++			ipa.tx_other++;
++		}
++	}
++	mbuf_freem(m);
++	return 0;
++}
++
++static errno_t
++ipa_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++		user_addr_t list = (cmd == SIOCGIFMEDIA64) ? ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
++		int media = IFM_ETHER | IFM_AUTO;
++		ifmr->ifm_current = media;
++		ifmr->ifm_active = ipa.if_up ? (IFM_ETHER | IFM_1000_T | IFM_FDX) : media;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = IFM_AVALID | (ipa.if_up ? IFM_ACTIVE : 0);
++		ifmr->ifm_count = 1;
++		if (list != USER_ADDR_NULL) {
++			return copyout(&media, list, sizeof(media));
++		}
++		return 0;
++	}
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++	case SIOCSIFMTU:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++ipa_if_detach(ifnet_t ifp __unused)
++{
++}
++
++static void
++ipa_rx_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	thread_set_thread_name(current_thread(), "sweet ipa rx");
++	for (;;) {
++		unsigned n = 0;
++		if (ipa.ready) {
++			struct ipa_rx_ctx rc = { NULL, NULL, 0 };
++			lck_mtx_lock(&ipa_dlock);
++			if (ipa.ready) {
++				n += ipa_events(&ipa_rx_ch, ipa_rx_event, &rc);
++				n += ipa_events(&ipa_lan_ch, ipa_rx_event, NULL);
++				ipa_events(&ipa_tx_ch, ipa_tx_event, NULL);
++			}
++			lck_mtx_unlock(&ipa_dlock);
++			if (rc.head) {
++				ipa_input(rc.head);
++			}
++		}
++		uint64_t deadline;
++		clock_interval_to_deadline(n ? 1 : (ipa.if_up ? 2 : 50), NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline((event_t)&ipa_rx_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++static bool
++ipa_stage_netif(void)
++{
++	if (ipa.ifp) {
++		printf("SWEET IPA: 6: rmnet0 is there already\n");
++		return true;
++	}
++	if (!ipa.ready) {
++		ipa_fail("stage 6 needs the data path (stage 4)");
++		return false;
++	}
++	struct ifnet_init_eparams init;
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "sweet-ipa-rmnet";
++	init.uniqueid_len = sizeof("sweet-ipa-rmnet") - 1;
++	init.name = "rmnet";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = ipa_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = ipa_if_ioctl;
++	init.detach = ipa_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	ifnet_t ifp = NULL;
++	if (ifnet_allocate_extended(&init, &ifp) != 0) {
++		ipa_fail("ifnet_allocate failed");
++		return false;
++	}
++	ifnet_set_addrlen(ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(ifp, ETHER_HDR_LEN);
++	ifnet_set_mtu(ifp, 1500);
++	ifnet_set_baudrate(ifp, 150000000);
++	ifnet_set_flags(ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(ifp, NULL) != 0) {
++		ipa_fail("ifnet_attach failed");
++		return false;
++	}
++	ifnet_set_lladdr(ifp, ipa_mac, ETHER_ADDR_LEN);
++	errno_t berr = bpf_attach(ifp, DLT_EN10MB, ETHER_HDR_LEN, NULL, NULL);
++	errno_t perr = proto_plumb(PF_INET, ifp);
++	ipa.ifp = ifp;
++	if (!ipa.rx_thread && kernel_thread_start(ipa_rx_thread, NULL, &ipa.rx_thread) != KERN_SUCCESS) {
++		ipa.rx_thread = NULL;
++		ipa_fail("no receive thread");
++		return false;
++	}
++	printf("SWEET IPA: 6: rmnet0 attached (bpf %d, inet %d), receive thread running\n", berr, perr);
++	return true;
++}
++
++/* "ADDR MASK GW MTU": rmnet0 gets the session's address, up; "down": down */
++static int
++ipa_session(const char *s)
++{
++	uint32_t v[4][4] = { { 0 } }, mtu = 1500;
++	if (!ipa.ifp) {
++		return ENXIO;
++	}
++	if (strncmp(s, "down", 4) == 0) {
++		ipa.if_up = false;
++		ifnet_set_flags(ipa.ifp, 0, IFF_UP | IFF_RUNNING);
++		dlil_post_msg(ipa.ifp, KEV_DL_SUBCLASS, KEV_DL_LINK_OFF, NULL, 0, FALSE);
++		printf("SWEET IPA: rmnet0 down\n");
++		return 0;
++	}
++	/* four dotted quads and a number */
++	const char *p = s;
++	for (unsigned q = 0; q < 3; q++) {
++		for (unsigned k = 0; k < 4; k++) {
++			uint32_t n = 0;
++			unsigned digits = 0;
++			while (*p >= '0' && *p <= '9') {
++				n = n * 10 + (uint32_t)(*p++ - '0');
++				digits++;
++			}
++			if (!digits || n > 255 || (k < 3 && *p++ != '.')) {
++				return EINVAL;
++			}
++			v[q][k] = n;
++		}
++		while (*p == ' ') {
++			p++;
++		}
++	}
++	if (*p >= '0' && *p <= '9') {
++		mtu = 0;
++		while (*p >= '0' && *p <= '9') {
++			mtu = mtu * 10 + (uint32_t)(*p++ - '0');
++		}
++	}
++	if (mtu < 576 || mtu > 1500) {
++		return EINVAL;
++	}
++	uint32_t addr = htonl(v[0][0] << 24 | v[0][1] << 16 | v[0][2] << 8 | v[0][3]);
++	uint32_t mask = htonl(v[1][0] << 24 | v[1][1] << 16 | v[1][2] << 8 | v[1][3]);
++	uint32_t gw = htonl(v[2][0] << 24 | v[2][1] << 16 | v[2][2] << 8 | v[2][3]);
++	socket_t so = NULL;
++	errno_t err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	if (!err) {
++		struct ifaliasreq ifra;
++		bzero(&ifra, sizeof(ifra));
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "rmnet0");
++		struct sockaddr_in *a = (struct sockaddr_in *)&ifra.ifra_addr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = addr;
++		a = (struct sockaddr_in *)&ifra.ifra_mask;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = mask;
++		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = addr | ~mask;
++		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
++		sock_close(so);
++	}
++	ifnet_set_mtu(ipa.ifp, mtu);
++	ipa.addr = addr;
++	ipa.mask = mask;
++	ipa.gw = gw;
++	ipa.mtu = mtu;
++	ipa.if_up = err == 0;
++	ifnet_set_flags(ipa.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	dlil_post_msg(ipa.ifp, KEV_DL_SUBCLASS, KEV_DL_LINK_ON, NULL, 0, FALSE);
++	thread_wakeup(&ipa_rx_chan);
++	printf("SWEET IPA: rmnet0 %s (session address, mask and gateway given, MTU %u; err %d)\n", err ? "NOT configured" : "up",
++	    mtu, err);
++	return err;
++}
++
++/* ---- stage 5: the QMI handshake (service thread) --------------------------------------------------------------- */
++
++static const uint8_t *
++ipa_tlv(const uint8_t *m, uint32_t len, uint8_t type, uint16_t *size)
++{
++	for (uint32_t o = 7; o + 3 <= len;) {
++		uint16_t l = (uint16_t)(m[o + 1] | m[o + 2] << 8);
++		if (o + 3 + l > len) {
++			return NULL;
++		}
++		if (m[o] == type) {
++			*size = l;
++			return m + o + 3;
++		}
++		o += 3 + l;
++	}
++	return NULL;
++}
++
++static unsigned
++ipa_put32(uint8_t *at, uint8_t type, uint32_t v)
++{
++	at[0] = type;
++	at[1] = 4;
++	at[2] = 0;
++	memcpy(at + 3, &v, 4);
++	return 7;
++}
++
++static unsigned
++ipa_put2x32(uint8_t *at, uint8_t type, uint32_t a, uint32_t b)
++{
++	at[0] = type;
++	at[1] = 8;
++	at[2] = 0;
++	memcpy(at + 3, &a, 4);
++	memcpy(at + 7, &b, 4);
++	return 11;
++}
++
++/* a message with the result TLV alone: a response (2, the transaction echoed) or an indication (4) */
++static void
++ipa_qmi_result(uint32_t from, uint32_t node, uint32_t port, uint8_t type, uint16_t txn, uint16_t msg)
++{
++	uint8_t b[14] = { type, (uint8_t)txn, (uint8_t)(txn >> 8), (uint8_t)msg, (uint8_t)(msg >> 8), 7, 0, 2, 4, 0, 0, 0, 0, 0 };
++	(void)ipc_qrtr_send(Q_DATA, from, node, port, b, sizeof(b));
++}
++
++static void
++ipa_qmi_complete(void)
++{
++	if (ipa.ind_wanted && !ipa.ind_sent && ipa.driver_ready && (ipa.uc_ready || (ipa.opt & IPA_OPT_EARLY_COMPLETE))) {
++		ipa_qmi_result(IPA_HOST_PORT, ipa.reg_node, ipa.reg_port, 4, 0, 0x22);
++		ipa.ind_sent = true;
++		printf("SWEET IPA: 5: INIT_COMPLETE indication (0x22) sent to the modem\n");
++	}
++}
++
++static void
++ipa_send_init_driver(void)
++{
++	uint8_t b[200];
++	unsigned at = 7;
++	const uint32_t o = ipa.mem_offset, routes = 8;  /* the modem's route entries: 0..7 of 15 */
++
++	if (++ipa.txn == 0) {
++		ipa.txn = 1;
++	}
++	b[0] = 0;
++	b[1] = (uint8_t)ipa.txn;
++	b[2] = (uint8_t)(ipa.txn >> 8);
++	b[3] = 0x21;
++	b[4] = 0;
++	at += ipa_put32(b + at, 0x10, 3);                                       /* platform: MSM Android */
++	at += ipa_put2x32(b + at, 0x11, o + 0x0688, o + 0x0688 + 0x0140 - 1);  /* the modem's header table */
++	at += ipa_put2x32(b + at, 0x12, o + 0x0508, routes - 1);               /* IPv4 routes */
++	at += ipa_put2x32(b + at, 0x13, o + 0x0608, routes - 1);               /* IPv6 routes */
++	at += ipa_put32(b + at, 0x14, o + 0x0308);                              /* IPv4 filters */
++	at += ipa_put32(b + at, 0x15, o + 0x0408);                              /* IPv6 filters */
++	at += ipa_put2x32(b + at, 0x16, o + 0x0bd8, 0x1024);                    /* the modem's own region */
++	at += ipa_put32(b + at, 0x17, ipa_rx_ch.ep);                            /* ctrl_comm_dest_end_pt: AP_MODEM_RX */
++	if (!(ipa.opt & IPA_OPT_NO_SKIP_UC)) {
++		b[at++] = 0x18;                                                 /* skip_uc_load: 0, first boot */
++		b[at++] = 1;
++		b[at++] = 0;
++		b[at++] = 0;
++	}
++	at += ipa_put2x32(b + at, 0x19, o + 0x07d0, o + 0x07d0 + 0x0200 - 1);  /* the modem's processing contexts */
++	at += ipa_put2x32(b + at, 0x1b, o + 0x0488, routes - 1);               /* hashed IPv4 routes */
++	at += ipa_put2x32(b + at, 0x1c, o + 0x0588, routes - 1);               /* hashed IPv6 routes */
++	at += ipa_put32(b + at, 0x1d, o + 0x0288);                              /* hashed IPv4 filters */
++	at += ipa_put32(b + at, 0x1e, o + 0x0388);                              /* hashed IPv6 filters */
++	b[5] = (uint8_t)(at - 7);
++	b[6] = (uint8_t)((at - 7) >> 8);
++	bool sent = ipc_qrtr_send(Q_DATA, IPA_CLIENT_PORT, ipa.modem_node, ipa.modem_port, b, at);
++	ipa.init_sent = sent;
++	printf("SWEET IPA: 5: INIT_DRIVER (%u bytes, local memory offset %#x) to the modem's IPA service at %u:%#x: %s\n", at, o,
++	    ipa.modem_node, ipa.modem_port, sent ? "sent" : "NOT SENT");
++}
++
++/* the modem's messages to our ports; true if they were ours */
++static bool
++ipa_qrtr_rx(uint32_t dport, uint32_t node, uint32_t port, const uint8_t *m, uint32_t len)
++{
++	uint16_t size = 0;
++	const uint8_t *v;
++
++	if (dport != IPA_HOST_PORT && dport != IPA_CLIENT_PORT) {
++		return false;
++	}
++	if (len < 7) {
++		return true;
++	}
++	uint16_t txn = (uint16_t)(m[1] | m[2] << 8), msg = (uint16_t)(m[3] | m[4] << 8);
++	printf("SWEET IPA: qmi: %s port: type %u msg %#x txn %u, %u bytes from %u:%#x\n", dport == IPA_HOST_PORT ? "service" : "client",
++	    m[0], msg, txn, len, node, port);
++	if (dport == IPA_CLIENT_PORT) {
++		if (m[0] == 2 && msg == 0x21 && (v = ipa_tlv(m, len, 2, &size)) && size >= 4) {
++			ipa.init_result = v[0] | v[1] << 8;
++			ipa.init_error = v[2] | v[3] << 8;
++			ipa.driver_ready = ipa.init_result == 0;
++			printf("SWEET IPA: 5: THE MODEM %s INIT_DRIVER (result %d, error %d)\n", ipa.driver_ready ? "ACCEPTS" : "REFUSES",
++			    ipa.init_result, ipa.init_error);
++			ipa_qmi_complete();
++		}
++		return true;
++	}
++	if (m[0] != 0) {
++		return true;
++	}
++	ipa.requests++;
++	switch (msg) {
++	case 0x20:              /* INDICATION_REGISTER */
++		ipa_qmi_result(IPA_HOST_PORT, node, port, 2, txn, msg);
++		ipa.reg_node = node;
++		ipa.reg_port = port;
++		ipa.ind_wanted = true;
++		printf("SWEET IPA: 5: the modem registers for our indications\n");
++		ipa_qmi_complete();
++		break;
++	case 0x35:              /* DRIVER_INIT_COMPLETE */
++		ipa_qmi_result(IPA_HOST_PORT, node, port, 2, txn, msg);
++		ipa.uc_ready = true;
++		printf("SWEET IPA: 5: the modem says its IPA driver is up (DRIVER_INIT_COMPLETE)\n");
++		ipa_qmi_complete();
++		break;
++	case 0x23:              /* INSTALL_FILTER_RULE */
++	case 0x27:              /* CONFIG */
++		/* Linux's ipa_qmi.c answers neither; the 6T port found that answering them broke its data path */
++		printf("SWEET IPA: 5: the modem's request %#x left unanswered, as Linux leaves it\n", msg);
++		break;
++	default:
++		ipa_qmi_result(IPA_HOST_PORT, node, port, 2, txn, msg);
++		printf("SWEET IPA: 5: the modem's request %#x answered with success\n", msg);
++		break;
++	}
++	return true;
++}
++
++/* our "ipa" entry in the outbound SMP2P item (beryllium_wlan.c made it, value 0) */
++static bool
++ipa_smp2p_set(uint32_t value)
++{
++	uint32_t d = ms.smp2p_out;
++	if (!d) {
++		return false;
++	}
++	uint32_t valid = MIN(smem_u32(d + 12) >> 16, SMP2P_MAX_ENTRY);
++	for (uint32_t k = 0; k < valid; k++) {
++		char name[17];
++		for (uint32_t c = 0; c < 16; c += 4) {
++			uint32_t w = smem_u32(d + 20 + k * 20 + c);
++			memcpy(name + c, &w, 4);
++		}
++		name[16] = 0;
++		if (strcmp(name, "ipa") == 0) {
++			wl_wr(wl.smem, d + 20 + k * 20 + 16, value);
++			ms_smp2p_kick();
++			return true;
++		}
++	}
++	return false;
++}
++
++/* service thread, every loop */
++static void
++ipa_pump(void)
++{
++	static uint64_t next_ms;
++	uint32_t in = 0;
++	if (!ipa.qmi_go) {
++		return;
++	}
++	if (ms_now_ms() >= next_ms && (next_ms = ms_now_ms() + 100) && ms_smp2p_in("ipa", &in) &&
++	    (!ipa.smp2p_in_seen || in != ipa.smp2p_in)) {
++		printf("SWEET IPA: smp2p: the modem's \"ipa\" entry %#x (bit 0 clock query, bit 1 setup ready)\n", in);
++		ipa.smp2p_in = in;
++		ipa.smp2p_in_seen = 1;
++	}
++	if (!ipa.qmi_go) {
++		return;
++	}
++	if (!ipa.announced) {
++		uint32_t srv[5] = { Q_NEW_SERVER, IPA_QMI_SERVICE, 1u | 1u << 8, QRTR_NODE_LOCAL, IPA_HOST_PORT };
++		ipa.announced = ipc_qrtr_send(Q_NEW_SERVER, QRTR_PORT_CTRL, ipc.node, QRTR_PORT_CTRL, srv, sizeof(srv));
++		printf("SWEET IPA: 5: our IPA QMI service (0x31 instance 1) at %u:%#x announced: %s\n", QRTR_NODE_LOCAL, IPA_HOST_PORT,
++		    ipa.announced ? "yes" : "NO");
++	}
++	if (!ipa.init_sent) {
++		lck_mtx_lock(&qp_lock);
++		for (unsigned i = 0; i < nqsvc; i++) {
++			if (qsvc[i].svc == IPA_QMI_SERVICE && (qsvc[i].vi >> 8) == 2) {
++				ipa.modem_node = qsvc[i].node;
++				ipa.modem_port = qsvc[i].port;
++			}
++		}
++		lck_mtx_unlock(&qp_lock);
++		if (ipa.modem_port) {
++			ipa_send_init_driver();
++		}
++	}
++	if (!ipa.smp2p_set) {
++		ipa.smp2p_set = ipa_smp2p_set(3);
++		printf("SWEET IPA: 5: our SMP2P \"ipa\" entry = 3 (valid, clock on): %s\n", ipa.smp2p_set ? "set" : "NOT SET");
++	}
++}
++
++static bool
++ipa_stage_qmi(void)
++{
++	if (!ipa.ready) {
++		ipa_fail("stage 5 needs the data path (stage 4)");
++		return false;
++	}
++	ipa.qmi_go = true;
++	thread_wakeup(&wl.sleep_chan);
++	for (unsigned t = 0; t < 30 && !(ipa.announced && ipa.init_sent && ipa.smp2p_set); t++) {
++		delay(100000);
++	}
++	if (!ipa.announced || !ipa.init_sent || !ipa.smp2p_set) {
++		ipa_fail("stage 5: announced %d, INIT_DRIVER sent %d, SMP2P set %d (is the Wi-Fi service thread running?)",
++		    ipa.announced, ipa.init_sent, ipa.smp2p_set);
++		return false;
++	}
++	return true;
++}
++
++/* ---- sysctls -------------------------------------------------------------------------------------------------- */
++
++static bool
++ipa_run_stage(int s)
++{
++	switch (s) {
++	case 1: return ipa_stage_power();
++	case 2: return ipa_stage_config();
++	case 3: return ipa_stage_firmware();
++	case 4: return ipa_stage_channels();
++	case 5: return ipa_stage_qmi();
++	case 6: return ipa_stage_netif();
++	case 10: ipa_channels_free(); return true;
++	default: return false;
++	}
++}
++
++static int
++sweet_ipa_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int s = (int)ipa.stage, error = sysctl_handle_int(oidp, &s, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (!sweet_board_beryllium()) {
++		return ENODEV;
++	}
++	lck_mtx_lock(&ipa_lock);
++	ipa.err[0] = 0;
++	bool ok = true;
++	if (s == 9) {
++		for (int k = 1; k <= 6 && ok; k++) {
++			ok = ipa_run_stage(k);
++			if (ok) {
++				ipa.stage = (uint32_t)k;
++			}
++		}
++	} else if ((s >= 1 && s <= 6) || s == 10) {
++		ok = ipa_run_stage(s);
++		if (ok && s <= 6) {
++			ipa.stage = (uint32_t)s;
++		}
++	} else {
++		ok = false;
++		ipa_fail("no stage %d", s);
++	}
++	lck_mtx_unlock(&ipa_lock);
++	return ok ? 0 : EIO;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sweet_ipa_sysctl, "I",
++    "IPA bring-up stage: 1 power 2 config 3 firmware 4 channels 5 qmi 6 netif, 9 all, 10 free the channels (3073)");
++
++SYSCTL_UINT(_kern, OID_AUTO, sweet_ipa_opt, CTLFLAG_RW | CTLFLAG_LOCKED, &ipa.opt, 0,
++    "IPA options: 1 6T scratch, 2 TX deaggr, 4 plain QMAP, 8 early INIT_COMPLETE, 16 trace, 32 no skip_uc TLV (3073)");
++
++static int
++sweet_ipa_session_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[80];
++	int error;
++	if (!req->newptr) {
++		snprintf(buf, sizeof(buf), "%s", ipa.if_up ? "up" : "down");
++		return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++	}
++	if (req->newlen == 0 || req->newlen >= sizeof(buf)) {
++		return EINVAL;
++	}
++	error = SYSCTL_IN(req, buf, req->newlen);
++	if (error) {
++		return error;
++	}
++	buf[req->newlen] = 0;
++	return ipa_session(buf);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_session, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sweet_ipa_session_sysctl,
++    "A", "rmnet0: \"ADDR MASK GATEWAY MTU\" or \"down\" (3073)");
++
++static int
++sweet_ipa_status_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char *b = kalloc_data(1536, Z_WAITOK | Z_ZERO);
++	if (!b) {
++		return ENOMEM;
++	}
++	size_t n = 0;
++	n += snprintf(b + n, 1536 - n, "stage %u opt %#x clock %d smmu %d configured %d fw %d ready %d %s; last error: %s\n",
++	    ipa.stage, ipa.opt, ipa.clock, ipa.smmu, ipa.configured, ipa.fw, ipa.ready, ipa.qmap4 ? "QMAPv4" : "QMAP",
++	    ipa.err[0] ? ipa.err : "none");
++	if (ipa.regs && ipa.clock) {
++		n += snprintf(b + n, 1536 - n, "GSI status %#x, error log %#x, IPA route %#x\n", gsi_rd(GSI_STATUS), gsi_rd(GSI_ERROR_LOG),
++		    ipa_rd(IPA_ROUTE));
++	}
++	for (unsigned k = 0; k < 4; k++) {
++		struct ipa_ch *ch = ipa_chs[k];
++		n += snprintf(b + n, 1536 - n, "%s: ch %u ep %u state %d; next %u done %u events %u; packets %llu bytes %llu dropped %llu "
++		    "errors %llu\n", ch->name, ch->id, ch->ep, ipa.regs && ipa.clock && ipa.fw ? (int)ipa_ch_state(ch) : -1, ch->next,
++		    ch->done, ch->events, ch->packets, ch->bytes, ch->dropped, ch->errors);
++	}
++	n += snprintf(b + n, 1536 - n, "qmi: go %d announced %d init_sent %d driver_ready %d (result %d error %d) uc_ready %d "
++	    "ind_wanted %d ind_sent %d requests %u; smp2p ours %d, modem's %#x (seen %u)\n", ipa.qmi_go, ipa.announced, ipa.init_sent,
++	    ipa.driver_ready, ipa.init_result, ipa.init_error, ipa.uc_ready, ipa.ind_wanted, ipa.ind_sent, ipa.requests, ipa.smp2p_set,
++	    ipa.smp2p_in, ipa.smp2p_in_seen);
++	n += snprintf(b + n, 1536 - n, "rmnet0: %s %s MTU %u; out: IPv4 %llu ARP %llu other %llu (ARP answered %llu); in: IP %llu "
++	    "dropped %llu\n", ipa.ifp ? "attached" : "absent", ipa.if_up ? "up" : "down", ipa.mtu, ipa.tx_ip, ipa.tx_arp,
++	    ipa.tx_other, ipa.arp_replies, ipa.rx_ip, ipa.rx_drop);
++	int error = SYSCTL_OUT(req, b, n + 1);
++	kfree_data(b, 1536);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ipa_status, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_ipa_status_sysctl,
++    "A", "IPA bring-up state (3073)");
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index f050404..84370dc 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -660,6 +660,56 @@ out:
+ 	return error;
+ }
+ 
++/*
++ * 3073: one BCM vote by name: commit, valid while vote != 0, y = vote (14 bits). For the IPA's clock, the BCM "IP0"
++ * (Linux clk-rpmh.c: sdm845 RPMH_IPA_CLK; HakiOS's OnePlus 6T port votes it at 0x3fff). Only the names below.
++ */
++int sweet_rpmh_bcm_vote(const char *res, uint32_t vote);
++int
++sweet_rpmh_bcm_vote(const char *res, uint32_t vote)
++{
++	static const char *const allowed[] = { "IP0" };
++	unsigned i;
++	if (!sweet_board_beryllium() || !res) {
++		return EINVAL;
++	}
++	for (i = 0; i < sizeof(allowed) / sizeof(allowed[0]); ++i) {
++		if (!strcmp(res, allowed[i])) {
++			break;
++		}
++	}
++	if (i == sizeof(allowed) / sizeof(allowed[0])) {
++		printf("SWEET RPMH: %s is not an allowed BCM\n", res);
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0, aux = 0, aux_len = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup_slave(res, RH_BCM, &address, &aux, &aux_len);
++	}
++	if (!error) {
++		uint32_t unit = aux_len >= 4 ? (rh_db16(aux) | ((uint32_t)rh_db16(aux + 2) << 16)) : 0;
++		uint32_t width = aux_len >= 6 ? rh_db16(aux + 4) : 0;
++		uint32_t value = (1u << 30) | (vote ? (1u << 29) : 0) | (vote & 0x3fffu);
++		printf("SWEET RPMH: %s BCM %#x (unit %u, width %u): vote %#x -> cmd %#x\n", res, address, unit, width, vote, value);
++		error = rh_cmds(&address, &value, 1);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: %s BCM vote failed errno=%d\n", res, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ int
+ sweet_rpmh_arc_vote(const char *res, bool max)
+ {
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index 2467862..af72191 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -44,6 +44,7 @@ int sweet_smmu_probe_sid(unsigned sid, unsigned level);
+ #define L1_SIZE         0x1000u         /* one 512-entry level-1 table */
+ 
+ static vm_offset_t smmu_base;
++static vm_offset_t smmu_l1v, smmu_l2v;  /* 3073: the bank's level-1 table, and a level-2 one for GiB 0 (sweet_smmu_map_block) */
+ static int smmu_cb = -1;                /* shared translating context bank */
+ static unsigned smmu_nsmr;
+ static int smmu_next_smr;               /* first free SMR to try next */
+@@ -118,6 +119,7 @@ smmu_bank_create(void)
+ 	}
+ 	uint64_t l1_pa = ptoa_64(pn);
+ 	volatile uint64_t *l1 = (volatile uint64_t *)l1v;
++	smmu_l1v = l1v;
+ 	for (unsigned i = 2; i < 10; i++) {
+ 		l1[i] = (uint64_t)i << 30 | 1u << 10 | 2u << 8 | 1u << 6 | 1;
+ 	}
+@@ -156,6 +158,65 @@ smmu_bank_create(void)
+ 	return 0;
+ }
+ 
++/*
++ * 3073: one 2 MiB block of the first GiB (below DRAM) identity-mapped into the shared bank, Normal NC, RW: the IPA's
++ * IMEM (Linux ipa_imem_init(): sdm845 0x146bd000 + 0x2000, mapped 1:1 into the IPA's domain; the downstream DT's
++ * ipa_smmu_ap qcom,additional-mapping). Needs the bank (a sweet_smmu_map_sid() first). Idempotent.
++ */
++int sweet_smmu_map_block(uint64_t pa);
++int
++sweet_smmu_map_block(uint64_t pa)
++{
++	int error = 0;
++
++	if (pa >= (1ull << 30)) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&smmu_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	if (smmu_cb < 0 || smmu_base == 0 || smmu_l1v == 0) {
++		error = ENODEV;
++		goto out;
++	}
++	volatile uint64_t *l1 = (volatile uint64_t *)smmu_l1v;
++	if (smmu_l2v == 0) {
++		vm_offset_t l2v = 0;
++		if (kmem_alloc_contig(kernel_map, &l2v, L1_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			error = ENOMEM;
++			goto out;
++		}
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)l2v);
++		if (!pn) {
++			error = ENOMEM;
++			goto out;
++		}
++		sweet_dma_sync_va((const void *)l2v, L1_SIZE);
++		smmu_l2v = l2v;
++		l1[0] = ptoa_64(pn) | 3;                                /* table */
++		sweet_dma_sync_va((const void *)smmu_l1v, L1_SIZE);
++	}
++	volatile uint64_t *l2 = (volatile uint64_t *)smmu_l2v;
++	uint64_t block = pa & ~0x1fffffull;
++	l2[(pa >> 21) & 0x1ff] = block | 1u << 10 | 2u << 8 | 1u << 6 | 1;     /* block, AF, OSH, RW, attr 0 (Normal NC) */
++	sweet_dma_sync_va((const void *)smmu_l2v, L1_SIZE);
++	{
++		uint32_t id1 = smmu_rd(0x24);
++		unsigned pgshift = (id1 >> 31) ? 16 : 12;
++		uint32_t cb = ((1u << (((id1 >> 28) & 7) + 1)) << pgshift) + ((uint32_t)smmu_cb << pgshift);
++		smmu_wr(cb + 0x618, 0);                         /* TLBIALL */
++		smmu_wr(cb + 0x7f0, 0);                         /* TLBSYNC */
++		for (int t = 0; t < 100000 && (smmu_rd(cb + 0x7f4) & 1); t++) {
++			delay(1);
++		}
++	}
++	printf("SWEET SMMU: bank %d: 2 MiB block %#llx mapped 1:1\n", smmu_cb, block);
++out:
++	__atomic_store_n(&smmu_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ /* 3058c: the shared bank's fault status (FSR, FAR) for callers that want to see context faults; -1 without a bank */
+ int sweet_smmu_bank_fault(uint32_t *fsr, uint64_t *far, bool clear);
+ int
