@@ -1,0 +1,254 @@
+diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
+index 8228f52..d1983b5 100644
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -33,6 +33,16 @@
+  * sweetreboot=bootloader; then a panic also resets into fastboot (unattended
+  * tests). The sysctl does not affect panics.
+  *
++ * Power off (3074, iOS's "slide to power off" and Settings > General > Shut Down: launchd's reboot(RB_HALT),
++ * halt_all_cpus(FALSE), haltRestart(kPEHaltCPU), which until now fell to the stock spin with the phone left on):
++ * the PM8998 PON's PS_HOLD reset type (PS_HOLD_RST_CTL 0x85a, bits 3:0) set to SHUTDOWN (4) with its enable bit
++ * (PS_HOLD_RST_CTL2 0x85b bit 7) off around the change, then PS_HOLD dropped: the PMIC powers the phone off
++ * instead of resetting it. As Linux drivers/input/misc/pm8941-pwrkey.c (pm8941_reboot_notify: SYS_POWER_OFF ->
++ * PON_PS_HOLD_TYPE_SHUTDOWN) and downstream qpnp-power-on.c (qpnp_pon_reset_config) do; the Mi 8's DT makes the
++ * PM8998 PON the system reset one (qcom,system-reset) and sets no other power-off type. A restart puts back the
++ * reset type found at boot. If PS_HOLD does not power off (2 s), PSCI SYSTEM_OFF. With a charger plugged in the
++ * PMIC is expected to power the phone straight back on (charger power-on), as on Android.
++ *
+  * Reset time may be non-preemptible (halt_all_cpus, panic): everything is
+  * mapped by sweet_reboot_init() and the SPMI helpers run lock-less there.
+  * All logs start with "SWEET REBOOT:".
+@@ -65,6 +75,11 @@ extern int sweet_ufs_flush_final(void);      /* bsd/dev/sweet_ufs.c: SYNCHRONIZE
+ #define SR_MAGIC_NORMAL     0u
+ #define SR_MAGIC_RECOVERY   0x1u           /* pm8998.dtsi mode-recovery */
+ #define SR_MAGIC_BOOTLOADER 0x2u           /* pm8998.dtsi mode-bootloader */
++#define SR_PON_PSHOLD_CTL   0x085au        /* 3074: PON_PS_HOLD_RST_CTL, bits 3:0 the reset type */
++#define SR_PON_PSHOLD_CTL2  0x085bu        /* PON_PS_HOLD_RST_CTL2, bit 7 enables it */
++#define SR_PSHOLD_ENABLE    0x80u
++#define SR_PSHOLD_TYPE_MASK 0x0fu
++#define SR_PSHOLD_SHUTDOWN  4u             /* PON_POWER_OFF_SHUTDOWN */
+ 
+ enum { SR_NORMAL = 0, SR_BOOTLOADER = 1, SR_RECOVERY = 2, SR_BERGAMOTA = 3 };
+ 
+@@ -73,6 +88,63 @@ static int sr_override = -1;               /* sysctl; -1 = none */
+ static volatile uint32_t *sr_pshold;
+ static volatile uint32_t *sr_imem;
+ static bool sr_ready, sr_pon_ready, sr_in_panic;
++static int sr_boot_type = -1;              /* 3074: PS_HOLD reset type at boot (put back by a restart) */
++static bool sr_type_changed;
++static char sr_reasons[320];               /* 3074: why the PMIC powered on / off last time (kern.sweet_pon_reasons) */
++
++/*
++ * 3074: the PM8998 PON's latched reasons, read at boot. PM8998 has a gen2 PON (downstream qpnp-power-on.c PON_OFFSET():
++ * gen2 registers at 0xc0+): PON_REASON1 0x8c0 (bit 0 hard reset, 1 SMPL, 2 RTC, 3 DC charger, 4 USB charger, 5 PON1,
++ * 6 cable, 7 power key), WARM_RESET_REASON1 0x8c2 (non-zero: a warm reset), POFF_REASON1/2 0x8c5/0x8c6 (the last real
++ * power-off: bit 0 software, 1 PS_HOLD, 2 PMIC watchdog, 3/4 keypad reset 1/2, 5 power key + reset line, 6 reset line,
++ * 7 long power key; 0x8c6 bit 3 charger, 4 thermal, 5 UVLO, 6 over-temperature, 7 stage 3 reset), OFF_REASON 0x8c7,
++ * FAULT_REASON1/2 0x8c8/0x8c9, S3_RESET_REASON 0x8ca. Seen on the Mi 8 (2026-11-07): after the user's long power-key
++ * reset POFF 0x80, after this file's power off POFF 0x02 (PS_HOLD). The 0x808 of gen1 PONs reads 0x03 either way.
++ */
++static void
++sr_read_reasons(void)
++{
++	static const unsigned regs[] = { 0x8c0, 0x8c2, 0x8c5, 0x8c6, 0x8c7, 0x8c8, 0x8c9, 0x8ca };
++	static const char *const on[8] = { "hard-reset", "smpl", "rtc", "dc-charger", "usb-charger", "pon1", "cable",
++		                           "power-key" };
++	static const char *const off[16] = { "software", "ps-hold", "pmic-wd", "keypad-reset1", "keypad-reset2",
++		                             "power-key+reset", "reset-line", "long-power-key", NULL, NULL, NULL, "charger",
++		                             "thermal", "uvlo", "overtemp", "stage3" };
++	uint8_t v[sizeof(regs) / sizeof(regs[0])];
++	size_t n = 0;
++
++	for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		if (sweet_spmi_read(SR_PON_SID, regs[i], &v[i]) != 0) {
++			snprintf(sr_reasons, sizeof(sr_reasons), "unreadable (0x%03x)", regs[i]);
++			return;
++		}
++	}
++	n += snprintf(sr_reasons + n, sizeof(sr_reasons) - n, "on:");
++	for (unsigned b = 0; b < 8; b++) {
++		if (v[0] & (1u << b)) {
++			n += snprintf(sr_reasons + n, sizeof(sr_reasons) - n, " %s", on[b]);
++		}
++	}
++	n += snprintf(sr_reasons + n, sizeof(sr_reasons) - n, "%s; last power-off:", v[1] ? " (warm reset)" : "");
++	unsigned poff = (unsigned)v[2] | (unsigned)v[3] << 8;
++	for (unsigned b = 0; b < 16; b++) {
++		if ((poff & (1u << b)) && off[b]) {
++			n += snprintf(sr_reasons + n, sizeof(sr_reasons) - n, " %s", off[b]);
++		}
++	}
++	snprintf(sr_reasons + n, sizeof(sr_reasons) - n, "; 8c0 %02x 8c2 %02x 8c5 %02x 8c6 %02x 8c7 %02x 8c8 %02x 8c9 %02x 8ca %02x",
++	    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
++}
++
++static int
++sr_reasons_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	return SYSCTL_OUT(req, sr_reasons, strlen(sr_reasons) + 1);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_pon_reasons, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sr_reasons_sysctl, "A",
++    "3074: the PM8998's latched power-on / power-off reasons of this boot");
+ 
+ static const char *
+ sr_name(int mode)
+@@ -161,9 +233,61 @@ sweet_reboot_init(void)
+ 		sr_pon_ready = true;
+ 	}
+ 	sr_ready = sr_pshold != NULL;
+-	printf("SWEET REBOOT: boot-arg mode %s, PS_HOLD %s, IMEM %s, PON spare write %s\n",
++	sr_read_reasons();
++	printf("SWEET REBOOT: PON reasons: %s\n", sr_reasons);
++	uint8_t ctl = 0, ctl2 = 0;
++	if (sweet_spmi_read(SR_PON_SID, SR_PON_PSHOLD_CTL, &ctl) == 0 &&
++	    sweet_spmi_read(SR_PON_SID, SR_PON_PSHOLD_CTL2, &ctl2) == 0) {
++		sr_boot_type = ctl & SR_PSHOLD_TYPE_MASK;
++	}
++	size_t rl = strlen(sr_reasons);
++	snprintf(sr_reasons + rl, sizeof(sr_reasons) - rl, "; PS_HOLD reset type at boot %d (%s)", sr_boot_type,
++	    sr_boot_type < 0 ? "unread" : (ctl2 & SR_PSHOLD_ENABLE) ? "enabled" : "disabled");
++	printf("SWEET REBOOT: boot-arg mode %s, PS_HOLD %s, IMEM %s, PON spare write %s, PS_HOLD reset type %d (%s)\n",
+ 	    sr_name(sr_bootarg), sr_pshold ? "mapped" : "NOT mapped",
+-	    sr_imem ? "mapped" : "NOT mapped", sr_pon_ready ? "ready" : "unavailable");
++	    sr_imem ? "mapped" : "NOT mapped", sr_pon_ready ? "ready" : "unavailable", sr_boot_type,
++	    sr_boot_type < 0 ? "unread" : (ctl2 & SR_PSHOLD_ENABLE) ? "enabled" : "disabled");
++}
++
++/*
++ * 3074: the PMIC's answer to PS_HOLD going low (pm8941-pwrkey.c / qpnp_pon_reset_config): enable off, wait for
++ * the PMIC to latch it ("10 sleep clock cycles": 32 kHz, so 1 ms is ample), the type, enable on. 0 when set.
++ */
++static int
++sr_pon_pshold_type(unsigned type)
++{
++	uint8_t ctl = 0, ctl2 = 0, v;
++
++	if (!sr_pon_ready || sweet_spmi_read(SR_PON_SID, SR_PON_PSHOLD_CTL, &ctl) != 0 ||
++	    sweet_spmi_read(SR_PON_SID, SR_PON_PSHOLD_CTL2, &ctl2) != 0) {
++		printf("SWEET REBOOT: PS_HOLD reset type not readable\n");
++		return -1;
++	}
++	if ((ctl & SR_PSHOLD_TYPE_MASK) == type && (ctl2 & SR_PSHOLD_ENABLE)) {
++		printf("SWEET REBOOT: PS_HOLD reset type %u already\n", type);
++		return 0;
++	}
++	v = (uint8_t)(ctl2 & ~SR_PSHOLD_ENABLE);
++	if (sweet_spmi_write(SR_PON_SID, SR_PON_PSHOLD_CTL2, &v, 1) != 0) {
++		goto fail;
++	}
++	delay(1000);
++	v = (uint8_t)((ctl & ~SR_PSHOLD_TYPE_MASK) | type);
++	if (sweet_spmi_write(SR_PON_SID, SR_PON_PSHOLD_CTL, &v, 1) != 0) {
++		goto fail;
++	}
++	v = (uint8_t)(ctl2 | SR_PSHOLD_ENABLE);
++	if (sweet_spmi_write(SR_PON_SID, SR_PON_PSHOLD_CTL2, &v, 1) != 0) {
++		goto fail;
++	}
++	sr_type_changed = true;
++	(void)sweet_spmi_read(SR_PON_SID, SR_PON_PSHOLD_CTL, &ctl);
++	(void)sweet_spmi_read(SR_PON_SID, SR_PON_PSHOLD_CTL2, &ctl2);
++	printf("SWEET REBOOT: PS_HOLD reset type -> %u (read back 0x85a 0x%02x, 0x85b 0x%02x)\n", type, ctl, ctl2);
++	return (ctl & SR_PSHOLD_TYPE_MASK) == type && (ctl2 & SR_PSHOLD_ENABLE) ? 0 : -1;
++fail:
++	printf("SWEET REBOOT: PS_HOLD reset type write FAILED\n");
++	return -1;
+ }
+ 
+ /*
+@@ -234,6 +358,9 @@ sweet_reboot_restart(int panic_restart)
+ 	}
+ 	sweet_spmi_atomic();
+ 	printf("SWEET REBOOT: resetting, mode %s%s\n", sr_name(mode), panic_restart || sr_in_panic ? " (panic)" : "");
++	if (sr_type_changed && sr_boot_type >= 0) {
++		(void)sr_pon_pshold_type((unsigned)sr_boot_type);     /* 3074: a power off that did not happen */
++	}
+ 	/* bergamota: PON reason 0 (normal) so ABL boots the boot partition, where our shim lives. */
+ 	sr_pon_set_reason(mode == SR_BOOTLOADER ? SR_MAGIC_BOOTLOADER :
+ 	    mode == SR_RECOVERY ? SR_MAGIC_RECOVERY : SR_MAGIC_NORMAL);
+@@ -253,4 +380,42 @@ sweet_reboot_restart(int panic_restart)
+ 	delay(2000 * 1000);
+ 	return -1;
+ }
++/* 3074: PSCI SYSTEM_OFF (SMCCC 1.0), when PS_HOLD did not power off. */
++static void
++sr_psci_system_off(void)
++{
++	register uint64_t x0 __asm__("x0") = 0x84000008ULL;
++	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7",
++	    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++}
++
++/*
++ * 3074: power the phone off (haltRestart kPEHaltCPU / kPEUPSDelayHaltCPU). Returns only if nothing powered it off
++ * (-1: the caller falls back to the old spin).
++ */
++int
++sweet_reboot_poweroff(void)
++{
++	int flush = sweet_ufs_flush_final();
++	printf("SWEET REBOOT: UFS cache flush -> %d%s\n", flush, flush == EBUSY ? " (busy, skipped)" : "");
++	if (!sr_ready) {
++		return -1;
++	}
++	sweet_spmi_atomic();
++	printf("SWEET REBOOT: powering off\n");
++	sr_pon_set_reason(SR_MAGIC_NORMAL);     /* the next power-on boots normally */
++	if (sr_pon_pshold_type(SR_PSHOLD_SHUTDOWN) == 0) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		*sr_pshold = 0;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		delay(2000 * 1000);
++		printf("SWEET REBOOT: PS_HOLD did not power off, PSCI SYSTEM_OFF\n");
++	} else {
++		printf("SWEET REBOOT: PS_HOLD left alone (it would reset), PSCI SYSTEM_OFF\n");
++	}
++	sr_psci_system_off();
++	delay(2000 * 1000);
++	printf("SWEET REBOOT: still on after PSCI SYSTEM_OFF\n");
++	return -1;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 51d8c78..9195e05 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -284,8 +284,10 @@ sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
+ 		}
+ 	}
+ 	if (sid == 0) {
+-		/* PON spare (reboot reason); RTC alarm data 0x6140-0x6143 (the RTC offset, sweet_rtc_set) */
+-		return (addr == 0x088fu && len == 1) || (addr >= 0x6140u && addr + len <= 0x6144u);
++		/* PON spare (reboot reason); 3074: PON PS_HOLD_RST_CTL/CTL2 (the power-off type, sweet_reboot_poweroff);
++		 * RTC alarm data 0x6140-0x6143 (the RTC offset, sweet_rtc_set) */
++		return ((addr == 0x088fu || addr == 0x085au || addr == 0x085bu) && len == 1) ||
++		       (addr >= 0x6140u && addr + len <= 0x6144u);
+ 	}
+ 	if (sid != 3) {
+ 		return false;
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index c6d113f..1dbc789 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -12,6 +12,7 @@
+ 
+ extern "C" int sweet_reboot_restart(int panic_restart);
+ extern "C" void sweet_reboot_note_panic(void);
++extern "C" int sweet_reboot_poweroff(void);
+ #include "../../../bsd/dev/sweet_board.h"
+ #include "../../../bsd/dev/sweet_spmi.h"
+ 
+@@ -67,6 +68,10 @@ SweetPlatformExpert::haltRestart(unsigned int type)
+ 	case kPERestartCPU:
+ 		(void)sweet_reboot_restart(0);
+ 		break;
++	case kPEHaltCPU:                /* 3074: iOS's power off (reboot RB_HALT): the PMIC powers the phone off */
++	case kPEUPSDelayHaltCPU:
++		(void)sweet_reboot_poweroff();
++		break;
+ 	default:
+ 		break;
+ 	}
