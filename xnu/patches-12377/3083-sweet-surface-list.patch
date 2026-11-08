@@ -1,0 +1,113 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 8eca04a..f31becb 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1135,6 +1135,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			ret = kIOReturnNoResources;
+ 		}
+ 	}
++	proc_selfname(s->creator, sizeof(s->creator));
+ 	if (ret == kIOReturnSuccess && s->memory == NULL) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+@@ -1779,3 +1780,85 @@ IOSurfaceRootUserClient::getTargetAndTrapForIndex(IOService **targetP, UInt32 in
+ 	return &sweet_surface_traps[index];
+ }
+ #endif /* SWEET */
++
++/*
++ * 3083: kern.sweet_surface_list (root): the buffer surfaces' memory against SWEET_SURFACE_WIRED_MAX, the live surfaces'
++ * bytes and count by the process that made them, and the 24 largest (id, creator, size, format, dimensions). For finding
++ * who fills the 1.5 GB (the camera's still pipeline did, 2026-11-08).
++ */
++#include <sys/sysctl.h>
++static int
++sweet_surface_list_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	const size_t cap = 8192;
++	char *buf = (char *)kalloc_data(cap, Z_WAITOK_ZERO);
++	if (buf == NULL || sweet_surface_lock == NULL) {
++		if (buf) {
++			kfree_data(buf, cap);
++		}
++		return ENOMEM;
++	}
++	struct { char name[17]; uint64_t bytes; uint32_t n; } by[32];
++	struct { uint32_t id, size, w, h, fmt; char name[17]; } big[24];
++	unsigned nby = 0, nbig = 0, live = 0;
++	uint64_t total = 0;
++	bzero(by, sizeof(by));
++	bzero(big, sizeof(big));
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID; id++) {
++		SweetSurface *s = sweet_surface_table[id];
++		if (s == NULL) {
++			continue;
++		}
++		live++;
++		total += s->allocSize;
++		unsigned k = 0;
++		while (k < nby && strncmp(by[k].name, s->creator, 16) != 0) {
++			k++;
++		}
++		if (k == nby && nby < 32) {
++			strlcpy(by[nby].name, s->creator[0] ? s->creator : "?", sizeof(by[nby].name));
++			nby++;
++		}
++		if (k < nby) {
++			by[k].bytes += s->allocSize;
++			by[k].n++;
++		}
++		/* keep the 24 largest: replace the smallest kept when this one is larger */
++		unsigned slot = nbig < 24 ? nbig++ : 24;
++		if (slot == 24) {
++			unsigned m = 0;
++			for (unsigned q = 1; q < 24; q++) {
++				if (big[q].size < big[m].size) {
++					m = q;
++				}
++			}
++			slot = big[m].size < s->allocSize ? m : 24;
++		}
++		if (slot < 24) {
++			big[slot].id = id;
++			big[slot].size = s->allocSize;
++			big[slot].w = s->width;
++			big[slot].h = s->height;
++			big[slot].fmt = s->pixelFormat;
++			strlcpy(big[slot].name, s->creator[0] ? s->creator : "?", sizeof(big[slot].name));
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	size_t o = (size_t)snprintf(buf, cap, "wired %llu MiB of %llu MiB; %u live surfaces, %llu MiB\n",
++	    sweet_surface_wired >> 20, SWEET_SURFACE_WIRED_MAX >> 20, live, total >> 20);
++	for (unsigned k = 0; k < nby && o < cap; k++) {
++		o += (size_t)snprintf(buf + o, cap - o, "by %s: %u surfaces, %llu MiB\n", by[k].name, by[k].n, by[k].bytes >> 20);
++	}
++	for (unsigned k = 0; k < nbig && o < cap; k++) {
++		uint32_t f = big[k].fmt;
++		o += (size_t)snprintf(buf + o, cap - o, "id %u %s %u KiB %ux%u '%c%c%c%c'\n", big[k].id, big[k].name, big[k].size >> 10, big[k].w,
++		    big[k].h, (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f);
++	}
++	int error = SYSCTL_OUT(req, buf, strnlen(buf, cap) + 1);
++	kfree_data(buf, cap);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_surface_list, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_surface_list_sysctl, "A",
++    "3083: buffer surfaces by creator and the largest ones");
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index f34577b..e63086f 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -52,8 +52,9 @@ public:
+ 	uint32_t                  gpuBlitsSeen; /* ... of which the framebuffer has already presented */
+ 	uint32_t                  cpuWrites;    /* write-unlocks (IOSurfaceUnlock without ReadOnly), patch 0216 */
+ 	uint32_t                  cpuWritesSeen;        /* ... of which the framebuffer has already scanned */
++	char                      creator[17];          /* 3083: the process that made it (kern.sweet_surface_list) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; pooled = false; poolPages = 0; poolPA = 0; scanned = false; gpuBlits = 0; gpuBlitsSeen = 0; cpuWrites = 0; cpuWritesSeen = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; pooled = false; poolPages = 0; poolPA = 0; scanned = false; gpuBlits = 0; gpuBlitsSeen = 0; cpuWrites = 0; cpuWritesSeen = 0; creator[0] = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use; wrapped memory: of the first pixel), or 0. */
