@@ -550,6 +550,11 @@ static const struct prop stream_props[] = {
 	{ "VideoOutputsColorInfo", "Collection", "ReadWrite" }, { "RegionOfInterestForCameraControls", "Collection", "ReadWrite" },
 	{ "AEMeteringMode", "Number", "ReadWrite" }, { "MaxFrameCoalescingDuration", "Number", "ReadWrite" },
 	{ "LimitAERange", "Boolean", "ReadWrite" },
+	/* tap to focus and expose: CMCapture sets these (refused as unsupported they were -12787 on every tap) */
+	{ "AFWindowParams", "Collection", "ReadWrite" }, { "AEWindowParams", "Collection", "ReadWrite" },
+	{ "Apply3AWindowSettings", "Boolean", "WriteOnly" }, { "AutoFocusMode", "Number", "ReadWrite" },
+	{ "MatrixFocusParams", "Collection", "ReadWrite" }, { "AFSearchPositions", "Collection", "ReadWrite" },
+	{ "TimeMachineSuspendNow", "Boolean", "WriteOnly" }, { "TimeMachineResumeNow", "Boolean", "WriteOnly" },
 }, device_props[] = {
 	{ "StreamArray", "Collection", "ReadOnly" }, { "Clock", "Clock", "ReadOnly" }, { "ClientIsActive", "Boolean", "ReadWrite" },
 	{ "SupportedSynchronizedStreamsGroups", "Collection", "ReadOnly" }, { "MemoryPoolID", "Number", "ReadWrite" },
@@ -934,9 +939,18 @@ stream_set_property_real(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		(void)sysctlbyname("kern.sweet_torch", NULL, NULL, &v, sizeof(v));
 		return 0;
 	}
-	if (key_is(key, "RegionOfInterestForCameraControls")) {
-		int one = 1;
-		(void)sysctlbyname("kern.sweet_cam_focus", NULL, NULL, &one, sizeof(one));   /* a tap: focus again */
+	if (key_is(key, "Apply3AWindowSettings") || key_is(key, "RegionOfInterestForCameraControls")) {
+		/* a tap (CMCapture applies its new AF/AE windows) or a new region: the kernel's focus sweep again, at most once a second */
+		static uint64_t last;
+		uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+		if (now - last > 1000000000ull) {
+			int one = 1;
+			last = now;
+			(void)sysctlbyname("kern.sweet_cam_focus", NULL, NULL, &one, sizeof(one));
+			if (key_is(key, "Apply3AWindowSettings")) {
+				say("stream: Apply3AWindowSettings: focusing again");
+			}
+		}
 	}
 	say_once("stream: set (not used)", key, value);
 	return 0;
