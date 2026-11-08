@@ -733,6 +733,7 @@ struct output {
 	bool enabled;
 	void *handler;                  /* a block ^(CVPixelBufferRef, CMTime) */
 	uint64_t delivered;
+	unsigned dropped;               /* frames not given: the pool at its threshold (deliver) */
 };
 
 struct stream {
@@ -1137,7 +1138,27 @@ deliver(struct output *out, const struct isp *p, CMTime pts, CFDictionaryRef md)
 	uint32_t pf = (uint32_t)get_i(out->config, "PixelFormat", PF_420F);
 
 	if (gp && CFGetTypeID(gp) == CVPixelBufferPoolGetTypeID()) {
-		if (CVPixelBufferPoolCreatePixelBuffer(NULL, (CVPixelBufferPoolRef)gp, &pb) != kCVReturnSuccess) {
+		/*
+		 * at most 6 buffers out of each pool (the still output's own count, when larger): when the consumers fall behind
+		 * (the still pipeline's ~500 Metal pipelines compiling at the start of a session took the CPUs for ~15 s) the frame is
+		 * dropped, as an ISP does, instead of the pool growing until the kernel's 1.5 GB of surfaces ran out
+		 */
+		static CFDictionaryRef aux;
+		if (!aux) {
+			int lim = 6;
+			CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &lim);
+			const void *k = kCVPixelBufferPoolAllocationThresholdKey, *v = n;
+			aux = CFDictionaryCreate(NULL, &k, &v, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+			CFRelease(n);
+		}
+		CVReturn cr = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(NULL, (CVPixelBufferPoolRef)gp, aux, &pb);
+		if (cr == kCVReturnWouldExceedAllocationThreshold) {
+			out->dropped++;
+			if (out->dropped == 1 || out->dropped % 300 == 0)
+				say("%{public}s: %u frames dropped (its consumers hold all %d buffers)", out->name, out->dropped, 6);
+			return;
+		}
+		if (cr != kCVReturnSuccess) {
 			pb = NULL;
 		}
 	}
@@ -1262,6 +1283,21 @@ worker(void *ctx)
 		}
 		pthread_mutex_unlock(&s->lock);
 		CFRelease(md);
+		/*
+		 * a guard while the still pipeline is brought up: past 1200 MiB of the kernel's 1536 MiB of surfaces (xnu 3083's
+		 * kern.sweet_surface_list) cameracaptured ends itself, with the list in the log, rather than starve the phone (it did
+		 * twice: every surface failed, SSH stopped answering)
+		 */
+		if (s->frames % 30 == 0) {
+			char sl[8192];
+			size_t sll = sizeof(sl);
+			if (sysctlbyname("kern.sweet_surface_list", sl, &sll, NULL, 0) == 0 && strtoul(sl + 6, NULL, 10) >= 1200) {
+				say("surface memory guard: %{public}s", sl);
+				say("surface memory guard: cameracaptured ends itself");
+				usleep(200000);
+				_exit(1);
+			}
+		}
 		if (s->frames <= 2 || s->frames % 300 == 0) {
 			say("frame %u: %u lines x %.1f x %.2f, lens %u; white balance R %.2f B %.2f; outputs %d%d%d%d enabled %d%d%d%d, delivering %d",
 			    h->seq, h->exposure_lines, h->again_x256 / 256.0, h->dgain_x256 / 256.0, h->lens, isp.wb[0], isp.wb[2],
@@ -2177,6 +2213,7 @@ m2m_scale(CVPixelBufferRef src, CGRect sr, CVPixelBufferRef dst, CGRect dr)
 {
 	if (!src || !dst)
 		return -1;
+	uint64_t t_start = clock_gettime_nsec_np(CLOCK_MONOTONIC);
 	OSType sf = CVPixelBufferGetPixelFormatType(src), df = CVPixelBufferGetPixelFormatType(dst);
 	enum m2m_kind sk = m2m_kind_of(sf), dk = m2m_kind_of(df);
 	size_t sw = CVPixelBufferGetWidth(src), sh = CVPixelBufferGetHeight(src), dw = CVPixelBufferGetWidth(dst), dh = CVPixelBufferGetHeight(dst);
@@ -2234,6 +2271,20 @@ m2m_scale(CVPixelBufferRef src, CGRect sr, CVPixelBufferRef dst, CGRect dr)
 	if (done++ < 6)
 		say("m2m: %c%c%c%c %.0fx%.0f to %c%c%c%c %.0fx%.0f: %d", sf >> 24, sf >> 16 & 255, sf >> 8 & 255, sf & 255, sr.size.width,
 		    sr.size.height, df >> 24, df >> 16 & 255, df >> 8 & 255, df & 255, dr.size.width, dr.size.height, err);
+	/* how much of the CPU this costs: calls and milliseconds over each 5 s */
+	static uint64_t t_window, busy_ns;
+	static unsigned calls;
+	uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+	busy_ns += now - t_start;
+	calls++;
+	if (!t_window)
+		t_window = now;
+	if (now - t_window > 5000000000ull) {
+		say("m2m: %u transforms, %.0f ms of CPU in the last %.1f s", calls, busy_ns / 1e6, (now - t_window) / 1e9);
+		t_window = now;
+		busy_ns = 0;
+		calls = 0;
+	}
 	return err;
 }
 
@@ -2363,10 +2414,45 @@ say_methods(const char *cls_name)
 	free(iv);
 }
 
+/*
+ * Photographic/smart style rendering off: with FigColorCube working (Chlorophyll's RGB-over-YCbCr formats 540-545) every
+ * preview frame went through a style stage drawing into a two-plane RGB8/RGB10_420_2P surface, which bgmtl encodes back on
+ * the CPU (~0.6 s a 1734x1300 frame): frames piled up until the kernel's 1.5 GB of surfaces ran out. The source formats say
+ * they cannot render styles, as the iPhone 11 they describe could not before iOS 26's styles came. /private/var/tmp/
+ * sweetcam.styles leaves them on.
+ */
+static BOOL
+answer_no(id self, SEL sel)
+{
+	(void)self;
+	(void)sel;
+	return NO;
+}
+
+static void
+hook_styles(void)
+{
+	if (access("/private/var/tmp/sweetcam.styles", F_OK) == 0)
+		return;
+	static const char *const sels[] = { "isSemanticStyleRenderingSupported", "isSmartStyleRenderingSupported", "semanticRenderingSupported",
+		"isApplyStandardSmartStyleForStillsWhenNoStyleRequestedSupported" };
+	Class c = objc_getClass("FigCaptureSourceVideoFormat");
+	unsigned n = 0;
+	for (unsigned i = 0; c && i < sizeof(sels) / sizeof(sels[0]); i++) {
+		Method m = class_getInstanceMethod(c, sel_registerName(sels[i]));
+		if (m) {
+			method_setImplementation(m, (IMP)answer_no);
+			n++;
+		}
+	}
+	say("styles: %u FigCaptureSourceVideoFormat answers made NO", n);
+}
+
 static void
 hook(void)
 {
 	hook_nrf();
+	hook_styles();
 	hook_m2m();
 	say_imps();
 	if (access("/private/var/tmp/sweetcam.nilwatch", F_OK) == 0)
@@ -2524,6 +2610,30 @@ metal_device(void)
 	 * the phone gets them), else the phone's own */
 	const char *drv = access("/usr/local/lib/bgmtl-cam/bgmtl-inject.dylib", R_OK) == 0 ? "/usr/local/lib/bgmtl-cam/bgmtl-inject.dylib"
 	                                                                                     : "/usr/local/lib/bgmtl/bgmtl-inject.dylib";
+	/* bgmtl's trace for this process only (one line per command buffer, pass and pipeline: bgmtl-trace-<pid>.txt) */
+	if (access("/private/var/tmp/sweetcam.mtltrace", F_OK) == 0)
+		setenv("BGMTL_TRACE", "1", 1);
+	/*
+	 * the preview stages that the camera's pipeline does without, refused as they were before Chlorophyll could build them:
+	 * the Metal stand-in for the missing rotation hardware (VTPixelRotationSession's transform shaders) and the colour cube;
+	 * built, they ran every preview frame at about 6 a second here and the frames waiting for them filled the surfaces.
+	 * /private/var/tmp/sweetcam.allstages: nothing refused
+	 */
+	if (access("/private/var/tmp/sweetcam.allstages", F_OK) != 0)
+	{
+		/* the list: /private/var/tmp/sweetcam.deny (one line, comma-separated) when present, else these */
+		char deny[1024] = "fragmentTransformYUV,fragmentTransformRGBA,fragmentTransformY,fragmentTransformUV,fragmentTransformYY,"
+		                  "colorCubeFragment2D,VCPRender,VCPDownsample";
+		FILE *df = fopen("/private/var/tmp/sweetcam.deny", "r");
+		if (df) {
+			if (fgets(deny, sizeof(deny), df)) {
+				deny[strcspn(deny, "\r\n")] = 0;
+			}
+			fclose(df);
+		}
+		setenv("BGMTL_DENY", deny, 1);
+		say("Metal: refused here: %{public}s", deny);
+	}
 	void *h = dlopen(drv, RTLD_NOW);
 	say("Metal: driver %{public}s", drv);
 	int (*state)(unsigned *) = h ? dlsym(h, "bgmtl_gpu_state") : NULL;
