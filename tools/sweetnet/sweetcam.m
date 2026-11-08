@@ -1939,10 +1939,35 @@ hook_specialise(void)
 	    gOrigLibData != NULL, gOrigLibFile != NULL);
 }
 
+/* where some CMCapture methods are (offset in their image), for reading them on the Mac */
+static void
+say_imps(void)
+{
+	static const struct {
+		const char *cls, *sel;
+	} t[] = {
+		{ "BWUBNode", "_setupProcessorCoordinator" }, { "BWUBNode", "_setupProcessingStateWithSettings:" },
+		{ "BWUBNode", "prepareForCurrentConfigurationToBecomeLive" },
+	};
+	for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+		Class c = objc_getClass(t[i].cls);
+		Method m = c ? class_getInstanceMethod(c, sel_registerName(t[i].sel)) : NULL;
+		IMP imp = m ? method_getImplementation(m) : NULL;
+		Dl_info di = { 0 };
+		if (imp && dladdr((void *)imp, &di) && di.dli_fbase) {
+			say("imp: -[%{public}s %{public}s] at %{public}s+%#lx", t[i].cls, t[i].sel, strrchr(di.dli_fname, '/') + 1,
+			    (unsigned long)((uintptr_t)imp - (uintptr_t)di.dli_fbase));
+		} else {
+			say("imp: -[%{public}s %{public}s] not found", t[i].cls, t[i].sel);
+		}
+	}
+}
+
 static void
 hook(void)
 {
 	hook_nrf();
+	say_imps();
 	Class g = objc_getClass("BWGraph");
 	Method gm = g ? class_getInstanceMethod(g, sel_registerName("connectOutput:toInput:pipelineStage:deferredAttach:")) : NULL;
 	if (gm) {
