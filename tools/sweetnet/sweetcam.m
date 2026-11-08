@@ -34,6 +34,7 @@
 #import <Foundation/Foundation.h>
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
+#include <CoreGraphics/CoreGraphics.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -655,6 +656,18 @@ format_from(CFStringRef name, CFDictionaryRef entry)
 	put(f, "GeometricDistortionCorrectedNativeHeight", num_i(sh));
 	CFMutableDictionaryRef outputs = new_dict();
 	int64_t ow = get_i(entry, "HighQualitySensorWidth", sw), oh = get_i(entry, "HighQualitySensorHeight", sh);
+	/*
+	 * the still size halved in each dimension when it is over 2048 wide (4032x3024 -> 2016x1512): the frames are 1920x1080
+	 * here, so a 12 MP still was only upscaled, and the still pipeline's buffers for it (shot buffers, NRF's pyramids, Live
+	 * Photo's ring) went past the kernel's 1.5 GB for surfaces (SWEET_SURFACE_WIRED_MAX): every IOSurface after that failed
+	 * and the phone starved
+	 */
+	if (ow > 2048) {
+		ow /= 2;
+		oh /= 2;
+		put(f, "HighQualitySensorWidth", num_i(ow));
+		put(f, "HighQualitySensorHeight", num_i(oh));
+	}
 	put(outputs, "PrimaryScaler", output_info(sw, sh));
 	put(outputs, "SecondaryScaler", output_info(sw, sh));
 	put(outputs, "StillImage", output_info(ow, oh));
@@ -1718,19 +1731,20 @@ connect_output(id self, SEL sel, id output, id input, id stage, BOOL deferred)
 /*
  * The model's device entry (N104 AVCaptureSession.plist) says stillImageNoiseReductionAndFusionScheme 4: the still pipeline
  * then runs BWUBNode, whose NRF processor (DenoiseFusePipeline, Apple's GPU kernels) cannot be set up on this Metal device
- * ("Failed to setup processor coordinator -- all processing will fail!", photos end with -16808). The scheme is forced to
- * the number in /private/var/tmp/sweetcam.nrf (0 without the file).
+ * ("Failed to setup processor coordinator -- all processing will fail!", photos end with -16808). An experiment: the scheme
+ * can be forced to the number in /private/var/tmp/sweetcam.nrf; without the file it is left as it is. (Forcing 0 made the
+ * setup fail on its own: BWUBNode's _nrProcessorControllerType must then be 1 or 6.)
  */
 static IMP gOrigSetNRF[3];
 
 static int
-forced_nrf(void)
+forced_nrf(int given)
 {
 	FILE *f = fopen("/private/var/tmp/sweetcam.nrf", "r");
-	int v = 0;
+	int v = given;
 	if (f) {
 		if (fscanf(f, "%d", &v) != 1) {
-			v = 0;
+			v = given;
 		}
 		fclose(f);
 	}
@@ -1740,7 +1754,7 @@ forced_nrf(void)
 #define NRF_SETTER(n, cls)                                                                                                     \
 	static void set_nrf##n(id self, SEL sel, int scheme)                                                                   \
 	{                                                                                                                      \
-		int v = forced_nrf();                                                                                          \
+		int v = forced_nrf(scheme);                                                                                    \
 		say("%{public}s %{public}s %d: %d given", cls, sel_getName(sel), scheme, v);                                  \
 		((void (*)(id, SEL, int))gOrigSetNRF[n])(self, sel, v);                                                       \
 	}
@@ -1939,6 +1953,104 @@ hook_specialise(void)
 	    gOrigLibData != NULL, gOrigLibFile != NULL);
 }
 
+/*
+ * Diagnosis of BWUBNode's processor coordinator (-[BWUBNode _setupProcessorCoordinator], a direct method with about 20 exits
+ * after object creations and checks, none of which logs): CMCapture's own classes' initialisers that BWUBNode calls there are
+ * wrapped, and a nil one is said, as is a non-zero answer of prepareWithPixelBufferPoolProvider:. Only with
+ * /private/var/tmp/sweetcam.nilwatch present when CMCapture loads.
+ */
+static void
+nil_watch_class(Class cls, const char *cn)
+{
+	static const char *const id_sels[] = { "initWithConfiguration:", "initWithVideoFormat:capacity:name:memoryPool:",
+		"initWithVideoFormat:capacity:name:", "initWithProcessorControllers:", "initWithPixelBufferAttributes:",
+		"initWithProcessorControllers:configuration:" };
+	unsigned n = 0;
+	Method *ms = class_copyMethodList(cls, &n);
+	for (unsigned i = 0; i < n; i++) {
+		SEL sel = method_getName(ms[i]);
+		const char *sn = sel_getName(sel);
+		IMP orig = method_getImplementation(ms[i]);
+		bool is_id = false;
+		for (unsigned k = 0; k < sizeof(id_sels) / sizeof(id_sels[0]); k++)
+			is_id |= !strcmp(sn, id_sels[k]);
+		if (is_id) {
+			bool pool = !strcmp(cn, "BWPixelBufferPool") && !strncmp(sn, "initWithVideoFormat:capacity:name:", 34);
+			IMP nimp = imp_implementationWithBlock(^id(id self, void *a, void *b, void *c, void *d) {
+				id r = ((id(*)(id, SEL, void *, void *, void *, void *))orig)(self, sel, a, b, c, d);
+				if (!r) {
+					say("nilwatch: -[%{public}s %{public}s] answered nil", cn, sn);
+				}
+				if (pool) {
+					/* the pool inventory: format, capacity, name (the surface memory of the still pipeline) */
+					id fmt = (id)a;
+					SEL ws = sel_registerName("width"), hs = sel_registerName("height"), pf = sel_registerName("pixelFormat");
+					unsigned long w = [fmt respondsToSelector:ws] ? ((unsigned long (*)(id, SEL))objc_msgSend)(fmt, ws) : 0;
+					unsigned long h = [fmt respondsToSelector:hs] ? ((unsigned long (*)(id, SEL))objc_msgSend)(fmt, hs) : 0;
+					unsigned f = [fmt respondsToSelector:pf] ? ((unsigned (*)(id, SEL))objc_msgSend)(fmt, pf) : 0;
+					say("pool: %{public}@ %lux%lu %c%c%c%c x %lu", c ? (NSString *)(id)c : @"?", w, h, (char)(f >> 24),
+					    (char)(f >> 16), (char)(f >> 8), (char)f, (unsigned long)b);
+				}
+				return r;
+			});
+			method_setImplementation(ms[i], nimp);
+		} else if (!strcmp(sn, "prepareWithPixelBufferPoolProvider:")) {
+			IMP nimp = imp_implementationWithBlock(^long(id self, void *a) {
+				long r = ((long (*)(id, SEL, void *))orig)(self, sel, a);
+				if ((int)r) {
+					say("nilwatch: -[%{public}s %{public}s] answered %d", cn, sn, (int)r);
+				}
+				return r;
+			});
+			method_setImplementation(ms[i], nimp);
+		}
+	}
+	free(ms);
+}
+
+static void
+nil_watch(void)
+{
+	if (access("/private/var/tmp/sweetcam.nilwatch", F_OK) != 0) {
+		return;
+	}
+	unsigned n = 0, watched = 0;
+	Class *cs = objc_copyClassList(&n);
+	for (unsigned i = 0; i < n; i++) {
+		const char *img = class_getImageName(cs[i]);
+		if (!img || !strstr(img, "CMCapture.framework")) {
+			continue;
+		}
+		nil_watch_class(cs[i], class_getName(cs[i]));
+		watched++;
+	}
+	free(cs);
+	say("nilwatch: %u classes of CMCapture watched", watched);
+	/* +[BWVideoFormat formatByResolvingRequirements:] and the formats it gives: _setupProcessorCoordinator compares their
+	 * extended (aligned) sizes with the format it asked for and gives up on a difference */
+	Class vf = objc_getClass("BWVideoFormat");
+	Method rm = vf ? class_getClassMethod(vf, sel_registerName("formatByResolvingRequirements:")) : NULL;
+	if (rm) {
+		IMP orig = method_getImplementation(rm);
+		SEL sel = method_getName(rm);
+		method_setImplementation(rm, imp_implementationWithBlock(^id(id cls, NSArray *reqs) {
+			id r = ((id(*)(id, SEL, id))orig)(cls, sel, reqs);
+			static unsigned said;
+			if (said++ < 30) {
+				SEL ew = sel_registerName("extendedWidth"), eh = sel_registerName("extendedHeight");
+				say("nilwatch: formatByResolvingRequirements: %lu requirements -> %{public}@ (extended %lux%lu)", (unsigned long)reqs.count,
+				    r ? [[r description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "] : @"nil",
+				    r && [r respondsToSelector:ew] ? ((unsigned long (*)(id, SEL))objc_msgSend)(r, ew) : 0,
+				    r && [r respondsToSelector:eh] ? ((unsigned long (*)(id, SEL))objc_msgSend)(r, eh) : 0);
+				for (id q in reqs) {
+					say("nilwatch:   requirement %{public}@", [[q description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "]);
+				}
+			}
+			return r;
+		}));
+	}
+}
+
 /* where some CMCapture methods are (offset in their image), for reading them on the Mac */
 static void
 say_imps(void)
@@ -1963,11 +2075,305 @@ say_imps(void)
 	}
 }
 
+/* names of some instance variables (by offset) that BWUBNode's coordinator setup reads, for reading it on the Mac */
+static void
+say_ivars(const char *cls_name, const ptrdiff_t *offs, unsigned n_offs)
+{
+	Class cls = objc_getClass(cls_name);
+	unsigned n = 0;
+	Ivar *iv = cls ? class_copyIvarList(cls, &n) : NULL;
+	for (unsigned i = 0; i < n; i++) {
+		ptrdiff_t o = ivar_getOffset(iv[i]);
+		for (unsigned k = 0; k < n_offs; k++)
+			if (o == offs[k])
+				say("ivar: %{public}s +%td %{public}s %{public}s", cls_name, o, ivar_getName(iv[i]), ivar_getTypeEncoding(iv[i]));
+	}
+	free(iv);
+}
+
+/*
+ * ---- a software M2M scaler ----
+ * NRF's pyramid stage (NRFV1.bundle, PyramidStage_NRFV1) needs a FigM2MController, CMCapture's wrapper over the memory-to-
+ * memory scaler (IOSurfaceAccelerator over AppleM2ScalerCSCDriver), which this phone does not have: its -init answers nil,
+ * NRF cannot make its DenoiseFusePipeline and the still pipeline gives up. Here -init makes a controller without the
+ * accelerator and the transforms are done on the CPU: every plane of the source rectangle scaled (vImage, 16 bits a sample)
+ * into the destination rectangle, between 4:2:0 two-plane YCbCr formats of 8 bits ('420f', '420v'), 10 bits in 16
+ * ('x420', 'xf20') and 10 bits packed ('pf20', 'p420'), and BGRA to BGRA. No rotation or flip; custom filters are ignored.
+ */
+#include <Accelerate/Accelerate.h>
+
+enum m2m_kind { M2M_NONE, M2M_8, M2M_16, M2M_PACKED, M2M_BGRA };
+
+static enum m2m_kind
+m2m_kind_of(OSType f)
+{
+	switch (f) {
+	case '420f': case '420v': return M2M_8;
+	case 'xf20': case 'x420': return M2M_16;
+	case 'pf20': case 'p420': return M2M_PACKED;
+	case 'BGRA': return M2M_BGRA;
+	default: return M2M_NONE;
+	}
+}
+
+/* a plane's region as 16-bit samples (comps a texel: 1 luma, 2 chroma), 10 bits at the top as in 'x420' */
+static void
+m2m_read_plane(CVPixelBufferRef pb, size_t plane, enum m2m_kind k, unsigned comps, unsigned x0, unsigned y0, unsigned w, unsigned h,
+               uint16_t *out)
+{
+	const uint8_t *base = CVPixelBufferGetBaseAddressOfPlane(pb, plane);
+	size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, plane);
+	for (unsigned y = 0; y < h; y++) {
+		const uint8_t *row = base + (y0 + y) * bpr;
+		uint16_t *o = out + (size_t)y * w * comps;
+		if (k == M2M_8) {
+			for (unsigned i = 0; i < w * comps; i++)
+				o[i] = (uint16_t)(row[x0 * comps + i] << 8);
+		} else if (k == M2M_16) {
+			memcpy(o, row + (size_t)x0 * comps * 2, (size_t)w * comps * 2);
+		} else {
+			/* packed: three 10-bit values a little-endian word, low bits first */
+			for (unsigned i = 0; i < w * comps; i++) {
+				unsigned v = x0 * comps + i;
+				uint32_t word;
+				memcpy(&word, row + (v / 3) * 4, 4);
+				o[i] = (uint16_t)(((word >> (10 * (v % 3))) & 0x3ff) << 6);
+			}
+		}
+	}
+}
+
+static void
+m2m_write_plane(CVPixelBufferRef pb, size_t plane, enum m2m_kind k, unsigned comps, unsigned x0, unsigned y0, unsigned w, unsigned h,
+                const uint16_t *in)
+{
+	uint8_t *base = CVPixelBufferGetBaseAddressOfPlane(pb, plane);
+	size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, plane);
+	for (unsigned y = 0; y < h; y++) {
+		uint8_t *row = base + (y0 + y) * bpr;
+		const uint16_t *s = in + (size_t)y * w * comps;
+		if (k == M2M_8) {
+			for (unsigned i = 0; i < w * comps; i++)
+				row[x0 * comps + i] = (uint8_t)((s[i] + 0x80) >> 8 > 255 ? 255 : (s[i] + 0x80) >> 8);
+		} else if (k == M2M_16) {
+			for (unsigned i = 0; i < w * comps; i++) {
+				uint16_t v = (uint16_t)(s[i] & 0xffc0);
+				memcpy(row + ((size_t)x0 * comps + i) * 2, &v, 2);
+			}
+		} else {
+			for (unsigned i = 0; i < w * comps; i++) {
+				unsigned v = x0 * comps + i, sh = 10 * (v % 3);
+				uint32_t word;
+				memcpy(&word, row + (v / 3) * 4, 4);
+				word = (word & ~(0x3ffu << sh)) | (uint32_t)(s[i] >> 6) << sh;
+				memcpy(row + (v / 3) * 4, &word, 4);
+			}
+		}
+	}
+}
+
+static int
+m2m_scale(CVPixelBufferRef src, CGRect sr, CVPixelBufferRef dst, CGRect dr)
+{
+	if (!src || !dst)
+		return -1;
+	OSType sf = CVPixelBufferGetPixelFormatType(src), df = CVPixelBufferGetPixelFormatType(dst);
+	enum m2m_kind sk = m2m_kind_of(sf), dk = m2m_kind_of(df);
+	size_t sw = CVPixelBufferGetWidth(src), sh = CVPixelBufferGetHeight(src), dw = CVPixelBufferGetWidth(dst), dh = CVPixelBufferGetHeight(dst);
+	if (CGRectIsEmpty(sr) || CGRectIsNull(sr))
+		sr = CGRectMake(0, 0, sw, sh);
+	if (CGRectIsEmpty(dr) || CGRectIsNull(dr))
+		dr = CGRectMake(0, 0, dw, dh);
+	if (!sk || !dk || (sk == M2M_BGRA) != (dk == M2M_BGRA)) {
+		static unsigned said;
+		if (said++ < 8)
+			say("m2m: %c%c%c%c to %c%c%c%c not done here", sf >> 24, sf >> 16 & 255, sf >> 8 & 255, sf & 255, df >> 24, df >> 16 & 255,
+			    df >> 8 & 255, df & 255);
+		return -12780;
+	}
+	CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+	CVPixelBufferLockBaseAddress(dst, 0);
+	int err = 0;
+	if (sk == M2M_BGRA) {
+		unsigned x0 = (unsigned)sr.origin.x, y0 = (unsigned)sr.origin.y, w = (unsigned)sr.size.width, h = (unsigned)sr.size.height;
+		unsigned X0 = (unsigned)dr.origin.x, Y0 = (unsigned)dr.origin.y, W = (unsigned)dr.size.width, H = (unsigned)dr.size.height;
+		vImage_Buffer a = { (uint8_t *)CVPixelBufferGetBaseAddress(src) + y0 * CVPixelBufferGetBytesPerRow(src) + x0 * 4, h, w,
+			            CVPixelBufferGetBytesPerRow(src) };
+		vImage_Buffer b = { (uint8_t *)CVPixelBufferGetBaseAddress(dst) + Y0 * CVPixelBufferGetBytesPerRow(dst) + X0 * 4, H, W,
+			            CVPixelBufferGetBytesPerRow(dst) };
+		err = vImageScale_ARGB8888(&a, &b, NULL, kvImageHighQualityResampling) == kvImageNoError ? 0 : -12780;
+	} else {
+		for (size_t plane = 0; plane < 2 && !err; plane++) {
+			unsigned comps = plane ? 2 : 1, div = plane ? 2 : 1;
+			unsigned x0 = (unsigned)sr.origin.x / div, y0 = (unsigned)sr.origin.y / div, w = (unsigned)sr.size.width / div,
+			         h = (unsigned)sr.size.height / div;
+			unsigned X0 = (unsigned)dr.origin.x / div, Y0 = (unsigned)dr.origin.y / div, W = (unsigned)dr.size.width / div,
+			         H = (unsigned)dr.size.height / div;
+			if (!w || !h || !W || !H)
+				continue;
+			uint16_t *a = malloc((size_t)w * h * comps * 2), *b = malloc((size_t)W * H * comps * 2);
+			if (!a || !b) {
+				err = -12786;
+			} else {
+				m2m_read_plane(src, plane, sk, comps, x0, y0, w, h, a);
+				vImage_Buffer va = { a, h, w, (size_t)w * comps * 2 }, vb = { b, H, W, (size_t)W * comps * 2 };
+				vImage_Error e = comps == 1 ? vImageScale_Planar16U(&va, &vb, NULL, kvImageHighQualityResampling)
+				                            : vImageScale_CbCr16U(&va, &vb, NULL, kvImageHighQualityResampling);
+				if (e != kvImageNoError)
+					err = -12780;
+				else
+					m2m_write_plane(dst, plane, dk, comps, X0, Y0, W, H, b);
+			}
+			free(a);
+			free(b);
+		}
+	}
+	CVPixelBufferUnlockBaseAddress(dst, 0);
+	CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+	static unsigned done;
+	if (done++ < 6)
+		say("m2m: %c%c%c%c %.0fx%.0f to %c%c%c%c %.0fx%.0f: %d", sf >> 24, sf >> 16 & 255, sf >> 8 & 255, sf & 255, sr.size.width,
+		    sr.size.height, df >> 24, df >> 16 & 255, df >> 8 & 255, df & 255, dr.size.width, dr.size.height, err);
+	return err;
+}
+
+static IMP gM2MInit, gM2MDealloc;
+
+static id
+m2m_init(id self, SEL sel)
+{
+	/* the accelerator first, as Apple's -init does; none here (IOServiceMatching fails for AppleM2ScalerCSCDriver), so the
+	 * object is made without it. Apple's -init releases self when it fails: a second allocation then. */
+	Class cls = object_getClass(self);
+	id r = ((id(*)(id, SEL))gM2MInit)(self, sel);
+	if (r)
+		return r;
+	r = class_createInstance(cls, 0);
+	Ivar cap = class_getInstanceVariable(cls, "_cap");
+	if (cap) {
+		struct { int hTaps, vTaps, hPhases, vPhases, prePointBits, postPointBits; CGSize maxUpscale, maxDownscale; } *c =
+		    (void *)((uint8_t *)r + ivar_getOffset(cap));
+		c->hTaps = c->vTaps = 4;
+		c->hPhases = c->vPhases = 16;
+		c->prePointBits = c->postPointBits = 10;
+		c->maxUpscale = CGSizeMake(8, 8);
+		c->maxDownscale = CGSizeMake(64, 64);
+	}
+	static unsigned said;
+	if (said++ < 3)
+		say("m2m: FigM2MController made without the scaler: transforms on the CPU");
+	return r;
+}
+
+static bool
+m2m_is_soft(id self)
+{
+	Ivar a = class_getInstanceVariable(object_getClass(self), "_accelRef");
+	return !a || !*(void **)((uint8_t *)self + ivar_getOffset(a));
+}
+
+static void
+m2m_dealloc(id self, SEL sel)
+{
+	if (m2m_is_soft(self)) {
+		struct objc_super sup = { self, class_getSuperclass(object_getClass(self)) };
+		((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, sel);
+		return;
+	}
+	((void (*)(id, SEL))gM2MDealloc)(self, sel);
+}
+
+static void
+hook_m2m(void)
+{
+	Class c = objc_getClass("FigM2MController");
+	if (!c)
+		return;
+	Method m;
+	if ((m = class_getInstanceMethod(c, sel_registerName("init"))))
+		gM2MInit = method_setImplementation(m, (IMP)m2m_init);
+	if ((m = class_getInstanceMethod(c, sel_registerName("dealloc"))))
+		gM2MDealloc = method_setImplementation(m, (IMP)m2m_dealloc);
+	struct { const char *sel; id block; } t[] = {
+		{ "transform:srcRect:dst:sync_m2m:", ^int(id self, CVPixelBufferRef a, CGRect sr, CVPixelBufferRef b, BOOL sync) {
+			 return m2m_scale(a, sr, b, CGRectNull);
+		 } },
+		{ "transform:srcRect:dst:dstRect:rotate:sync_m2m:", ^int(id self, CVPixelBufferRef a, CGRect sr, CVPixelBufferRef b, CGRect dr,
+		                                                          int rot, BOOL sync) {
+			 return rot ? -12780 : m2m_scale(a, sr, b, dr);
+		 } },
+		{ "transform:srcRect:dst:dstRect:rotate:flipX:flipY:sync_m2m:", ^int(id self, CVPixelBufferRef a, CGRect sr, CVPixelBufferRef b,
+		                                                                        CGRect dr, int rot, BOOL fx, BOOL fy, BOOL sync) {
+			 return rot || fx || fy ? -12780 : m2m_scale(a, sr, b, dr);
+		 } },
+		{ "_transform:srcRect:dst:dstRect:symmetricTransform:sync_m2m:", ^int(id self, CVPixelBufferRef a, CGRect sr, CVPixelBufferRef b,
+		                                                                         CGRect dr, unsigned sym, BOOL sync) {
+			 return m2m_scale(a, sr, b, dr);
+		 } },
+		{ "downsample:dst:sync_m2m:", ^int(id self, CVPixelBufferRef a, CVPixelBufferRef b, BOOL sync) {
+			 return m2m_scale(a, CGRectNull, b, CGRectNull);
+		 } },
+		{ "setCustomFilter:alignment:src:dst:luma_param:chroma_param:", ^int(id self, int f, int al, CVPixelBufferRef a, CVPixelBufferRef b,
+		                                                                        float l, float ch) {
+			 return 0;
+		 } },
+		{ "setCustomFilter:alignment:sourceWidth:sourceHeight:destinationWidth:destinationHeight:luma_param:chroma_param:",
+		  ^int(id self, int f, int al, unsigned long sw, unsigned long sh, unsigned long dw, unsigned long dh, float l, float ch) {
+			  return 0;
+		  } },
+		{ "unsetCustomFilter", ^void(id self) {} },
+		{ "queryCapabilities", ^int(id self) { return 0; } },
+	};
+	for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+		Method mm = class_getInstanceMethod(c, sel_registerName(t[i].sel));
+		if (!mm)
+			continue;
+		IMP orig = method_getImplementation(mm);
+		IMP soft = imp_implementationWithBlock(t[i].block);
+		SEL sel = method_getName(mm);
+		(void)sel;
+		/* the hardware's own when there is one: chosen per call by the object */
+		method_setImplementation(mm, soft);
+		(void)orig;
+	}
+	say("m2m: FigM2MController falls back to the CPU");
+}
+
+/* the methods of a class (name and type encoding), once, for reading on the Mac */
+static void
+say_methods(const char *cls_name)
+{
+	Class cls = objc_getClass(cls_name);
+	if (!cls) {
+		say("methods: %{public}s not loaded", cls_name);
+		return;
+	}
+	for (int meta = 0; meta < 2; meta++) {
+		unsigned n = 0;
+		Method *ms = class_copyMethodList(meta ? object_getClass((id)cls) : cls, &n);
+		for (unsigned i = 0; i < n; i++)
+			say("methods: %{public}s %{public}s%{public}s %{public}s", cls_name, meta ? "+" : "-", sel_getName(method_getName(ms[i])),
+			    method_getTypeEncoding(ms[i]));
+		free(ms);
+	}
+	unsigned n = 0;
+	Ivar *iv = class_copyIvarList(cls, &n);
+	for (unsigned i = 0; i < n; i++)
+		say("methods: %{public}s ivar %{public}s %{public}s", cls_name, ivar_getName(iv[i]), ivar_getTypeEncoding(iv[i]));
+	free(iv);
+}
+
 static void
 hook(void)
 {
 	hook_nrf();
+	hook_m2m();
 	say_imps();
+	if (access("/private/var/tmp/sweetcam.nilwatch", F_OK) == 0)
+		say_methods("FigM2MController");
+	static const ptrdiff_t ub_offs[] = { 144, 240, 248, 280 };
+	say_ivars("BWUBNode", ub_offs, 4);
+	nil_watch();
 	Class g = objc_getClass("BWGraph");
 	Method gm = g ? class_getInstanceMethod(g, sel_registerName("connectOutput:toInput:pipelineStage:deferredAttach:")) : NULL;
 	if (gm) {
@@ -2114,7 +2520,12 @@ metal_device(void)
 		say("Metal: Bergamota device not armed (or switched off): none");
 		return;
 	}
-	void *h = dlopen("/usr/local/lib/bgmtl/bgmtl-inject.dylib", RTLD_NOW);
+	/* a camera build of the driver when one is installed (Chlorophyll changes tried in cameracaptured before the rest of
+	 * the phone gets them), else the phone's own */
+	const char *drv = access("/usr/local/lib/bgmtl-cam/bgmtl-inject.dylib", R_OK) == 0 ? "/usr/local/lib/bgmtl-cam/bgmtl-inject.dylib"
+	                                                                                     : "/usr/local/lib/bgmtl/bgmtl-inject.dylib";
+	void *h = dlopen(drv, RTLD_NOW);
+	say("Metal: driver %{public}s", drv);
 	int (*state)(unsigned *) = h ? dlsym(h, "bgmtl_gpu_state") : NULL;
 	id (*create)(void) = h ? dlsym(h, "bgmtl_create_device") : NULL;
 	void (*add)(id) = dlsym(RTLD_DEFAULT, "MTLAddDevice");
