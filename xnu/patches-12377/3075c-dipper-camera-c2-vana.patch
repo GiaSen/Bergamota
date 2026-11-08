@@ -1,0 +1,139 @@
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+index bdec6c1..3236c6b 100644
+--- a/bsd/dev/dipper_camera.c
++++ b/bsd/dev/dipper_camera.c
+@@ -23,9 +23,10 @@
+  * ID and powers it down again. The sequence is the sensor's own (its CamX module file com.qti.sensormodule.imx363.bin of
+  * the phone's vendor partition, read by hand; NOTES "CAMERA C2"): up VANA 1 ms, CUSTOM1 high 1 ms, VIO 1 ms, VDIG 1 ms,
+  * RESET high 12 ms, MCLK 10 ms; down RESET low, VDIG, VIO, CUSTOM1 low, VANA, MCLK, 1 ms each. The rails as the live DT
+- * gives them: VANA = PM8998 L22 (also the OLED panel's vdda: NEVER voted or changed here; C2 only reads it and goes on if
+- * it is already on at 2.8-3.0 V) plus the VANA switch GPIO 12; CUSTOM1 = GPIO 40; VIO = camera_viodd_ldo's enable GPIO 75;
+- * VDIG = camera_vdig_ldo's enable GPIO 99 (the DT also names PM8998 GPIO 11 for VDIG: only read here); RESET = GPIO 119;
++ * gives them: VANA = PM8998 L22 voted on at 2.864 V through RPMh (the DT's init voltage and lowest; the display node also
++ * names L22 as "oled-vdda", though the panel's supply list has only vddio and vci: so it is never voted off here) plus the
++ * VANA switch GPIO 12; CUSTOM1 = GPIO 40; VIO = camera_viodd_ldo's enable GPIO 75; VDIG = camera_vdig_ldo's enable GPIO 99
++ * and PM8998 GPIO 11 (output high, only if its subtype is an LV/MV GPIO; put back as found); RESET = GPIO 119;
+  * MCLK = camcc MCLK0 on GPIO 13 (function cam_mclk, 4 mA), from the crystal at 19.2 MHz (the module asks 24 MHz, which
+  * needs camcc's PLL2; enough to read an ID), inside titan_top_gdsc (the sensors' cam_clk), after GCC's CAMERA_XO branch.
+  * The chip ID: slave 0x34 (8-bit), 2 bytes at register 0x0016, expected 0x0363, through the CCI master 0 pins (GPIO 17
+@@ -46,6 +47,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void delay(int usec);
++extern int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);     /* sweet_rpmh.c */
+ 
+ #define CAM_GCC_CAM_PA          0x0010b000u     /* GCC page with the camera branches */
+ #define CAM_GCC_AHB             0x008u          /* GCC_CAMERA_AHB_CBCR (critical) */
+@@ -451,7 +453,9 @@ cam_c2(void)
+ 	uint32_t xo, gd;
+ 	unsigned l22_mv;
+ 	static const uint16_t ldo_offs[] = { 0x08, 0x40, 0x41, 0x45, 0x46 };
+-	static const uint16_t gpio_offs[] = { 0x08, 0x40, 0x41, 0x42, 0x44, 0x45, 0x46 };
++	static const uint16_t gpio_offs[] = { 0x05, 0x40, 0x41, 0x42, 0x44, 0x45, 0x46 };
++	bool g11_set = false;
++	int vrc;
+ 	uint8_t l22[5], g11[7];
+ 
+ 	cam_len = 0;
+@@ -467,15 +471,9 @@ cam_c2(void)
+ 		cam_say("GCC's camera AHB clock is off: nothing done");
+ 		return;
+ 	}
+-	/* VANA: PM8998 L22 must already be on (the panel's vdda); only read */
+-	pm_regs("PM8998 L22 (status1, vset lo, hi, mode, en_ctl)", 0x5500, ldo_offs, 5, l22);
+-	pm_regs("PM8998 GPIO11 (status1, mode, vin, pull, out src, out ctl, en)", 0xca00, gpio_offs, 7, g11);
+-	l22_mv = (unsigned)l22[1] | (unsigned)l22[2] << 8;
+-	if (!(l22[4] & 0x80) || l22_mv < 2800 || l22_mv > 3000) {
+-		cam_say("L22 not on at 2.8-3.0 V (en_ctl %#x, %u mV): nothing done (it is never switched here)", l22[4], l22_mv);
+-		return;
+-	}
+-	cam_say("L22 on at %u mV: VANA is there", l22_mv);
++	pm_regs("PM8998 L22 before (status1, 0x40, 0x41, mode, en_ctl)", 0x5500, ldo_offs, 5, l22);
++	pm_regs("PM8998 GPIO11 (subtype, mode, vin, pull, out src, out ctl, en)", 0xca00, gpio_offs, 7, g11);
++	(void)l22_mv;
+ 	if (!pins_save()) {
+ 		cam_say("TLMM not mapped: nothing done");
+ 		return;
+@@ -509,8 +507,15 @@ cam_c2(void)
+ 	}
+ 	cam_say("titan_top GDSCR %#x (CFG %#x)", cam_rd(camcc, CC_TITAN_GDSCR), cam_rd(camcc, CC_TITAN_GDSCR + 4));
+ 
+-	/* the module file's power-up */
++	/* the module file's power-up. VANA: L22 voted on (never off here), its switch GPIO 12 */
+ 	powered = true;
++	vrc = sweet_rpmh_vreg_set("ldoa22", 2864, true);
++	delay(500);
++	pm_regs("PM8998 L22 after the vote", 0x5500, ldo_offs, 5, l22);
++	if (vrc) {
++		cam_say("L22 vote failed (%d)", vrc);
++		goto down;
++	}
+ 	pin_out(P_VANA, true);
+ 	delay(1000);
+ 	pin_out(P_CUSTOM1, true);
+@@ -518,6 +523,16 @@ cam_c2(void)
+ 	pin_out(P_VIO, true);
+ 	delay(1000);
+ 	pin_out(P_VDIG, true);
++	if (g11[0] == 0x10 || g11[0] == 0x11) {         /* GPIO_LV / GPIO_MV: output (MODE 0x10), level high (source inverted) */
++		uint8_t m = 0x10, o = 0x80, rm = 0, ro = 0;
++		g11_set = sweet_spmi_write(0, 0xca44, &o, 1) == 0 && sweet_spmi_write(0, 0xca40, &m, 1) == 0;
++		(void)sweet_spmi_read(0, 0xca40, &rm);
++		(void)sweet_spmi_read(0, 0xca44, &ro);
++		cam_say("PM8998 GPIO11 high: %s (mode %#x, source %#x)", g11_set ? "written" : "write FAILED", rm, ro);
++		g11_set = true;                         /* (put back whatever happened) */
++	} else {
++		cam_say("PM8998 GPIO11 subtype %#x is not LV/MV: not driven", g11[0]);
++	}
+ 	delay(1000);
+ 	pin_out(P_RESET, true);
+ 	delay(12000);
+@@ -562,6 +577,10 @@ down:
+ 		pin_out(P_RESET, false);
+ 		delay(1000);
+ 		pin_out(P_VDIG, false);
++		if (g11_set) {
++			(void)sweet_spmi_write(0, 0xca40, &g11[1], 1);
++			(void)sweet_spmi_write(0, 0xca44, &g11[4], 1);
++		}
+ 		delay(1000);
+ 		pin_out(P_VIO, false);
+ 		delay(1000);
+@@ -583,8 +602,9 @@ down:
+ 	if (xo_was_off) {
+ 		cam_wr(gcc, CAM_GCC_XO, cam_rd(gcc, CAM_GCC_XO) & ~CBCR_ENABLE);
+ 	}
+-	cam_say("powered down: MCLK0 CBCR %#x, titan_top GDSCR %#x, GCC CAMERA_XO %#x, pins as found", cam_rd(camcc, CC_MCLK0_CBCR),
+-	    cam_rd(camcc, CC_TITAN_GDSCR), cam_rd(gcc, CAM_GCC_XO));
++	cam_say("powered down: MCLK0 CBCR %#x, titan_top GDSCR %#x, GCC CAMERA_XO %#x, pins as found%s; L22 left voted on",
++	    cam_rd(camcc, CC_MCLK0_CBCR), cam_rd(camcc, CC_TITAN_GDSCR), cam_rd(gcc, CAM_GCC_XO), g11_set ? ", PM8998 GPIO11 as found" : "");
++	pm_regs("PM8998 GPIO11 after", 0xca00, gpio_offs, 7, g11);
+ }
+ 
+ static int
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 84370dc..73052d8 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -409,6 +409,7 @@ static const struct { const char *res; unsigned lo, hi; } rh_wcn_rails[] = {
+  */
+ static const struct { const char *res; unsigned lo, hi; } rh_dipper_rails[] = {
+ 	{ "ldoa28", 3300, 3300 },
++	{ "ldoa22", 2864, 2864 },       /* 3075b: the rear main camera's VANA (live DT cam-sensor@0, init 2.864 V); only voted on */
+ };
+ 
+ /*
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index bc7d3fc..04e5178 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -287,7 +287,8 @@ sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
+ 	if (sid == 0) {
+ 		/* PON spare (reboot reason); 3074: PON PS_HOLD_RST_CTL/CTL2 (the power-off type, sweet_reboot_poweroff);
+ 		 * RTC alarm data 0x6140-0x6143 (the RTC offset, sweet_rtc_set) */
+-		return ((addr == 0x088fu || addr == 0x085au || addr == 0x085bu) && len == 1) ||
++		/* 3075b: PM8998 GPIO 11's MODE_CTL and DIG_OUT_SOURCE_CTL (the rear main camera's VDIG switch in the live DT) */
++		return ((addr == 0x088fu || addr == 0x085au || addr == 0x085bu || addr == 0xca40u || addr == 0xca44u) && len == 1) ||
+ 		       (addr >= 0x6140u && addr + len <= 0x6144u);
+ 	}
+ 	if (sid != 3) {

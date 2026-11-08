@@ -1,0 +1,48 @@
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+index 3236c6b..187261a 100644
+--- a/bsd/dev/dipper_camera.c
++++ b/bsd/dev/dipper_camera.c
+@@ -523,8 +523,8 @@ cam_c2(void)
+ 	pin_out(P_VIO, true);
+ 	delay(1000);
+ 	pin_out(P_VDIG, true);
+-	if (g11[0] == 0x10 || g11[0] == 0x11) {         /* GPIO_LV / GPIO_MV: output (MODE 0x10), level high (source inverted) */
+-		uint8_t m = 0x10, o = 0x80, rm = 0, ro = 0;
++	if (g11[0] == 0x10 || g11[0] == 0x11) {         /* GPIO_LV / GPIO_MV: MODE_CTL bits 1:0 = 1 output; level high (source inverted) */
++		uint8_t m = 0x01, o = 0x80, rm = 0, ro = 0;
+ 		g11_set = sweet_spmi_write(0, 0xca44, &o, 1) == 0 && sweet_spmi_write(0, 0xca40, &m, 1) == 0;
+ 		(void)sweet_spmi_read(0, 0xca40, &rm);
+ 		(void)sweet_spmi_read(0, 0xca44, &ro);
+@@ -557,11 +557,32 @@ cam_c2(void)
+ 	    cam_rd(camcc, CC_MCLK0_CMD), cam_rd(camcc, CC_MCLK0_CFG));
+ 	delay(10000);
+ 
++	/* 3075d: the pins as they are now (level read back) */
++	for (unsigned i = 0; i < P_COUNT; i++) {
++		vm_offset_t b = pin_base(c2_pins[i].tile, c2_pins[i].gpio);
++		cam_say("gpio %3u cfg %#06x in %u out %u", c2_pins[i].gpio, cam_rd(b, 0), cam_rd(b, 4) & 1, (cam_rd(b, 4) >> 1) & 1);
++	}
+ 	/* the chip ID over the CCI master 0 pins */
+ 	i2c_line(P_SCL, true);
+ 	i2c_line(P_SDA, true);
+ 	delay(100);
+ 	cam_say("I2C lines idle: SDA %d SCL %d", i2c_get(P_SDA), i2c_get(P_SCL));
++	{
++		/* 3075d: who answers on this bus (an address byte with the write bit, then a stop: nothing is written) */
++		char line[200];
++		size_t k = (size_t)snprintf(line, sizeof(line), "I2C bus (CCI 0 pins), 7-bit addresses that ACK:");
++		unsigned n = 0;
++		for (unsigned a = 0x08; a < 0x78; a++) {
++			i2c_start();
++			bool ack = i2c_tx((uint8_t)(a << 1));
++			i2c_stop();
++			if (ack && k < sizeof(line) - 8) {
++				k += (size_t)snprintf(line + k, sizeof(line) - k, " %#04x", a);
++				n++;
++			}
++		}
++		cam_say("%s%s", line, n ? "" : " none");
++	}
+ 	got = i2c_read16(0x34, 0x0016, id, 2);
+ 	if (got == 2) {
+ 		unsigned v = (unsigned)id[0] << 8 | id[1];
