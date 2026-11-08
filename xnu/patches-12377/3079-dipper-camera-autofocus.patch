@@ -1,0 +1,264 @@
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+index cdb22ab..10d089b 100644
+--- a/bsd/dev/dipper_camera.c
++++ b/bsd/dev/dipper_camera.c
+@@ -54,6 +54,8 @@
+  * just finished metered (green mean above black, saturation), the next exposure written under the sensor's group hold
+  * as integration lines (frame length stretched to at most 2460 lines), then analog gain (to 16x), then digital (to 4x);
+  * the first frame on target ends the run and is kept; frame times from mach_absolute_time.
++ * Patch 3079: the lens actuator (AK7372, VAF on GPIO 26) and contrast autofocus after the exposure (kern.sweet_cam_af,
++ * default on; kern.sweet_cam_lens by hand), the kept frame then the one at the contrast peak.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -255,8 +257,9 @@ pin_base(unsigned tile, unsigned gpio)
+ struct cam_pin { uint16_t gpio; uint8_t tile; bool saved; uint32_t cfg, io; };
+ static struct cam_pin c2_pins[] = {
+ 	{ 12, CAM_S }, { 13, CAM_S }, { 17, CAM_S }, { 18, CAM_S }, { 40, CAM_S }, { 75, CAM_E }, { 99, CAM_N }, { 119, CAM_N },
++	{ 26, CAM_S },          /* 3079: VAF, the lens actuator's supply (actuator_rear_regulator) */
+ };
+-enum { P_VANA, P_MCLK, P_SDA, P_SCL, P_CUSTOM1, P_VIO, P_VDIG, P_RESET, P_COUNT };
++enum { P_VANA, P_MCLK, P_SDA, P_SCL, P_CUSTOM1, P_VIO, P_VDIG, P_RESET, P_VAF, P_COUNT };
+ 
+ static bool
+ pins_save(void)
+@@ -1496,6 +1499,92 @@ c4_ns(uint64_t abs)
+ 	return ns;
+ }
+ 
++/*
++ * 3079: the lens actuator, an AKM AK7372 (the IMX363 module file's actuatorDriver "dipper_imx363_ak7372_semco": 8-bit
++ * slave 0x18, byte register addresses, the 10-bit lens code << 6 as a word in 0x00/0x01, init 0x00 = 0x3c, 0x01 = 0,
++ * 0x02 = 0, 100 us apart; power VAF on, 10 ms). VAF = the live DT's actuator_rear_regulator: TLMM GPIO 26 high, fed by
++ * PMI8998 BOB. Contrast autofocus after the exposure is on target: a coarse pass over the codes 0-1023, a fine pass
++ * around the best, each code scored on the frame finished 3 frames after the move.
++ */
++#define AF_ADDR         0x18u
++#define AF_INIT_CODE    240u    /* 0x3c00 >> 6 */
++static unsigned cam_af = 1;
++static unsigned cam_lens = AF_INIT_CODE;
++static unsigned af_pos;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_cam_af, CTLFLAG_RW | CTLFLAG_LOCKED, &cam_af, 0, "3079: kern.sweet_cam=4 contrast autofocus (1) or the lens at kern.sweet_cam_lens (0)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_cam_lens, CTLFLAG_RW | CTLFLAG_LOCKED, &cam_lens, 0, "3079: manual lens code 0-1023");
++
++static bool
++af_write(uint8_t reg, const uint8_t *v, int n)
++{
++	i2c_start();
++	bool ok = i2c_tx(AF_ADDR) && i2c_tx(reg);
++	for (int i = 0; ok && i < n; i++) {
++		ok = i2c_tx(v[i]);
++	}
++	i2c_stop();
++	return ok;
++}
++
++/* the lens to a code in steps of at most 96, 1 ms apart (big jumps ring) */
++static bool
++af_move(unsigned code)
++{
++	bool ok = true;
++
++	if (code > 1023u) {
++		code = 1023u;
++	}
++	while (ok && af_pos != code) {
++		unsigned next = code > af_pos ? (code - af_pos > 96u ? af_pos + 96u : code) : (af_pos - code > 96u ? af_pos - 96u : code);
++		uint16_t w = (uint16_t)(next << 6);
++		const uint8_t b[2] = { (uint8_t)(w >> 8), (uint8_t)w };
++		ok = af_write(0x00, b, 2);
++		af_pos = next;
++		if (af_pos != code) {
++			delay(1000);
++		}
++	}
++	return ok;
++}
++
++/* contrast of the middle third: squared differences of neighbouring greens along even lines (8 high bits) */
++static uint64_t
++af_sharpness(const uint8_t *f)
++{
++	uint64_t sum = 0;
++	const unsigned g0 = C4_W / 12, g1 = 2 * C4_W / 12;     /* 4-pixel groups 160-319 */
++
++	for (unsigned y = C4_H / 3; y < 2 * C4_H / 3; y += 2) {
++		const uint8_t *r = f + (size_t)y * C4_STRIDE;
++		sweet_dma_sync_va(r + 5 * g0, 5 * (g1 - g0) + 8);
++		for (unsigned g = g0; g < g1; g++) {
++			int a = r[5 * g + 1], b = r[5 * g + 3], c = r[5 * (g + 1) + 1];
++			sum += (uint64_t)((a - b) * (a - b) + (b - c) * (b - c));
++		}
++	}
++	return sum;
++}
++
++/* who answers on the CCI 0 pins' bus (an address byte with the write bit, then a stop) */
++static void
++i2c_scan_say(const char *what)
++{
++	char line[200];
++	size_t k = (size_t)snprintf(line, sizeof(line), "%s, 7-bit addresses that ACK:", what);
++	unsigned n = 0;
++	for (unsigned a = 0x08; a < 0x78; a++) {
++		i2c_start();
++		bool ack = i2c_tx((uint8_t)(a << 1));
++		i2c_stop();
++		if (ack && k < sizeof(line) - 8) {
++			k += (size_t)snprintf(line + k, sizeof(line) - k, " %#04x", a);
++			n++;
++		}
++	}
++	cam_say("%s%s", line, n ? "" : " none");
++}
++
+ static void
+ cam_c4(void)
+ {
+@@ -1505,9 +1594,13 @@ cam_c4(void)
+ 	uint64_t far = 0;
+ 	unsigned frames = 0, nrcg = 0, nbr = 0, kept = 0, fll_mode = 0;
+ 	unsigned nframes = cam_frames < 4 ? 4 : cam_frames > 600 ? 600 : cam_frames;
++	if (cam_af && nframes < 200) {
++		nframes = 200;          /* 3079: room for the focus passes */
++	}
+ 	uint64_t t_start = 0, t_first = 0, t_last = 0;
+ 	struct cam_exp exp = { 0 };
+-	bool ae_done = false;
++	bool ae_done = false, af_ok = false, af_done = false;
++	unsigned af_best = 0;
+ 	struct s0_state s0 = { 0 };
+ 	static const struct { const char *name; uint32_t cmd, cfg; } rcgs[] = {
+ 		{ "slow_ahb", 0x6054, 0x000 },          /* XO 19.2 MHz */
+@@ -1749,6 +1842,24 @@ cam_c4(void)
+ 			goto stop;
+ 		}
+ 	}
++	/* 3079: the lens actuator: VAF on, the module file's init, then auto focus later or the lens where asked */
++	{
++		pin_out(P_VAF, true);
++		delay(10000);
++		i2c_scan_say("CCI 0 bus with VAF on");
++		const uint8_t hi = 0x3c, zero = 0;
++		af_ok = af_write(0x00, &hi, 1);
++		delay(100);
++		af_ok = af_ok && af_write(0x01, &zero, 1);
++		delay(100);
++		af_ok = af_ok && af_write(0x02, &zero, 1);
++		delay(100);
++		af_pos = AF_INIT_CODE;
++		if (af_ok && !cam_af) {
++			af_ok = af_move(cam_lens);
++		}
++		cam_say("actuator AK7372 at 0x18: %s; lens at %u", af_ok ? "init written, active" : "NO ACK", af_pos);
++	}
+ 	/* 3078: the starting exposure: auto starts where the last auto run ended (else the mode's own), manual as given */
+ 	{
+ 		fll_mode = s0_read8(0x0340) << 8 | s0_read8(0x0341);
+@@ -1784,7 +1895,14 @@ cam_c4(void)
+ 	 */
+ 	{
+ 		uint64_t now, limit_ns = (uint64_t)nframes * 100000000ull + 2000000000ull;
+-		unsigned cur = 0, since = 0;
++		unsigned cur = 0, since = 0, state = 0;   /* 0 exposure, 1 focus passes, 2 keep the next frame */
++		unsigned af_code[20], af_n = 0, af_i = 0;
++		uint64_t af_score[20];
++		bool af_fine = false;
++		for (unsigned c = 0; c < 1024u && af_n < 17; c += 64) {
++			af_code[af_n++] = c;           /* coarse: 0, 64, ... 960 */
++		}
++		af_code[af_n++] = 1023;
+ 		t_start = mach_absolute_time();
+ 		for (unsigned dbg = 0; frames < nframes; ) {
+ 			now = mach_absolute_time();
+@@ -1813,7 +1931,53 @@ cam_c4(void)
+ 				t_first = now;
+ 			}
+ 			t_last = now;
+-			if (!cam_ae || since < 3) {
++			if (since < 3) {
++				continue;
++			}
++			if (state == 1) {
++				/* 3079: focus passes: score the code moved to 3 frames ago, then the next one */
++				const uint8_t *fb = (const uint8_t *)c4_buf + (size_t)kept * C4_FRAME;
++				af_score[af_i] = af_sharpness(fb);
++				cam_say("lens %4u: contrast %llu", af_code[af_i], af_score[af_i]);
++				af_i++;
++				if (af_i == af_n) {
++					unsigned b = 0;
++					for (unsigned i = 1; i < af_n; i++) {
++						if (af_score[i] > af_score[b]) {
++							b = i;
++						}
++					}
++					af_best = af_code[b];
++					if (!af_fine) {
++						af_fine = true;
++						af_n = 0;
++						for (int c = (int)af_best - 48; c <= (int)af_best + 48; c += 16) {
++							if (c >= 0 && c <= 1023 && af_n < 16) {
++								af_code[af_n++] = (unsigned)c;
++							}
++						}
++						af_i = 0;
++					} else {
++						state = 2;              /* to the best, then keep a frame */
++						(void)af_move(af_best);
++						since = 0;
++						continue;
++					}
++				}
++				(void)af_move(af_code[af_i]);
++				since = 0;
++				continue;
++			}
++			if (state == 2) {
++				af_done = af_ok && cam_af;
++				break;
++			}
++			if (!cam_ae) {
++				state = (af_ok && cam_af) ? 1 : 2;
++				if (state == 1) {
++					(void)af_move(af_code[0]);
++				}
++				since = 0;
+ 				continue;
+ 			}
+ 			unsigned mean, sat;
+@@ -1827,7 +1991,13 @@ cam_c4(void)
+ 			    frames, mean, C4_AE_TARGET, sat, exp.lines, exp.fll, exp.acode, exp.dgain, on_target ? ": kept" : "");
+ 			if (on_target) {
+ 				ae_done = true;
+-				break;
++				if (!(af_ok && cam_af)) {
++					break;
++				}
++				state = 1;                      /* 3079: exposure held, now focus */
++				(void)af_move(af_code[0]);
++				since = 0;
++				continue;
+ 			}
+ 			uint64_t ratio = mean ? (uint64_t)C4_AE_TARGET * 256u / mean : 8u * 256u;   /* x 256 */
+ 			if (ratio > 8u * 256u) {
+@@ -1875,6 +2045,9 @@ stop:
+ 	if (cam_ae && ae_done) {
+ 		cam_ae_e256 = exp.e256;
+ 	}
++	if (af_ok) {
++		cam_say("focus: %s, lens %u", af_done ? "contrast peak" : cam_af ? "NOT finished" : "manual", af_done ? af_best : cam_lens);
++	}
+ 	if (frames) {
+ 		cam_say("exposure %s: %u lines (fll %u), analog gain code %u (x%u.%02u), digital %#x; kept buffer %u", cam_ae ?
+ 		    (ae_done ? "on target" : "NOT on target") : "manual", exp.lines, exp.fll, exp.acode,
+@@ -1891,6 +2064,10 @@ stop:
+ 	(void)sweet_smmu_bank_fault(&fsr, &far, true);
+ 	cam_say("SMMU identity bank FSR %#x FAR %#llx", fsr, far);
+ 
++	if (af_ok) {
++		(void)af_move(0);               /* 3079: the lens back to its rest gently before VAF goes off */
++		delay(5000);
++	}
+ 	s0_down(&s0);
+ 	if (phy_on) {
+ 		cam_wr(csiphy0, 0x814, 0);
