@@ -1,0 +1,245 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 701e2fe..fb626d9 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -121,6 +121,7 @@ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/dipper_audio.c		standard
+ bsd/dev/dipper_haptics.c	standard
+ bsd/dev/dipper_sensors.c	standard
++bsd/dev/dipper_camera.c	standard
+ bsd/dev/sweet_80211.c			standard
+ bsd/dev/sweet_wpa.c			standard
+ bsd/dev/sweet_wlan_frames.c		standard
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+new file mode 100644
+index 0000000..ad5630e
+--- /dev/null
++++ b/bsd/dev/dipper_camera.c
+@@ -0,0 +1,227 @@
++/*
++ * Mi 8 (dipper) cameras, patch 3075, step C1: a read-only look at the camera hardware (NOTES "CAMERA: FORKS SURVEY").
++ *
++ * The SoC's camera block is Qualcomm's Titan 170 (CPAS hw version 0x170110 in the live DT): the CCI (the cameras' I2C) at
++ * 0xac4a000, CSIPHY 0-3 at 0xac65000-0xac68000, CSID0/VFE0 0xacb3000/0xacaf000, CSID1/VFE1 0xacba000/0xacb6000, behind
++ * the power domain titan_top_gdsc and the camera clock controller (camcc, 0xad00000). Register offsets from the Mi 8's own
++ * kernel (LineageOS android_kernel_xiaomi_sdm845: drivers/clk/qcom/camcc-sdm845.c, gcc-sdm845.c, pinctrl-sdm845-v2.c),
++ * read as data.
++ *
++ * Nothing is written. kern.sweet_cam=1 (root) reads, in this order, and stops before anything whose clock is off (an
++ * unclocked read can hang the bus):
++ *   1. GCC's camera branches (always readable): CAMERA_AHB 0x10b008 and CAMERA_XO 0x10b02c (Linux marks both critical,
++ *      always on), CAMERA_AXI 0x10b020
++ *   2. only if GCC's camera AHB clock runs: camcc's PLLs 0-3 (mode registers), the power domains titan_top (0xb134), IFE 0
++ *      (0x9004), IFE 1 (0xa004), the branches the sensors and the CCI need (CPAS AHB, CAMNOC AXI, SOC AHB, CCI, MCLK0-3,
++ *      CSIPHY0-3, CSI0PHYTIMER, IFE 0 and its CSID) and the MCLK0 / CCI / slow AHB clock generators
++ *   3. the camera pins (TLMM, each through its own tile: a write through the wrong one resets the phone, dipper_audio.c):
++ *      CFG and IN_OUT of the sensors' MCLK, reset and supply-switch pins and the CCI's
++ *   4. only if titan_top is on and the CCI, CPAS AHB and SOC AHB clocks run: the CCI's version register
++ * The result: kern.sweet_cam_status (text) and the console ("SWEET CAM:").
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <stdarg.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++#include "sweet_board.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define CAM_GCC_CAM_PA          0x0010b000u     /* GCC page with the camera branches */
++#define CAM_GCC_AHB             0x008u          /* GCC_CAMERA_AHB_CBCR (critical) */
++#define CAM_GCC_AXI             0x020u          /* GCC_CAMERA_AXI_CBCR */
++#define CAM_GCC_XO              0x02cu          /* GCC_CAMERA_XO_CBCR (critical) */
++#define CAM_CC_PA               0x0ad00000u     /* camcc */
++#define CAM_CC_SIZE             0x10000u
++#define CAM_CCI_PA              0x0ac4a000u
++#define CAM_TLMM_NORTH_PA       0x03900000u     /* TLMM 0x03400000 + the tiles of pinctrl-sdm845-v2.c */
++#define CAM_TLMM_SOUTH_PA       0x03d00000u
++#define CAM_TLMM_EAST_PA        0x03500000u
++#define CBCR_OFF                0x80000000u     /* CLK_OFF: the branch is not running */
++#define GDSC_PWR_ON             0x80000000u
++#define PLL_LOCK                0x80000000u
++
++enum { R_RAW, R_PLL, R_GDSC, R_CBCR };
++static const struct { const char *name; uint32_t off; uint8_t kind; } cam_cc_regs[] = {
++	{ "pll0 mode", 0x0000, R_PLL }, { "pll1 mode", 0x1000, R_PLL }, { "pll2 mode", 0x2000, R_PLL },
++	{ "pll3 mode", 0x3000, R_PLL }, { "titan_top gdscr", 0xb134, R_GDSC }, { "ife_0 gdscr", 0x9004, R_GDSC },
++	{ "ife_1 gdscr", 0xa004, R_GDSC }, { "cpas_ahb cbcr", 0xb11c, R_CBCR }, { "camnoc_axi cbcr", 0xb124, R_CBCR },
++	{ "soc_ahb cbcr", 0xb13c, R_CBCR }, { "cci cbcr", 0xb0f0, R_CBCR }, { "mclk0 cbcr", 0x401c, R_CBCR },
++	{ "mclk1 cbcr", 0x403c, R_CBCR }, { "mclk2 cbcr", 0x405c, R_CBCR }, { "mclk3 cbcr", 0x407c, R_CBCR },
++	{ "csiphy0 cbcr", 0x5020, R_CBCR }, { "csiphy1 cbcr", 0x5044, R_CBCR }, { "csiphy2 cbcr", 0x5068, R_CBCR },
++	{ "csiphy3 cbcr", 0x508c, R_CBCR }, { "csi0phytimer cbcr", 0x501c, R_CBCR }, { "ife_0 cbcr", 0x9024, R_CBCR },
++	{ "ife_0_csid cbcr", 0x9050, R_CBCR }, { "mclk0 rcg cmd", 0x4004, R_RAW }, { "mclk0 rcg cfg", 0x4008, R_RAW },
++	{ "mclk0 m", 0x400c, R_RAW }, { "mclk0 n", 0x4010, R_RAW }, { "mclk0 d", 0x4014, R_RAW },
++	{ "cci rcg cmd", 0xb0d8, R_RAW }, { "cci rcg cfg", 0xb0dc, R_RAW }, { "slow_ahb rcg cmd", 0x6054, R_RAW },
++	{ "slow_ahb rcg cfg", 0x6058, R_RAW },
++};
++
++/* The live DT's camera pins (qcom,cam-sensor@0..3, qcom,cci@ac4a000, the regulator-fixed switches) and their tiles */
++enum { CAM_N, CAM_S, CAM_E };
++static const struct { uint16_t gpio; uint8_t tile; const char *what; } cam_pins[] = {
++	{ 12, CAM_S, "sensor0 vana" }, { 13, CAM_S, "MCLK0 (sensor0)" }, { 14, CAM_S, "MCLK1 (sensor3)" },
++	{ 15, CAM_S, "MCLK2 (sensor2)" }, { 16, CAM_S, "MCLK3 (sensor1)" }, { 17, CAM_S, "CCI SDA0" }, { 18, CAM_S, "CCI SCL0" },
++	{ 19, CAM_S, "CCI SDA1" }, { 20, CAM_S, "CCI SCL1" }, { 22, CAM_S, "sensor3 vdig" }, { 25, CAM_S, "sensor3 reset" },
++	{ 36, CAM_S, "sensor1 vio" }, { 39, CAM_E, "sensor1 vdig" }, { 40, CAM_S, "sensor0 custom" },
++	{ 43, CAM_E, "sensor1 reset" }, { 44, CAM_E, "sensor3 vana" }, { 75, CAM_E, "camera_viodd_ldo" },
++	{ 80, CAM_N, "sensor2 vana" }, { 99, CAM_N, "camera_vdig_ldo" }, { 104, CAM_N, "sensor2 reset" },
++	{ 119, CAM_N, "sensor0 reset" }, { 121, CAM_N, "sensor1 vana" },
++};
++
++#define CAM_STATUS_LEN 4096
++static char *cam_status;
++static size_t cam_len;
++static LCK_GRP_DECLARE(cam_lck_grp, "sweet_cam");
++static LCK_MTX_DECLARE(cam_lock, &cam_lck_grp);
++
++static void cam_say(const char *fmt, ...) __printflike(1, 2);
++static void
++cam_say(const char *fmt, ...)
++{
++	char line[200];
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	printf("SWEET CAM: %s\n", line);
++	if (cam_status && cam_len < CAM_STATUS_LEN - 1) {
++		cam_len += (size_t)snprintf(cam_status + cam_len, CAM_STATUS_LEN - cam_len, "%s\n", line);
++		if (cam_len > CAM_STATUS_LEN - 1) {
++			cam_len = CAM_STATUS_LEN - 1;
++		}
++	}
++}
++
++static inline uint32_t
++cam_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return v;
++}
++
++static const char *
++cbcr_state(uint32_t v)
++{
++	return (v & CBCR_OFF) ? "off" : "running";
++}
++
++static void
++cam_look(void)
++{
++	static vm_offset_t gcc, camcc, cci, tlmm[3];
++	static const vm_offset_t tile_pa[3] = { CAM_TLMM_NORTH_PA, CAM_TLMM_SOUTH_PA, CAM_TLMM_EAST_PA };
++	static const char *const tile_name[3] = { "north", "south", "east" };
++
++	cam_len = 0;
++	if (!gcc && !(gcc = ml_io_map(CAM_GCC_CAM_PA, 0x1000))) {
++		cam_say("GCC not mapped");
++		return;
++	}
++	uint32_t ahb = cam_rd(gcc, CAM_GCC_AHB), axi = cam_rd(gcc, CAM_GCC_AXI), xo = cam_rd(gcc, CAM_GCC_XO);
++	cam_say("GCC camera AHB %#010x (%s), AXI %#010x (%s), XO %#010x (%s)", ahb, cbcr_state(ahb), axi, cbcr_state(axi), xo,
++	    cbcr_state(xo));
++
++	bool top_on = false, cci_clk = false, cpas_ahb = false, soc_ahb = false;
++	if (ahb & CBCR_OFF) {
++		cam_say("camcc not read: GCC's camera AHB clock is off");
++	} else if (!camcc && !(camcc = ml_io_map(CAM_CC_PA, CAM_CC_SIZE))) {
++		cam_say("camcc not mapped");
++	} else {
++		for (unsigned i = 0; i < sizeof(cam_cc_regs) / sizeof(cam_cc_regs[0]); i++) {
++			uint32_t off = cam_cc_regs[i].off, v = cam_rd(camcc, off);
++			const char *note = "";
++			if (cam_cc_regs[i].kind == R_PLL) {
++				note = (v & PLL_LOCK) ? " (locked)" : " (not locked)";
++			} else if (cam_cc_regs[i].kind == R_GDSC) {
++				note = (v & GDSC_PWR_ON) ? " (power on)" : " (power off)";
++			} else if (cam_cc_regs[i].kind == R_CBCR) {
++				note = (v & CBCR_OFF) ? " (off)" : " (running)";
++			}
++			cam_say("camcc %-18s 0x%04x = %#010x%s", cam_cc_regs[i].name, off, v, note);
++			if (off == 0xb134) {
++				top_on = (v & GDSC_PWR_ON) != 0;
++			} else if (off == 0xb0f0) {
++				cci_clk = !(v & CBCR_OFF);
++			} else if (off == 0xb11c) {
++				cpas_ahb = !(v & CBCR_OFF);
++			} else if (off == 0xb13c) {
++				soc_ahb = !(v & CBCR_OFF);
++			}
++		}
++	}
++
++	for (unsigned i = 0; i < sizeof(cam_pins) / sizeof(cam_pins[0]); i++) {
++		unsigned t = cam_pins[i].tile, g = cam_pins[i].gpio;
++		if (!tlmm[t] && !(tlmm[t] = ml_io_map(tile_pa[t], 0x100000))) {
++			cam_say("TLMM %s tile not mapped", tile_name[t]);
++			continue;
++		}
++		uint32_t cfg = cam_rd(tlmm[t], g * 0x1000u), io = cam_rd(tlmm[t], g * 0x1000u + 4);
++		/* CFG: bits 1:0 pull, 5:2 function, 8:6 drive (2 mA steps), 9 output enable; IN_OUT: bit 0 in, bit 1 out */
++		cam_say("gpio %3u %-6s %-18s cfg %#06x (func %u, pull %u, %u mA, oe %u), in %u out %u", g, tile_name[t],
++		    cam_pins[i].what, cfg, (cfg >> 2) & 0xf, cfg & 3, ((cfg >> 6) & 7) * 2 + 2, (cfg >> 9) & 1, io & 1, (io >> 1) & 1);
++	}
++
++	if (!top_on || !cci_clk || !cpas_ahb || !soc_ahb) {
++		cam_say("CCI not read: titan_top %s, CCI clock %s, CPAS AHB %s, SOC AHB %s", top_on ? "on" : "off",
++		    cci_clk ? "on" : "off", cpas_ahb ? "on" : "off", soc_ahb ? "on" : "off");
++	} else if (!cci && !(cci = ml_io_map(CAM_CCI_PA, 0x4000))) {
++		cam_say("CCI not mapped");
++	} else {
++		cam_say("CCI hw version %#010x", cam_rd(cci, 0x0));
++	}
++}
++
++static int
++cam_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = 0, error = sysctl_handle_int(oidp, &v, 0, req);
++
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (v != 1) {
++		return EINVAL;
++	}
++	if (!sweet_board_is("xiaomi,dipper")) {
++		return ENODEV;
++	}
++	lck_mtx_lock(&cam_lock);
++	if (!cam_status) {
++		cam_status = kalloc_data(CAM_STATUS_LEN, Z_WAITOK | Z_ZERO);
++	}
++	if (cam_status) {
++		cam_look();
++	}
++	lck_mtx_unlock(&cam_lock);
++	return cam_status ? 0 : ENOMEM;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, cam_sysctl, "I",
++    "3075: 1 = a read-only look at the camera hardware (kern.sweet_cam_status)");
++
++static int
++cam_status_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int error;
++
++	lck_mtx_lock(&cam_lock);
++	if (!cam_status || cam_len == 0) {
++		error = SYSCTL_OUT(req, "not looked yet (kern.sweet_cam=1)\n", 35);
++	} else {
++		error = SYSCTL_OUT(req, cam_status, cam_len + 1);
++	}
++	lck_mtx_unlock(&cam_lock);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_status, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, cam_status_sysctl, "A",
++    "3075: what the last look at the camera hardware found");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
