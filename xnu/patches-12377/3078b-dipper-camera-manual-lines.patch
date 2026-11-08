@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+index a40b5cb..58cf12c 100644
+--- a/bsd/dev/dipper_camera.c
++++ b/bsd/dev/dipper_camera.c
+@@ -1435,11 +1435,12 @@ c4_meter(const uint8_t *f, unsigned *mean, unsigned *sat_pm)
+ }
+ 
+ /* a total exposure (lines x gain x 256) as integration lines (frame length stretched up to C4_FLL_MAX), then analog
+- * gain up to 16x, then digital gain up to 4x; e256 = what that gives */
++ * gain up to 16x, then digital gain up to 4x; e256 = what that gives. lines != 0 (3078b, manual): those lines, the rest
++ * as gain */
+ static void
+-c4_exp_split(uint64_t e256, unsigned fll_mode, struct cam_exp *a)
++c4_exp_split(uint64_t e256, unsigned fll_mode, unsigned lines, struct cam_exp *a)
+ {
+-	uint64_t lmax = C4_FLL_MAX - C4_MARGIN, l = e256 / 256;
++	uint64_t lmax = C4_FLL_MAX - C4_MARGIN, l = lines ? lines : e256 / 256;
+ 
+ 	if (l < 4) {
+ 		l = 4;
+@@ -1762,7 +1763,7 @@ cam_c4(void)
+ 		} else {
+ 			e = (uint64_t)(cam_lines ? cam_lines : l0) * (cam_gain < 100 ? 100 : cam_gain) * 256u / 100u;
+ 		}
+-		c4_exp_split(e, fll_mode, &exp);
++		c4_exp_split(e, fll_mode, cam_ae ? 0 : (cam_lines ? cam_lines : l0), &exp);
+ 		bool ok = s0_set_exposure(&exp);
+ 		cam_say("%s exposure: mode frame length %u, start %u lines (fll %u), again code %u, dgain %#x%s", cam_ae ? "auto" : "manual",
+ 		    fll_mode, exp.lines, exp.fll, exp.acode, exp.dgain, ok ? "" : " (NOT acked)");
+@@ -1839,7 +1840,7 @@ cam_c4(void)
+ 				ratio = 180u;                   /* clipped highlights: down by at least 30 % */
+ 			}
+ 			uint64_t e = exp.e256 * ratio / 256u;
+-			c4_exp_split(e < 4u * 256u ? 4u * 256u : e, fll_mode, &exp);
++			c4_exp_split(e < 4u * 256u ? 4u * 256u : e, fll_mode, 0, &exp);
+ 			if (!s0_set_exposure(&exp)) {
+ 				cam_say("exposure write NOT acked");
+ 			}

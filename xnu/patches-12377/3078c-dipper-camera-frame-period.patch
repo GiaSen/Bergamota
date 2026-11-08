@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+index 58cf12c..cdb22ab 100644
+--- a/bsd/dev/dipper_camera.c
++++ b/bsd/dev/dipper_camera.c
+@@ -1799,7 +1799,7 @@ cam_c4(void)
+ 				dbg++;
+ 			}
+ 			if (!(cam_rd(vfe0, VFE_BUS_STATUS(1)) & 1u)) {
+-				delay(100);
++				delay(20);              /* 3078c: short waits (longer ones can sleep past a done under load) */
+ 				continue;
+ 			}
+ 			kept = cur;
+@@ -1866,6 +1866,12 @@ stop:
+ 	} else {
+ 		cam_say("%u frame(s)", frames);
+ 	}
++	if (frames > 1) {
++		/* 3078c: the CSID's own start-of-frame timestamps (19.2 MHz): current 0x390, previous 0x398 */
++		uint32_t sof = cam_rd(csid0, CSID_RDI0(0x90)) - cam_rd(csid0, CSID_RDI0(0x98));
++		cam_say("CSID RDI 0 start-of-frame period %u ticks of 19.2 MHz = %u us (%u.%02u fps)", sof, (unsigned)((uint64_t)sof * 10u / 192u),
++		    sof ? 19200000u / sof : 0, sof ? (1920000000u / sof) % 100u : 0);
++	}
+ 	if (cam_ae && ae_done) {
+ 		cam_ae_e256 = exp.e256;
+ 	}

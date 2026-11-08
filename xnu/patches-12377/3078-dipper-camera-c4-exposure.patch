@@ -1,0 +1,341 @@
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+index 67c112a..a40b5cb 100644
+--- a/bsd/dev/dipper_camera.c
++++ b/bsd/dev/dipper_camera.c
+@@ -46,6 +46,14 @@
+  * stream is mapped and the window is open (an unmatched stream can reset the SoC). The buffer has room for four frames
+  * (the write master's frame increment) and is filled with 0xa5 first, so what the hardware wrote shows. Stopped after
+  * the first frame done (or 2 s), both blocks reset, clocks and domains put back as found.
++ *
++ * Patch 3077, step C4: kern.sweet_cam=4 runs the rear main sensor itself (sequence from kern.sweet_cam_seq: init + mode
++ * 2, 1920x1080 RAW10, made by tools/camera/camx_v1.py from the phone's own module file) through CSIPHY 0, CSID 0, RDI 0
++ * and IFE 0 into memory (NOTES "CAMERA C4"). Patch 3078: auto exposure in that run (kern.sweet_cam_ae, default on; or
++ * kern.sweet_cam_lines / kern.sweet_cam_gain by hand): two frame buffers the write master alternates between, the frame
++ * just finished metered (green mean above black, saturation), the next exposure written under the sensor's group hold
++ * as integration lines (frame length stretched to at most 2460 lines), then analog gain (to 16x), then digital (to 4x);
++ * the first frame on target ends the run and is kept; frame times from mach_absolute_time.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -55,6 +63,7 @@
+ #include <stdarg.h>
+ #include <kern/kalloc.h>
+ #include <kern/locks.h>
++#include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+@@ -1113,9 +1122,26 @@ extern int sweet_rpmh_arc_vote(const char *res, bool max);                     /
+ #define C4_H            1080u
+ #define C4_STRIDE       (C4_W * 10u / 8u)       /* MIPI RAW10: 2400 bytes a line */
+ #define C4_FRAME        (C4_STRIDE * C4_H)
+-#define C4_GUARD        0x100000u               /* after the frame: must stay 0xa5 */
+-#define C4_BUF          (C4_FRAME + C4_GUARD)
+-#define C4_FRAMES       4u                      /* frames written before stopping (the last one is kept) */
++#define C4_GUARD        0x100000u               /* after the frames: must stay 0xa5 */
++#define C4_BUF          (2u * C4_FRAME + C4_GUARD)      /* 3078: two frames, the write master alternates */
++#define C4_FLL_MAX      2460u   /* 3078: frame length cap for longer exposures (2 x mode 2's 1230 lines: half its frame rate) */
++#define C4_MARGIN       20u     /* integration time <= frame length - 20 (the module file's vertical offset) */
++#define C4_AGAIN_MAX    480u    /* analog gain code: gain = 512 / (512 - code), 16x (the module file's maximum) */
++#define C4_DGAIN_MAX    0x400u  /* digital gain 8.8, 4x */
++#define C4_AE_TARGET    150u    /* green mean, 10-bit above the black level 64 (about 16 % of full scale) */
++
++/* 3078: kern.sweet_cam=4 settings (the run reports what it used) */
++static unsigned cam_frames = 60;       /* frames at most (60 = 1 s at 60 fps) */
++static unsigned cam_ae = 1;            /* 1: auto exposure; 0: kern.sweet_cam_lines and kern.sweet_cam_gain as given */
++static unsigned cam_lines;             /* integration time in lines (0: the mode's own) */
++static unsigned cam_gain = 100;        /* total gain x 100 (analog first, up to 16x, then digital up to 4x) */
++static uint64_t cam_ae_e256;           /* the last auto exposure (lines x gain x 256): the next run starts there */
++SYSCTL_UINT(_kern, OID_AUTO, sweet_cam_frames, CTLFLAG_RW | CTLFLAG_LOCKED, &cam_frames, 0, "3078: kern.sweet_cam=4 frames at most (4-600)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_cam_ae, CTLFLAG_RW | CTLFLAG_LOCKED, &cam_ae, 0, "3078: kern.sweet_cam=4 auto exposure (1) or manual (0)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_cam_lines, CTLFLAG_RW | CTLFLAG_LOCKED, &cam_lines, 0, "3078: manual integration time in lines (0: the mode's)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_cam_gain, CTLFLAG_RW | CTLFLAG_LOCKED, &cam_gain, 0, "3078: manual total gain x 100");
++
++struct cam_exp { unsigned lines, fll, acode, dgain; uint64_t e256; };
+ #define C4_SEQ_MAX      2048u
+ #define C4_SETTLE       17u     /* Linux's csiphy_settle_cnt_calc: 534 Mb/s a lane (DDR 267 MHz), PHY timer 240 MHz */
+ 
+@@ -1381,6 +1407,94 @@ c4_row_mean(const uint8_t *f, unsigned y)
+ 	return sum / C4_W;
+ }
+ 
++/*
++ * 3078: auto exposure. The meter: green pixels (RGGB: the odd pixels of even lines, the even pixels of odd lines), their
++ * 8 high bits x 4 less the black level, on every 16th line pair, every other 4-pixel group; saturated = high byte >= 0xfc.
++ */
++static void
++c4_meter(const uint8_t *f, unsigned *mean, unsigned *sat_pm)
++{
++	uint64_t sum = 0;
++	unsigned n = 0, sat = 0;
++
++	for (unsigned y = 0; y + 1 < C4_H; y += 16) {
++		const uint8_t *r0 = f + (size_t)y * C4_STRIDE, *r1 = r0 + C4_STRIDE;
++		sweet_dma_sync_va(r0, 2 * C4_STRIDE);
++		for (unsigned g = 0; g < C4_W / 4; g += 2) {
++			const unsigned v[4] = { r0[5 * g + 1], r0[5 * g + 3], r1[5 * g], r1[5 * g + 2] };
++			for (unsigned k = 0; k < 4; k++) {
++				unsigned p = v[k] * 4u;
++				sum += p > 64u ? p - 64u : 0u;
++				sat += v[k] >= 0xfcu;
++				n++;
++			}
++		}
++	}
++	*mean = n ? (unsigned)(sum / n) : 0;
++	*sat_pm = n ? sat * 1000u / n : 0;
++}
++
++/* a total exposure (lines x gain x 256) as integration lines (frame length stretched up to C4_FLL_MAX), then analog
++ * gain up to 16x, then digital gain up to 4x; e256 = what that gives */
++static void
++c4_exp_split(uint64_t e256, unsigned fll_mode, struct cam_exp *a)
++{
++	uint64_t lmax = C4_FLL_MAX - C4_MARGIN, l = e256 / 256;
++
++	if (l < 4) {
++		l = 4;
++	}
++	if (l > lmax) {
++		l = lmax;
++	}
++	uint64_t g = e256 / l;                                  /* total gain x 256 */
++	if (g < 256) {
++		g = 256;
++	}
++	uint64_t ag = g > 16u * 256u ? 16u * 256u : g;
++	unsigned code = 512u - (unsigned)(512u * 256u / ag);
++	if (code > C4_AGAIN_MAX) {
++		code = C4_AGAIN_MAX;
++	}
++	uint64_t ag_real = 512ull * 256u / (512u - code);       /* x 256 */
++	uint64_t dg = g * 256u / ag_real;                       /* 8.8 */
++	if (dg < 0x100u) {
++		dg = 0x100u;
++	}
++	if (dg > C4_DGAIN_MAX) {
++		dg = C4_DGAIN_MAX;
++	}
++	a->lines = (unsigned)l;
++	a->fll = (unsigned)l + C4_MARGIN > fll_mode ? (unsigned)l + C4_MARGIN : fll_mode;
++	a->acode = code;
++	a->dgain = (unsigned)dg;
++	a->e256 = l * ag_real * dg / 256u;
++}
++
++/* the exposure into the sensor under group hold: frame length 0x0340, integration 0x0202, analog gain 0x0204, the four
++ * digital gains 0x020e-0x0215 */
++static bool
++s0_set_exposure(const struct cam_exp *a)
++{
++	uint8_t hold = 1, release = 0;
++	const uint8_t f[2] = { (uint8_t)(a->fll >> 8), (uint8_t)a->fll };
++	const uint8_t e[4] = { (uint8_t)(a->lines >> 8), (uint8_t)a->lines, (uint8_t)(a->acode >> 8), (uint8_t)a->acode };
++	const uint8_t d[8] = { (uint8_t)(a->dgain >> 8), (uint8_t)a->dgain, (uint8_t)(a->dgain >> 8), (uint8_t)a->dgain,
++		               (uint8_t)(a->dgain >> 8), (uint8_t)a->dgain, (uint8_t)(a->dgain >> 8), (uint8_t)a->dgain };
++	bool ok = i2c_write(0x34, 0x0104, &hold, 1) && i2c_write(0x34, 0x0340, f, 2) && i2c_write(0x34, 0x0202, e, 4) &&
++	    i2c_write(0x34, 0x020e, d, 8);
++	(void)i2c_write(0x34, 0x0104, &release, 1);
++	return ok;
++}
++
++static uint64_t
++c4_ns(uint64_t abs)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns;
++}
++
+ static void
+ cam_c4(void)
+ {
+@@ -1388,7 +1502,11 @@ cam_c4(void)
+ 	bool streamed = false, phy_on = false;
+ 	uint32_t pll2_was = 0, pll3_was = 0, rg_bias = 0, rg_bg = 0, v, fsr = 0;
+ 	uint64_t far = 0;
+-	unsigned frames = 0, waited = 0, nrcg = 0, nbr = 0;
++	unsigned frames = 0, nrcg = 0, nbr = 0, kept = 0, fll_mode = 0;
++	unsigned nframes = cam_frames < 4 ? 4 : cam_frames > 600 ? 600 : cam_frames;
++	uint64_t t_start = 0, t_first = 0, t_last = 0;
++	struct cam_exp exp = { 0 };
++	bool ae_done = false;
+ 	struct s0_state s0 = { 0 };
+ 	static const struct { const char *name; uint32_t cmd, cfg; } rcgs[] = {
+ 		{ "slow_ahb", 0x6054, 0x000 },          /* XO 19.2 MHz */
+@@ -1428,7 +1546,7 @@ cam_c4(void)
+ 	}
+ 	memset((void *)c4_buf, C3_FILL, C4_BUF);
+ 	sweet_dma_sync_va((const void *)c4_buf, C4_BUF);
+-	cam_say("frame buffer %u bytes (frame %u + guard %u) at PA %#llx; sequence %u records", C4_BUF, C4_FRAME, C4_GUARD,
++	cam_say("frame buffer %u bytes (2 x frame %u + guard %u) at PA %#llx; sequence %u records", C4_BUF, C4_FRAME, C4_GUARD,
+ 	    c4_buf_pa, cam_seq_n);
+ 	cam_say("CX vote max: %d", sweet_rpmh_arc_vote("cx.lvl", true));       /* kept, as audio and Wi-Fi keep it */
+ 
+@@ -1630,6 +1748,25 @@ cam_c4(void)
+ 			goto stop;
+ 		}
+ 	}
++	/* 3078: the starting exposure: auto starts where the last auto run ended (else the mode's own), manual as given */
++	{
++		fll_mode = s0_read8(0x0340) << 8 | s0_read8(0x0341);
++		unsigned l0 = s0_read8(0x0202) << 8 | s0_read8(0x0203);
++		if (fll_mode > 0xffffu || l0 > 0xffffu || fll_mode < 100u) {
++			cam_say("frame length / integration time not readable");
++			goto stop;
++		}
++		uint64_t e;
++		if (cam_ae) {
++			e = cam_ae_e256 ? cam_ae_e256 : (uint64_t)l0 * 256u;
++		} else {
++			e = (uint64_t)(cam_lines ? cam_lines : l0) * (cam_gain < 100 ? 100 : cam_gain) * 256u / 100u;
++		}
++		c4_exp_split(e, fll_mode, &exp);
++		bool ok = s0_set_exposure(&exp);
++		cam_say("%s exposure: mode frame length %u, start %u lines (fll %u), again code %u, dgain %#x%s", cam_ae ? "auto" : "manual",
++		    fll_mode, exp.lines, exp.fll, exp.acode, exp.dgain, ok ? "" : " (NOT acked)");
++	}
+ 	{
+ 		uint8_t one = 1;
+ 		streamed = i2c_write(0x34, 0x0100, &one, 1);
+@@ -1639,23 +1776,75 @@ cam_c4(void)
+ 		goto stop;
+ 	}
+ 
+-	/* frames: each write master 0 done is cleared and the same address written again (address registers unsynced) */
+-	for (waited = 0; waited < 20000 && frames < C4_FRAMES; waited++) {
+-		if (cam_rd(vfe0, VFE_BUS_STATUS(1)) & 1u) {
+-			frames++;
++	/*
++	 * 3078: frames into two buffers, the write master moved to the other one at each done (address registers unsynced:
++	 * taken at the next frame start); with auto exposure the frame just finished is metered once the exposure has been
++	 * the same for 3 frames (the sensor's latency), and the run stops at the first frame on target, which is kept.
++	 */
++	{
++		uint64_t now, limit_ns = (uint64_t)nframes * 100000000ull + 2000000000ull;
++		unsigned cur = 0, since = 0;
++		t_start = mach_absolute_time();
++		for (unsigned dbg = 0; frames < nframes; ) {
++			now = mach_absolute_time();
++			uint64_t el = c4_ns(now - t_start);
++			if (el > limit_ns) {
++				break;
++			}
++			if ((dbg == 0 && el > 100000000ull) || (dbg == 1 && el > 500000000ull)) {
++				cam_say("at %llu ms: CSID rx status %#x, packets %u, ECC %#x, CRC errors %u, long header %#x, CSIPHY status0 %#x",
++				    el / 1000000ull, cam_rd(csid0, CSID_RX_STATUS), cam_rd(csid0, 0x160), cam_rd(csid0, 0x164),
++				    cam_rd(csid0, 0x168), cam_rd(csid0, 0x130), cam_rd(csiphy0, 0x8b0));
++				dbg++;
++			}
++			if (!(cam_rd(vfe0, VFE_BUS_STATUS(1)) & 1u)) {
++				delay(100);
++				continue;
++			}
++			kept = cur;
++			cur ^= 1u;
++			cam_wr(vfe0, VFE_WM(0, 0x14), c4_buf_iova + cur * C4_FRAME);
+ 			cam_wr(vfe0, VFE_BUS_CLEAR(1), 1u);
+ 			cam_wr(vfe0, VFE_BUS_CLEAR_GLOBAL, 1);
+-			if (frames < C4_FRAMES) {
+-				cam_wr(vfe0, VFE_WM(0, 0x14), c4_buf_iova);
++			frames++;
++			since++;
++			if (frames == 1) {
++				t_first = now;
+ 			}
+-			cam_say("frame %u done at %u.%u ms", frames, waited / 10, waited % 10);
+-		}
+-		if (waited == 1000 || waited == 5000) {
+-			cam_say("at %u ms: CSID rx status %#x, packets %u, ECC %#x, CRC errors %u, long header %#x, CSIPHY status0 %#x",
+-			    waited / 10, cam_rd(csid0, CSID_RX_STATUS), cam_rd(csid0, 0x160), cam_rd(csid0, 0x164),
+-			    cam_rd(csid0, 0x168), cam_rd(csid0, 0x130), cam_rd(csiphy0, 0x8b0));
++			t_last = now;
++			if (!cam_ae || since < 3) {
++				continue;
++			}
++			unsigned mean, sat;
++			c4_meter((const uint8_t *)c4_buf + (size_t)kept * C4_FRAME, &mean, &sat);
++			bool on_target = mean * 100u >= C4_AE_TARGET * 85u && mean * 100u <= C4_AE_TARGET * 118u && sat < 20u;
++			if (!on_target && (exp.lines == C4_FLL_MAX - C4_MARGIN && exp.acode == C4_AGAIN_MAX && exp.dgain == C4_DGAIN_MAX) &&
++			    mean < C4_AE_TARGET) {
++				on_target = true;               /* as bright as it goes */
++			}
++			cam_say("frame %u: green mean %u (target %u), saturated %u/1000, exposure %u lines (fll %u) again %u dgain %#x%s",
++			    frames, mean, C4_AE_TARGET, sat, exp.lines, exp.fll, exp.acode, exp.dgain, on_target ? ": kept" : "");
++			if (on_target) {
++				ae_done = true;
++				break;
++			}
++			uint64_t ratio = mean ? (uint64_t)C4_AE_TARGET * 256u / mean : 8u * 256u;   /* x 256 */
++			if (ratio > 8u * 256u) {
++				ratio = 8u * 256u;
++			}
++			if (ratio < 32u) {
++				ratio = 32u;
++			}
++			if (sat >= 20u && ratio > 180u) {
++				ratio = 180u;                   /* clipped highlights: down by at least 30 % */
++			}
++			uint64_t e = exp.e256 * ratio / 256u;
++			c4_exp_split(e < 4u * 256u ? 4u * 256u : e, fll_mode, &exp);
++			if (!s0_set_exposure(&exp)) {
++				cam_say("exposure write NOT acked");
++			}
++			since = 0;
+ 		}
+-		delay(100);
+ 	}
+ 
+ stop:
+@@ -1669,7 +1858,21 @@ stop:
+ 	cam_wr(vfe0, VFE_WM(0, 0x08), 0);
+ 	cam_wr(vfe0, VFE_REG_UPDATE, 1u << 1);
+ 	delay(2000);
+-	cam_say("%u frame(s) in %u.%u ms", frames, waited / 10, waited % 10);
++	if (frames > 1) {
++		uint64_t us = c4_ns(t_last - t_first) / 1000u / (frames - 1);
++		cam_say("%u frame(s), first after %llu ms, then one every %llu us (%llu.%02llu fps)", frames,
++		    c4_ns(t_first - t_start) / 1000000u, us, us ? 1000000u / us : 0, us ? (100000000u / us) % 100u : 0);
++	} else {
++		cam_say("%u frame(s)", frames);
++	}
++	if (cam_ae && ae_done) {
++		cam_ae_e256 = exp.e256;
++	}
++	if (frames) {
++		cam_say("exposure %s: %u lines (fll %u), analog gain code %u (x%u.%02u), digital %#x; kept buffer %u", cam_ae ?
++		    (ae_done ? "on target" : "NOT on target") : "manual", exp.lines, exp.fll, exp.acode,
++		    512u / (512u - exp.acode), (51200u / (512u - exp.acode)) % 100u, exp.dgain, kept);
++	}
+ 	cam_say("VFE0 irq status %#x %#x, violation %#x; bus status %#x %#x %#x", cam_rd(vfe0, VFE_IRQ_STATUS0),
+ 	    cam_rd(vfe0, VFE_IRQ_STATUS1), cam_rd(vfe0, VFE_VIOLATION), cam_rd(vfe0, VFE_BUS_STATUS(0)),
+ 	    cam_rd(vfe0, VFE_BUS_STATUS(1)), cam_rd(vfe0, VFE_BUS_STATUS(2)));
+@@ -1709,7 +1912,7 @@ stop:
+ 	/* what reached memory */
+ 	sweet_dma_sync_va((const void *)c4_buf, C4_BUF);
+ 	{
+-		const uint8_t *b = (const uint8_t *)c4_buf;
++		const uint8_t *b = (const uint8_t *)c4_buf + (size_t)kept * C4_FRAME;
+ 		size_t n = 0, last = 0, guard = 0;
+ 		for (size_t i = 0; i < C4_FRAME; i++) {
+ 			if (b[i] != C3_FILL) {
+@@ -1717,8 +1920,8 @@ stop:
+ 				last = i;
+ 			}
+ 		}
+-		for (size_t i = C4_FRAME; i < C4_BUF; i++) {
+-			guard += b[i] != C3_FILL;
++		for (size_t i = 2u * C4_FRAME; i < C4_BUF; i++) {
++			guard += ((const uint8_t *)c4_buf)[i] != C3_FILL;
+ 		}
+ 		cam_say("frame: %zu of %u bytes written (last at %zu); guard bytes changed: %zu", n, C4_FRAME, last, guard);
+ 		if (n) {
+@@ -1726,7 +1929,7 @@ stop:
+ 			    c4_row_mean(b, 0), c4_row_mean(b, 270), c4_row_mean(b, 540), c4_row_mean(b, 810), c4_row_mean(b, 1079),
+ 			    b[0], b[1], b[2], b[3], b[4]);
+ 		}
+-		cam_frame_ptr = (const uint8_t *)c4_buf;
++		cam_frame_ptr = b;
+ 		cam_frame_len = C4_FRAME;
+ 	}
+ 
