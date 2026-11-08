@@ -1,0 +1,325 @@
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+index 46df30b..8fd05da 100644
+--- a/bsd/dev/dipper_camera.c
++++ b/bsd/dev/dipper_camera.c
+@@ -42,7 +42,7 @@
+  * CPHY RX; nothing of the CSID or the IFE is touched unless they all run. Memory: the IFE's SMMU streams (the live DT's
+  * msm_cam_smmu_ife: 0x808, 0x810/0x818, 0xc08, 0xc10/0xc18) go to sweet_smmu.c's identity bank; the write master's
+  * address register has 32 bits and this kernel's memory is above 4 GiB, so (3076b) the buffer is reached through
+- * sweet_smmu_window32(), IOVA 0x40000000 + its offset in its DRAM GiB; the write master is only enabled when every
++ * sweet_smmu_map32() (3080; 3076b had a 1 GiB window), IOVA 0x40000000 and up; the write master is only enabled when every
+  * stream is mapped and the window is open (an unmatched stream can reset the SoC). The buffer has room for four frames
+  * (the write master's frame increment) and is filled with 0xa5 first, so what the hardware wrote shows. Stopped after
+  * the first frame done (or 2 s), both blocks reset, clocks and domains put back as found.
+@@ -79,7 +79,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern int sweet_smmu_map_sid(unsigned sid);                                    /* sweet_smmu.c */
+ extern int sweet_smmu_bank_fault(uint32_t *fsr, uint64_t *far, bool clear);
+-extern int sweet_smmu_window32(uint64_t pa, uint32_t *iova);
++extern int sweet_smmu_map32(uint64_t pa, uint64_t len, uint32_t *iova);  /* 3080 */
+ extern void delay(int usec);
+ extern int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);     /* sweet_rpmh.c */
+ 
+@@ -724,7 +724,7 @@ static const struct { const char *name; uint32_t cbcr; } c3_branches[] = {
+ static const uint16_t c3_sids[] = { 0x808, 0x810, 0x818, 0xc08, 0xc10, 0xc18 };
+ 
+ static vm_offset_t vfe0, csid0;
+-static vm_offset_t cam_buf;             /* contiguous, inside one DRAM GiB (3076b: reached through sweet_smmu_window32) */
++static vm_offset_t cam_buf;             /* contiguous (reached through sweet_smmu_map32) */
+ static uint64_t cam_buf_pa;
+ static uint32_t cam_buf_iova;
+ static size_t cam_frame_len;            /* what kern.sweet_cam_frame hands out */
+@@ -904,7 +904,7 @@ cam_c3(void)
+ 		}
+ 	}
+ 	if (smmu_ok) {
+-		int r = sweet_smmu_window32(cam_buf_pa, &cam_buf_iova);
++		int r = sweet_smmu_map32(cam_buf_pa, C3_BUF, &cam_buf_iova);
+ 		if (r) {
+ 			smmu_ok = false;
+ 			cam_say("SMMU 32-bit window NOT opened (%d)", r);
+@@ -1128,9 +1128,9 @@ extern kern_return_t thread_terminate(thread_t);
+ #define C4_H            1080u
+ #define C4_STRIDE       (C4_W * 10u / 8u)       /* MIPI RAW10: 2400 bytes a line */
+ #define C4_FRAME        (C4_STRIDE * C4_H)
+-#define C4_GUARD        0x100000u               /* after the frames: must stay 0xa5 */
++#define C4_GUARD        0x40000u                /* after each frame: must stay 0xa5 */
+ #define C4_NBUF         3u      /* 3080: three frame buffers (the one-shot run uses two, the stream all three) */
+-#define C4_BUF          (C4_NBUF * C4_FRAME + C4_GUARD)
++#define C4_BUF          (C4_FRAME + C4_GUARD)   /* 3080: each buffer its own allocation (8.8 MB in one piece was refused) */
+ #define C4_FLL_MAX      2460u   /* 3078: frame length cap for longer exposures (2 x mode 2's 1230 lines: half its frame rate) */
+ #define C4_MARGIN       20u     /* integration time <= frame length - 20 (the module file's vertical offset) */
+ #define C4_AGAIN_MAX    480u    /* analog gain code: gain = 512 / (512 - code), 16x (the module file's maximum) */
+@@ -1169,9 +1169,10 @@ static struct cam_seq_rec *cam_seq;
+ static unsigned cam_seq_n;
+ 
+ static vm_offset_t csiphy0, refgen;
+-static vm_offset_t c4_buf;
+-static uint64_t c4_buf_pa;
+-static uint32_t c4_buf_iova;
++static vm_offset_t c4_va[C4_NBUF];
++static uint64_t c4_pa[C4_NBUF];
++static uint32_t c4_iova[C4_NBUF];
++#define C4_FB(i)        ((const uint8_t *)c4_va[(i)])
+ 
+ /* Linux camss-csiphy-3ph-1-0.c lane_regs_sdm845 ("GEN2 1.0 2PH"), the do-not-program entries left out; s = settle count */
+ static const struct { uint16_t off; uint8_t val; uint8_t s; } csiphy_lane_regs[] = {
+@@ -1381,24 +1382,25 @@ s0_down(struct s0_state *st)
+ static bool
+ c4_buffer(void)
+ {
+-	if (c4_buf) {
+-		return true;
+-	}
+-	vm_offset_t v = 0;
+-	if (kmem_alloc_contig(kernel_map, &v, round_page(C4_BUF), PAGE_MASK, 0, 0, KMA_DATA | KMA_PERMANENT,
+-	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		cam_say("no contiguous memory for %u bytes", C4_BUF);
+-		return false;
+-	}
+-	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)v);
+-	uint64_t pa = pn ? ptoa_64(pn) : 0;
+-	if (!pa || pa < 0x80000000ull || pa + round_page(C4_BUF) > 0x280000000ull ||
+-	    (pa >> 30) != ((pa + round_page(C4_BUF) - 1) >> 30)) {
+-		cam_say("C4 buffer at %#llx: outside the identity map or across a GiB boundary, not used", pa);
+-		return false;
++	for (unsigned i = 0; i < C4_NBUF; i++) {
++		if (c4_va[i]) {
++			continue;
++		}
++		vm_offset_t v = 0;
++		if (kmem_alloc_contig(kernel_map, &v, round_page(C4_BUF), PAGE_MASK, 0, 0, KMA_DATA | KMA_PERMANENT,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			cam_say("no contiguous memory for buffer %u (%u bytes)", i, C4_BUF);
++			return false;
++		}
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)v);
++		uint64_t pa = pn ? ptoa_64(pn) : 0;
++		if (!pa || pa < 0x80000000ull || pa + round_page(C4_BUF) > 0x280000000ull) {
++			cam_say("buffer %u at %#llx: outside the identity map, not used", i, pa);
++			return false;
++		}
++		c4_va[i] = v;
++		c4_pa[i] = pa;
+ 	}
+-	c4_buf = v;
+-	c4_buf_pa = pa;
+ 	return true;
+ }
+ 
+@@ -1728,10 +1730,12 @@ c4_up(struct c4_run *r, unsigned min_fll)
+ 	if (!c4_buffer()) {
+ 		return false;
+ 	}
+-	memset((void *)c4_buf, C3_FILL, C4_BUF);
+-	sweet_dma_sync_va((const void *)c4_buf, C4_BUF);
+-	cam_say("frame buffers %u bytes (%u x frame %u + guard %u) at PA %#llx; sequence %u records", C4_BUF, C4_NBUF, C4_FRAME,
+-	    C4_GUARD, c4_buf_pa, cam_seq_n);
++	for (unsigned i = 0; i < C4_NBUF; i++) {
++		memset((void *)c4_va[i], C3_FILL, C4_BUF);
++		sweet_dma_sync_va((const void *)c4_va[i], C4_BUF);
++	}
++	cam_say("frame buffers: %u x (frame %u + guard %u) at PA %#llx %#llx %#llx; sequence %u records", C4_NBUF, C4_FRAME, C4_GUARD,
++	    c4_pa[0], c4_pa[1], c4_pa[2], cam_seq_n);
+ 	cam_say("CX vote max: %d", sweet_rpmh_arc_vote("cx.lvl", true));       /* kept, as audio and Wi-Fi keep it */
+ 
+ 	/* GCC's camera XO and AXI, titan_top and ife_0 (as C3) */
+@@ -1799,12 +1803,15 @@ c4_up(struct c4_run *r, unsigned min_fll)
+ 				ok = false;
+ 			}
+ 		}
+-		if (!ok || sweet_smmu_window32(c4_buf_pa, &c4_buf_iova) != 0) {
++		for (unsigned i = 0; ok && i < C4_NBUF; i++) {
++			ok = sweet_smmu_map32(c4_pa[i], C4_BUF, &c4_iova[i]) == 0;
++		}
++		if (!ok) {
+ 			cam_say("SMMU streams or window NOT set: no streaming");
+ 			return false;
+ 		}
+ 		(void)sweet_smmu_bank_fault(&fsr, &far, true);
+-		cam_say("SMMU: IFE streams mapped, buffer IOVA %#x", c4_buf_iova);
++		cam_say("SMMU: IFE streams mapped, buffer IOVAs %#x %#x %#x", c4_iova[0], c4_iova[1], c4_iova[2]);
+ 	}
+ 
+ 	/* refgen (msm-4.9 refgen.c: BG_CTRL bits 2:1 on, BIAS_EN 7) */
+@@ -1878,7 +1885,7 @@ c4_up(struct c4_run *r, unsigned min_fll)
+ 	cam_wr(vfe0, VFE_WM(0, 0x24), 0);
+ 	cam_wr(vfe0, VFE_WM(0, 0x28), 0xff01);
+ 	cam_wr(vfe0, VFE_WM(0, 0x08), 1u | 1u << 1);
+-	cam_wr(vfe0, VFE_WM(0, 0x14), c4_buf_iova);
++	cam_wr(vfe0, VFE_WM(0, 0x14), c4_iova[0]);
+ 	cam_wr(vfe0, VFE_WM(0, 0x58), C4_FRAME);
+ 	cam_wr(vfe0, VFE_REG_UPDATE, 1u << 1);
+ 
+@@ -2141,7 +2148,7 @@ cam_c4(void)
+ 			}
+ 			kept = cur;
+ 			cur ^= 1u;
+-			cam_wr(vfe0, VFE_WM(0, 0x14), c4_buf_iova + cur * C4_FRAME);
++			cam_wr(vfe0, VFE_WM(0, 0x14), c4_iova[cur]);
+ 			cam_wr(vfe0, VFE_BUS_CLEAR(1), 1u);
+ 			cam_wr(vfe0, VFE_BUS_CLEAR_GLOBAL, 1);
+ 			frames++;
+@@ -2153,7 +2160,7 @@ cam_c4(void)
+ 			if (since < 3) {
+ 				continue;
+ 			}
+-			const uint8_t *fb = (const uint8_t *)c4_buf + (size_t)kept * C4_FRAME;
++			const uint8_t *fb = C4_FB(kept);
+ 			if (state == 1) {
+ 				c4_af_step(&af, fb, true);
+ 				if (af.done) {
+@@ -2215,9 +2222,11 @@ cam_c4(void)
+ 	c4_down(r, true);
+ 
+ 	/* what reached memory */
+-	sweet_dma_sync_va((const void *)c4_buf, C4_BUF);
++	for (unsigned i = 0; i < C4_NBUF; i++) {
++		sweet_dma_sync_va(C4_FB(i), C4_BUF);
++	}
+ 	{
+-		const uint8_t *b = (const uint8_t *)c4_buf + (size_t)kept * C4_FRAME;
++		const uint8_t *b = C4_FB(kept);
+ 		size_t n = 0, last = 0, guard = 0;
+ 		for (size_t i = 0; i < C4_FRAME; i++) {
+ 			if (b[i] != C3_FILL) {
+@@ -2225,8 +2234,10 @@ cam_c4(void)
+ 				last = i;
+ 			}
+ 		}
+-		for (size_t i = (size_t)C4_NBUF * C4_FRAME; i < C4_BUF; i++) {
+-			guard += ((const uint8_t *)c4_buf)[i] != C3_FILL;
++		for (unsigned k = 0; k < C4_NBUF; k++) {
++			for (size_t i = C4_FRAME; i < C4_BUF; i++) {
++				guard += C4_FB(k)[i] != C3_FILL;
++			}
+ 		}
+ 		cam_say("frame: %zu of %u bytes written (last at %zu); guard bytes changed: %zu", n, C4_FRAME, last, guard);
+ 		if (n) {
+@@ -2336,7 +2347,7 @@ cam_stream_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 		target = next;
+ 		lck_spin_unlock(&cam_live_spin);
+-		cam_wr(vfe0, VFE_WM(0, 0x14), c4_buf_iova + target * C4_FRAME);
++		cam_wr(vfe0, VFE_WM(0, 0x14), c4_iova[target]);
+ 		cam_wr(vfe0, VFE_BUS_CLEAR(1), 1u);
+ 		cam_wr(vfe0, VFE_BUS_CLEAR_GLOBAL, 1);
+ 		thread_wakeup((event_t)&cam_live_seq);
+@@ -2346,7 +2357,7 @@ cam_stream_thread(void *arg __unused, wait_result_t wr __unused)
+ 		if (since < 3) {
+ 			continue;
+ 		}
+-		const uint8_t *fb = (const uint8_t *)c4_buf + (size_t)done * C4_FRAME;
++		const uint8_t *fb = C4_FB(done);
+ 		if (af_state == 1) {
+ 			c4_af_step(&af, fb, false);
+ 			if (af.done) {
+@@ -2502,7 +2513,7 @@ cam_live_sysctl SYSCTL_HANDLER_ARGS
+ 	if (l < 0) {
+ 		return EAGAIN;
+ 	}
+-	const uint8_t *b = (const uint8_t *)c4_buf + (size_t)l * C4_FRAME;
++	const uint8_t *b = C4_FB(l);
+ 	sweet_dma_sync_va(b, C4_FRAME);
+ 	error = SYSCTL_OUT(req, &h, sizeof(h));
+ 	if (!error) {
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index be0dfea..b1088e7 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -287,20 +287,25 @@ out:
+ }
+ 
+ /*
+- * 3076b: a 32-bit window for masters whose address registers have 32 bits (the camera IFE's write masters) when their
+- * buffer is above 4 GiB (this kernel's memory is): the second GiB of IOVA space (0x40000000-0x7fffffff, below DRAM, so
+- * unused by the identity map) becomes one 1 GiB block onto the DRAM GiB that holds pa (Normal NC, RW), in the shared bank
+- * (and the IPA's, which reads the same tables). *iova is pa's address in the window. One window: a later call for another
+- * GiB moves it. Needs the bank (a sweet_smmu_map_sid() first).
++ * 3080 (replaces 3076b's one 1 GiB window): 32-bit addresses for masters whose address registers have 32 bits (the
++ * camera IFE's write masters) when their buffers are above 4 GiB (this kernel's memory is). The second GiB of IOVA
++ * space (0x40000000-0x7fffffff, below DRAM, so unused by the identity map) gets a level-2 table, and each call maps the
++ * 2 MiB blocks that cover [pa, pa + len) one after the other into it (Normal NC, RW; the shared bank and the IPA's read
++ * the same tables). *iova = pa's address there. A range already mapped by an earlier call is not mapped again. Blocks
++ * are never unmapped (the callers' buffers are permanent). Needs the bank (a sweet_smmu_map_sid() first).
+  */
+-int sweet_smmu_window32(uint64_t pa, uint32_t *iova);
++static vm_offset_t smmu_w32_l2v;
++static unsigned smmu_w32_next;
++static struct { uint64_t pa; uint64_t len; uint32_t iova; } smmu_w32_maps[16];
++static unsigned smmu_w32_nmaps;
++
++int sweet_smmu_map32(uint64_t pa, uint64_t len, uint32_t *iova);
+ int
+-sweet_smmu_window32(uint64_t pa, uint32_t *iova)
++sweet_smmu_map32(uint64_t pa, uint64_t len, uint32_t *iova)
+ {
+ 	int error = 0;
+-	uint64_t gib = pa >> 30;
+ 
+-	if (gib < 2 || gib > 9 || !iova) {
++	if (!iova || len == 0 || pa < 0x80000000ull || pa + len > 0x280000000ull) {
+ 		return EINVAL;  /* only the identity map's DRAM, 0x80000000..0x27fffffff */
+ 	}
+ 	if (__atomic_exchange_n(&smmu_lock, 1, __ATOMIC_ACQUIRE)) {
+@@ -310,9 +315,41 @@ sweet_smmu_window32(uint64_t pa, uint32_t *iova)
+ 		error = ENODEV;
+ 		goto out;
+ 	}
++	for (unsigned i = 0; i < smmu_w32_nmaps; i++) {
++		if (pa >= smmu_w32_maps[i].pa && pa + len <= smmu_w32_maps[i].pa + smmu_w32_maps[i].len) {
++			*iova = smmu_w32_maps[i].iova + (uint32_t)(pa - smmu_w32_maps[i].pa);
++			goto out;
++		}
++	}
++	uint64_t first = pa & ~0x1fffffull, last = (pa + len - 1) & ~0x1fffffull;
++	unsigned nb = (unsigned)((last - first) >> 21) + 1;
++	if (smmu_w32_next + nb > 512 || smmu_w32_nmaps == sizeof(smmu_w32_maps) / sizeof(smmu_w32_maps[0])) {
++		error = ENOSPC;
++		goto out;
++	}
+ 	volatile uint64_t *l1 = (volatile uint64_t *)smmu_l1v;
+-	l1[1] = gib << 30 | 1u << 10 | 2u << 8 | 1u << 6 | 1;  /* block, AF, OSH, RW, attr 0 (Normal NC) */
+-	sweet_dma_sync_va((const void *)smmu_l1v, L1_SIZE);
++	if (smmu_w32_l2v == 0) {
++		vm_offset_t l2v = 0;
++		if (kmem_alloc_contig(kernel_map, &l2v, L1_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			error = ENOMEM;
++			goto out;
++		}
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)l2v);
++		if (!pn) {
++			error = ENOMEM;
++			goto out;
++		}
++		sweet_dma_sync_va((const void *)l2v, L1_SIZE);
++		smmu_w32_l2v = l2v;
++		l1[1] = ptoa_64(pn) | 3;                        /* table */
++		sweet_dma_sync_va((const void *)smmu_l1v, L1_SIZE);
++	}
++	volatile uint64_t *l2 = (volatile uint64_t *)smmu_w32_l2v;
++	for (unsigned k = 0; k < nb; k++) {
++		l2[smmu_w32_next + k] = (first + ((uint64_t)k << 21)) | 1u << 10 | 2u << 8 | 1u << 6 | 1;     /* block, AF, OSH, RW, Normal NC */
++	}
++	sweet_dma_sync_va((const void *)smmu_w32_l2v, L1_SIZE);
+ 	{
+ 		uint32_t id1 = smmu_rd(0x24);
+ 		unsigned pgshift = (id1 >> 31) ? 16 : 12;
+@@ -329,8 +366,14 @@ sweet_smmu_window32(uint64_t pa, uint32_t *iova)
+ 			}
+ 		}
+ 	}
+-	*iova = 0x40000000u + (uint32_t)(pa & 0x3fffffffu);
+-	printf("SWEET SMMU: bank %d: 32-bit window 0x40000000 -> DRAM GiB %#llx\n", smmu_cb, gib << 30);
++	uint32_t base = 0x40000000u + (smmu_w32_next << 21);
++	smmu_w32_maps[smmu_w32_nmaps].pa = first;
++	smmu_w32_maps[smmu_w32_nmaps].len = (uint64_t)nb << 21;
++	smmu_w32_maps[smmu_w32_nmaps].iova = base;
++	smmu_w32_nmaps++;
++	smmu_w32_next += nb;
++	*iova = base + (uint32_t)(pa - first);
++	printf("SWEET SMMU: bank %d: %#llx+%#llx at 32-bit IOVA %#x (%u blocks of 2 MiB)\n", smmu_cb, pa, len, *iova, nb);
+ out:
+ 	__atomic_store_n(&smmu_lock, 0, __ATOMIC_RELEASE);
+ 	return error;

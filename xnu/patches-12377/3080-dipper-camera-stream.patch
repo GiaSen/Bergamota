@@ -1,0 +1,1171 @@
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+index 10d089b..46df30b 100644
+--- a/bsd/dev/dipper_camera.c
++++ b/bsd/dev/dipper_camera.c
+@@ -66,6 +66,8 @@
+ #include <kern/kalloc.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <pexpert/pexpert.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+@@ -1110,6 +1112,7 @@ down:
+ /* ---- 3077, step C4: the IMX363's own frames through CSIPHY 0, CSID 0, RDI 0 and IFE 0 into memory ----------------- */
+ 
+ extern int sweet_rpmh_arc_vote(const char *res, bool max);                     /* sweet_rpmh.c */
++extern kern_return_t thread_terminate(thread_t);
+ 
+ #define CAM_CSIPHY0_PA  0x0ac65000u
+ #define CAM_REFGEN_PA   0x00ff1000u     /* qcom,refgen-regulator: the CSIPHYs' reference (only they name it in the live DT) */
+@@ -1126,7 +1129,8 @@ extern int sweet_rpmh_arc_vote(const char *res, bool max);                     /
+ #define C4_STRIDE       (C4_W * 10u / 8u)       /* MIPI RAW10: 2400 bytes a line */
+ #define C4_FRAME        (C4_STRIDE * C4_H)
+ #define C4_GUARD        0x100000u               /* after the frames: must stay 0xa5 */
+-#define C4_BUF          (2u * C4_FRAME + C4_GUARD)      /* 3078: two frames, the write master alternates */
++#define C4_NBUF         3u      /* 3080: three frame buffers (the one-shot run uses two, the stream all three) */
++#define C4_BUF          (C4_NBUF * C4_FRAME + C4_GUARD)
+ #define C4_FLL_MAX      2460u   /* 3078: frame length cap for longer exposures (2 x mode 2's 1230 lines: half its frame rate) */
+ #define C4_MARGIN       20u     /* integration time <= frame length - 20 (the module file's vertical offset) */
+ #define C4_AGAIN_MAX    480u    /* analog gain code: gain = 512 / (512 - code), 16x (the module file's maximum) */
+@@ -1585,43 +1589,129 @@ i2c_scan_say(const char *what)
+ 	cam_say("%s%s", line, n ? "" : " none");
+ }
+ 
++/*
++ * 3080: one camera run's state (what was switched on, to be put back), shared by the one-shot capture (kern.sweet_cam=4)
++ * and the streaming thread (kern.sweet_cam_stream=1). c4_up() does everything up to the sensor streaming; c4_down()
++ * stops and puts back whatever c4_up() got to.
++ */
++static const struct { const char *name; uint32_t cmd, cfg; } c4_rcgs[] = {
++	{ "slow_ahb", 0x6054, 0x000 },          /* XO 19.2 MHz */
++	{ "cphy_rx", 0x9060, 0x501 },           /* PLL3 even 384 MHz */
++	{ "ife_0", 0x900c, 0x102 },             /* PLL2 even / 1.5 = 320 MHz */
++	{ "ife_0_csid", 0x9038, 0x501 },        /* PLL3 even 384 MHz */
++	{ "csi0phytimer", CC_PHYTIMER0_CMD, 0x103 },    /* PLL2 even / 2 = 240 MHz */
++};
++#define C4_NRCG (sizeof(c4_rcgs) / sizeof(c4_rcgs[0]))
++static const struct { const char *name; uint32_t cbcr; } c4_brs[] = {
++	{ "cpas_ahb", 0xb11c }, { "soc_ahb", 0xb13c }, { "camnoc_axi", 0xb124 }, { "ife_0_axi", 0x907c },
++	{ "ife_0", 0x9024 }, { "ife_0_csid", 0x9050 }, { "ife_0_cphy_rx", 0x9078 }, { "csiphy0", CC_CSIPHY0_CBCR },
++	{ "csi0phytimer", CC_PHYTIMER0_CBCR },
++};
++#define C4_NBR (sizeof(c4_brs) / sizeof(c4_brs[0]))
++
++struct c4_run {
++	bool xo_was_off, axi_was_off, top_was_off, ife_was_off, refgen_set, phy_on, blocks, streamed, af_ok;
++	uint32_t pll2_was, pll3_was, rg_bias, rg_bg;
++	unsigned nrcg, nbr, fll_mode;
++	uint32_t rcg_was[C4_NRCG], br_was[C4_NBR];
++	struct s0_state s0;
++	struct cam_exp exp;
++};
++
++/* the auto-exposure step on a metered frame: true when on target (or as bright as it goes); else the next exposure written */
++static bool
++c4_ae_step(struct c4_run *r, unsigned mean, unsigned sat, unsigned min_fll)
++{
++	bool on_target = mean * 100u >= C4_AE_TARGET * 85u && mean * 100u <= C4_AE_TARGET * 118u && sat < 20u;
++	if (!on_target && r->exp.lines == C4_FLL_MAX - C4_MARGIN && r->exp.acode == C4_AGAIN_MAX && r->exp.dgain == C4_DGAIN_MAX &&
++	    mean < C4_AE_TARGET) {
++		on_target = true;                       /* as bright as it goes */
++	}
++	if (on_target) {
++		return true;
++	}
++	uint64_t ratio = mean ? (uint64_t)C4_AE_TARGET * 256u / mean : 8u * 256u;   /* x 256 */
++	if (ratio > 8u * 256u) {
++		ratio = 8u * 256u;
++	}
++	if (ratio < 32u) {
++		ratio = 32u;
++	}
++	if (sat >= 20u && ratio > 180u) {
++		ratio = 180u;                           /* clipped highlights: down by at least 30 % */
++	}
++	uint64_t e = r->exp.e256 * ratio / 256u;
++	c4_exp_split(e < 4u * 256u ? 4u * 256u : e, min_fll > r->fll_mode ? min_fll : r->fll_mode, 0, &r->exp);
++	if (!s0_set_exposure(&r->exp)) {
++		cam_say("exposure write NOT acked");
++	}
++	return false;
++}
++
++/* the focus sweep: a coarse pass 0, 64 ... 960, 1023, then +-48 in 16s around the best, then the best */
++struct c4_af {
++	unsigned code[20], n, i, best;
++	uint64_t score[20];
++	bool fine, done;
++};
++
+ static void
+-cam_c4(void)
++c4_af_begin(struct c4_af *a)
+ {
+-	bool xo_was_off = false, axi_was_off = false, top_was_off = false, ife_was_off = false, refgen_set = false;
+-	bool streamed = false, phy_on = false;
+-	uint32_t pll2_was = 0, pll3_was = 0, rg_bias = 0, rg_bg = 0, v, fsr = 0;
+-	uint64_t far = 0;
+-	unsigned frames = 0, nrcg = 0, nbr = 0, kept = 0, fll_mode = 0;
+-	unsigned nframes = cam_frames < 4 ? 4 : cam_frames > 600 ? 600 : cam_frames;
+-	if (cam_af && nframes < 200) {
+-		nframes = 200;          /* 3079: room for the focus passes */
++	a->n = a->i = a->best = 0;
++	a->fine = a->done = false;
++	for (unsigned c = 0; c < 1024u && a->n < 17; c += 64) {
++		a->code[a->n++] = c;
+ 	}
+-	uint64_t t_start = 0, t_first = 0, t_last = 0;
+-	struct cam_exp exp = { 0 };
+-	bool ae_done = false, af_ok = false, af_done = false;
+-	unsigned af_best = 0;
+-	struct s0_state s0 = { 0 };
+-	static const struct { const char *name; uint32_t cmd, cfg; } rcgs[] = {
+-		{ "slow_ahb", 0x6054, 0x000 },          /* XO 19.2 MHz */
+-		{ "cphy_rx", 0x9060, 0x501 },           /* PLL3 even 384 MHz */
+-		{ "ife_0", 0x900c, 0x102 },             /* PLL2 even / 1.5 = 320 MHz */
+-		{ "ife_0_csid", 0x9038, 0x501 },        /* PLL3 even 384 MHz */
+-		{ "csi0phytimer", CC_PHYTIMER0_CMD, 0x103 },    /* PLL2 even / 2 = 240 MHz */
+-	};
+-	uint32_t rcg_was[sizeof(rcgs) / sizeof(rcgs[0])];
+-	static const struct { const char *name; uint32_t cbcr; } brs[] = {
+-		{ "cpas_ahb", 0xb11c }, { "soc_ahb", 0xb13c }, { "camnoc_axi", 0xb124 }, { "ife_0_axi", 0x907c },
+-		{ "ife_0", 0x9024 }, { "ife_0_csid", 0x9050 }, { "ife_0_cphy_rx", 0x9078 }, { "csiphy0", CC_CSIPHY0_CBCR },
+-		{ "csi0phytimer", CC_PHYTIMER0_CBCR },
+-	};
+-	uint32_t br_was[sizeof(brs) / sizeof(brs[0])];
++	a->code[a->n++] = 1023;
++	(void)af_move(a->code[0]);
++}
++
++/* the score of the code moved to 3 frames ago; moves to the next code (or to the best when done) */
++static void
++c4_af_step(struct c4_af *a, const uint8_t *frame, bool say)
++{
++	a->score[a->i] = af_sharpness(frame);
++	if (say) {
++		cam_say("lens %4u: contrast %llu", a->code[a->i], a->score[a->i]);
++	}
++	a->i++;
++	if (a->i == a->n) {
++		unsigned b = 0;
++		for (unsigned i = 1; i < a->n; i++) {
++			if (a->score[i] > a->score[b]) {
++				b = i;
++			}
++		}
++		a->best = a->code[b];
++		if (!a->fine) {
++			a->fine = true;
++			a->n = 0;
++			for (int c = (int)a->best - 48; c <= (int)a->best + 48; c += 16) {
++				if (c >= 0 && c <= 1023 && a->n < 16) {
++					a->code[a->n++] = (unsigned)c;
++				}
++			}
++			a->i = 0;
++		} else {
++			a->done = true;
++			(void)af_move(a->best);
++			return;
++		}
++	}
++	(void)af_move(a->code[a->i]);
++}
++
++/* everything up to the sensor streaming into buffer 0; min_fll: the frame length at least (C4_FLL_MAX: a steady 30 fps) */
++static bool
++c4_up(struct c4_run *r, unsigned min_fll)
++{
++	uint32_t v, fsr = 0;
++	uint64_t far = 0;
+ 
+-	cam_len = 0;
+-	cam_frame_len = 0;
+ 	if (!cam_seq || cam_seq_n == 0) {
+ 		cam_say("no sensor sequence loaded (write kern.sweet_cam_seq first)");
+-		return;
++		return false;
+ 	}
+ 	if ((!gcc && !(gcc = ml_io_map(CAM_GCC_CAM_PA, 0x1000))) || (!camcc && !(camcc = ml_io_map(CAM_CC_PA, CAM_CC_SIZE))) ||
+ 	    (!vfe0 && !(vfe0 = ml_io_map(CAM_VFE0_PA, CAM_VFE0_SIZE))) ||
+@@ -1629,77 +1719,77 @@ cam_c4(void)
+ 	    (!csiphy0 && !(csiphy0 = ml_io_map(CAM_CSIPHY0_PA, 0x1000))) ||
+ 	    (!refgen && !(refgen = ml_io_map(CAM_REFGEN_PA, 0x1000)))) {
+ 		cam_say("registers not mapped");
+-		return;
++		return false;
+ 	}
+ 	if (cam_rd(gcc, CAM_GCC_AHB) & CBCR_OFF) {
+ 		cam_say("GCC's camera AHB clock is off: nothing done");
+-		return;
++		return false;
+ 	}
+ 	if (!c4_buffer()) {
+-		return;
++		return false;
+ 	}
+ 	memset((void *)c4_buf, C3_FILL, C4_BUF);
+ 	sweet_dma_sync_va((const void *)c4_buf, C4_BUF);
+-	cam_say("frame buffer %u bytes (2 x frame %u + guard %u) at PA %#llx; sequence %u records", C4_BUF, C4_FRAME, C4_GUARD,
+-	    c4_buf_pa, cam_seq_n);
++	cam_say("frame buffers %u bytes (%u x frame %u + guard %u) at PA %#llx; sequence %u records", C4_BUF, C4_NBUF, C4_FRAME,
++	    C4_GUARD, c4_buf_pa, cam_seq_n);
+ 	cam_say("CX vote max: %d", sweet_rpmh_arc_vote("cx.lvl", true));       /* kept, as audio and Wi-Fi keep it */
+ 
+ 	/* GCC's camera XO and AXI, titan_top and ife_0 (as C3) */
+ 	v = cam_rd(gcc, CAM_GCC_XO);
+ 	if (v & CBCR_OFF) {
+-		xo_was_off = true;
++		r->xo_was_off = true;
+ 		cam_wr(gcc, CAM_GCC_XO, v | CBCR_ENABLE);
+ 		if (!wait_clear(gcc, CAM_GCC_XO, CBCR_OFF, 500)) {
+ 			cam_say("GCC CAMERA_XO did not start");
+-			goto down;
++			return false;
+ 		}
+ 	}
+ 	v = cam_rd(gcc, CAM_GCC_AXI);
+ 	if (!(v & CBCR_ENABLE)) {
+-		axi_was_off = true;
++		r->axi_was_off = true;
+ 		cam_wr(gcc, CAM_GCC_AXI, v | CBCR_ENABLE);
+ 		(void)wait_clear(gcc, CAM_GCC_AXI, CBCR_OFF, 500);
+ 	}
+ 	v = cam_rd(camcc, CC_TITAN_GDSCR);
+ 	if (!(v & GDSC_PWR_ON)) {
+-		top_was_off = true;
++		r->top_was_off = true;
+ 		cam_wr(camcc, CC_TITAN_GDSCR, v & ~GDSC_SW_COLLAPSE);
+ 		if (!wait_set(camcc, CC_TITAN_GDSCR, GDSC_PWR_ON, 10000)) {
+ 			cam_say("titan_top did not power on");
+-			goto down;
++			return false;
+ 		}
+ 	}
+ 	v = cam_rd(camcc, CC_IFE0_GDSCR);
+ 	if (!(v & GDSC_PWR_ON)) {
+-		ife_was_off = true;
++		r->ife_was_off = true;
+ 		cam_wr(camcc, CC_IFE0_GDSCR, v & ~GDSC_SW_COLLAPSE);
+ 		if (!wait_set(camcc, CC_IFE0_GDSCR, GDSC_PWR_ON, 10000)) {
+ 			cam_say("ife_0 did not power on");
+-			goto down;
++			return false;
+ 		}
+ 	}
+ 
+ 	/* PLL2 960 MHz (even output / 2 = 480), PLL3 384 MHz (even / 1): the L values of the phone's own kernel (camcc-sdm845.c) */
+-	if (!cc_pll_on(CC_PLL2, 0x32, 0, 1, &pll2_was) || !cc_pll_on(CC_PLL3, 0x14, 0, 0, &pll3_was)) {
+-		goto down;
++	if (!cc_pll_on(CC_PLL2, 0x32, 0, 1, &r->pll2_was) || !cc_pll_on(CC_PLL3, 0x14, 0, 0, &r->pll3_was)) {
++		return false;
+ 	}
+-	for (nrcg = 0; nrcg < sizeof(rcgs) / sizeof(rcgs[0]); nrcg++) {
+-		if (!cc_rcg_set(rcgs[nrcg].name, rcgs[nrcg].cmd, rcgs[nrcg].cfg, false, 0, 0, 0, &rcg_was[nrcg])) {
+-			nrcg++;
+-			goto down;
++	for (r->nrcg = 0; r->nrcg < C4_NRCG; r->nrcg++) {
++		if (!cc_rcg_set(c4_rcgs[r->nrcg].name, c4_rcgs[r->nrcg].cmd, c4_rcgs[r->nrcg].cfg, false, 0, 0, 0, &r->rcg_was[r->nrcg])) {
++			r->nrcg++;
++			return false;
+ 		}
+ 	}
+-	for (nbr = 0; nbr < sizeof(brs) / sizeof(brs[0]); nbr++) {
+-		br_was[nbr] = cam_rd(camcc, brs[nbr].cbcr);
+-		cam_wr(camcc, brs[nbr].cbcr, br_was[nbr] | CBCR_ENABLE);
+-		if (!wait_clear(camcc, brs[nbr].cbcr, CBCR_OFF, 1000)) {
+-			cam_say("branch %s did not start (%#x): nothing of the camera blocks touched", brs[nbr].name,
+-			    cam_rd(camcc, brs[nbr].cbcr));
+-			nbr++;
+-			goto down;
++	for (r->nbr = 0; r->nbr < C4_NBR; r->nbr++) {
++		r->br_was[r->nbr] = cam_rd(camcc, c4_brs[r->nbr].cbcr);
++		cam_wr(camcc, c4_brs[r->nbr].cbcr, r->br_was[r->nbr] | CBCR_ENABLE);
++		if (!wait_clear(camcc, c4_brs[r->nbr].cbcr, CBCR_OFF, 1000)) {
++			cam_say("branch %s did not start (%#x): nothing of the camera blocks touched", c4_brs[r->nbr].name,
++			    cam_rd(camcc, c4_brs[r->nbr].cbcr));
++			r->nbr++;
++			return false;
+ 		}
+ 	}
+-	cam_say("all %u branches running", (unsigned)nbr);
++	cam_say("all %u branches running", (unsigned)r->nbr);
+ 
+ 	/* the IFE's streams and the 32-bit window (as C3) */
+ 	{
+@@ -1711,22 +1801,22 @@ cam_c4(void)
+ 		}
+ 		if (!ok || sweet_smmu_window32(c4_buf_pa, &c4_buf_iova) != 0) {
+ 			cam_say("SMMU streams or window NOT set: no streaming");
+-			goto down;
++			return false;
+ 		}
+ 		(void)sweet_smmu_bank_fault(&fsr, &far, true);
+ 		cam_say("SMMU: IFE streams mapped, buffer IOVA %#x", c4_buf_iova);
+ 	}
+ 
+ 	/* refgen (msm-4.9 refgen.c: BG_CTRL bits 2:1 on, BIAS_EN 7) */
+-	rg_bias = cam_rd(refgen, 0x08);
+-	rg_bg = cam_rd(refgen, 0x14);
+-	if ((rg_bias & 7u) != 7u || (rg_bg & 6u) != 6u) {
+-		refgen_set = true;
+-		cam_wr(refgen, 0x14, (rg_bg & ~6u) | 6u);
++	r->rg_bias = cam_rd(refgen, 0x08);
++	r->rg_bg = cam_rd(refgen, 0x14);
++	if ((r->rg_bias & 7u) != 7u || (r->rg_bg & 6u) != 6u) {
++		r->refgen_set = true;
++		cam_wr(refgen, 0x14, (r->rg_bg & ~6u) | 6u);
+ 		cam_wr(refgen, 0x08, 7u);
+ 		delay(100);
+ 	}
+-	cam_say("refgen bias %#x bg %#x (was %#x %#x)", cam_rd(refgen, 0x08), cam_rd(refgen, 0x14), rg_bias, rg_bg);
++	cam_say("refgen bias %#x bg %#x (was %#x %#x)", cam_rd(refgen, 0x08), cam_rd(refgen, 0x14), r->rg_bias, r->rg_bg);
+ 
+ 	/* CSIPHY 0: version, reset, the common registers and lanes as Linux's csiphy_lanes_enable (4 data lanes + clock) */
+ 	cam_wr(csiphy0, 0x818, 2);                              /* SHOW_REV_ID */
+@@ -1745,10 +1835,11 @@ cam_c4(void)
+ 	for (unsigned i = 11; i < 22; i++) {
+ 		cam_wr(csiphy0, 0x800 + 4 * i, 0);              /* interrupt masks off */
+ 	}
+-	phy_on = true;
++	r->phy_on = true;
+ 	cam_say("CSIPHY0 lanes on, settle count %u", C4_SETTLE);
+ 
+ 	/* VFE 0 and CSID 0 reset (as C3) */
++	r->blocks = true;
+ 	cam_wr(vfe0, VFE_IRQ_MASK0, 1u << 31);
+ 	cam_wr(vfe0, VFE_RESET_CMD, 0x3f9fu);
+ 	bool vok = wait_set(vfe0, VFE_IRQ_STATUS0, 1u << 31, 100000);
+@@ -1765,7 +1856,7 @@ cam_c4(void)
+ 	cam_wr(csid0, CSID_IRQ_CMD, 1);
+ 	cam_say("VFE0 reset %s, CSID0 reset %s", vok ? "acked" : "NOT acked", cok ? "done" : "NOT done");
+ 	if (!vok || !cok) {
+-		goto stop;
++		return false;
+ 	}
+ 	cam_wr(vfe0, VFE_IRQ_MASK0, ~0u);
+ 	cam_wr(vfe0, VFE_IRQ_MASK1, ~0u);
+@@ -1809,28 +1900,28 @@ cam_c4(void)
+ 	cam_wr(csid0, 0x108, 1u | 1u << 1 | 0x2bu << 4);      /* capture the long packet header (DT 0x2b, VC 0) and short packets */
+ 	cam_wr(csid0, CSID_RDI0(0x08), 1);
+ 
+-	/* the sensor: power, chip ID, its sequence, readback, stream on */
+-	if (!s0_up(&s0)) {
+-		goto stop;
++	/* the sensor: power, chip ID, its sequence, readback */
++	if (!s0_up(&r->s0)) {
++		return false;
+ 	}
+ 	{
+ 		uint8_t id[2] = { 0, 0 };
+ 		int got = i2c_read16(0x34, 0x0016, id, 2);
+ 		cam_say("chip ID %#06x (%d)", (unsigned)id[0] << 8 | id[1], got);
+ 		if (got != 2) {
+-			goto stop;
++			return false;
+ 		}
+ 	}
+ 	{
+ 		unsigned bad = 0;
+ 		for (unsigned i = 0; i < cam_seq_n; i++) {
+-			const struct cam_seq_rec *r = &cam_seq[i];
+-			if (r->op == 2) {
+-				delay((int)(r->val > 100000 ? 100000 : r->val));
++			const struct cam_seq_rec *q = &cam_seq[i];
++			if (q->op == 2) {
++				delay((int)(q->val > 100000 ? 100000 : q->val));
+ 				continue;
+ 			}
+-			uint8_t b[2] = { (uint8_t)(r->op == 1 ? r->val >> 8 : r->val), (uint8_t)r->val };
+-			if (!i2c_write(0x34, r->reg, r->op == 1 ? b : &b[1], r->op == 1 ? 2 : 1)) {
++			uint8_t b[2] = { (uint8_t)(q->op == 1 ? q->val >> 8 : q->val), (uint8_t)q->val };
++			if (!i2c_write(0x34, q->reg, q->op == 1 ? b : &b[1], q->op == 1 ? 2 : 1)) {
+ 				bad++;
+ 			}
+ 		}
+@@ -1839,7 +1930,7 @@ cam_c4(void)
+ 		    s0_read8(0x0340), s0_read8(0x0341), s0_read8(0x0342), s0_read8(0x0343), s0_read8(0x034c), s0_read8(0x034d),
+ 		    s0_read8(0x034e), s0_read8(0x034f));
+ 		if (bad) {
+-			goto stop;
++			return false;
+ 		}
+ 	}
+ 	/* 3079: the lens actuator: VAF on, the module file's init, then auto focus later or the lens where asked */
+@@ -1848,25 +1939,25 @@ cam_c4(void)
+ 		delay(10000);
+ 		i2c_scan_say("CCI 0 bus with VAF on");
+ 		const uint8_t hi = 0x3c, zero = 0;
+-		af_ok = af_write(0x00, &hi, 1);
++		r->af_ok = af_write(0x00, &hi, 1);
+ 		delay(100);
+-		af_ok = af_ok && af_write(0x01, &zero, 1);
++		r->af_ok = r->af_ok && af_write(0x01, &zero, 1);
+ 		delay(100);
+-		af_ok = af_ok && af_write(0x02, &zero, 1);
++		r->af_ok = r->af_ok && af_write(0x02, &zero, 1);
+ 		delay(100);
+ 		af_pos = AF_INIT_CODE;
+-		if (af_ok && !cam_af) {
+-			af_ok = af_move(cam_lens);
++		if (r->af_ok && !cam_af) {
++			r->af_ok = af_move(cam_lens);
+ 		}
+-		cam_say("actuator AK7372 at 0x18: %s; lens at %u", af_ok ? "init written, active" : "NO ACK", af_pos);
++		cam_say("actuator AK7372 at 0x18: %s; lens at %u", r->af_ok ? "init written, active" : "NO ACK", af_pos);
+ 	}
+ 	/* 3078: the starting exposure: auto starts where the last auto run ended (else the mode's own), manual as given */
+ 	{
+-		fll_mode = s0_read8(0x0340) << 8 | s0_read8(0x0341);
++		r->fll_mode = s0_read8(0x0340) << 8 | s0_read8(0x0341);
+ 		unsigned l0 = s0_read8(0x0202) << 8 | s0_read8(0x0203);
+-		if (fll_mode > 0xffffu || l0 > 0xffffu || fll_mode < 100u) {
++		if (r->fll_mode > 0xffffu || l0 > 0xffffu || r->fll_mode < 100u) {
+ 			cam_say("frame length / integration time not readable");
+-			goto stop;
++			return false;
+ 		}
+ 		uint64_t e;
+ 		if (cam_ae) {
+@@ -1874,35 +1965,163 @@ cam_c4(void)
+ 		} else {
+ 			e = (uint64_t)(cam_lines ? cam_lines : l0) * (cam_gain < 100 ? 100 : cam_gain) * 256u / 100u;
+ 		}
+-		c4_exp_split(e, fll_mode, cam_ae ? 0 : (cam_lines ? cam_lines : l0), &exp);
+-		bool ok = s0_set_exposure(&exp);
++		c4_exp_split(e, min_fll > r->fll_mode ? min_fll : r->fll_mode, cam_ae ? 0 : (cam_lines ? cam_lines : l0), &r->exp);
++		bool ok = s0_set_exposure(&r->exp);
+ 		cam_say("%s exposure: mode frame length %u, start %u lines (fll %u), again code %u, dgain %#x%s", cam_ae ? "auto" : "manual",
+-		    fll_mode, exp.lines, exp.fll, exp.acode, exp.dgain, ok ? "" : " (NOT acked)");
++		    r->fll_mode, r->exp.lines, r->exp.fll, r->exp.acode, r->exp.dgain, ok ? "" : " (NOT acked)");
+ 	}
+ 	{
+ 		uint8_t one = 1;
+-		streamed = i2c_write(0x34, 0x0100, &one, 1);
+-		cam_say("stream on: %s", streamed ? "acked" : "NO ACK");
++		r->streamed = i2c_write(0x34, 0x0100, &one, 1);
++		cam_say("stream on: %s", r->streamed ? "acked" : "NO ACK");
+ 	}
+-	if (!streamed) {
+-		goto stop;
++	return r->streamed;
++}
++
++/* stop the sensor and the blocks, put back everything c4_up() switched on; report: the status registers first */
++static void
++c4_down(struct c4_run *r, bool report)
++{
++	uint32_t fsr = 0;
++	uint64_t far = 0;
++
++	if (r->blocks) {
++		/* the sensor stops at the end of its frame; then RDI 0 halted and the write master off */
++		if (r->streamed) {
++			uint8_t zero = 0;
++			(void)i2c_write(0x34, 0x0100, &zero, 1);
++			delay(40000);
++		}
++		cam_wr(csid0, CSID_RDI0(0x08), 0);
++		cam_wr(vfe0, VFE_WM(0, 0x08), 0);
++		cam_wr(vfe0, VFE_REG_UPDATE, 1u << 1);
++		delay(2000);
++		if (report) {
++			cam_say("VFE0 irq status %#x %#x, violation %#x; bus status %#x %#x %#x", cam_rd(vfe0, VFE_IRQ_STATUS0),
++			    cam_rd(vfe0, VFE_IRQ_STATUS1), cam_rd(vfe0, VFE_VIOLATION), cam_rd(vfe0, VFE_BUS_STATUS(0)),
++			    cam_rd(vfe0, VFE_BUS_STATUS(1)), cam_rd(vfe0, VFE_BUS_STATUS(2)));
++			cam_say("CSID0 top %#x, rx %#x, rdi0 %#x", cam_rd(csid0, CSID_TOP_STATUS), cam_rd(csid0, CSID_RX_STATUS),
++			    cam_rd(csid0, CSID_RDI0_STATUS));
++			reg_dump("CSID0 rx block", csid0, 0x100, 0x170);
++			reg_dump("CSID0 rdi0 block", csid0, CSID_RDI0(0), CSID_RDI0(0x100));
++			reg_dump("CSIPHY0 status", csiphy0, 0x8b0, 0x8e0);
++		}
++		(void)sweet_smmu_bank_fault(&fsr, &far, true);
++		cam_say("SMMU identity bank FSR %#x FAR %#llx", fsr, far);
++	}
++	if (r->af_ok) {
++		(void)af_move(0);               /* 3079: the lens back to its rest gently before VAF goes off */
++		delay(5000);
++	}
++	s0_down(&r->s0);
++	if (r->phy_on) {
++		cam_wr(csiphy0, 0x814, 0);
++		cam_wr(csiphy0, 0x818, 0);
++		cam_wr(csiphy0, 0x800, 1);
++		delay(1000);
++		cam_wr(csiphy0, 0x800, 0);
++	}
++	if (r->blocks) {
++		cam_wr(vfe0, VFE_IRQ_MASK0, 1u << 31);
++		cam_wr(vfe0, VFE_RESET_CMD, 0x3f9fu);
++		(void)wait_set(vfe0, VFE_IRQ_STATUS0, 1u << 31, 100000);
++		cam_wr(vfe0, VFE_IRQ_CLEAR0, ~0u);
++		cam_wr(vfe0, VFE_IRQ_CLEAR1, ~0u);
++		cam_wr(vfe0, VFE_IRQ_CMD, 1);
++		for (unsigned n = 0; n < 3; n++) {
++			cam_wr(vfe0, VFE_BUS_CLEAR(n), ~0u);
++		}
++		cam_wr(vfe0, VFE_BUS_CLEAR_GLOBAL, 1);
++		cam_wr(csid0, CSID_RST_STROBES, 0x1e);
++		(void)wait_set(csid0, CSID_TOP_STATUS, 1u, 100000);
++		cam_wr(csid0, CSID_RX_CLEAR, ~0u);
++		cam_wr(csid0, CSID_RDI0_CLEAR, ~0u);
++		cam_wr(csid0, CSID_TOP_CLEAR, ~0u);
++		cam_wr(csid0, CSID_IRQ_CMD, 1);
++	}
++	while (r->nbr > 0) {
++		r->nbr--;
++		if (!(r->br_was[r->nbr] & CBCR_ENABLE)) {
++			cam_wr(camcc, c4_brs[r->nbr].cbcr, cam_rd(camcc, c4_brs[r->nbr].cbcr) & ~CBCR_ENABLE);
++			(void)wait_set(camcc, c4_brs[r->nbr].cbcr, CBCR_OFF, 500);
++		}
++	}
++	while (r->nrcg > 0) {
++		r->nrcg--;
++		cc_rcg_park(c4_rcgs[r->nrcg].cmd, r->rcg_was[r->nrcg]);
++	}
++	if (camcc && (r->pll3_was != 0 || cam_rd(camcc, CC_PLL3 + PLL_MODE) != 0)) {
++		cc_pll_off(CC_PLL3, r->pll3_was);
++	}
++	if (camcc && (r->pll2_was != 0 || cam_rd(camcc, CC_PLL2 + PLL_MODE) != 0)) {
++		cc_pll_off(CC_PLL2, r->pll2_was);
++	}
++	if (r->refgen_set) {
++		cam_wr(refgen, 0x08, r->rg_bias);
++		cam_wr(refgen, 0x14, r->rg_bg);
++	}
++	if (r->ife_was_off) {
++		cam_wr(camcc, CC_IFE0_GDSCR, cam_rd(camcc, CC_IFE0_GDSCR) | GDSC_SW_COLLAPSE);
++		(void)wait_clear(camcc, CC_IFE0_GDSCR, GDSC_PWR_ON, 10000);
++	}
++	if (r->top_was_off) {
++		cam_wr(camcc, CC_TITAN_GDSCR, cam_rd(camcc, CC_TITAN_GDSCR) | GDSC_SW_COLLAPSE);
++		(void)wait_clear(camcc, CC_TITAN_GDSCR, GDSC_PWR_ON, 10000);
++	}
++	if (r->axi_was_off) {
++		cam_wr(gcc, CAM_GCC_AXI, cam_rd(gcc, CAM_GCC_AXI) & ~CBCR_ENABLE);
++	}
++	if (r->xo_was_off) {
++		cam_wr(gcc, CAM_GCC_XO, cam_rd(gcc, CAM_GCC_XO) & ~CBCR_ENABLE);
++	}
++	if (camcc && gcc && refgen) {
++		cam_say("put back: PLL2 mode %#x, PLL3 mode %#x, refgen %#x/%#x, ife_0 %#x, titan_top %#x, GCC AXI %#x, XO %#x",
++		    cam_rd(camcc, CC_PLL2 + PLL_MODE), cam_rd(camcc, CC_PLL3 + PLL_MODE), cam_rd(refgen, 0x08), cam_rd(refgen, 0x14),
++		    cam_rd(camcc, CC_IFE0_GDSCR), cam_rd(camcc, CC_TITAN_GDSCR), cam_rd(gcc, CAM_GCC_AXI), cam_rd(gcc, CAM_GCC_XO));
++	}
++}
++
++/* the CSID's own start-of-frame period in microseconds (19.2 MHz timestamps: current 0x390, previous 0x398) */
++static unsigned
++c4_sof_us(void)
++{
++	uint32_t sof = cam_rd(csid0, CSID_RDI0(0x90)) - cam_rd(csid0, CSID_RDI0(0x98));
++	return (unsigned)((uint64_t)sof * 10u / 192u);
++}
++
++static struct c4_run c4r;
++
++/* kern.sweet_cam=4: one run, auto exposure then autofocus (3078, 3079), the last frame kept for kern.sweet_cam_frame */
++static void
++cam_c4(void)
++{
++	struct c4_run *r = &c4r;
++	unsigned frames = 0, kept = 0;
++	unsigned nframes = cam_frames < 4 ? 4 : cam_frames > 600 ? 600 : cam_frames;
++	uint64_t t_start = 0, t_first = 0, t_last = 0;
++	bool ae_done = false, af_done = false;
++	struct c4_af af;
++
++	if (cam_af && nframes < 200) {
++		nframes = 200;          /* 3079: room for the focus passes */
++	}
++	bzero(r, sizeof(*r));
++	bzero(&af, sizeof(af));
++	cam_len = 0;
++	cam_frame_len = 0;
++	if (!c4_up(r, 0)) {
++		c4_down(r, true);
++		return;
+ 	}
+ 
+ 	/*
+ 	 * 3078: frames into two buffers, the write master moved to the other one at each done (address registers unsynced:
+ 	 * taken at the next frame start); with auto exposure the frame just finished is metered once the exposure has been
+-	 * the same for 3 frames (the sensor's latency), and the run stops at the first frame on target, which is kept.
++	 * the same for 3 frames (the sensor's latency); 3079: then the focus passes; the frame at the end is kept.
+ 	 */
+ 	{
+ 		uint64_t now, limit_ns = (uint64_t)nframes * 100000000ull + 2000000000ull;
+ 		unsigned cur = 0, since = 0, state = 0;   /* 0 exposure, 1 focus passes, 2 keep the next frame */
+-		unsigned af_code[20], af_n = 0, af_i = 0;
+-		uint64_t af_score[20];
+-		bool af_fine = false;
+-		for (unsigned c = 0; c < 1024u && af_n < 17; c += 64) {
+-			af_code[af_n++] = c;           /* coarse: 0, 64, ... 960 */
+-		}
+-		af_code[af_n++] = 1023;
+ 		t_start = mach_absolute_time();
+ 		for (unsigned dbg = 0; frames < nframes; ) {
+ 			now = mach_absolute_time();
+@@ -1934,164 +2153,66 @@ cam_c4(void)
+ 			if (since < 3) {
+ 				continue;
+ 			}
++			const uint8_t *fb = (const uint8_t *)c4_buf + (size_t)kept * C4_FRAME;
+ 			if (state == 1) {
+-				/* 3079: focus passes: score the code moved to 3 frames ago, then the next one */
+-				const uint8_t *fb = (const uint8_t *)c4_buf + (size_t)kept * C4_FRAME;
+-				af_score[af_i] = af_sharpness(fb);
+-				cam_say("lens %4u: contrast %llu", af_code[af_i], af_score[af_i]);
+-				af_i++;
+-				if (af_i == af_n) {
+-					unsigned b = 0;
+-					for (unsigned i = 1; i < af_n; i++) {
+-						if (af_score[i] > af_score[b]) {
+-							b = i;
+-						}
+-					}
+-					af_best = af_code[b];
+-					if (!af_fine) {
+-						af_fine = true;
+-						af_n = 0;
+-						for (int c = (int)af_best - 48; c <= (int)af_best + 48; c += 16) {
+-							if (c >= 0 && c <= 1023 && af_n < 16) {
+-								af_code[af_n++] = (unsigned)c;
+-							}
+-						}
+-						af_i = 0;
+-					} else {
+-						state = 2;              /* to the best, then keep a frame */
+-						(void)af_move(af_best);
+-						since = 0;
+-						continue;
+-					}
++				c4_af_step(&af, fb, true);
++				if (af.done) {
++					state = 2;
+ 				}
+-				(void)af_move(af_code[af_i]);
+ 				since = 0;
+ 				continue;
+ 			}
+ 			if (state == 2) {
+-				af_done = af_ok && cam_af;
++				af_done = r->af_ok && cam_af;
+ 				break;
+ 			}
+ 			if (!cam_ae) {
+-				state = (af_ok && cam_af) ? 1 : 2;
++				state = (r->af_ok && cam_af) ? 1 : 2;
+ 				if (state == 1) {
+-					(void)af_move(af_code[0]);
++					c4_af_begin(&af);
+ 				}
+ 				since = 0;
+ 				continue;
+ 			}
+ 			unsigned mean, sat;
+-			c4_meter((const uint8_t *)c4_buf + (size_t)kept * C4_FRAME, &mean, &sat);
+-			bool on_target = mean * 100u >= C4_AE_TARGET * 85u && mean * 100u <= C4_AE_TARGET * 118u && sat < 20u;
+-			if (!on_target && (exp.lines == C4_FLL_MAX - C4_MARGIN && exp.acode == C4_AGAIN_MAX && exp.dgain == C4_DGAIN_MAX) &&
+-			    mean < C4_AE_TARGET) {
+-				on_target = true;               /* as bright as it goes */
+-			}
++			c4_meter(fb, &mean, &sat);
++			bool on = c4_ae_step(r, mean, sat, 0);
+ 			cam_say("frame %u: green mean %u (target %u), saturated %u/1000, exposure %u lines (fll %u) again %u dgain %#x%s",
+-			    frames, mean, C4_AE_TARGET, sat, exp.lines, exp.fll, exp.acode, exp.dgain, on_target ? ": kept" : "");
+-			if (on_target) {
++			    frames, mean, C4_AE_TARGET, sat, r->exp.lines, r->exp.fll, r->exp.acode, r->exp.dgain, on ? ": on target" : "");
++			if (on) {
+ 				ae_done = true;
+-				if (!(af_ok && cam_af)) {
++				if (!(r->af_ok && cam_af)) {
+ 					break;
+ 				}
+ 				state = 1;                      /* 3079: exposure held, now focus */
+-				(void)af_move(af_code[0]);
+-				since = 0;
+-				continue;
+-			}
+-			uint64_t ratio = mean ? (uint64_t)C4_AE_TARGET * 256u / mean : 8u * 256u;   /* x 256 */
+-			if (ratio > 8u * 256u) {
+-				ratio = 8u * 256u;
+-			}
+-			if (ratio < 32u) {
+-				ratio = 32u;
+-			}
+-			if (sat >= 20u && ratio > 180u) {
+-				ratio = 180u;                   /* clipped highlights: down by at least 30 % */
+-			}
+-			uint64_t e = exp.e256 * ratio / 256u;
+-			c4_exp_split(e < 4u * 256u ? 4u * 256u : e, fll_mode, 0, &exp);
+-			if (!s0_set_exposure(&exp)) {
+-				cam_say("exposure write NOT acked");
++				c4_af_begin(&af);
+ 			}
+ 			since = 0;
+ 		}
+ 	}
+ 
+-stop:
+-	/* the sensor stops at the end of its frame; then RDI 0 halted and the write master off */
+-	if (streamed) {
+-		uint8_t zero = 0;
+-		(void)i2c_write(0x34, 0x0100, &zero, 1);
+-		delay(30000);
+-	}
+-	cam_wr(csid0, CSID_RDI0(0x08), 0);
+-	cam_wr(vfe0, VFE_WM(0, 0x08), 0);
+-	cam_wr(vfe0, VFE_REG_UPDATE, 1u << 1);
+-	delay(2000);
+ 	if (frames > 1) {
+ 		uint64_t us = c4_ns(t_last - t_first) / 1000u / (frames - 1);
+ 		cam_say("%u frame(s), first after %llu ms, then one every %llu us (%llu.%02llu fps)", frames,
+ 		    c4_ns(t_first - t_start) / 1000000u, us, us ? 1000000u / us : 0, us ? (100000000u / us) % 100u : 0);
++		unsigned sof = c4_sof_us();
++		cam_say("CSID RDI 0 start-of-frame period %u us (%u.%02u fps)", sof, sof ? 1000000u / sof : 0,
++		    sof ? (100000000u / sof) % 100u : 0);
+ 	} else {
+ 		cam_say("%u frame(s)", frames);
+ 	}
+-	if (frames > 1) {
+-		/* 3078c: the CSID's own start-of-frame timestamps (19.2 MHz): current 0x390, previous 0x398 */
+-		uint32_t sof = cam_rd(csid0, CSID_RDI0(0x90)) - cam_rd(csid0, CSID_RDI0(0x98));
+-		cam_say("CSID RDI 0 start-of-frame period %u ticks of 19.2 MHz = %u us (%u.%02u fps)", sof, (unsigned)((uint64_t)sof * 10u / 192u),
+-		    sof ? 19200000u / sof : 0, sof ? (1920000000u / sof) % 100u : 0);
+-	}
+ 	if (cam_ae && ae_done) {
+-		cam_ae_e256 = exp.e256;
++		cam_ae_e256 = r->exp.e256;
+ 	}
+-	if (af_ok) {
+-		cam_say("focus: %s, lens %u", af_done ? "contrast peak" : cam_af ? "NOT finished" : "manual", af_done ? af_best : cam_lens);
++	if (r->af_ok) {
++		cam_say("focus: %s, lens %u", af_done ? "contrast peak" : cam_af ? "NOT finished" : "manual", af_done ? af.best : cam_lens);
+ 	}
+ 	if (frames) {
+ 		cam_say("exposure %s: %u lines (fll %u), analog gain code %u (x%u.%02u), digital %#x; kept buffer %u", cam_ae ?
+-		    (ae_done ? "on target" : "NOT on target") : "manual", exp.lines, exp.fll, exp.acode,
+-		    512u / (512u - exp.acode), (51200u / (512u - exp.acode)) % 100u, exp.dgain, kept);
+-	}
+-	cam_say("VFE0 irq status %#x %#x, violation %#x; bus status %#x %#x %#x", cam_rd(vfe0, VFE_IRQ_STATUS0),
+-	    cam_rd(vfe0, VFE_IRQ_STATUS1), cam_rd(vfe0, VFE_VIOLATION), cam_rd(vfe0, VFE_BUS_STATUS(0)),
+-	    cam_rd(vfe0, VFE_BUS_STATUS(1)), cam_rd(vfe0, VFE_BUS_STATUS(2)));
+-	cam_say("CSID0 top %#x, rx %#x, rdi0 %#x", cam_rd(csid0, CSID_TOP_STATUS), cam_rd(csid0, CSID_RX_STATUS),
+-	    cam_rd(csid0, CSID_RDI0_STATUS));
+-	reg_dump("CSID0 rx block", csid0, 0x100, 0x170);
+-	reg_dump("CSID0 rdi0 block", csid0, CSID_RDI0(0), CSID_RDI0(0x100));
+-	reg_dump("CSIPHY0 status", csiphy0, 0x8b0, 0x8e0);
+-	(void)sweet_smmu_bank_fault(&fsr, &far, true);
+-	cam_say("SMMU identity bank FSR %#x FAR %#llx", fsr, far);
+-
+-	if (af_ok) {
+-		(void)af_move(0);               /* 3079: the lens back to its rest gently before VAF goes off */
+-		delay(5000);
+-	}
+-	s0_down(&s0);
+-	if (phy_on) {
+-		cam_wr(csiphy0, 0x814, 0);
+-		cam_wr(csiphy0, 0x818, 0);
+-		cam_wr(csiphy0, 0x800, 1);
+-		delay(1000);
+-		cam_wr(csiphy0, 0x800, 0);
+-	}
+-	cam_wr(vfe0, VFE_IRQ_MASK0, 1u << 31);
+-	cam_wr(vfe0, VFE_RESET_CMD, 0x3f9fu);
+-	(void)wait_set(vfe0, VFE_IRQ_STATUS0, 1u << 31, 100000);
+-	cam_wr(vfe0, VFE_IRQ_CLEAR0, ~0u);
+-	cam_wr(vfe0, VFE_IRQ_CLEAR1, ~0u);
+-	cam_wr(vfe0, VFE_IRQ_CMD, 1);
+-	for (unsigned n = 0; n < 3; n++) {
+-		cam_wr(vfe0, VFE_BUS_CLEAR(n), ~0u);
++		    (ae_done ? "on target" : "NOT on target") : "manual", r->exp.lines, r->exp.fll, r->exp.acode,
++		    512u / (512u - r->exp.acode), (51200u / (512u - r->exp.acode)) % 100u, r->exp.dgain, kept);
+ 	}
+-	cam_wr(vfe0, VFE_BUS_CLEAR_GLOBAL, 1);
+-	cam_wr(csid0, CSID_RST_STROBES, 0x1e);
+-	(void)wait_set(csid0, CSID_TOP_STATUS, 1u, 100000);
+-	cam_wr(csid0, CSID_RX_CLEAR, ~0u);
+-	cam_wr(csid0, CSID_RDI0_CLEAR, ~0u);
+-	cam_wr(csid0, CSID_TOP_CLEAR, ~0u);
+-	cam_wr(csid0, CSID_IRQ_CMD, 1);
++	c4_down(r, true);
+ 
+ 	/* what reached memory */
+ 	sweet_dma_sync_va((const void *)c4_buf, C4_BUF);
+@@ -2104,7 +2225,7 @@ stop:
+ 				last = i;
+ 			}
+ 		}
+-		for (size_t i = 2u * C4_FRAME; i < C4_BUF; i++) {
++		for (size_t i = (size_t)C4_NBUF * C4_FRAME; i < C4_BUF; i++) {
+ 			guard += ((const uint8_t *)c4_buf)[i] != C3_FILL;
+ 		}
+ 		cam_say("frame: %zu of %u bytes written (last at %zu); guard bytes changed: %zu", n, C4_FRAME, last, guard);
+@@ -2116,47 +2237,284 @@ stop:
+ 		cam_frame_ptr = b;
+ 		cam_frame_len = C4_FRAME;
+ 	}
++}
+ 
+-down:
+-	while (nbr > 0) {
+-		nbr--;
+-		if (!(br_was[nbr] & CBCR_ENABLE)) {
+-			cam_wr(camcc, brs[nbr].cbcr, cam_rd(camcc, brs[nbr].cbcr) & ~CBCR_ENABLE);
+-			(void)wait_set(camcc, brs[nbr].cbcr, CBCR_OFF, 500);
++/*
++ * 3080: streaming. kern.sweet_cam_stream=1 starts a kernel thread that keeps the sensor running at a steady 30 fps
++ * (frame length 2460), the write master cycling through three buffers so that the newest finished frame is never the
++ * one being written and one a reader is copying is never chosen; auto exposure all the time (outside +-15 % of the
++ * target), one focus sweep once the exposure is first on target and again on kern.sweet_cam_focus=1.
++ * kern.sweet_cam_live hands out a header and the newest frame; written with the last sequence number seen, it waits (up
++ * to 500 ms) for a newer one. kern.sweet_cam_stream=0 stops and puts everything back.
++ */
++struct cam_live_hdr {
++	uint32_t magic;                 /* 'SCAM' */
++	uint16_t version, hdr_size;
++	uint32_t seq;
++	uint16_t width, height, stride, format; /* format 1: MIPI RAW10, RGGB */
++	uint16_t black, white;
++	uint32_t exposure_lines, line_ns, again_x256, dgain_x256, lens, af_state;
++	uint64_t timestamp_ns;          /* the write master's done, mach_absolute_time in ns */
++	uint32_t frame_us, flags;
++};
++#define CAM_LIVE_MAGIC  0x4d414353u
++#define C4_LINE_NS      13530u          /* mode 2: 16.641 ms / 1230 lines (the CSID's timestamps) */
++
++static LCK_SPIN_DECLARE(cam_live_spin, &cam_lck_grp);
++static volatile unsigned cam_stream_state;     /* 0 off, 1 starting, 2 streaming, 3 stopping */
++static volatile bool cam_stream_stop, cam_focus_req;
++static int cam_live_latest = -1;
++static unsigned cam_live_readers[C4_NBUF];
++static uint32_t cam_live_seq;
++static struct cam_live_hdr cam_live_meta[C4_NBUF];
++
++static void
++cam_stream_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	struct c4_run *r = &c4r;
++	struct c4_af af;
++	unsigned target = 0, since = 0, frames = 0, af_state = 0;     /* af_state: 0 not yet, 1 sweeping, 2 done */
++	bool ae_on = false;
++	uint64_t t_prev = 0;
++
++	lck_mtx_lock(&cam_lock);
++	bzero(r, sizeof(*r));
++	bzero(&af, sizeof(af));
++	cam_len = 0;
++	cam_say("stream: starting");
++	lck_spin_lock(&cam_live_spin);
++	cam_live_latest = -1;
++	lck_spin_unlock(&cam_live_spin);
++	if (!c4_up(r, C4_FLL_MAX)) {
++		c4_down(r, true);
++		cam_stream_state = 0;
++		cam_say("stream: did not start");
++		lck_mtx_unlock(&cam_lock);
++		thread_wakeup((event_t)&cam_live_seq);
++		thread_terminate(current_thread());
++		return;
++	}
++	cam_stream_state = 2;
++	cam_say("stream: running");
++	while (!cam_stream_stop) {
++		if (!(cam_rd(vfe0, VFE_BUS_STATUS(1)) & 1u)) {
++			delay(2000);    /* at 30 fps the vertical blank is about 18 ms: a 2 ms poll moves the address in time */
++			continue;
++		}
++		uint64_t now = mach_absolute_time();
++		unsigned done = target;
++		lck_spin_lock(&cam_live_spin);
++		cam_live_latest = (int)done;
++		struct cam_live_hdr *h = &cam_live_meta[done];
++		bzero(h, sizeof(*h));
++		h->magic = CAM_LIVE_MAGIC;
++		h->version = 1;
++		h->hdr_size = sizeof(*h);
++		h->seq = ++cam_live_seq;
++		h->width = C4_W;
++		h->height = C4_H;
++		h->stride = C4_STRIDE;
++		h->format = 1;
++		h->black = 64;
++		h->white = 1023;
++		h->exposure_lines = r->exp.lines;
++		h->line_ns = C4_LINE_NS;
++		h->again_x256 = (unsigned)(512u * 256u / (512u - r->exp.acode));
++		h->dgain_x256 = r->exp.dgain;
++		h->lens = af_pos;
++		h->af_state = af_state;
++		h->timestamp_ns = c4_ns(now);
++		h->frame_us = t_prev ? (uint32_t)(c4_ns(now - t_prev) / 1000u) : 0;
++		/* the next target: not the newest, not one being read */
++		unsigned next = done;
++		for (unsigned k = 1; k < C4_NBUF; k++) {
++			unsigned c = (done + k) % C4_NBUF;
++			if (cam_live_readers[c] == 0) {
++				next = c;
++				break;
++			}
++		}
++		target = next;
++		lck_spin_unlock(&cam_live_spin);
++		cam_wr(vfe0, VFE_WM(0, 0x14), c4_buf_iova + target * C4_FRAME);
++		cam_wr(vfe0, VFE_BUS_CLEAR(1), 1u);
++		cam_wr(vfe0, VFE_BUS_CLEAR_GLOBAL, 1);
++		thread_wakeup((event_t)&cam_live_seq);
++		t_prev = now;
++		frames++;
++		since++;
++		if (since < 3) {
++			continue;
++		}
++		const uint8_t *fb = (const uint8_t *)c4_buf + (size_t)done * C4_FRAME;
++		if (af_state == 1) {
++			c4_af_step(&af, fb, false);
++			if (af.done) {
++				af_state = 2;
++				cam_say("stream: focus at lens %u (frame %u)", af.best, frames);
++			}
++			since = 0;
++			continue;
++		}
++		if (cam_ae) {
++			unsigned mean, sat;
++			c4_meter(fb, &mean, &sat);
++			bool on = c4_ae_step(r, mean, sat, C4_FLL_MAX);
++			if (on && !ae_on) {
++				cam_say("stream: exposure on target at frame %u: %u lines, analog code %u, digital %#x", frames,
++				    r->exp.lines, r->exp.acode, r->exp.dgain);
++				cam_ae_e256 = r->exp.e256;
++			}
++			ae_on = on;
++		}
++		if (r->af_ok && cam_af && (cam_focus_req || (af_state == 0 && (ae_on || !cam_ae)))) {
++			cam_focus_req = false;
++			af_state = 1;
++			c4_af_begin(&af);
++		}
++		since = 0;
++	}
++	cam_stream_state = 3;
++	/* wait for readers to finish with the buffers before the hardware is switched off */
++	for (int i = 0; i < 100; i++) {
++		lck_spin_lock(&cam_live_spin);
++		unsigned busy = 0;
++		for (unsigned k = 0; k < C4_NBUF; k++) {
++			busy += cam_live_readers[k];
+ 		}
++		cam_live_latest = -1;
++		lck_spin_unlock(&cam_live_spin);
++		if (!busy) {
++			break;
++		}
++		delay(10000);
+ 	}
+-	while (nrcg > 0) {
+-		nrcg--;
+-		cc_rcg_park(rcgs[nrcg].cmd, rcg_was[nrcg]);
++	cam_say("stream: stopping after %u frames", frames);
++	c4_down(r, false);
++	cam_stream_state = 0;
++	cam_stream_stop = false;
++	lck_mtx_unlock(&cam_lock);
++	thread_wakeup((event_t)&cam_live_seq);
++	thread_terminate(current_thread());
++}
++
++static int
++cam_stream_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = (int)cam_stream_state, error = sysctl_handle_int(oidp, &v, 0, req);
++
++	if (error || !req->newptr) {
++		return error;
+ 	}
+-	if (pll3_was != 0 || cam_rd(camcc, CC_PLL3 + PLL_MODE) != 0) {
+-		cc_pll_off(CC_PLL3, pll3_was);
++	if (!sweet_board_is("xiaomi,dipper")) {
++		return ENODEV;
+ 	}
+-	if (pll2_was != 0 || cam_rd(camcc, CC_PLL2 + PLL_MODE) != 0) {
+-		cc_pll_off(CC_PLL2, pll2_was);
++	if (v == 1) {
++		if (cam_stream_state != 0) {
++			return 0;               /* already running or on its way */
++		}
++		if (!cam_status) {
++			cam_status = kalloc_data(CAM_STATUS_LEN, Z_WAITOK | Z_ZERO);
++			if (!cam_status) {
++				return ENOMEM;
++			}
++		}
++		thread_t t;
++		cam_stream_stop = false;
++		cam_stream_state = 1;
++		if (kernel_thread_start(cam_stream_thread, NULL, &t) != KERN_SUCCESS) {
++			cam_stream_state = 0;
++			return ENOMEM;
++		}
++		thread_deallocate(t);
++		/* wait until it streams or gives up (power-up, the sensor's sequence, the lens: about a second) */
++		for (int i = 0; i < 300 && cam_stream_state == 1; i++) {
++			delay(10000);
++		}
++		return cam_stream_state == 2 ? 0 : EIO;
+ 	}
+-	if (refgen_set) {
+-		cam_wr(refgen, 0x08, rg_bias);
+-		cam_wr(refgen, 0x14, rg_bg);
++	if (v == 0) {
++		if (cam_stream_state == 0) {
++			return 0;
++		}
++		cam_stream_stop = true;
++		for (int i = 0; i < 300 && cam_stream_state != 0; i++) {
++			delay(10000);
++		}
++		return cam_stream_state == 0 ? 0 : EBUSY;
+ 	}
+-	if (ife_was_off) {
+-		cam_wr(camcc, CC_IFE0_GDSCR, cam_rd(camcc, CC_IFE0_GDSCR) | GDSC_SW_COLLAPSE);
+-		(void)wait_clear(camcc, CC_IFE0_GDSCR, GDSC_PWR_ON, 10000);
++	return EINVAL;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_stream, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
++    cam_stream_sysctl, "I", "3080: 1 = stream the rear main camera (kern.sweet_cam_live), 0 = stop; reads 0 off, 1 starting, 2 streaming, 3 stopping");
++
++static int
++cam_focus_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = 0, error = sysctl_handle_int(oidp, &v, 0, req);
++
++	if (!error && req->newptr && v == 1) {
++		cam_focus_req = true;
+ 	}
+-	if (top_was_off) {
+-		cam_wr(camcc, CC_TITAN_GDSCR, cam_rd(camcc, CC_TITAN_GDSCR) | GDSC_SW_COLLAPSE);
+-		(void)wait_clear(camcc, CC_TITAN_GDSCR, GDSC_PWR_ON, 10000);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_focus, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
++    cam_focus_sysctl, "I", "3080: 1 = focus again while streaming");
++
++static int
++cam_live_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint32_t last = 0;
++	bool have_last = false;
++	int error = 0, l;
++
++	if (!req->oldptr) {
++		return SYSCTL_OUT(req, NULL, sizeof(struct cam_live_hdr) + C4_FRAME);
+ 	}
+-	if (axi_was_off) {
+-		cam_wr(gcc, CAM_GCC_AXI, cam_rd(gcc, CAM_GCC_AXI) & ~CBCR_ENABLE);
++	if (req->newptr) {
++		error = SYSCTL_IN(req, &last, sizeof(last));
++		if (error) {
++			return error;
++		}
++		have_last = true;
+ 	}
+-	if (xo_was_off) {
+-		cam_wr(gcc, CAM_GCC_XO, cam_rd(gcc, CAM_GCC_XO) & ~CBCR_ENABLE);
++	if (cam_stream_state != 2) {
++		return ENXIO;
+ 	}
+-	cam_say("put back: PLL2 mode %#x, PLL3 mode %#x, refgen %#x/%#x, ife_0 %#x, titan_top %#x, GCC AXI %#x, XO %#x",
+-	    cam_rd(camcc, CC_PLL2 + PLL_MODE), cam_rd(camcc, CC_PLL3 + PLL_MODE), cam_rd(refgen, 0x08), cam_rd(refgen, 0x14),
+-	    cam_rd(camcc, CC_IFE0_GDSCR), cam_rd(camcc, CC_TITAN_GDSCR), cam_rd(gcc, CAM_GCC_AXI), cam_rd(gcc, CAM_GCC_XO));
++	/* a frame newer than the one the caller has (up to 500 ms) */
++	for (int i = 0; i < 50 && cam_stream_state == 2 && (cam_live_latest < 0 || (have_last && cam_live_seq == last)); i++) {
++		assert_wait_timeout((event_t)&cam_live_seq, THREAD_INTERRUPTIBLE, 10, NSEC_PER_MSEC);
++		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_INTERRUPTED) {
++			return EINTR;
++		}
++	}
++	struct cam_live_hdr h;
++	lck_spin_lock(&cam_live_spin);
++	l = cam_live_latest;
++	if (l >= 0) {
++		cam_live_readers[l]++;
++		h = cam_live_meta[l];
++	}
++	lck_spin_unlock(&cam_live_spin);
++	if (l < 0) {
++		return EAGAIN;
++	}
++	const uint8_t *b = (const uint8_t *)c4_buf + (size_t)l * C4_FRAME;
++	sweet_dma_sync_va(b, C4_FRAME);
++	error = SYSCTL_OUT(req, &h, sizeof(h));
++	if (!error) {
++		error = SYSCTL_OUT(req, b, C4_FRAME);
++	}
++	lck_spin_lock(&cam_live_spin);
++	cam_live_readers[l]--;
++	lck_spin_unlock(&cam_live_spin);
++	return error;
+ }
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_live, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
++    cam_live_sysctl, "S", "3080: the newest streamed frame (header + 1920x1080 MIPI RAW10); write the last seq seen to wait for a newer one");
+ 
+ /* 3077: the sensor's register sequence (8-byte records: u16 register, u8 op 0 write8 / 1 write16 / 2 wait us, u8 0, u32 value) */
+ static int
+@@ -2165,7 +2523,9 @@ cam_seq_sysctl SYSCTL_HANDLER_ARGS
+ #pragma unused(oidp, arg1, arg2)
+ 	int error = 0;
+ 
+-	lck_mtx_lock(&cam_lock);
++	if (!lck_mtx_try_lock(&cam_lock)) {
++		return EBUSY;                   /* 3080: streaming */
++	}
+ 	if (req->oldptr) {
+ 		error = cam_seq ? SYSCTL_OUT(req, cam_seq, cam_seq_n * sizeof(cam_seq[0])) : SYSCTL_OUT(req, "", 0);
+ 	} else if (!req->newptr) {
+@@ -2214,7 +2574,9 @@ cam_sysctl SYSCTL_HANDLER_ARGS
+ 	if (!sweet_board_is("xiaomi,dipper")) {
+ 		return ENODEV;
+ 	}
+-	lck_mtx_lock(&cam_lock);
++	if (cam_stream_state != 0 || !lck_mtx_try_lock(&cam_lock)) {
++		return EBUSY;                   /* 3080: streaming (kern.sweet_cam_stream=0 first) */
++	}
+ 	if (!cam_status) {
+ 		cam_status = kalloc_data(CAM_STATUS_LEN, Z_WAITOK | Z_ZERO);
+ 	}
+@@ -2241,13 +2603,15 @@ cam_status_sysctl SYSCTL_HANDLER_ARGS
+ #pragma unused(oidp, arg1, arg2)
+ 	int error;
+ 
+-	lck_mtx_lock(&cam_lock);
++	bool locked = lck_mtx_try_lock(&cam_lock);     /* 3080: the stream thread holds it while streaming */
+ 	if (!cam_status || cam_len == 0) {
+ 		error = SYSCTL_OUT(req, "not looked yet (kern.sweet_cam=1)\n", 35);
+ 	} else {
+ 		error = SYSCTL_OUT(req, cam_status, cam_len + 1);
+ 	}
+-	lck_mtx_unlock(&cam_lock);
++	if (locked) {
++		lck_mtx_unlock(&cam_lock);
++	}
+ 	return error;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_status, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, cam_status_sysctl, "A",
+@@ -2260,7 +2624,9 @@ cam_frame_sysctl SYSCTL_HANDLER_ARGS
+ #pragma unused(oidp, arg1, arg2)
+ 	int error;
+ 
+-	lck_mtx_lock(&cam_lock);
++	if (!lck_mtx_try_lock(&cam_lock)) {
++		return EBUSY;                   /* 3080: streaming (kern.sweet_cam_live) */
++	}
+ 	if (!cam_frame_ptr || cam_frame_len == 0) {
+ 		error = ENOENT;
+ 	} else {
