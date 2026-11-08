@@ -40,6 +40,7 @@
 #include <math.h>
 #include <mach/mach_time.h>
 #include <mach-o/dyld.h>
+#include <objc/message.h>
 #include <objc/runtime.h>
 #include <os/log.h>
 #include <pthread.h>
@@ -716,6 +717,7 @@ struct stream {
 	pthread_t worker;
 	volatile bool running, delivering, worker_started;
 	uint64_t frames;
+	volatile int still_pending;     /* still output pictures still to give after StillImageCaptureNow */
 };
 
 static struct stream *
@@ -915,6 +917,12 @@ stream_set_property_real(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		free(keys);
 		free(values);
 		pthread_mutex_unlock(&s->lock);
+		return 0;
+	}
+	if (key_is(key, "StillImageCaptureNow")) {
+		/* the still output gets pictures only when one is asked for (CMCapture discards the others): the next 3 frames */
+		s->still_pending = 3;
+		say("stream: StillImageCaptureNow: the next 3 frames to the still output");
 		return 0;
 	}
 	if (key_is(key, "TorchLevel")) {
@@ -1204,8 +1212,11 @@ worker(void *ctx)
 			if (!out->handler || !out->config || !(out->enabled || (i == 0 && s->delivering))) {
 				continue;
 			}
-			if (i == 2 && s->frames % 10 != 0) {
-				continue;               /* the still output: one picture in ten (its size makes it slow here) */
+			if (i == 2) {
+				if (s->still_pending <= 0) {
+					continue;       /* the still output: only after StillImageCaptureNow (12 MP on the CPU) */
+				}
+				s->still_pending--;
 			}
 			if (i == 4) {
 				continue;               /* no depth here */
@@ -1735,6 +1746,175 @@ hook_nrf(void)
 	}
 }
 
+/*
+ * Metal function specialisation (-[_MTLLibrary newFunctionWithName:constantValues:error:], -newFunctionWithDescriptor:error:)
+ * is not bgmtl's: it goes to Apple's own path. Still processing (NRFV1.bundle) makes its kernels that way; a failure is
+ * logged here with the error (said for the first 40).
+ */
+static IMP gOrigFnCV, gOrigFnDesc;
+
+static void
+say_fn_fail(const char *how, NSString *name, NSError *err)
+{
+	static unsigned n;
+	if (n++ < 80) {
+		say("Metal: %{public}s %{public}@ failed: %{public}@", how, name, err ? [err description] : @"(no error)");
+	}
+}
+
+static id
+fn_cv(id self, SEL sel, NSString *name, id cv, NSError **err)
+{
+	NSError *e = nil;
+	id r = ((id (*)(id, SEL, NSString *, id, NSError **))gOrigFnCV)(self, sel, name, cv, &e);
+	if (!r) {
+		say_fn_fail("specialising", name, e);
+	}
+	if (err) {
+		*err = e;
+	}
+	return r;
+}
+
+static id
+fn_desc(id self, SEL sel, id desc, NSError **err)
+{
+	NSError *e = nil;
+	/*
+	 * a descriptor naming binary archives (Apple's precompiled GPU code, e.g. NRFV1.bundle/binaryArchive.g12p) with
+	 * MTLFunctionOptionFailOnBinaryArchiveMiss fails here ("Failed to find specialized function ... in binary archive": no
+	 * archive has code for this GPU): specialised from the library's AIR instead, without archives
+	 */
+	static SEL s_archives, s_set_archives, s_options, s_set_options;
+	if (!s_archives) {
+		s_archives = sel_registerName("binaryArchives");
+		s_set_archives = sel_registerName("setBinaryArchives:");
+		s_options = sel_registerName("options");
+		s_set_options = sel_registerName("setOptions:");
+	}
+	id use = desc;
+	if ([desc respondsToSelector:s_archives] && [desc respondsToSelector:s_set_archives] && [desc respondsToSelector:@selector(copy)]) {
+		NSArray *a = ((NSArray * (*)(id, SEL))objc_msgSend)(desc, s_archives);
+		NSUInteger opt = [desc respondsToSelector:s_options] ? ((NSUInteger (*)(id, SEL))objc_msgSend)(desc, s_options) : 0;
+		if (a.count || (opt & 4)) {
+			use = [desc copy];
+			((void (*)(id, SEL, id))objc_msgSend)(use, s_set_archives, nil);
+			if ([use respondsToSelector:s_set_options]) {
+				((void (*)(id, SEL, NSUInteger))objc_msgSend)(use, s_set_options, opt & ~(NSUInteger)4);
+			}
+			static unsigned said;
+			if (said++ < 3) {
+				say("Metal: %{public}@ asked from %lu binary archive(s), options %#lx: specialised from AIR instead",
+				    [desc respondsToSelector:@selector(name)] ? [desc name] : @"?", (unsigned long)a.count, (unsigned long)opt);
+			}
+		}
+	}
+	id r = ((id (*)(id, SEL, id, NSError **))gOrigFnDesc)(self, sel, use, &e);
+	if (use != desc) {
+		[use release];
+	}
+	if (!r) {
+		say_fn_fail("function from descriptor", [desc respondsToSelector:@selector(name)] ? [desc name] : @"?", e);
+	}
+	if (err) {
+		*err = e;
+	}
+	return r;
+}
+
+/* more of the same watch: libraries, plain function lookups and the asynchronous specialisations (nil results said) */
+static IMP gOrigFnName, gOrigFnCVAsync, gOrigFnDescAsync, gOrigLibBundle, gOrigLibURL, gOrigLibData, gOrigLibFile;
+
+static id
+fn_name(id self, SEL sel, NSString *name)
+{
+	id r = ((id (*)(id, SEL, NSString *))gOrigFnName)(self, sel, name);
+	if (!r) {
+		say_fn_fail("function lookup", name, nil);
+	}
+	return r;
+}
+
+static void
+fn_cv_async(id self, SEL sel, NSString *name, id cv, void (^handler)(id, NSError *))
+{
+	void (^h)(id, NSError *) = [handler copy];
+	void (^w)(id, NSError *) = ^(id f, NSError *e) {
+		if (!f) {
+			say_fn_fail("specialising (async)", name, e);
+		}
+		h(f, e);
+	};
+	((void (*)(id, SEL, NSString *, id, id))gOrigFnCVAsync)(self, sel, name, cv, w);
+	[h release];
+}
+
+static void
+fn_desc_async(id self, SEL sel, id desc, void (^handler)(id, NSError *))
+{
+	NSString *name = [desc respondsToSelector:@selector(name)] ? [[desc name] copy] : @"?";
+	void (^h)(id, NSError *) = [handler copy];
+	void (^w)(id, NSError *) = ^(id f, NSError *e) {
+		if (!f) {
+			say_fn_fail("function from descriptor (async)", name, e);
+		}
+		h(f, e);
+	};
+	((void (*)(id, SEL, id, id))gOrigFnDescAsync)(self, sel, desc, w);
+	[h release];
+}
+
+#define LIB_WATCH(fn, orig, what)                                                                                              \
+	static id fn(id self, SEL sel, id arg, NSError **err)                                                                  \
+	{                                                                                                                      \
+		NSError *e = nil;                                                                                              \
+		id r = ((id (*)(id, SEL, id, NSError **))orig)(self, sel, arg, &e);                                           \
+		if (!r) {                                                                                                      \
+			say_fn_fail(what, [arg description], e);                                                               \
+		}                                                                                                              \
+		if (err) {                                                                                                     \
+			*err = e;                                                                                              \
+		}                                                                                                              \
+		return r;                                                                                                      \
+	}
+LIB_WATCH(lib_bundle, gOrigLibBundle, "default library of bundle")
+LIB_WATCH(lib_url, gOrigLibURL, "library from URL")
+LIB_WATCH(lib_data, gOrigLibData, "library from data")
+LIB_WATCH(lib_file, gOrigLibFile, "library from file")
+
+static void
+hook_one(Class c, const char *sel, IMP imp, IMP *orig)
+{
+	Method m = c ? class_getInstanceMethod(c, sel_registerName(sel)) : NULL;
+	if (m && !*orig) {
+		*orig = method_setImplementation(m, imp);
+	}
+}
+
+static void
+hook_specialise(void)
+{
+	Class lib = objc_getClass("_MTLLibrary");
+	Method m;
+	hook_one(lib, "newFunctionWithName:", (IMP)fn_name, &gOrigFnName);
+	hook_one(lib, "newFunctionWithName:constantValues:completionHandler:", (IMP)fn_cv_async, &gOrigFnCVAsync);
+	hook_one(lib, "newFunctionWithDescriptor:completionHandler:", (IMP)fn_desc_async, &gOrigFnDescAsync);
+	Class dev = objc_getClass("BGMTLDevice");
+	hook_one(dev, "newDefaultLibraryWithBundle:error:", (IMP)lib_bundle, &gOrigLibBundle);
+	hook_one(dev, "newLibraryWithURL:error:", (IMP)lib_url, &gOrigLibURL);
+	hook_one(dev, "newLibraryWithData:error:", (IMP)lib_data, &gOrigLibData);
+	hook_one(dev, "newLibraryWithFile:error:", (IMP)lib_file, &gOrigLibFile);
+	if (lib && (m = class_getInstanceMethod(lib, sel_registerName("newFunctionWithName:constantValues:error:")))) {
+		gOrigFnCV = method_setImplementation(m, (IMP)fn_cv);
+	}
+	if (lib && (m = class_getInstanceMethod(lib, sel_registerName("newFunctionWithDescriptor:error:")))) {
+		gOrigFnDesc = method_setImplementation(m, (IMP)fn_desc);
+	}
+	say("Metal: specialisation watched (%d %d %d %d %d; libraries %d %d %d %d)", gOrigFnCV != NULL, gOrigFnDesc != NULL,
+	    gOrigFnName != NULL, gOrigFnCVAsync != NULL, gOrigFnDescAsync != NULL, gOrigLibBundle != NULL, gOrigLibURL != NULL,
+	    gOrigLibData != NULL, gOrigLibFile != NULL);
+}
+
 static void
 hook(void)
 {
@@ -1916,6 +2096,7 @@ metal_device(void)
 	}
 	add(dev);
 	say("Metal: %{public}@ registered in cameracaptured", [dev description]);
+	hook_specialise();
 	/* CoreMedia's CMMTLCommandQueue forwards Apple's private queue methods (setCompletionQueue: ...) that Chlorophyll's queue
 	 * does not have: such messages are taken here (said once a selector) and answered with zero */
 	id q = [dev performSelector:@selector(newCommandQueue)];
