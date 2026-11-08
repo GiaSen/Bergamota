@@ -1,0 +1,544 @@
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+index 187261a..7840738 100644
+--- a/bsd/dev/dipper_camera.c
++++ b/bsd/dev/dipper_camera.c
+@@ -32,6 +32,19 @@
+  * The chip ID: slave 0x34 (8-bit), 2 bytes at register 0x0016, expected 0x0363, through the CCI master 0 pins (GPIO 17
+  * SDA, 18 SCL) driven by hand as open-drain GPIOs (~50 kHz) instead of the CCI block (HakiOS does the same on its POCO).
+  * Every pin is put back as it was found; the branch, the domain and GCC's XO only if this run switched them on.
++ *
++ * Patch 3076, step C3: kern.sweet_cam=3 (root) sends CSID 0's own test pattern (colour bars, RAW8, 640x480, two frames)
++ * through its RDI 0 into IFE 0's write master 0 and from there into memory; kern.sweet_cam_frame hands the buffer out.
++ * No sensor is involved. Register layout and sequence: mainline Linux's camss (camss-csid-gen2.c for Titan 170's CSID,
++ * camss-vfe-17x.c for its IFE, camss.c's sdm845 resources), read as data. Clocks: GCC CAMERA_XO and CAMERA_AXI, the
++ * domains titan_top and ife_0, camcc's slow AHB, CPHY RX, IFE 0 and IFE 0 CSID clock generators all from the crystal
++ * (19.2 MHz; the PLLs stay off) and the branches CPAS AHB, SOC AHB, CAMNOC AXI, IFE 0 AXI, IFE 0, IFE 0 CSID, IFE 0
++ * CPHY RX; nothing of the CSID or the IFE is touched unless they all run. Memory: the IFE's SMMU streams (the live DT's
++ * msm_cam_smmu_ife: 0x808, 0x810/0x818, 0xc08, 0xc10/0xc18) go to sweet_smmu.c's identity bank, so the write master
++ * takes the buffer's physical address (below 4 GiB: the address register has 32 bits); the write master is only
++ * enabled when every stream is mapped (an unmatched stream can reset the SoC). The buffer has room for four frames
++ * (the write master's frame increment) and is filled with 0xa5 first, so what the hardware wrote shows. Stopped after
++ * the first frame done (or 2 s), both blocks reset, clocks and domains put back as found.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -42,10 +55,16 @@
+ #include <kern/kalloc.h>
+ #include <kern/locks.h>
+ #include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
+ #include "sweet_board.h"
+ #include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern int sweet_smmu_map_sid(unsigned sid);                                    /* sweet_smmu.c */
++extern int sweet_smmu_bank_fault(uint32_t *fsr, uint64_t *far, bool clear);
+ extern void delay(int usec);
+ extern int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);     /* sweet_rpmh.c */
+ 
+@@ -90,7 +109,7 @@ static const struct { uint16_t gpio; uint8_t tile; const char *what; } cam_pins[
+ 	{ 119, CAM_N, "sensor0 reset" }, { 121, CAM_N, "sensor1 vana" },
+ };
+ 
+-#define CAM_STATUS_LEN 4096
++#define CAM_STATUS_LEN 8192
+ static char *cam_status;
+ static size_t cam_len;
+ static LCK_GRP_DECLARE(cam_lck_grp, "sweet_cam");
+@@ -628,6 +647,440 @@ down:
+ 	pm_regs("PM8998 GPIO11 after", 0xca00, gpio_offs, 7, g11);
+ }
+ 
++/* ---- 3076, step C3: CSID 0's test pattern through RDI 0 and IFE 0's write master 0 into memory -------------------- */
++
++#define CAM_VFE0_PA     0x0acaf000u
++#define CAM_VFE0_SIZE   0x4000u
++#define CAM_CSID0_PA    0x0acb3000u
++#define CAM_CSID0_SIZE  0x1000u
++#define CC_IFE0_GDSCR   0x9004u
++#define RCG_ROOT_EN     0x2u
++#define C3_W            640u
++#define C3_H            480u
++#define C3_FRAME        (C3_W * C3_H)   /* RAW8: one byte a pixel */
++#define C3_SLOTS        4u
++#define C3_BUF          (C3_FRAME * C3_SLOTS)
++#define C3_FILL         0xa5u
++
++/* VFE 170 (camss-vfe-17x.c) */
++#define VFE_RESET_CMD   0x018u
++#define VFE_IRQ_CMD     0x058u
++#define VFE_IRQ_MASK0   0x05cu
++#define VFE_IRQ_MASK1   0x060u
++#define VFE_IRQ_CLEAR0  0x064u
++#define VFE_IRQ_CLEAR1  0x068u
++#define VFE_IRQ_STATUS0 0x06cu
++#define VFE_IRQ_STATUS1 0x070u
++#define VFE_VIOLATION   0x07cu
++#define VFE_REG_UPDATE  0x4acu
++#define VFE_BUS_MASK(n)   (0x2044u + 4u * (n))
++#define VFE_BUS_CLEAR(n)  (0x2050u + 4u * (n))
++#define VFE_BUS_STATUS(n) (0x205cu + 4u * (n))
++#define VFE_BUS_CLEAR_GLOBAL 0x2068u
++#define VFE_WM(n, r)    (0x2200u + 0x100u * (n) + (r))  /* r: 0 STATUS0, 4 STATUS1, 8 CFG, 0x14 IMAGE_ADDR, ... */
++
++/* CSID 170 (camss-csid-gen2.c) */
++#define CSID_RST_STROBES 0x010u
++#define CSID_RX_STATUS  0x020u
++#define CSID_RX_MASK    0x024u
++#define CSID_RX_CLEAR   0x028u
++#define CSID_RDI0_STATUS 0x040u
++#define CSID_RDI0_MASK  0x044u
++#define CSID_RDI0_CLEAR 0x048u
++#define CSID_TOP_STATUS 0x070u
++#define CSID_TOP_MASK   0x074u
++#define CSID_TOP_CLEAR  0x078u
++#define CSID_IRQ_CMD    0x080u
++#define CSID_RX_CFG0    0x100u
++#define CSID_RX_CFG1    0x104u
++#define CSID_RDI0(r)    (0x300u + (r))
++#define CSID_TPG(r)     (0x600u + (r))
++
++static const struct { const char *name; uint32_t cmd; } c3_rcgs[] = {
++	{ "slow_ahb", 0x6054 }, { "cphy_rx", 0x9060 }, { "ife_0", 0x900c }, { "ife_0_csid", 0x9038 },
++};
++#define C3_NRCG (sizeof(c3_rcgs) / sizeof(c3_rcgs[0]))
++static const struct { const char *name; uint32_t cbcr; } c3_branches[] = {
++	{ "cpas_ahb", 0xb11c }, { "soc_ahb", 0xb13c }, { "camnoc_axi", 0xb124 }, { "ife_0_axi", 0x907c },
++	{ "ife_0", 0x9024 }, { "ife_0_csid", 0x9050 }, { "ife_0_cphy_rx", 0x9078 },
++};
++#define C3_NBR (sizeof(c3_branches) / sizeof(c3_branches[0]))
++static const uint16_t c3_sids[] = { 0x808, 0x810, 0x818, 0xc08, 0xc10, 0xc18 };
++
++static vm_offset_t vfe0, csid0;
++static vm_offset_t cam_buf;             /* contiguous, below 4 GiB, IOVA == PA through sweet_smmu's identity bank */
++static uint64_t cam_buf_pa;
++static size_t cam_frame_len;            /* what kern.sweet_cam_frame hands out */
++
++/* the non-zero words of base+[from, to), as few lines as needed */
++static void
++reg_dump(const char *what, vm_offset_t base, uint32_t from, uint32_t to)
++{
++	char line[200];
++	size_t k = (size_t)snprintf(line, sizeof(line), "%s:", what);
++	unsigned n = 0;
++
++	for (uint32_t o = from; o < to; o += 4) {
++		uint32_t v = cam_rd(base, o);
++		if (!v) {
++			continue;
++		}
++		if (k > sizeof(line) - 24) {
++			cam_say("%s", line);
++			k = (size_t)snprintf(line, sizeof(line), "%s (cont.):", what);
++		}
++		k += (size_t)snprintf(line + k, sizeof(line) - k, " %x=%x", o, v);
++		n++;
++	}
++	cam_say("%s%s", line, n ? "" : " all zero");
++}
++
++static bool
++c3_buffer(void)
++{
++	if (cam_buf) {
++		return true;
++	}
++	vm_offset_t v = 0;
++	/* max_pnum: pages below 4 GiB (the write master's address register has 32 bits) */
++	if (kmem_alloc_contig(kernel_map, &v, round_page(C3_BUF), PAGE_MASK, (ppnum_t)(atop_64(0x100000000ull) - 1), 0,
++	    KMA_DATA | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		cam_say("no contiguous memory below 4 GiB for %u bytes", C3_BUF);
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)v);
++	uint64_t pa = pn ? ptoa_64(pn) : 0;
++	if (!pa || pa < 0x80000000ull || pa + round_page(C3_BUF) > 0x100000000ull) {
++		cam_say("frame buffer at %#llx: not in DRAM below 4 GiB, not used", pa);
++		return false;   /* kept allocated (permanent); never handed to the hardware */
++	}
++	cam_buf = v;
++	cam_buf_pa = pa;
++	return true;
++}
++
++/* one byte line of a frame: values at the middle of eight equal columns */
++static void
++c3_row(const uint8_t *f, unsigned y)
++{
++	const uint8_t *r = f + (size_t)y * C3_W;
++	cam_say("row %3u, columns 1/16..15/16: %02x %02x %02x %02x %02x %02x %02x %02x", y, r[C3_W / 16], r[3 * C3_W / 16],
++	    r[5 * C3_W / 16], r[7 * C3_W / 16], r[9 * C3_W / 16], r[11 * C3_W / 16], r[13 * C3_W / 16], r[15 * C3_W / 16]);
++}
++
++static void
++cam_c3(void)
++{
++	bool xo_was_off = false, axi_was_off = false, top_was_off = false, ife_was_off = false;
++	bool clocks = false, streamed = false;
++	uint32_t rcg_cmd[C3_NRCG], br_was[C3_NBR];
++	unsigned nrcg = 0, nbr = 0, done_ms = 0;
++	uint32_t v, fsr = 0;
++	uint64_t far = 0;
++	int cb;
++
++	cam_len = 0;
++	cam_frame_len = 0;
++	if (!gcc && !(gcc = ml_io_map(CAM_GCC_CAM_PA, 0x1000))) {
++		cam_say("GCC not mapped");
++		return;
++	}
++	if (!camcc && !(camcc = ml_io_map(CAM_CC_PA, CAM_CC_SIZE))) {
++		cam_say("camcc not mapped");
++		return;
++	}
++	if ((!vfe0 && !(vfe0 = ml_io_map(CAM_VFE0_PA, CAM_VFE0_SIZE))) ||
++	    (!csid0 && !(csid0 = ml_io_map(CAM_CSID0_PA, CAM_CSID0_SIZE)))) {
++		cam_say("VFE0/CSID0 not mapped");
++		return;
++	}
++	if (cam_rd(gcc, CAM_GCC_AHB) & CBCR_OFF) {
++		cam_say("GCC's camera AHB clock is off: nothing done");
++		return;
++	}
++	if (!c3_buffer()) {
++		return;
++	}
++	memset((void *)cam_buf, C3_FILL, C3_BUF);
++	sweet_dma_sync_va((const void *)cam_buf, C3_BUF);
++	cam_say("frame buffer %u bytes at PA %#llx, filled with %#x", C3_BUF, cam_buf_pa, C3_FILL);
++
++	/* GCC's camera XO and AXI branches, then titan_top and ife_0 */
++	v = cam_rd(gcc, CAM_GCC_XO);
++	if (v & CBCR_OFF) {
++		xo_was_off = true;
++		cam_wr(gcc, CAM_GCC_XO, v | CBCR_ENABLE);
++		if (!wait_clear(gcc, CAM_GCC_XO, CBCR_OFF, 500)) {
++			cam_say("GCC CAMERA_XO did not start (%#x)", cam_rd(gcc, CAM_GCC_XO));
++			goto down;
++		}
++	}
++	v = cam_rd(gcc, CAM_GCC_AXI);
++	if (!(v & CBCR_ENABLE)) {
++		axi_was_off = true;
++		cam_wr(gcc, CAM_GCC_AXI, v | CBCR_ENABLE);
++		(void)wait_clear(gcc, CAM_GCC_AXI, CBCR_OFF, 500);     /* a voted branch: its status may lag */
++	}
++	cam_say("GCC CAMERA_XO %#x, CAMERA_AXI %#x", cam_rd(gcc, CAM_GCC_XO), cam_rd(gcc, CAM_GCC_AXI));
++	v = cam_rd(camcc, CC_TITAN_GDSCR);
++	if (!(v & GDSC_PWR_ON)) {
++		top_was_off = true;
++		cam_wr(camcc, CC_TITAN_GDSCR, v & ~GDSC_SW_COLLAPSE);
++		if (!wait_set(camcc, CC_TITAN_GDSCR, GDSC_PWR_ON, 10000)) {
++			cam_say("titan_top did not power on (GDSCR %#x)", cam_rd(camcc, CC_TITAN_GDSCR));
++			goto down;
++		}
++	}
++	v = cam_rd(camcc, CC_IFE0_GDSCR);
++	if (!(v & GDSC_PWR_ON)) {
++		ife_was_off = true;
++		cam_wr(camcc, CC_IFE0_GDSCR, v & ~GDSC_SW_COLLAPSE);
++		if (!wait_set(camcc, CC_IFE0_GDSCR, GDSC_PWR_ON, 10000)) {
++			cam_say("ife_0 did not power on (GDSCR %#x, CFG %#x)", cam_rd(camcc, CC_IFE0_GDSCR),
++			    cam_rd(camcc, CC_IFE0_GDSCR + 4));
++			goto down;
++		}
++	}
++	cam_say("titan_top GDSCR %#x, ife_0 GDSCR %#x (CFG %#x)", cam_rd(camcc, CC_TITAN_GDSCR), cam_rd(camcc, CC_IFE0_GDSCR),
++	    cam_rd(camcc, CC_IFE0_GDSCR + 4));
++
++	/* the clock generators from the crystal (CFG 0: source 0 = XO, divide by 1), switched while their root is off, then held on */
++	clocks = true;
++	for (nrcg = 0; nrcg < C3_NRCG; nrcg++) {
++		uint32_t c = c3_rcgs[nrcg].cmd;
++		rcg_cmd[nrcg] = cam_rd(camcc, c);
++		uint32_t cfg0 = cam_rd(camcc, c + 4);
++		cam_wr(camcc, c + 4, 0);
++		cam_wr(camcc, c, cam_rd(camcc, c) | RCG_UPDATE);
++		bool upd = wait_clear(camcc, c, RCG_UPDATE, 1000);
++		cam_wr(camcc, c, cam_rd(camcc, c) | RCG_ROOT_EN);
++		bool on = wait_clear(camcc, c, RCG_ROOT_OFF, 1000);
++		cam_say("rcg %-10s was cmd %#x cfg %#x; now cmd %#x cfg %#x%s%s", c3_rcgs[nrcg].name, rcg_cmd[nrcg], cfg0,
++		    cam_rd(camcc, c), cam_rd(camcc, c + 4), upd ? "" : " UPDATE STUCK", on ? "" : " ROOT OFF");
++		if (!upd || !on) {
++			nrcg++;
++			goto down;
++		}
++	}
++	for (nbr = 0; nbr < C3_NBR; nbr++) {
++		uint32_t c = c3_branches[nbr].cbcr;
++		br_was[nbr] = cam_rd(camcc, c);
++		cam_wr(camcc, c, br_was[nbr] | CBCR_ENABLE);
++		if (!wait_clear(camcc, c, CBCR_OFF, 1000)) {
++			cam_say("branch %s did not start (%#x): CSID and IFE not touched", c3_branches[nbr].name, cam_rd(camcc, c));
++			nbr++;
++			goto down;
++		}
++	}
++	cam_say("all %u branches running", (unsigned)C3_NBR);
++	cam_say("VFE0 hw version %#x, CSID0 hw version %#x", cam_rd(vfe0, 0x0), cam_rd(csid0, 0x0));
++
++	/* the IFE's streams to the identity bank; the write master only if all of them are */
++	bool smmu_ok = true;
++	for (unsigned i = 0; i < sizeof(c3_sids) / sizeof(c3_sids[0]); i++) {
++		int r = sweet_smmu_map_sid(c3_sids[i]);
++		if (r) {
++			smmu_ok = false;
++			cam_say("SMMU stream %#x NOT mapped (%d)", c3_sids[i], r);
++		}
++	}
++	cb = sweet_smmu_bank_fault(&fsr, &far, true);
++	cam_say("SMMU: IFE streams %s; identity bank %d FSR before %#x", smmu_ok ? "mapped" : "NOT all mapped", cb, fsr);
++
++	/* both blocks reset (as Linux: VFE global reset, CSID reset strobes 0x1e) */
++	cam_wr(vfe0, VFE_IRQ_MASK0, 1u << 31);
++	cam_wr(vfe0, VFE_RESET_CMD, 0x3f9fu);
++	bool vok = wait_set(vfe0, VFE_IRQ_STATUS0, 1u << 31, 100000);
++	cam_say("VFE0 reset %s (IRQ status %#x %#x)", vok ? "acked" : "NOT acked", cam_rd(vfe0, VFE_IRQ_STATUS0),
++	    cam_rd(vfe0, VFE_IRQ_STATUS1));
++	cam_wr(vfe0, VFE_IRQ_CLEAR0, ~0u);
++	cam_wr(vfe0, VFE_IRQ_CLEAR1, ~0u);
++	cam_wr(vfe0, VFE_IRQ_CMD, 1);
++	cam_wr(csid0, CSID_TOP_CLEAR, 1);
++	cam_wr(csid0, CSID_IRQ_CMD, 1);
++	cam_wr(csid0, CSID_TOP_MASK, 1);
++	cam_wr(csid0, CSID_IRQ_CMD, 1);
++	cam_wr(csid0, CSID_RST_STROBES, 0x1e);
++	bool cok = wait_set(csid0, CSID_TOP_STATUS, 1u, 100000);
++	cam_say("CSID0 reset %s (top status %#x)", cok ? "done" : "NOT done", cam_rd(csid0, CSID_TOP_STATUS));
++	cam_wr(csid0, CSID_TOP_CLEAR, cam_rd(csid0, CSID_TOP_STATUS));
++	cam_wr(csid0, CSID_IRQ_CMD, 1);
++	if (!vok || !cok) {
++		goto stop;
++	}
++
++	/* every status bit latched (no interrupt line is enabled for these blocks: only read here) */
++	cam_wr(vfe0, VFE_IRQ_MASK0, ~0u);
++	cam_wr(vfe0, VFE_IRQ_MASK1, ~0u);
++	for (unsigned n = 0; n < 3; n++) {
++		cam_wr(vfe0, VFE_BUS_MASK(n), ~0u);
++	}
++	cam_wr(csid0, CSID_RX_MASK, ~0u);
++	cam_wr(csid0, CSID_RDI0_MASK, ~0u);
++
++	/* write master 0 (RDI 0), as Linux's vfe_wm_start / vfe_wm_update / vfe_reg_update */
++	if (smmu_ok) {
++		cam_wr(vfe0, 0x226c, 1u << 1 | 1u << 7);        /* WM debug status cfg */
++		cam_wr(vfe0, 0x2080, 0);                        /* addr sync frame header */
++		cam_wr(vfe0, 0x200c, 0xfffff);                  /* no clock gating at the bus input */
++		cam_wr(vfe0, 0x211c, 0);                        /* test bus */
++		cam_wr(vfe0, 0x2084, (1u << 24) - 1);           /* addr no sync */
++		cam_wr(vfe0, VFE_WM(0, 0x5c), 0xf);             /* burst limit */
++		cam_wr(vfe0, VFE_WM(0, 0x1c), 0xff01);          /* buffer width cfg */
++		cam_wr(vfe0, VFE_WM(0, 0x20), 0);               /* buffer height cfg */
++		cam_wr(vfe0, VFE_WM(0, 0x24), 0);               /* packer */
++		cam_wr(vfe0, VFE_WM(0, 0x28), 0xff01);          /* stride */
++		cam_wr(vfe0, VFE_WM(0, 0x08), 1u | 1u << 1);    /* enable, frame based (MIPI raw) */
++		cam_wr(vfe0, VFE_WM(0, 0x14), (uint32_t)cam_buf_pa);
++		cam_wr(vfe0, VFE_WM(0, 0x58), C3_FRAME);        /* frame increment */
++		cam_wr(vfe0, VFE_REG_UPDATE, 1u << 1);          /* RDI 0 */
++		bool ru = wait_set(vfe0, VFE_IRQ_STATUS0, 1u << 5, 20000);
++		cam_say("WM0 at %#x, RDI 0 register update %s", cam_rd(vfe0, VFE_WM(0, 0x14)), ru ? "acked" : "not acked");
++		reg_dump("WM0", vfe0, VFE_WM(0, 0), VFE_WM(0, 0x60));
++	} else {
++		cam_say("write master left off: the CSID runs alone");
++	}
++
++	/* CSID 0: RDI 0 (payload only, data type RAW8, VC 0), the receiver, RDI 0 resumed, then the test pattern on */
++	cam_wr(csid0, CSID_RDI0(0x00), 1u | 1u << 1 | 1u << 2 | 0xfu << 12 | 0x2au << 16);
++	cam_wr(csid0, CSID_RDI0(0x04), 2);
++	cam_wr(csid0, CSID_RDI0(0x10), 1);      /* frame drop period, pattern */
++	cam_wr(csid0, CSID_RDI0(0x0c), 0);
++	cam_wr(csid0, CSID_RDI0(0x18), 1);      /* irq subsample period, pattern */
++	cam_wr(csid0, CSID_RDI0(0x14), 0);
++	cam_wr(csid0, CSID_RDI0(0x28), 1);      /* pixel drop period, pattern */
++	cam_wr(csid0, CSID_RDI0(0x24), 0);
++	cam_wr(csid0, CSID_RDI0(0x30), 1);      /* line drop period, pattern */
++	cam_wr(csid0, CSID_RDI0(0x2c), 0);
++	cam_wr(csid0, CSID_RDI0(0x08), 0);
++	cam_wr(csid0, CSID_RDI0(0x00), cam_rd(csid0, CSID_RDI0(0x00)) | 1u << 31);
++	cam_wr(csid0, CSID_RX_CFG0, 3u | 0x3210u << 4);         /* 4 lanes, lanes 0-3 in order, PHY 0 (the generator overrides) */
++	cam_wr(csid0, CSID_RX_CFG1, 1u | 1u << 6);              /* ECC correction, MISR */
++	cam_wr(csid0, CSID_RDI0(0x08), 1);                      /* resume at frame boundary */
++	cam_wr(csid0, CSID_TPG(0x04), 0u | 1u << 10 | 2u << 16);  /* VC 0, one shot, 2 frames */
++	cam_wr(csid0, CSID_TPG(0x08), 0x740u | 0x3ffu << 12);   /* H and V blanking */
++	cam_wr(csid0, CSID_TPG(0x0c), 0x12345678);              /* LFSR seed */
++	cam_wr(csid0, CSID_TPG(0x10), C3_H | C3_W << 16);
++	cam_wr(csid0, CSID_TPG(0x14), 0x2a);                    /* data type RAW8 */
++	cam_wr(csid0, CSID_TPG(0x18), 8u | 0xbeu << 4 | 1u << 16);  /* colour bars, user byte 0xbe, encode RAW8 */
++	cam_wr(csid0, CSID_TPG(0x40), 0);
++	cam_wr(csid0, CSID_TPG(0x44), 0);
++	cam_wr(csid0, CSID_TPG(0x00), 1u | 1u << 1 | 1u << 2 | 3u << 4 | 0x64u << 8 | 0xau << 20);
++	streamed = true;
++
++	/* the first frame done (write master 0's buf done), or 2 s */
++	for (done_ms = 0; done_ms < 20000; done_ms++) {
++		if (cam_rd(vfe0, VFE_BUS_STATUS(1)) & 1u) {
++			break;
++		}
++		if (!smmu_ok && (cam_rd(csid0, CSID_RDI0_STATUS) & ~1u) && done_ms > 3000) {
++			break;
++		}
++		delay(100);
++	}
++
++stop:
++	/* stop at once: pattern off, RDI 0 halted, write master off */
++	cam_wr(csid0, CSID_TPG(0x00), 0);
++	cam_wr(csid0, CSID_RDI0(0x08), 0);
++	cam_wr(vfe0, VFE_WM(0, 0x08), 0);
++	cam_wr(vfe0, VFE_REG_UPDATE, 1u << 1);
++	if (streamed) {
++		cam_say("%s after %u.%u ms", (cam_rd(vfe0, VFE_BUS_STATUS(1)) & 1u) ? "WM0 BUF DONE" : "no WM0 buf done",
++		    done_ms / 10, done_ms % 10);
++	}
++	delay(5000);
++	cam_say("VFE0 irq status %#x %#x, violation %#x; bus status %#x %#x %#x", cam_rd(vfe0, VFE_IRQ_STATUS0),
++	    cam_rd(vfe0, VFE_IRQ_STATUS1), cam_rd(vfe0, VFE_VIOLATION), cam_rd(vfe0, VFE_BUS_STATUS(0)),
++	    cam_rd(vfe0, VFE_BUS_STATUS(1)), cam_rd(vfe0, VFE_BUS_STATUS(2)));
++	cam_say("CSID0 top %#x, rx %#x, rdi0 %#x", cam_rd(csid0, CSID_TOP_STATUS), cam_rd(csid0, CSID_RX_STATUS),
++	    cam_rd(csid0, CSID_RDI0_STATUS));
++	reg_dump("CSID0 rdi0 block", csid0, CSID_RDI0(0), CSID_RDI0(0x100));
++	reg_dump("CSID0 tpg", csid0, CSID_TPG(0), CSID_TPG(0x50));
++	cb = sweet_smmu_bank_fault(&fsr, &far, true);
++	cam_say("SMMU identity bank %d FSR after %#x FAR %#llx", cb, fsr, far);
++
++	/* both blocks reset again (nothing left running), statuses cleared */
++	cam_wr(vfe0, VFE_IRQ_MASK0, 1u << 31);
++	cam_wr(vfe0, VFE_RESET_CMD, 0x3f9fu);
++	(void)wait_set(vfe0, VFE_IRQ_STATUS0, 1u << 31, 100000);
++	cam_wr(vfe0, VFE_IRQ_CLEAR0, ~0u);
++	cam_wr(vfe0, VFE_IRQ_CLEAR1, ~0u);
++	cam_wr(vfe0, VFE_IRQ_CMD, 1);
++	for (unsigned n = 0; n < 3; n++) {
++		cam_wr(vfe0, VFE_BUS_CLEAR(n), ~0u);
++	}
++	cam_wr(vfe0, VFE_BUS_CLEAR_GLOBAL, 1);
++	cam_wr(csid0, CSID_RST_STROBES, 0x1e);
++	(void)wait_set(csid0, CSID_TOP_STATUS, 1u, 100000);
++	cam_wr(csid0, CSID_RX_CLEAR, ~0u);
++	cam_wr(csid0, CSID_RDI0_CLEAR, ~0u);
++	cam_wr(csid0, CSID_TOP_CLEAR, ~0u);
++	cam_wr(csid0, CSID_IRQ_CMD, 1);
++
++	/* what reached memory */
++	sweet_dma_sync_va((const void *)cam_buf, C3_BUF);
++	{
++		const uint8_t *b = (const uint8_t *)cam_buf;
++		size_t first = C3_BUF, last = 0;
++		for (unsigned s = 0; s < C3_SLOTS; s++) {
++			size_t n = 0;
++			for (size_t i = (size_t)s * C3_FRAME; i < (size_t)(s + 1) * C3_FRAME; i++) {
++				if (b[i] != C3_FILL) {
++					n++;
++					if (i < first) {
++						first = i;
++					}
++					last = i;
++				}
++			}
++			cam_say("frame slot %u: %zu of %u bytes written", s, n, C3_FRAME);
++		}
++		if (last) {
++			cam_say("written from offset %zu to %zu; first bytes %02x %02x %02x %02x %02x %02x %02x %02x", first, last,
++			    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
++			c3_row(b, 0);
++			c3_row(b, C3_H / 2);
++			c3_row(b, C3_H - 1);
++		}
++		cam_frame_len = C3_BUF;
++	}
++
++down:
++	/* clocks, generators, domains and GCC's branches back as found */
++	while (clocks && nbr > 0) {
++		nbr--;
++		uint32_t c = c3_branches[nbr].cbcr;
++		if (!(br_was[nbr] & CBCR_ENABLE)) {
++			cam_wr(camcc, c, cam_rd(camcc, c) & ~CBCR_ENABLE);
++			(void)wait_set(camcc, c, CBCR_OFF, 500);
++		}
++	}
++	while (clocks && nrcg > 0) {
++		nrcg--;
++		uint32_t c = c3_rcgs[nrcg].cmd;
++		if (!(rcg_cmd[nrcg] & RCG_ROOT_EN)) {
++			cam_wr(camcc, c, cam_rd(camcc, c) & ~RCG_ROOT_EN);
++		}
++	}
++	if (ife_was_off) {
++		cam_wr(camcc, CC_IFE0_GDSCR, cam_rd(camcc, CC_IFE0_GDSCR) | GDSC_SW_COLLAPSE);
++		(void)wait_clear(camcc, CC_IFE0_GDSCR, GDSC_PWR_ON, 10000);
++	}
++	if (top_was_off) {
++		cam_wr(camcc, CC_TITAN_GDSCR, cam_rd(camcc, CC_TITAN_GDSCR) | GDSC_SW_COLLAPSE);
++		(void)wait_clear(camcc, CC_TITAN_GDSCR, GDSC_PWR_ON, 10000);
++	}
++	if (axi_was_off) {
++		cam_wr(gcc, CAM_GCC_AXI, cam_rd(gcc, CAM_GCC_AXI) & ~CBCR_ENABLE);
++	}
++	if (xo_was_off) {
++		cam_wr(gcc, CAM_GCC_XO, cam_rd(gcc, CAM_GCC_XO) & ~CBCR_ENABLE);
++	}
++	cam_say("put back: ife_0 GDSCR %#x, titan_top GDSCR %#x, GCC CAMERA_AXI %#x, CAMERA_XO %#x; generators left on XO",
++	    cam_rd(camcc, CC_IFE0_GDSCR), cam_rd(camcc, CC_TITAN_GDSCR), cam_rd(gcc, CAM_GCC_AXI), cam_rd(gcc, CAM_GCC_XO));
++}
++
+ static int
+ cam_sysctl SYSCTL_HANDLER_ARGS
+ {
+@@ -637,7 +1090,7 @@ cam_sysctl SYSCTL_HANDLER_ARGS
+ 	if (error || !req->newptr) {
+ 		return error;
+ 	}
+-	if (v != 1 && v != 2) {
++	if (v < 1 || v > 3) {
+ 		return EINVAL;
+ 	}
+ 	if (!sweet_board_is("xiaomi,dipper")) {
+@@ -650,15 +1103,17 @@ cam_sysctl SYSCTL_HANDLER_ARGS
+ 	if (cam_status) {
+ 		if (v == 1) {
+ 			cam_look();
+-		} else {
++		} else if (v == 2) {
+ 			cam_c2();
++		} else {
++			cam_c3();
+ 		}
+ 	}
+ 	lck_mtx_unlock(&cam_lock);
+ 	return cam_status ? 0 : ENOMEM;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_cam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, cam_sysctl, "I",
+-    "3075: 1 = a read-only look at the camera hardware, 2 (3075b) = the rear main sensor powered, its chip ID read, powered down (kern.sweet_cam_status)");
++    "3075: 1 = a read-only look at the camera hardware, 2 (3075b) = the rear main sensor powered, its chip ID read, powered down, 3 (3076) = CSID 0's test pattern into memory (kern.sweet_cam_status, kern.sweet_cam_frame)");
+ 
+ static int
+ cam_status_sysctl SYSCTL_HANDLER_ARGS
+@@ -677,4 +1132,23 @@ cam_status_sysctl SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_status, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, cam_status_sysctl, "A",
+     "3075: what the last look at the camera hardware found");
++
++/* 3076: C3's buffer as the hardware left it (4 frame slots of 640x480 RAW8, 0xa5 where nothing was written) */
++static int
++cam_frame_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int error;
++
++	lck_mtx_lock(&cam_lock);
++	if (!cam_buf || cam_frame_len == 0) {
++		error = ENOENT;
++	} else {
++		error = SYSCTL_OUT(req, (const void *)cam_buf, cam_frame_len);
++	}
++	lck_mtx_unlock(&cam_lock);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_frame, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, cam_frame_sysctl, "S",
++    "3076: the last kern.sweet_cam=3 buffer (4 x 640x480 RAW8)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
