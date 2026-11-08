@@ -243,23 +243,33 @@ kernel_stream(int on)
 	}
 	int e = errno;
 	if (on && e == EIO) {
-		/* no sensor sequence loaded yet (it is the phone vendor's, kept out of the image): load it once, as root */
+		/*
+		 * no sensor sequence loaded yet (it is the phone vendor's, kept out of the image): loaded from a file on the phone
+		 * (xnu 3082+ lets cameracaptured write kern.sweet_cam_seq; before, only root could)
+		 */
 		static const char *const paths[] = { "/usr/local/share/sweetcam/imx363-mode2.seq", "/var/root/imx363-mode2.seq" };
 		for (unsigned i = 0; i < 2; i++) {
 			FILE *f = fopen(paths[i], "rb");
 			if (!f) {
+				say("sequence: %{public}s: %{public}s", paths[i], strerror(errno));
 				continue;
 			}
 			static char seq[2048 * 8];
 			size_t n = fread(seq, 1, sizeof(seq), f);
 			fclose(f);
-			if (n && n % 8 == 0 && sysctlbyname("kern.sweet_cam_seq", NULL, NULL, seq, n) == 0) {
-				say("the sensor's sequence loaded from %{public}s (%zu records)", paths[i], n / 8);
-				if (sysctlbyname("kern.sweet_cam_stream", NULL, NULL, &on, sizeof(on)) == 0) {
-					return 0;
-				}
-				e = errno;
+			if (!n || n % 8 != 0) {
+				say("sequence: %{public}s: %zu bytes, not 8-byte records", paths[i], n);
+				continue;
 			}
+			if (sysctlbyname("kern.sweet_cam_seq", NULL, NULL, seq, n) != 0) {
+				say("sequence: kern.sweet_cam_seq refused it: %{public}s", strerror(errno));
+				break;
+			}
+			say("the sensor's sequence loaded from %{public}s (%zu records)", paths[i], n / 8);
+			if (sysctlbyname("kern.sweet_cam_stream", NULL, NULL, &on, sizeof(on)) == 0) {
+				return 0;
+			}
+			e = errno;
 			break;
 		}
 	}
