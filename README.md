@@ -52,7 +52,7 @@ Qualcomm ABL (stock, unlocked)
 </p>
 <p align="center"><sub>Enxerto's screens, rendered by its host test: boot, Bergamota fastboot, off-mode charging</sub></p>
 
-## Status (Mi 8, 2026-11-07)
+## Status (Mi 8, 2026-11-08)
 
 | Area | State |
 | --- | --- |
@@ -74,7 +74,7 @@ Qualcomm ABL (stock, unlocked)
 | Sensors | Partly working: the kernel (xnu 3072d and later; in the default image since 2026-11-07) starts the sensor DSP by itself. **Auto-brightness works** (checked by hand). The accelerometer, gyro, light and proximity sensors are iOS sensor devices; iOS's own orientation code expects Apple's motion coprocessor, so a small backboardd add-on (`tools/sweetnet/sweetorient-shim.m`) computes orientation from the accelerometer (installed by hand on the phone; in the root image `ios26-root-chl.simg` since 2026-11-07 with `RENEGADE_ORIENT=1`, not flashed yet). **Screen rotation works with backboardd on Apple's renderer** (checked by hand). **With our GPU renderer (Chlorophyll) it works too** (checked by hand in Photos, landscape and back; fix in gpu/metal: Chlorophyll did not support the rotated framebuffers iOS 26 draws landscape screens into; in the root image since 2026-11-07, not flashed yet). Proximity switches on by itself during use; not tried in a call. Compass and barometer not yet given to iOS. Chips: ICM20690 accel/gyro, AK0991x compass, TMD2725 light/proximity, BMP285 pressure |
 | Kernel | Heartwood on **xnu-12377.121.6**, Mi 8 patches 3001–3074, all in the default boot (image 120, since 2026-11-07). 3057 and later: modem QMI, codec, microphone, earpiece. 3068–3072d: sensor DSP, sensors for iOS. 3073–3073d: the IPA, mobile data (3073d polls it less often when quiet). 3074: power off |
 | Next candidates | Deeper sleep (the whole CPU cluster and its cache off); mobile data in the root image (rebuilt, not flashed; the default image has the kernel side); calls; sensors (proximity at the ear, compass, barometer) |
-| Not working | camera (started: on a test kernel, xnu 3075d, image 121d, the rear main camera's Sony IMX363 is powered up and answers with its chip ID, 2026-11-08; no picture yet), sensors (compass and barometer not given to iOS yet; proximity at the ear not tried in a call), fingerprint, SEP / Face ID. App Store and Weather stop at FairPlay. The Files app shows no locations: iOS 26's file provider only runs on APFS and our root is HFS+ |
+| Not working | camera (started, test kernels only: the rear main camera's Sony IMX363 is powered up and answers with its chip ID (xnu 3075d); the camera block's own test pattern goes through the image front end into memory and comes out right (xnu 3076b, image 122b), 2026-11-08; no picture from a sensor yet), sensors (compass and barometer not given to iOS yet; proximity at the ear not tried in a call), fingerprint, SEP / Face ID. App Store and Weather stop at FairPlay. The Files app shows no locations: iOS 26's file provider only runs on APFS and our root is HFS+ |
 
 Every boot, crash and decision is in [`NOTES.md`](NOTES.md); the newest Mi 8 results are at the top of its Mi 8 section.
 
@@ -296,6 +296,7 @@ It does this for every Mach-O in the root and for all of the dyld shared cache. 
 | `tools/sweetnet/` | Small on-device tools (`sweetps`, `sweetprefs`, `sweetuicache`, …) |
 | `tools/dipper-mkboot.sh` | The Mi 8 boot image with its current boot-args and ADT |
 | `tools/adt-wlan.py`, `adt-haptics.py` | Wi-Fi node; `/product/haptics` and `/product/camera` "flash" (iOS's vibration route and flashlight button) into an ADT |
+| `tools/camera/` | Camera bring-up helpers: `camframe.c` (the kernel's test frame to stdout, on the phone) and `frame2png.py` (RAW8 Bayer to PNG on the Mac) |
 | `tools/audio/` | `SweetSpeaker.driver` (the speaker and vibration motor as Core Audio devices, with the speaker guard), TAS2557 amp scripts from TI's firmware |
 | `gpu/metal/` | Chlorophyll, Metal on the Adreno 630 (submodule) |
 | `tools/identity/` | The Bergamota identity (Newton halftone, lime ground, Archivo + JetBrains Mono): `mkidentity.py` generates Enxerto's `art.h` and the kernel console's portrait, `mkicon.sh` the app icon |
