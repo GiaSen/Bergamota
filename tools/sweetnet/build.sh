@@ -95,6 +95,12 @@ if [ "${IOS18:-1}" = 1 ]; then
 		-o "$out18/sweettorch.dylib"
 	codesign -s - -f "$out18/sweettorch.dylib"
 	python3 -I "$pacstrip" --sign "$out18/sweettorch.dylib"
+	# iOS 26: the rear main camera in cameracaptured (loaded by sweettorch.dylib; frames from the kernel's kern.sweet_cam_live)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -Wno-objc-designated-initializers -Wno-four-char-constants -Wno-arc-performSelector-leaks -fno-objc-arc \
+		-dynamiclib -install_name /usr/local/lib/sweetcam.dylib -framework Foundation -framework CoreMedia -framework CoreVideo \
+		"$here/sweetcam.m" -o "$out18/sweetcam.dylib"
+	codesign -s - -f "$out18/sweetcam.dylib"
+	python3 -I "$pacstrip" --sign "$out18/sweetcam.dylib"
 	b18 sweeticonstyle sweeticonstyle.m iconstyle.entitlements -framework UIKit
 	b18 sweetopen sweetopen.m uicache.entitlements
 	# remote testing over SSH: screenshot of the panel (PNG) and synthetic touch/buttons
