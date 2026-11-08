@@ -28,6 +28,7 @@
 #include <objc/runtime.h>
 #include <os/log.h>
 #include <string.h>
+#include <unistd.h>
 #include <sys/sysctl.h>
 
 static os_log_t gLog;
@@ -286,5 +287,9 @@ sweettorch_init(void)
 	gLog = os_log_create("com.sweet.torch", "torch");
 	if (!hook()) {
 		_dyld_register_func_for_add_image(image_added);
+	}
+	/* the camera (sweetcam.dylib, when installed): loaded from here so cameracaptured needs no second load command */
+	if (access("/usr/local/lib/sweetcam.dylib", R_OK) == 0 && !dlopen("/usr/local/lib/sweetcam.dylib", RTLD_NOW)) {
+		os_log(gLog, "sweettorch: sweetcam.dylib not loaded: %{public}s", dlerror());
 	}
 }

@@ -1,0 +1,41 @@
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+index 8fd05da..52973ee 100644
+--- a/bsd/dev/dipper_camera.c
++++ b/bsd/dev/dipper_camera.c
+@@ -1302,11 +1302,16 @@ s0_up(struct s0_state *st)
+ 	pin_out(P_VANA, false);
+ 	pin_out(P_CUSTOM1, false);
+ 	st->powered = true;
+-	int vrc = sweet_rpmh_vreg_set("ldoa22", 2864, true);
+-	delay(500);
+-	if (vrc) {
+-		cam_say("L22 vote failed (%d)", vrc);
+-		return false;
++	/* 3081: L22 is voted once a boot (never voted off: the display node names it too), so a later run does not depend on RPMh */
++	static bool l22_voted;
++	if (!l22_voted) {
++		int vrc = sweet_rpmh_vreg_set("ldoa22", 2864, true);
++		delay(500);
++		if (vrc) {
++			cam_say("L22 vote failed (%d)", vrc);
++			return false;
++		}
++		l22_voted = true;
+ 	}
+ 	pin_out(P_VANA, true);
+ 	delay(1000);
+@@ -1736,7 +1741,13 @@ c4_up(struct c4_run *r, unsigned min_fll)
+ 	}
+ 	cam_say("frame buffers: %u x (frame %u + guard %u) at PA %#llx %#llx %#llx; sequence %u records", C4_NBUF, C4_FRAME, C4_GUARD,
+ 	    c4_pa[0], c4_pa[1], c4_pa[2], cam_seq_n);
+-	cam_say("CX vote max: %d", sweet_rpmh_arc_vote("cx.lvl", true));       /* kept, as audio and Wi-Fi keep it */
++	/* 3081: once a boot (kept, as audio and Wi-Fi keep it): a later run does not touch RPMh */
++	static bool cx_voted;
++	if (!cx_voted) {
++		int cx = sweet_rpmh_arc_vote("cx.lvl", true);
++		cam_say("CX vote max: %d", cx);
++		cx_voted = cx == 0;
++	}
+ 
+ 	/* GCC's camera XO and AXI, titan_top and ife_0 (as C3) */
+ 	v = cam_rd(gcc, CAM_GCC_XO);
