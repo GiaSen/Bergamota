@@ -1,0 +1,791 @@
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+index 43c135b..67c112a 100644
+--- a/bsd/dev/dipper_camera.c
++++ b/bsd/dev/dipper_camera.c
+@@ -714,6 +714,7 @@ static vm_offset_t cam_buf;             /* contiguous, inside one DRAM GiB (3076
+ static uint64_t cam_buf_pa;
+ static uint32_t cam_buf_iova;
+ static size_t cam_frame_len;            /* what kern.sweet_cam_frame hands out */
++static const uint8_t *cam_frame_ptr;    /* 3077: from C3's or C4's buffer */
+ 
+ /* the non-zero words of base+[from, to), as few lines as needed */
+ static void
+@@ -1055,6 +1056,7 @@ stop:
+ 			c3_row(b, C3_H / 2);
+ 			c3_row(b, C3_H - 1);
+ 		}
++		cam_frame_ptr = (const uint8_t *)cam_buf;
+ 		cam_frame_len = C3_BUF;
+ 	}
+ 
+@@ -1093,6 +1095,723 @@ down:
+ 	    cam_rd(camcc, CC_IFE0_GDSCR), cam_rd(camcc, CC_TITAN_GDSCR), cam_rd(gcc, CAM_GCC_AXI), cam_rd(gcc, CAM_GCC_XO));
+ }
+ 
++/* ---- 3077, step C4: the IMX363's own frames through CSIPHY 0, CSID 0, RDI 0 and IFE 0 into memory ----------------- */
++
++extern int sweet_rpmh_arc_vote(const char *res, bool max);                     /* sweet_rpmh.c */
++
++#define CAM_CSIPHY0_PA  0x0ac65000u
++#define CAM_REFGEN_PA   0x00ff1000u     /* qcom,refgen-regulator: the CSIPHYs' reference (only they name it in the live DT) */
++#define CC_PLL2         0x2000u
++#define CC_PLL3         0x3000u
++#define CC_CSIPHY0_CBCR 0x5020u
++#define CC_PHYTIMER0_CMD 0x5004u
++#define CC_PHYTIMER0_CBCR 0x501cu
++#define CC_MCLK0_M      0x400cu
++#define CC_MCLK0_N      0x4010u
++#define CC_MCLK0_D      0x4014u
++#define C4_W            1920u
++#define C4_H            1080u
++#define C4_STRIDE       (C4_W * 10u / 8u)       /* MIPI RAW10: 2400 bytes a line */
++#define C4_FRAME        (C4_STRIDE * C4_H)
++#define C4_GUARD        0x100000u               /* after the frame: must stay 0xa5 */
++#define C4_BUF          (C4_FRAME + C4_GUARD)
++#define C4_FRAMES       4u                      /* frames written before stopping (the last one is kept) */
++#define C4_SEQ_MAX      2048u
++#define C4_SETTLE       17u     /* Linux's csiphy_settle_cnt_calc: 534 Mb/s a lane (DDR 267 MHz), PHY timer 240 MHz */
++
++/* Fabia PLL registers (Linux clk-alpha-pll.c, msm-4.9 and mainline) */
++#define PLL_MODE        0x00u
++#define PLL_L           0x04u
++#define PLL_USER        0x0cu
++#define PLL_OPMODE      0x2cu
++#define PLL_FRAC        0x38u
++#define PLL_OUTCTRL     0x1u
++#define PLL_RESET_N     0x4u
++#define PLL_BYPASS_UPD  (1u << 23)
++#define PLL_LOCK_DET    (1u << 31)
++
++/* the sensor's register sequence (init + one mode) from tools/camera/camx_v1.py --seq, written by kern.sweet_cam_seq */
++struct cam_seq_rec { uint16_t reg; uint8_t op; uint8_t pad; uint32_t val; };
++static struct cam_seq_rec *cam_seq;
++static unsigned cam_seq_n;
++
++static vm_offset_t csiphy0, refgen;
++static vm_offset_t c4_buf;
++static uint64_t c4_buf_pa;
++static uint32_t c4_buf_iova;
++
++/* Linux camss-csiphy-3ph-1-0.c lane_regs_sdm845 ("GEN2 1.0 2PH"), the do-not-program entries left out; s = settle count */
++static const struct { uint16_t off; uint8_t val; uint8_t s; } csiphy_lane_regs[] = {
++	{ 0x0004, 0x0c, 0 }, { 0x002c, 0x01, 0 }, { 0x0034, 0x0f, 0 }, { 0x001c, 0x0a, 0 }, { 0x0014, 0x60, 0 },
++	{ 0x003c, 0xb8, 0 }, { 0x0000, 0x91, 0 }, { 0x0008, 0x00, 1 }, { 0x0010, 0x52, 0 }, { 0x0038, 0xfe, 0 },
++	{ 0x0060, 0x00, 0 }, { 0x0064, 0x7f, 0 },
++	{ 0x0704, 0x0c, 0 }, { 0x072c, 0x01, 0 }, { 0x0734, 0x0f, 0 }, { 0x071c, 0x0a, 0 }, { 0x0714, 0x60, 0 },
++	{ 0x0728, 0x04, 0 }, { 0x073c, 0xb8, 0 }, { 0x0700, 0x80, 0 }, { 0x0708, 0x14, 1 }, { 0x070c, 0xa5, 0 },
++	{ 0x0710, 0x52, 0 }, { 0x0738, 0x1f, 0 }, { 0x0760, 0x00, 0 }, { 0x0764, 0x7f, 0 },
++	{ 0x0204, 0x0c, 0 }, { 0x022c, 0x01, 0 }, { 0x0234, 0x0f, 0 }, { 0x021c, 0x0a, 0 }, { 0x0214, 0x60, 0 },
++	{ 0x023c, 0xb8, 0 }, { 0x0200, 0x91, 0 }, { 0x0208, 0x00, 1 }, { 0x0210, 0x52, 0 }, { 0x0238, 0xfe, 0 },
++	{ 0x0260, 0x00, 0 }, { 0x0264, 0x7f, 0 },
++	{ 0x0404, 0x0c, 0 }, { 0x042c, 0x01, 0 }, { 0x0434, 0x0f, 0 }, { 0x041c, 0x0a, 0 }, { 0x0414, 0x60, 0 },
++	{ 0x043c, 0xb8, 0 }, { 0x0400, 0x91, 0 }, { 0x0408, 0x00, 1 }, { 0x0410, 0x52, 0 }, { 0x0438, 0xfe, 0 },
++	{ 0x0460, 0x00, 0 }, { 0x0464, 0x7f, 0 },
++	{ 0x0604, 0x0c, 0 }, { 0x062c, 0x01, 0 }, { 0x0634, 0x0f, 0 }, { 0x061c, 0x0a, 0 }, { 0x0614, 0x60, 0 },
++	{ 0x063c, 0xb8, 0 }, { 0x0600, 0x91, 0 }, { 0x0608, 0x00, 1 }, { 0x0610, 0x52, 0 }, { 0x0638, 0xfe, 0 },
++	{ 0x0660, 0x00, 0 }, { 0x0664, 0x7f, 0 },
++};
++
++/* a camcc Fabia PLL brought up as Linux does (configure: L, FRAC, even post-divider, update bypass, out of reset; enable:
++ * outputs off, STANDBY, RUN, lock, outputs on). *was = its MODE before. true when locked. */
++static bool
++cc_pll_on(uint32_t base, uint32_t l, uint32_t frac, uint32_t even, uint32_t *was)
++{
++	*was = cam_rd(camcc, base + PLL_MODE);
++	if ((*was & PLL_OUTCTRL) && (cam_rd(camcc, base + PLL_OPMODE) & 1)) {
++		cam_say("pll %#x already running (mode %#x, L %#x): left as is", base, *was, cam_rd(camcc, base + PLL_L));
++		return (*was & PLL_LOCK_DET) != 0;
++	}
++	cam_wr(camcc, base + PLL_L, l);
++	cam_wr(camcc, base + PLL_FRAC, frac);
++	cam_wr(camcc, base + PLL_USER, (cam_rd(camcc, base + PLL_USER) & ~0xf07u) | even << 8);
++	cam_wr(camcc, base + PLL_MODE, cam_rd(camcc, base + PLL_MODE) | PLL_BYPASS_UPD);
++	cam_wr(camcc, base + PLL_MODE, cam_rd(camcc, base + PLL_MODE) | PLL_RESET_N);
++	cam_wr(camcc, base + PLL_MODE, cam_rd(camcc, base + PLL_MODE) & ~PLL_OUTCTRL);
++	cam_wr(camcc, base + PLL_OPMODE, 0);            /* STANDBY */
++	cam_wr(camcc, base + PLL_MODE, cam_rd(camcc, base + PLL_MODE) | PLL_RESET_N);
++	cam_wr(camcc, base + PLL_OPMODE, 1);            /* RUN */
++	bool locked = wait_set(camcc, base + PLL_MODE, PLL_LOCK_DET, 2000);
++	if (locked) {
++		cam_wr(camcc, base + PLL_USER, cam_rd(camcc, base + PLL_USER) | 0x7u);  /* main, even, odd outputs */
++		cam_wr(camcc, base + PLL_MODE, cam_rd(camcc, base + PLL_MODE) | PLL_OUTCTRL);
++	}
++	cam_say("pll %#x: L %#x frac %#x even div %u: %s (mode %#x, user %#x, opmode %#x)", base, l, frac, even ? 2u : 1u,
++	    locked ? "LOCKED" : "NOT LOCKED", cam_rd(camcc, base + PLL_MODE), cam_rd(camcc, base + PLL_USER),
++	    cam_rd(camcc, base + PLL_OPMODE));
++	return locked;
++}
++
++static void
++cc_pll_off(uint32_t base, uint32_t was)
++{
++	if ((was & PLL_OUTCTRL) && (was & PLL_RESET_N)) {
++		return;                                 /* it was running before: left */
++	}
++	cam_wr(camcc, base + PLL_MODE, cam_rd(camcc, base + PLL_MODE) & ~PLL_OUTCTRL);
++	cam_wr(camcc, base + PLL_USER, cam_rd(camcc, base + PLL_USER) & ~0x7u);
++	cam_wr(camcc, base + PLL_OPMODE, 0);
++	cam_wr(camcc, base + PLL_MODE, was);            /* back to the mode found (in reset) */
++}
++
++/* a clock generator to CFG (and M/N/D) while its root is off, then held on; false if it did not update or start */
++static bool
++cc_rcg_set(const char *name, uint32_t cmd, uint32_t cfg, bool mnd, uint32_t m, uint32_t n, uint32_t d, uint32_t *was_cmd)
++{
++	*was_cmd = cam_rd(camcc, cmd);
++	if (mnd) {
++		cam_wr(camcc, cmd + 0x8, m);
++		cam_wr(camcc, cmd + 0xc, n);
++		cam_wr(camcc, cmd + 0x10, d);
++	}
++	cam_wr(camcc, cmd + 4, cfg);
++	cam_wr(camcc, cmd, cam_rd(camcc, cmd) | RCG_UPDATE);
++	bool upd = wait_clear(camcc, cmd, RCG_UPDATE, 1000);
++	cam_wr(camcc, cmd, cam_rd(camcc, cmd) | RCG_ROOT_EN);
++	bool on = wait_clear(camcc, cmd, RCG_ROOT_OFF, 1000);
++	cam_say("rcg %-11s cmd %#x cfg %#x%s%s", name, cam_rd(camcc, cmd), cam_rd(camcc, cmd + 4), upd ? "" : " UPDATE STUCK",
++	    on ? "" : " ROOT OFF");
++	return upd && on;
++}
++
++static void
++cc_rcg_park(uint32_t cmd, uint32_t was_cmd)
++{
++	if (!(was_cmd & RCG_ROOT_EN)) {
++		cam_wr(camcc, cmd, cam_rd(camcc, cmd) & ~RCG_ROOT_EN);
++	}
++	cam_wr(camcc, cmd + 4, 0);                      /* back to XO (the PLLs go off) */
++	cam_wr(camcc, cmd, cam_rd(camcc, cmd) | RCG_UPDATE);
++	(void)wait_clear(camcc, cmd, RCG_UPDATE, 1000);
++}
++
++static bool
++i2c_write(uint8_t addr8, uint16_t reg, const uint8_t *v, int n)
++{
++	i2c_start();
++	bool ok = i2c_tx(addr8) && i2c_tx((uint8_t)(reg >> 8)) && i2c_tx((uint8_t)reg);
++	for (int i = 0; ok && i < n; i++) {
++		ok = i2c_tx(v[i]);
++	}
++	i2c_stop();
++	return ok;
++}
++
++static unsigned
++s0_read8(uint16_t reg)
++{
++	uint8_t v = 0;
++	return i2c_read16(0x34, reg, &v, 1) == 1 ? v : 0x1000u;
++}
++
++/* the sensor's power-up, as C2 (its module file's order), MCLK0 at 24 MHz from camcc PLL2 */
++struct s0_state { bool powered, g11_set, mclk_on; uint8_t g11[7]; };
++
++static bool
++s0_up(struct s0_state *st)
++{
++	static const uint16_t gpio_offs[] = { 0x05, 0x40, 0x41, 0x42, 0x44, 0x45, 0x46 };
++
++	pm_regs("PM8998 GPIO11 (subtype, mode, vin, pull, out src, out ctl, en)", 0xca00, gpio_offs, 7, st->g11);
++	if (!pins_save()) {
++		cam_say("TLMM not mapped");
++		return false;
++	}
++	pin_out(P_RESET, false);
++	pin_out(P_VANA, false);
++	pin_out(P_CUSTOM1, false);
++	st->powered = true;
++	int vrc = sweet_rpmh_vreg_set("ldoa22", 2864, true);
++	delay(500);
++	if (vrc) {
++		cam_say("L22 vote failed (%d)", vrc);
++		return false;
++	}
++	pin_out(P_VANA, true);
++	delay(1000);
++	pin_out(P_CUSTOM1, true);
++	delay(1000);
++	pin_out(P_VIO, true);
++	delay(1000);
++	pin_out(P_VDIG, true);
++	if (st->g11[0] == 0x10 || st->g11[0] == 0x11) {
++		uint8_t m = 0x01, o = 0x80;
++		(void)sweet_spmi_write(0, 0xca44, &o, 1);
++		(void)sweet_spmi_write(0, 0xca40, &m, 1);
++		st->g11_set = true;
++	}
++	delay(1000);
++	pin_out(P_RESET, true);
++	delay(12000);
++	/* MCLK0 24 MHz: PLL2 even (480 MHz) / 10, M/N 1/2 (Linux ftbl_cam_cc_mclk0_clk_src); D = ~2N for 50 % duty */
++	cam_wr(camcc, CC_MCLK0_M, 1);
++	cam_wr(camcc, CC_MCLK0_N, ~(2u - 1u) & 0xffu);
++	cam_wr(camcc, CC_MCLK0_D, ~2u & 0xffu);
++	cam_wr(camcc, CC_MCLK0_CFG, 19u | 1u << 8 | 2u << 12);    /* divide 10, PLL2 even, dual edge (M/N) */
++	cam_wr(camcc, CC_MCLK0_CMD, cam_rd(camcc, CC_MCLK0_CMD) | RCG_UPDATE);
++	if (!wait_clear(camcc, CC_MCLK0_CMD, RCG_UPDATE, 1000)) {
++		cam_say("MCLK0 generator did not update (CMD %#x)", cam_rd(camcc, CC_MCLK0_CMD));
++		return false;
++	}
++	cam_wr(camcc, CC_MCLK0_CBCR, cam_rd(camcc, CC_MCLK0_CBCR) | CBCR_ENABLE);
++	st->mclk_on = true;
++	if (!wait_clear(camcc, CC_MCLK0_CBCR, CBCR_OFF, 1000)) {
++		cam_say("MCLK0 branch did not start (CBCR %#x CMD %#x)", cam_rd(camcc, CC_MCLK0_CBCR), cam_rd(camcc, CC_MCLK0_CMD));
++		return false;
++	}
++	cam_wr(pin_base(c2_pins[P_MCLK].tile, c2_pins[P_MCLK].gpio), 0, PIN_CFG(1, PULL_NONE, 4, 0));
++	cam_say("sensor powered; MCLK0 CMD %#x CFG %#x M %#x N %#x D %#x (24 MHz)", cam_rd(camcc, CC_MCLK0_CMD),
++	    cam_rd(camcc, CC_MCLK0_CFG), cam_rd(camcc, CC_MCLK0_M), cam_rd(camcc, CC_MCLK0_N), cam_rd(camcc, CC_MCLK0_D));
++	delay(10000);
++	i2c_line(P_SCL, true);
++	i2c_line(P_SDA, true);
++	delay(100);
++	return true;
++}
++
++static void
++s0_down(struct s0_state *st)
++{
++	if (st->powered) {
++		pin_out(P_RESET, false);
++		delay(1000);
++		pin_out(P_VDIG, false);
++		if (st->g11_set) {
++			(void)sweet_spmi_write(0, 0xca40, &st->g11[1], 1);
++			(void)sweet_spmi_write(0, 0xca44, &st->g11[4], 1);
++		}
++		delay(1000);
++		pin_out(P_VIO, false);
++		delay(1000);
++		pin_out(P_CUSTOM1, false);
++		delay(1000);
++		pin_out(P_VANA, false);
++		delay(1000);
++	}
++	if (st->mclk_on) {
++		cam_wr(camcc, CC_MCLK0_CBCR, cam_rd(camcc, CC_MCLK0_CBCR) & ~CBCR_ENABLE);
++		(void)wait_set(camcc, CC_MCLK0_CBCR, CBCR_OFF, 500);
++		cam_wr(camcc, CC_MCLK0_CFG, 0);
++		cam_wr(camcc, CC_MCLK0_CMD, cam_rd(camcc, CC_MCLK0_CMD) | RCG_UPDATE);
++		(void)wait_clear(camcc, CC_MCLK0_CMD, RCG_UPDATE, 1000);
++	}
++	pins_restore();
++}
++
++static bool
++c4_buffer(void)
++{
++	if (c4_buf) {
++		return true;
++	}
++	vm_offset_t v = 0;
++	if (kmem_alloc_contig(kernel_map, &v, round_page(C4_BUF), PAGE_MASK, 0, 0, KMA_DATA | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		cam_say("no contiguous memory for %u bytes", C4_BUF);
++		return false;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)v);
++	uint64_t pa = pn ? ptoa_64(pn) : 0;
++	if (!pa || pa < 0x80000000ull || pa + round_page(C4_BUF) > 0x280000000ull ||
++	    (pa >> 30) != ((pa + round_page(C4_BUF) - 1) >> 30)) {
++		cam_say("C4 buffer at %#llx: outside the identity map or across a GiB boundary, not used", pa);
++		return false;
++	}
++	c4_buf = v;
++	c4_buf_pa = pa;
++	return true;
++}
++
++/* mean of the 8 high bits of a RAW10 line's pixels (the first 4 bytes of each 5) */
++static unsigned
++c4_row_mean(const uint8_t *f, unsigned y)
++{
++	const uint8_t *r = f + (size_t)y * C4_STRIDE;
++	unsigned sum = 0;
++	for (unsigned g = 0; g < C4_W / 4; g++) {
++		sum += (unsigned)r[5 * g] + r[5 * g + 1] + r[5 * g + 2] + r[5 * g + 3];
++	}
++	return sum / C4_W;
++}
++
++static void
++cam_c4(void)
++{
++	bool xo_was_off = false, axi_was_off = false, top_was_off = false, ife_was_off = false, refgen_set = false;
++	bool streamed = false, phy_on = false;
++	uint32_t pll2_was = 0, pll3_was = 0, rg_bias = 0, rg_bg = 0, v, fsr = 0;
++	uint64_t far = 0;
++	unsigned frames = 0, waited = 0, nrcg = 0, nbr = 0;
++	struct s0_state s0 = { 0 };
++	static const struct { const char *name; uint32_t cmd, cfg; } rcgs[] = {
++		{ "slow_ahb", 0x6054, 0x000 },          /* XO 19.2 MHz */
++		{ "cphy_rx", 0x9060, 0x501 },           /* PLL3 even 384 MHz */
++		{ "ife_0", 0x900c, 0x102 },             /* PLL2 even / 1.5 = 320 MHz */
++		{ "ife_0_csid", 0x9038, 0x501 },        /* PLL3 even 384 MHz */
++		{ "csi0phytimer", CC_PHYTIMER0_CMD, 0x103 },    /* PLL2 even / 2 = 240 MHz */
++	};
++	uint32_t rcg_was[sizeof(rcgs) / sizeof(rcgs[0])];
++	static const struct { const char *name; uint32_t cbcr; } brs[] = {
++		{ "cpas_ahb", 0xb11c }, { "soc_ahb", 0xb13c }, { "camnoc_axi", 0xb124 }, { "ife_0_axi", 0x907c },
++		{ "ife_0", 0x9024 }, { "ife_0_csid", 0x9050 }, { "ife_0_cphy_rx", 0x9078 }, { "csiphy0", CC_CSIPHY0_CBCR },
++		{ "csi0phytimer", CC_PHYTIMER0_CBCR },
++	};
++	uint32_t br_was[sizeof(brs) / sizeof(brs[0])];
++
++	cam_len = 0;
++	cam_frame_len = 0;
++	if (!cam_seq || cam_seq_n == 0) {
++		cam_say("no sensor sequence loaded (write kern.sweet_cam_seq first)");
++		return;
++	}
++	if ((!gcc && !(gcc = ml_io_map(CAM_GCC_CAM_PA, 0x1000))) || (!camcc && !(camcc = ml_io_map(CAM_CC_PA, CAM_CC_SIZE))) ||
++	    (!vfe0 && !(vfe0 = ml_io_map(CAM_VFE0_PA, CAM_VFE0_SIZE))) ||
++	    (!csid0 && !(csid0 = ml_io_map(CAM_CSID0_PA, CAM_CSID0_SIZE))) ||
++	    (!csiphy0 && !(csiphy0 = ml_io_map(CAM_CSIPHY0_PA, 0x1000))) ||
++	    (!refgen && !(refgen = ml_io_map(CAM_REFGEN_PA, 0x1000)))) {
++		cam_say("registers not mapped");
++		return;
++	}
++	if (cam_rd(gcc, CAM_GCC_AHB) & CBCR_OFF) {
++		cam_say("GCC's camera AHB clock is off: nothing done");
++		return;
++	}
++	if (!c4_buffer()) {
++		return;
++	}
++	memset((void *)c4_buf, C3_FILL, C4_BUF);
++	sweet_dma_sync_va((const void *)c4_buf, C4_BUF);
++	cam_say("frame buffer %u bytes (frame %u + guard %u) at PA %#llx; sequence %u records", C4_BUF, C4_FRAME, C4_GUARD,
++	    c4_buf_pa, cam_seq_n);
++	cam_say("CX vote max: %d", sweet_rpmh_arc_vote("cx.lvl", true));       /* kept, as audio and Wi-Fi keep it */
++
++	/* GCC's camera XO and AXI, titan_top and ife_0 (as C3) */
++	v = cam_rd(gcc, CAM_GCC_XO);
++	if (v & CBCR_OFF) {
++		xo_was_off = true;
++		cam_wr(gcc, CAM_GCC_XO, v | CBCR_ENABLE);
++		if (!wait_clear(gcc, CAM_GCC_XO, CBCR_OFF, 500)) {
++			cam_say("GCC CAMERA_XO did not start");
++			goto down;
++		}
++	}
++	v = cam_rd(gcc, CAM_GCC_AXI);
++	if (!(v & CBCR_ENABLE)) {
++		axi_was_off = true;
++		cam_wr(gcc, CAM_GCC_AXI, v | CBCR_ENABLE);
++		(void)wait_clear(gcc, CAM_GCC_AXI, CBCR_OFF, 500);
++	}
++	v = cam_rd(camcc, CC_TITAN_GDSCR);
++	if (!(v & GDSC_PWR_ON)) {
++		top_was_off = true;
++		cam_wr(camcc, CC_TITAN_GDSCR, v & ~GDSC_SW_COLLAPSE);
++		if (!wait_set(camcc, CC_TITAN_GDSCR, GDSC_PWR_ON, 10000)) {
++			cam_say("titan_top did not power on");
++			goto down;
++		}
++	}
++	v = cam_rd(camcc, CC_IFE0_GDSCR);
++	if (!(v & GDSC_PWR_ON)) {
++		ife_was_off = true;
++		cam_wr(camcc, CC_IFE0_GDSCR, v & ~GDSC_SW_COLLAPSE);
++		if (!wait_set(camcc, CC_IFE0_GDSCR, GDSC_PWR_ON, 10000)) {
++			cam_say("ife_0 did not power on");
++			goto down;
++		}
++	}
++
++	/* PLL2 960 MHz (even output / 2 = 480), PLL3 384 MHz (even / 1): the L values of the phone's own kernel (camcc-sdm845.c) */
++	if (!cc_pll_on(CC_PLL2, 0x32, 0, 1, &pll2_was) || !cc_pll_on(CC_PLL3, 0x14, 0, 0, &pll3_was)) {
++		goto down;
++	}
++	for (nrcg = 0; nrcg < sizeof(rcgs) / sizeof(rcgs[0]); nrcg++) {
++		if (!cc_rcg_set(rcgs[nrcg].name, rcgs[nrcg].cmd, rcgs[nrcg].cfg, false, 0, 0, 0, &rcg_was[nrcg])) {
++			nrcg++;
++			goto down;
++		}
++	}
++	for (nbr = 0; nbr < sizeof(brs) / sizeof(brs[0]); nbr++) {
++		br_was[nbr] = cam_rd(camcc, brs[nbr].cbcr);
++		cam_wr(camcc, brs[nbr].cbcr, br_was[nbr] | CBCR_ENABLE);
++		if (!wait_clear(camcc, brs[nbr].cbcr, CBCR_OFF, 1000)) {
++			cam_say("branch %s did not start (%#x): nothing of the camera blocks touched", brs[nbr].name,
++			    cam_rd(camcc, brs[nbr].cbcr));
++			nbr++;
++			goto down;
++		}
++	}
++	cam_say("all %u branches running", (unsigned)nbr);
++
++	/* the IFE's streams and the 32-bit window (as C3) */
++	{
++		bool ok = true;
++		for (unsigned i = 0; i < sizeof(c3_sids) / sizeof(c3_sids[0]); i++) {
++			if (sweet_smmu_map_sid(c3_sids[i]) != 0) {
++				ok = false;
++			}
++		}
++		if (!ok || sweet_smmu_window32(c4_buf_pa, &c4_buf_iova) != 0) {
++			cam_say("SMMU streams or window NOT set: no streaming");
++			goto down;
++		}
++		(void)sweet_smmu_bank_fault(&fsr, &far, true);
++		cam_say("SMMU: IFE streams mapped, buffer IOVA %#x", c4_buf_iova);
++	}
++
++	/* refgen (msm-4.9 refgen.c: BG_CTRL bits 2:1 on, BIAS_EN 7) */
++	rg_bias = cam_rd(refgen, 0x08);
++	rg_bg = cam_rd(refgen, 0x14);
++	if ((rg_bias & 7u) != 7u || (rg_bg & 6u) != 6u) {
++		refgen_set = true;
++		cam_wr(refgen, 0x14, (rg_bg & ~6u) | 6u);
++		cam_wr(refgen, 0x08, 7u);
++		delay(100);
++	}
++	cam_say("refgen bias %#x bg %#x (was %#x %#x)", cam_rd(refgen, 0x08), cam_rd(refgen, 0x14), rg_bias, rg_bg);
++
++	/* CSIPHY 0: version, reset, the common registers and lanes as Linux's csiphy_lanes_enable (4 data lanes + clock) */
++	cam_wr(csiphy0, 0x818, 2);                              /* SHOW_REV_ID */
++	cam_say("CSIPHY0 version %02x%02x%02x%02x", cam_rd(csiphy0, 0x8ec) & 0xff, cam_rd(csiphy0, 0x8e8) & 0xff,
++	    cam_rd(csiphy0, 0x8e4) & 0xff, cam_rd(csiphy0, 0x8e0) & 0xff);
++	cam_wr(csiphy0, 0x800, 1);
++	delay(5000);
++	cam_wr(csiphy0, 0x800, 0);
++	cam_wr(csiphy0, 0x814, 0x80u | 0x01u | 0x04u | 0x10u | 0x40u);  /* clock + data lanes 0-3 */
++	cam_wr(csiphy0, 0x818, 1);                              /* COMMON_PWRDN_B */
++	cam_wr(csiphy0, 0x81c, 2);
++	cam_wr(csiphy0, 0x800, 0);
++	for (unsigned i = 0; i < sizeof(csiphy_lane_regs) / sizeof(csiphy_lane_regs[0]); i++) {
++		cam_wr(csiphy0, csiphy_lane_regs[i].off, csiphy_lane_regs[i].s ? C4_SETTLE : csiphy_lane_regs[i].val);
++	}
++	for (unsigned i = 11; i < 22; i++) {
++		cam_wr(csiphy0, 0x800 + 4 * i, 0);              /* interrupt masks off */
++	}
++	phy_on = true;
++	cam_say("CSIPHY0 lanes on, settle count %u", C4_SETTLE);
++
++	/* VFE 0 and CSID 0 reset (as C3) */
++	cam_wr(vfe0, VFE_IRQ_MASK0, 1u << 31);
++	cam_wr(vfe0, VFE_RESET_CMD, 0x3f9fu);
++	bool vok = wait_set(vfe0, VFE_IRQ_STATUS0, 1u << 31, 100000);
++	cam_wr(vfe0, VFE_IRQ_CLEAR0, ~0u);
++	cam_wr(vfe0, VFE_IRQ_CLEAR1, ~0u);
++	cam_wr(vfe0, VFE_IRQ_CMD, 1);
++	cam_wr(csid0, CSID_TOP_CLEAR, 1);
++	cam_wr(csid0, CSID_IRQ_CMD, 1);
++	cam_wr(csid0, CSID_TOP_MASK, 1);
++	cam_wr(csid0, CSID_IRQ_CMD, 1);
++	cam_wr(csid0, CSID_RST_STROBES, 0x1e);
++	bool cok = wait_set(csid0, CSID_TOP_STATUS, 1u, 100000);
++	cam_wr(csid0, CSID_TOP_CLEAR, cam_rd(csid0, CSID_TOP_STATUS));
++	cam_wr(csid0, CSID_IRQ_CMD, 1);
++	cam_say("VFE0 reset %s, CSID0 reset %s", vok ? "acked" : "NOT acked", cok ? "done" : "NOT done");
++	if (!vok || !cok) {
++		goto stop;
++	}
++	cam_wr(vfe0, VFE_IRQ_MASK0, ~0u);
++	cam_wr(vfe0, VFE_IRQ_MASK1, ~0u);
++	for (unsigned n = 0; n < 3; n++) {
++		cam_wr(vfe0, VFE_BUS_MASK(n), ~0u);
++	}
++	cam_wr(csid0, CSID_RX_MASK, ~0u);
++	cam_wr(csid0, CSID_RDI0_MASK, ~0u);
++
++	/* write master 0 (as C3) */
++	cam_wr(vfe0, 0x226c, 1u << 1 | 1u << 7);
++	cam_wr(vfe0, 0x2080, 0);
++	cam_wr(vfe0, 0x200c, 0xfffff);
++	cam_wr(vfe0, 0x211c, 0);
++	cam_wr(vfe0, 0x2084, (1u << 24) - 1);
++	cam_wr(vfe0, VFE_WM(0, 0x5c), 0xf);
++	cam_wr(vfe0, VFE_WM(0, 0x1c), 0xff01);
++	cam_wr(vfe0, VFE_WM(0, 0x20), 0);
++	cam_wr(vfe0, VFE_WM(0, 0x24), 0);
++	cam_wr(vfe0, VFE_WM(0, 0x28), 0xff01);
++	cam_wr(vfe0, VFE_WM(0, 0x08), 1u | 1u << 1);
++	cam_wr(vfe0, VFE_WM(0, 0x14), c4_buf_iova);
++	cam_wr(vfe0, VFE_WM(0, 0x58), C4_FRAME);
++	cam_wr(vfe0, VFE_REG_UPDATE, 1u << 1);
++
++	/* CSID 0: RDI 0 = VC 0, RAW10 (0x2b), payload only; the receiver on PHY 0, 4 lanes in order (module laneAssign 0x3210) */
++	cam_wr(csid0, CSID_RDI0(0x00), 1u | 1u << 1 | 1u << 2 | 0xfu << 12 | 0x2bu << 16);
++	cam_wr(csid0, CSID_RDI0(0x04), 2);
++	cam_wr(csid0, CSID_RDI0(0x10), 1);
++	cam_wr(csid0, CSID_RDI0(0x0c), 0);
++	cam_wr(csid0, CSID_RDI0(0x18), 1);
++	cam_wr(csid0, CSID_RDI0(0x14), 0);
++	cam_wr(csid0, CSID_RDI0(0x28), 1);
++	cam_wr(csid0, CSID_RDI0(0x24), 0);
++	cam_wr(csid0, CSID_RDI0(0x30), 1);
++	cam_wr(csid0, CSID_RDI0(0x2c), 0);
++	cam_wr(csid0, CSID_RDI0(0x08), 0);
++	cam_wr(csid0, CSID_RDI0(0x00), cam_rd(csid0, CSID_RDI0(0x00)) | 1u << 31);
++	cam_wr(csid0, CSID_RX_CFG0, 3u | 0x3210u << 4 | 0u << 20);
++	cam_wr(csid0, CSID_RX_CFG1, 1u | 1u << 6);
++	cam_wr(csid0, 0x108, 1u | 1u << 1 | 0x2bu << 4);      /* capture the long packet header (DT 0x2b, VC 0) and short packets */
++	cam_wr(csid0, CSID_RDI0(0x08), 1);
++
++	/* the sensor: power, chip ID, its sequence, readback, stream on */
++	if (!s0_up(&s0)) {
++		goto stop;
++	}
++	{
++		uint8_t id[2] = { 0, 0 };
++		int got = i2c_read16(0x34, 0x0016, id, 2);
++		cam_say("chip ID %#06x (%d)", (unsigned)id[0] << 8 | id[1], got);
++		if (got != 2) {
++			goto stop;
++		}
++	}
++	{
++		unsigned bad = 0;
++		for (unsigned i = 0; i < cam_seq_n; i++) {
++			const struct cam_seq_rec *r = &cam_seq[i];
++			if (r->op == 2) {
++				delay((int)(r->val > 100000 ? 100000 : r->val));
++				continue;
++			}
++			uint8_t b[2] = { (uint8_t)(r->op == 1 ? r->val >> 8 : r->val), (uint8_t)r->val };
++			if (!i2c_write(0x34, r->reg, r->op == 1 ? b : &b[1], r->op == 1 ? 2 : 1)) {
++				bad++;
++			}
++		}
++		cam_say("sequence written: %u records, %u without ACK; readback 0x0112 %#x 0x0114 %#x frame length %#x%02x"
++		    " line length %#x%02x output %#x%02x x %#x%02x", cam_seq_n, bad, s0_read8(0x0112), s0_read8(0x0114),
++		    s0_read8(0x0340), s0_read8(0x0341), s0_read8(0x0342), s0_read8(0x0343), s0_read8(0x034c), s0_read8(0x034d),
++		    s0_read8(0x034e), s0_read8(0x034f));
++		if (bad) {
++			goto stop;
++		}
++	}
++	{
++		uint8_t one = 1;
++		streamed = i2c_write(0x34, 0x0100, &one, 1);
++		cam_say("stream on: %s", streamed ? "acked" : "NO ACK");
++	}
++	if (!streamed) {
++		goto stop;
++	}
++
++	/* frames: each write master 0 done is cleared and the same address written again (address registers unsynced) */
++	for (waited = 0; waited < 20000 && frames < C4_FRAMES; waited++) {
++		if (cam_rd(vfe0, VFE_BUS_STATUS(1)) & 1u) {
++			frames++;
++			cam_wr(vfe0, VFE_BUS_CLEAR(1), 1u);
++			cam_wr(vfe0, VFE_BUS_CLEAR_GLOBAL, 1);
++			if (frames < C4_FRAMES) {
++				cam_wr(vfe0, VFE_WM(0, 0x14), c4_buf_iova);
++			}
++			cam_say("frame %u done at %u.%u ms", frames, waited / 10, waited % 10);
++		}
++		if (waited == 1000 || waited == 5000) {
++			cam_say("at %u ms: CSID rx status %#x, packets %u, ECC %#x, CRC errors %u, long header %#x, CSIPHY status0 %#x",
++			    waited / 10, cam_rd(csid0, CSID_RX_STATUS), cam_rd(csid0, 0x160), cam_rd(csid0, 0x164),
++			    cam_rd(csid0, 0x168), cam_rd(csid0, 0x130), cam_rd(csiphy0, 0x8b0));
++		}
++		delay(100);
++	}
++
++stop:
++	/* the sensor stops at the end of its frame; then RDI 0 halted and the write master off */
++	if (streamed) {
++		uint8_t zero = 0;
++		(void)i2c_write(0x34, 0x0100, &zero, 1);
++		delay(30000);
++	}
++	cam_wr(csid0, CSID_RDI0(0x08), 0);
++	cam_wr(vfe0, VFE_WM(0, 0x08), 0);
++	cam_wr(vfe0, VFE_REG_UPDATE, 1u << 1);
++	delay(2000);
++	cam_say("%u frame(s) in %u.%u ms", frames, waited / 10, waited % 10);
++	cam_say("VFE0 irq status %#x %#x, violation %#x; bus status %#x %#x %#x", cam_rd(vfe0, VFE_IRQ_STATUS0),
++	    cam_rd(vfe0, VFE_IRQ_STATUS1), cam_rd(vfe0, VFE_VIOLATION), cam_rd(vfe0, VFE_BUS_STATUS(0)),
++	    cam_rd(vfe0, VFE_BUS_STATUS(1)), cam_rd(vfe0, VFE_BUS_STATUS(2)));
++	cam_say("CSID0 top %#x, rx %#x, rdi0 %#x", cam_rd(csid0, CSID_TOP_STATUS), cam_rd(csid0, CSID_RX_STATUS),
++	    cam_rd(csid0, CSID_RDI0_STATUS));
++	reg_dump("CSID0 rx block", csid0, 0x100, 0x170);
++	reg_dump("CSID0 rdi0 block", csid0, CSID_RDI0(0), CSID_RDI0(0x100));
++	reg_dump("CSIPHY0 status", csiphy0, 0x8b0, 0x8e0);
++	(void)sweet_smmu_bank_fault(&fsr, &far, true);
++	cam_say("SMMU identity bank FSR %#x FAR %#llx", fsr, far);
++
++	s0_down(&s0);
++	if (phy_on) {
++		cam_wr(csiphy0, 0x814, 0);
++		cam_wr(csiphy0, 0x818, 0);
++		cam_wr(csiphy0, 0x800, 1);
++		delay(1000);
++		cam_wr(csiphy0, 0x800, 0);
++	}
++	cam_wr(vfe0, VFE_IRQ_MASK0, 1u << 31);
++	cam_wr(vfe0, VFE_RESET_CMD, 0x3f9fu);
++	(void)wait_set(vfe0, VFE_IRQ_STATUS0, 1u << 31, 100000);
++	cam_wr(vfe0, VFE_IRQ_CLEAR0, ~0u);
++	cam_wr(vfe0, VFE_IRQ_CLEAR1, ~0u);
++	cam_wr(vfe0, VFE_IRQ_CMD, 1);
++	for (unsigned n = 0; n < 3; n++) {
++		cam_wr(vfe0, VFE_BUS_CLEAR(n), ~0u);
++	}
++	cam_wr(vfe0, VFE_BUS_CLEAR_GLOBAL, 1);
++	cam_wr(csid0, CSID_RST_STROBES, 0x1e);
++	(void)wait_set(csid0, CSID_TOP_STATUS, 1u, 100000);
++	cam_wr(csid0, CSID_RX_CLEAR, ~0u);
++	cam_wr(csid0, CSID_RDI0_CLEAR, ~0u);
++	cam_wr(csid0, CSID_TOP_CLEAR, ~0u);
++	cam_wr(csid0, CSID_IRQ_CMD, 1);
++
++	/* what reached memory */
++	sweet_dma_sync_va((const void *)c4_buf, C4_BUF);
++	{
++		const uint8_t *b = (const uint8_t *)c4_buf;
++		size_t n = 0, last = 0, guard = 0;
++		for (size_t i = 0; i < C4_FRAME; i++) {
++			if (b[i] != C3_FILL) {
++				n++;
++				last = i;
++			}
++		}
++		for (size_t i = C4_FRAME; i < C4_BUF; i++) {
++			guard += b[i] != C3_FILL;
++		}
++		cam_say("frame: %zu of %u bytes written (last at %zu); guard bytes changed: %zu", n, C4_FRAME, last, guard);
++		if (n) {
++			cam_say("row means (8 high bits): row 0 %u, 270 %u, 540 %u, 810 %u, 1079 %u; first bytes %02x %02x %02x %02x %02x",
++			    c4_row_mean(b, 0), c4_row_mean(b, 270), c4_row_mean(b, 540), c4_row_mean(b, 810), c4_row_mean(b, 1079),
++			    b[0], b[1], b[2], b[3], b[4]);
++		}
++		cam_frame_ptr = (const uint8_t *)c4_buf;
++		cam_frame_len = C4_FRAME;
++	}
++
++down:
++	while (nbr > 0) {
++		nbr--;
++		if (!(br_was[nbr] & CBCR_ENABLE)) {
++			cam_wr(camcc, brs[nbr].cbcr, cam_rd(camcc, brs[nbr].cbcr) & ~CBCR_ENABLE);
++			(void)wait_set(camcc, brs[nbr].cbcr, CBCR_OFF, 500);
++		}
++	}
++	while (nrcg > 0) {
++		nrcg--;
++		cc_rcg_park(rcgs[nrcg].cmd, rcg_was[nrcg]);
++	}
++	if (pll3_was != 0 || cam_rd(camcc, CC_PLL3 + PLL_MODE) != 0) {
++		cc_pll_off(CC_PLL3, pll3_was);
++	}
++	if (pll2_was != 0 || cam_rd(camcc, CC_PLL2 + PLL_MODE) != 0) {
++		cc_pll_off(CC_PLL2, pll2_was);
++	}
++	if (refgen_set) {
++		cam_wr(refgen, 0x08, rg_bias);
++		cam_wr(refgen, 0x14, rg_bg);
++	}
++	if (ife_was_off) {
++		cam_wr(camcc, CC_IFE0_GDSCR, cam_rd(camcc, CC_IFE0_GDSCR) | GDSC_SW_COLLAPSE);
++		(void)wait_clear(camcc, CC_IFE0_GDSCR, GDSC_PWR_ON, 10000);
++	}
++	if (top_was_off) {
++		cam_wr(camcc, CC_TITAN_GDSCR, cam_rd(camcc, CC_TITAN_GDSCR) | GDSC_SW_COLLAPSE);
++		(void)wait_clear(camcc, CC_TITAN_GDSCR, GDSC_PWR_ON, 10000);
++	}
++	if (axi_was_off) {
++		cam_wr(gcc, CAM_GCC_AXI, cam_rd(gcc, CAM_GCC_AXI) & ~CBCR_ENABLE);
++	}
++	if (xo_was_off) {
++		cam_wr(gcc, CAM_GCC_XO, cam_rd(gcc, CAM_GCC_XO) & ~CBCR_ENABLE);
++	}
++	cam_say("put back: PLL2 mode %#x, PLL3 mode %#x, refgen %#x/%#x, ife_0 %#x, titan_top %#x, GCC AXI %#x, XO %#x",
++	    cam_rd(camcc, CC_PLL2 + PLL_MODE), cam_rd(camcc, CC_PLL3 + PLL_MODE), cam_rd(refgen, 0x08), cam_rd(refgen, 0x14),
++	    cam_rd(camcc, CC_IFE0_GDSCR), cam_rd(camcc, CC_TITAN_GDSCR), cam_rd(gcc, CAM_GCC_AXI), cam_rd(gcc, CAM_GCC_XO));
++}
++
++/* 3077: the sensor's register sequence (8-byte records: u16 register, u8 op 0 write8 / 1 write16 / 2 wait us, u8 0, u32 value) */
++static int
++cam_seq_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int error = 0;
++
++	lck_mtx_lock(&cam_lock);
++	if (req->oldptr) {
++		error = cam_seq ? SYSCTL_OUT(req, cam_seq, cam_seq_n * sizeof(cam_seq[0])) : SYSCTL_OUT(req, "", 0);
++	} else if (!req->newptr) {
++		error = SYSCTL_OUT(req, NULL, cam_seq_n * sizeof(cam_seq[0]));
++	}
++	if (!error && req->newptr) {
++		size_t len = req->newlen;
++		if (len == 0 || len % sizeof(struct cam_seq_rec) || len > C4_SEQ_MAX * sizeof(struct cam_seq_rec)) {
++			error = EINVAL;
++		} else {
++			if (!cam_seq) {
++				cam_seq = kalloc_data(C4_SEQ_MAX * sizeof(struct cam_seq_rec), Z_WAITOK | Z_ZERO);
++			}
++			if (!cam_seq) {
++				error = ENOMEM;
++			} else {
++				error = SYSCTL_IN(req, cam_seq, len);
++				unsigned n = (unsigned)(len / sizeof(struct cam_seq_rec));
++				for (unsigned i = 0; !error && i < n; i++) {
++					if (cam_seq[i].op > 2 || (cam_seq[i].op != 2 && cam_seq[i].reg == 0x0100)) {
++						error = EINVAL;         /* unknown op, or the stream switch (this kernel's own) */
++					}
++				}
++				cam_seq_n = error ? 0 : n;
++			}
++		}
++	}
++	lck_mtx_unlock(&cam_lock);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_seq, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, cam_seq_sysctl, "S",
++    "3077: the rear main sensor's register sequence for kern.sweet_cam=4 (tools/camera/camx_v1.py --seq)");
++
+ static int
+ cam_sysctl SYSCTL_HANDLER_ARGS
+ {
+@@ -1102,7 +1821,7 @@ cam_sysctl SYSCTL_HANDLER_ARGS
+ 	if (error || !req->newptr) {
+ 		return error;
+ 	}
+-	if (v < 1 || v > 3) {
++	if (v < 1 || v > 4) {
+ 		return EINVAL;
+ 	}
+ 	if (!sweet_board_is("xiaomi,dipper")) {
+@@ -1117,15 +1836,17 @@ cam_sysctl SYSCTL_HANDLER_ARGS
+ 			cam_look();
+ 		} else if (v == 2) {
+ 			cam_c2();
+-		} else {
++		} else if (v == 3) {
+ 			cam_c3();
++		} else {
++			cam_c4();
+ 		}
+ 	}
+ 	lck_mtx_unlock(&cam_lock);
+ 	return cam_status ? 0 : ENOMEM;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_cam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, cam_sysctl, "I",
+-    "3075: 1 = a read-only look at the camera hardware, 2 (3075b) = the rear main sensor powered, its chip ID read, powered down, 3 (3076) = CSID 0's test pattern into memory (kern.sweet_cam_status, kern.sweet_cam_frame)");
++    "3075: 1 = a read-only look at the camera hardware, 2 (3075b) = the rear main sensor powered, its chip ID read, powered down, 3 (3076) = CSID 0's test pattern into memory, 4 (3077) = the rear main sensor's frames into memory (kern.sweet_cam_status, kern.sweet_cam_frame)");
+ 
+ static int
+ cam_status_sysctl SYSCTL_HANDLER_ARGS
+@@ -1153,14 +1874,14 @@ cam_frame_sysctl SYSCTL_HANDLER_ARGS
+ 	int error;
+ 
+ 	lck_mtx_lock(&cam_lock);
+-	if (!cam_buf || cam_frame_len == 0) {
++	if (!cam_frame_ptr || cam_frame_len == 0) {
+ 		error = ENOENT;
+ 	} else {
+-		error = SYSCTL_OUT(req, (const void *)cam_buf, cam_frame_len);
++		error = SYSCTL_OUT(req, (const void *)cam_frame_ptr, cam_frame_len);
+ 	}
+ 	lck_mtx_unlock(&cam_lock);
+ 	return error;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_cam_frame, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, cam_frame_sysctl, "S",
+-    "3076: the last kern.sweet_cam=3 buffer (4 x 640x480 RAW8)");
++    "3076: the last kern.sweet_cam=3 buffer (4 x 640x480 RAW8) or 3077: kern.sweet_cam=4 frame (1920x1080 MIPI RAW10)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
