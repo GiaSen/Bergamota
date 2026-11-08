@@ -2,11 +2,14 @@
  * Camera bring-up helper for the Mi 8 kernels (xnu 3076+).
  *   camframe              writes kern.sweet_cam_frame (the last kern.sweet_cam=3 / =4 buffer) to stdout;
  *                         tools/camera/frame2png.py makes a PNG of it
+ *   camframe -l N [OUT]   3080+: starts the stream (kern.sweet_cam_stream), reads N frames from kern.sweet_cam_live (each
+ *                         a newer one), says their timing, exposure and lens, writes the last frame's RAW10 to OUT, stops
  *   camframe -s FILE      loads FILE into kern.sweet_cam_seq (3077+: the rear main sensor's register sequence, made on
  *                         the Mac by tools/camera/camx_v1.py --seq from the phone's own module file; never in git)
  *   xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=18.0 camframe.c -o camframe && codesign -s - -f camframe
  *   cat camframe | ssh root@192.168.7.2 'cat > /var/root/camframe && chmod 755 /var/root/camframe'
  */
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,11 +39,94 @@ load_seq(const char *path)
 	return 0;
 }
 
+/* 3080: the kernel's stream header (kern.sweet_cam_live) */
+struct cam_live_hdr {
+	uint32_t magic;
+	uint16_t version, hdr_size;
+	uint32_t seq;
+	uint16_t width, height, stride, format;
+	uint16_t black, white;
+	uint32_t exposure_lines, line_ns, again_x256, dgain_x256, lens, af_state;
+	uint64_t timestamp_ns;
+	uint32_t frame_us, flags;
+};
+
+static int
+set_int(const char *name, int v)
+{
+	if (sysctlbyname(name, NULL, NULL, &v, sizeof(v)) != 0) {
+		perror(name);
+		return 1;
+	}
+	return 0;
+}
+
+/* camframe -l N OUT: stream, N frames through kern.sweet_cam_live (each waiting for a newer one), the last to OUT, stop */
+static int
+live(int n, const char *out)
+{
+	size_t cap = 0;
+	if (set_int("kern.sweet_cam_stream", 1)) {
+		return 1;
+	}
+	if (sysctlbyname("kern.sweet_cam_live", NULL, &cap, NULL, 0) != 0) {
+		perror("kern.sweet_cam_live size");
+		return 1;
+	}
+	char *buf = malloc(cap);
+	uint32_t last = 0;
+	uint64_t t0 = 0, tp = 0;
+	unsigned got = 0, dup = 0, skipped = 0;
+	for (int i = 0; buf && i < n; i++) {
+		size_t len = cap;
+		if (sysctlbyname("kern.sweet_cam_live", buf, &len, &last, sizeof(last)) != 0) {
+			perror("kern.sweet_cam_live");
+			break;
+		}
+		const struct cam_live_hdr *h = (const void *)buf;
+		if (h->seq == last) {
+			dup++;
+			continue;
+		}
+		if (got && h->seq != last + 1) {
+			skipped += h->seq - last - 1;
+		}
+		if (!t0) {
+			t0 = h->timestamp_ns;
+		}
+		if (i < 3 || i % 30 == 0 || i == n - 1) {
+			fprintf(stderr, "seq %u t %+.1f ms (%+.1f) frame %u us, exposure %u lines x %.2f x %.2f, lens %u af %u\n", h->seq,
+			    (h->timestamp_ns - t0) / 1e6, tp ? (h->timestamp_ns - tp) / 1e6 : 0.0, h->frame_us, h->exposure_lines,
+			    h->again_x256 / 256.0, h->dgain_x256 / 256.0, h->lens, h->af_state);
+		}
+		tp = h->timestamp_ns;
+		last = h->seq;
+		got++;
+	}
+	if (got > 1) {
+		fprintf(stderr, "%u frames read, %u skipped, %u repeated; %.2f frames/s read\n", got, skipped, dup,
+		    (got - 1) * 1e9 / (double)(tp - t0));
+	}
+	if (out && got) {
+		FILE *f = fopen(out, "wb");
+		const struct cam_live_hdr *h = (const void *)buf;
+		if (f) {
+			fwrite(buf + h->hdr_size, 1, (size_t)h->stride * h->height, f);
+			fclose(f);
+		}
+	}
+	set_int("kern.sweet_cam_stream", 0);
+	return got ? 0 : 1;
+}
+
 int
 main(int argc, char **argv)
 {
 	if (argc == 3 && strcmp(argv[1], "-s") == 0) {
 		return load_seq(argv[2]);
+	}
+	if (argc >= 3 && strcmp(argv[1], "-l") == 0) {
+		return live(atoi(argv[2]), argc > 3 ? argv[3] : NULL);
 	}
 	size_t len = 0;
 	if (sysctlbyname("kern.sweet_cam_frame", NULL, &len, NULL, 0) != 0 || len == 0) {
