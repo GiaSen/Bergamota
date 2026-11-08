@@ -1,0 +1,494 @@
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+index ad5630e..bdec6c1 100644
+--- a/bsd/dev/dipper_camera.c
++++ b/bsd/dev/dipper_camera.c
+@@ -18,6 +18,19 @@
+  *      CFG and IN_OUT of the sensors' MCLK, reset and supply-switch pins and the CCI's
+  *   4. only if titan_top is on and the CCI, CPAS AHB and SOC AHB clocks run: the CCI's version register
+  * The result: kern.sweet_cam_status (text) and the console ("SWEET CAM:").
++ *
++ * Patch 3075b, step C2: kern.sweet_cam=2 (root) powers the rear main sensor (cam-sensor@0, a Sony IMX363), reads its chip
++ * ID and powers it down again. The sequence is the sensor's own (its CamX module file com.qti.sensormodule.imx363.bin of
++ * the phone's vendor partition, read by hand; NOTES "CAMERA C2"): up VANA 1 ms, CUSTOM1 high 1 ms, VIO 1 ms, VDIG 1 ms,
++ * RESET high 12 ms, MCLK 10 ms; down RESET low, VDIG, VIO, CUSTOM1 low, VANA, MCLK, 1 ms each. The rails as the live DT
++ * gives them: VANA = PM8998 L22 (also the OLED panel's vdda: NEVER voted or changed here; C2 only reads it and goes on if
++ * it is already on at 2.8-3.0 V) plus the VANA switch GPIO 12; CUSTOM1 = GPIO 40; VIO = camera_viodd_ldo's enable GPIO 75;
++ * VDIG = camera_vdig_ldo's enable GPIO 99 (the DT also names PM8998 GPIO 11 for VDIG: only read here); RESET = GPIO 119;
++ * MCLK = camcc MCLK0 on GPIO 13 (function cam_mclk, 4 mA), from the crystal at 19.2 MHz (the module asks 24 MHz, which
++ * needs camcc's PLL2; enough to read an ID), inside titan_top_gdsc (the sensors' cam_clk), after GCC's CAMERA_XO branch.
++ * The chip ID: slave 0x34 (8-bit), 2 bytes at register 0x0016, expected 0x0363, through the CCI master 0 pins (GPIO 17
++ * SDA, 18 SCL) driven by hand as open-drain GPIOs (~50 kHz) instead of the CCI block (HakiOS does the same on its POCO).
++ * Every pin is put back as it was found; the branch, the domain and GCC's XO only if this run switched them on.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -29,8 +42,10 @@
+ #include <kern/locks.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_board.h"
++#include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void delay(int usec);
+ 
+ #define CAM_GCC_CAM_PA          0x0010b000u     /* GCC page with the camera branches */
+ #define CAM_GCC_AHB             0x008u          /* GCC_CAMERA_AHB_CBCR (critical) */
+@@ -112,12 +127,13 @@ cbcr_state(uint32_t v)
+ 	return (v & CBCR_OFF) ? "off" : "running";
+ }
+ 
++static vm_offset_t gcc, camcc, cci, tlmm[3];
++static const vm_offset_t tile_pa[3] = { CAM_TLMM_NORTH_PA, CAM_TLMM_SOUTH_PA, CAM_TLMM_EAST_PA };
++static const char *const tile_name[3] = { "north", "south", "east" };
++
+ static void
+ cam_look(void)
+ {
+-	static vm_offset_t gcc, camcc, cci, tlmm[3];
+-	static const vm_offset_t tile_pa[3] = { CAM_TLMM_NORTH_PA, CAM_TLMM_SOUTH_PA, CAM_TLMM_EAST_PA };
+-	static const char *const tile_name[3] = { "north", "south", "east" };
+ 
+ 	cam_len = 0;
+ 	if (!gcc && !(gcc = ml_io_map(CAM_GCC_CAM_PA, 0x1000))) {
+@@ -179,6 +195,398 @@ cam_look(void)
+ 	}
+ }
+ 
++/* ---- 3075b, step C2: the rear main sensor (IMX363) powered, its chip ID read, powered down ---------------------- */
++
++static inline void
++cam_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* a TLMM pin: its tile's mapping (NULL if not mapped) */
++static vm_offset_t
++pin_base(unsigned tile, unsigned gpio)
++{
++	if (!tlmm[tile] && !(tlmm[tile] = ml_io_map(tile_pa[tile], 0x100000))) {
++		return 0;
++	}
++	return tlmm[tile] + gpio * 0x1000u;
++}
++
++#define PIN_CFG(func, pull, ma, oe)     (((pull) & 3u) | (((func) & 0xfu) << 2) | ((((ma) / 2u - 1u) & 7u) << 6) | ((oe) ? 1u << 9 : 0))
++#define PULL_NONE 0u
++#define PULL_DOWN 1u
++#define PULL_UP   3u
++
++struct cam_pin { uint16_t gpio; uint8_t tile; bool saved; uint32_t cfg, io; };
++static struct cam_pin c2_pins[] = {
++	{ 12, CAM_S }, { 13, CAM_S }, { 17, CAM_S }, { 18, CAM_S }, { 40, CAM_S }, { 75, CAM_E }, { 99, CAM_N }, { 119, CAM_N },
++};
++enum { P_VANA, P_MCLK, P_SDA, P_SCL, P_CUSTOM1, P_VIO, P_VDIG, P_RESET, P_COUNT };
++
++static bool
++pins_save(void)
++{
++	for (unsigned i = 0; i < P_COUNT; i++) {
++		vm_offset_t b = pin_base(c2_pins[i].tile, c2_pins[i].gpio);
++		if (!b) {
++			return false;
++		}
++		c2_pins[i].cfg = cam_rd(b, 0);
++		c2_pins[i].io = cam_rd(b, 4);
++		c2_pins[i].saved = true;
++	}
++	return true;
++}
++
++static void
++pins_restore(void)
++{
++	for (unsigned i = 0; i < P_COUNT; i++) {
++		if (!c2_pins[i].saved) {
++			continue;
++		}
++		vm_offset_t b = pin_base(c2_pins[i].tile, c2_pins[i].gpio);
++		cam_wr(b, 4, c2_pins[i].io & 2u);       /* the output level first, then the configuration */
++		cam_wr(b, 0, c2_pins[i].cfg);
++		c2_pins[i].saved = false;
++	}
++}
++
++/* a plain GPIO output at a level (2 mA, no pull) */
++static void
++pin_out(unsigned p, bool high)
++{
++	vm_offset_t b = pin_base(c2_pins[p].tile, c2_pins[p].gpio);
++	cam_wr(b, 4, high ? 2u : 0u);
++	cam_wr(b, 0, PIN_CFG(0, PULL_NONE, 2, 1));
++}
++
++/* ---- I2C by hand on the CCI master 0 pins: open drain by output enable, the pins' pull-ups and the board's ---- */
++
++#define I2C_HALF_US 10          /* ~50 kHz */
++
++static void
++i2c_line(unsigned p, bool release)
++{
++	vm_offset_t b = pin_base(c2_pins[p].tile, c2_pins[p].gpio);
++	cam_wr(b, 0, PIN_CFG(0, PULL_UP, 2, release ? 0 : 1));        /* driven: output enable with the level 0 */
++}
++
++static bool
++i2c_get(unsigned p)
++{
++	return cam_rd(pin_base(c2_pins[p].tile, c2_pins[p].gpio), 4) & 1u;
++}
++
++static bool
++i2c_scl_high(void)
++{
++	i2c_line(P_SCL, true);
++	for (int i = 0; i < 1000; i++) {               /* clock stretching: up to 1 ms */
++		if (i2c_get(P_SCL)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++i2c_start(void)
++{
++	i2c_line(P_SDA, true);
++	(void)i2c_scl_high();
++	delay(I2C_HALF_US);
++	i2c_line(P_SDA, false);
++	delay(I2C_HALF_US);
++	i2c_line(P_SCL, false);
++	delay(I2C_HALF_US);
++}
++
++static void
++i2c_stop(void)
++{
++	i2c_line(P_SDA, false);
++	delay(I2C_HALF_US);
++	(void)i2c_scl_high();
++	delay(I2C_HALF_US);
++	i2c_line(P_SDA, true);
++	delay(I2C_HALF_US);
++}
++
++/* a byte out; true if acknowledged */
++static bool
++i2c_tx(uint8_t v)
++{
++	for (int bit = 7; bit >= 0; bit--) {
++		i2c_line(P_SDA, (v >> bit) & 1);
++		delay(I2C_HALF_US);
++		if (!i2c_scl_high()) {
++			return false;
++		}
++		delay(I2C_HALF_US);
++		i2c_line(P_SCL, false);
++	}
++	i2c_line(P_SDA, true);
++	delay(I2C_HALF_US);
++	(void)i2c_scl_high();
++	bool ack = !i2c_get(P_SDA);
++	delay(I2C_HALF_US);
++	i2c_line(P_SCL, false);
++	delay(I2C_HALF_US);
++	return ack;
++}
++
++static uint8_t
++i2c_rx(bool ack)
++{
++	uint8_t v = 0;
++
++	i2c_line(P_SDA, true);
++	for (int bit = 7; bit >= 0; bit--) {
++		delay(I2C_HALF_US);
++		(void)i2c_scl_high();
++		v |= (uint8_t)(i2c_get(P_SDA) << bit);
++		delay(I2C_HALF_US);
++		i2c_line(P_SCL, false);
++	}
++	i2c_line(P_SDA, !ack);
++	delay(I2C_HALF_US);
++	(void)i2c_scl_high();
++	delay(I2C_HALF_US);
++	i2c_line(P_SCL, false);
++	i2c_line(P_SDA, true);
++	delay(I2C_HALF_US);
++	return v;
++}
++
++/* n bytes from a 16-bit register of an 8-bit-addressed device; the number of bytes read, or -1 (no ACK at stage -k) */
++static int
++i2c_read16(uint8_t addr8, uint16_t reg, uint8_t *out, int n)
++{
++	int got = 0;
++
++	i2c_start();
++	if (!i2c_tx(addr8)) {
++		i2c_stop();
++		return -1;
++	}
++	if (!i2c_tx((uint8_t)(reg >> 8)) || !i2c_tx((uint8_t)reg)) {
++		i2c_stop();
++		return -2;
++	}
++	i2c_start();                                    /* repeated start */
++	if (!i2c_tx(addr8 | 1u)) {
++		i2c_stop();
++		return -3;
++	}
++	for (; got < n; got++) {
++		out[got] = i2c_rx(got + 1 < n);
++	}
++	i2c_stop();
++	return got;
++}
++
++/* ---- the clocks and the domain ---------------------------------------------------------------------------------- */
++
++static bool
++wait_clear(vm_offset_t base, uint32_t off, uint32_t bit, int us)
++{
++	for (int i = 0; i < us; i++) {
++		if (!(cam_rd(base, off) & bit)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++wait_set(vm_offset_t base, uint32_t off, uint32_t bit, int us)
++{
++	for (int i = 0; i < us; i++) {
++		if (cam_rd(base, off) & bit) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++#define CC_TITAN_GDSCR  0xb134u
++#define CC_MCLK0_CMD    0x4004u
++#define CC_MCLK0_CFG    0x4008u
++#define CC_MCLK0_CBCR   0x401cu
++#define GDSC_SW_COLLAPSE 0x1u
++#define CBCR_ENABLE     0x1u
++#define RCG_UPDATE      0x1u
++#define RCG_ROOT_OFF    0x80000000u
++
++/* PM8998 (SPMI SID 0): LDO22 at 0x5500 (the sensor's VANA and the panel's vdda), GPIO 11 at 0xca00 */
++static void
++pm_regs(const char *what, unsigned base, const uint16_t *offs, unsigned n, uint8_t *v)
++{
++	char line[160];
++	size_t k = (size_t)snprintf(line, sizeof(line), "%s:", what);
++	for (unsigned i = 0; i < n; i++) {
++		v[i] = 0xee;
++		int r = sweet_spmi_read(0, base + offs[i], &v[i]);
++		k += (size_t)snprintf(line + k, sizeof(line) - k, " %#x=%s%02x", base + offs[i], r ? "ERR:" : "", v[i]);
++		if (k >= sizeof(line)) {
++			break;
++		}
++	}
++	cam_say("%s", line);
++}
++
++static void
++cam_c2(void)
++{
++	bool xo_was_off = false, gdsc_was_off = false, mclk_on = false, powered = false;
++	uint8_t id[2] = { 0, 0 };
++	int got = 0;
++	uint32_t xo, gd;
++	unsigned l22_mv;
++	static const uint16_t ldo_offs[] = { 0x08, 0x40, 0x41, 0x45, 0x46 };
++	static const uint16_t gpio_offs[] = { 0x08, 0x40, 0x41, 0x42, 0x44, 0x45, 0x46 };
++	uint8_t l22[5], g11[7];
++
++	cam_len = 0;
++	if (!gcc && !(gcc = ml_io_map(CAM_GCC_CAM_PA, 0x1000))) {
++		cam_say("GCC not mapped");
++		return;
++	}
++	if (!camcc && !(camcc = ml_io_map(CAM_CC_PA, CAM_CC_SIZE))) {
++		cam_say("camcc not mapped");
++		return;
++	}
++	if (cam_rd(gcc, CAM_GCC_AHB) & CBCR_OFF) {
++		cam_say("GCC's camera AHB clock is off: nothing done");
++		return;
++	}
++	/* VANA: PM8998 L22 must already be on (the panel's vdda); only read */
++	pm_regs("PM8998 L22 (status1, vset lo, hi, mode, en_ctl)", 0x5500, ldo_offs, 5, l22);
++	pm_regs("PM8998 GPIO11 (status1, mode, vin, pull, out src, out ctl, en)", 0xca00, gpio_offs, 7, g11);
++	l22_mv = (unsigned)l22[1] | (unsigned)l22[2] << 8;
++	if (!(l22[4] & 0x80) || l22_mv < 2800 || l22_mv > 3000) {
++		cam_say("L22 not on at 2.8-3.0 V (en_ctl %#x, %u mV): nothing done (it is never switched here)", l22[4], l22_mv);
++		return;
++	}
++	cam_say("L22 on at %u mV: VANA is there", l22_mv);
++	if (!pins_save()) {
++		cam_say("TLMM not mapped: nothing done");
++		return;
++	}
++
++	/* the sensor held in reset, its switches low, before anything is switched on */
++	pin_out(P_RESET, false);
++	pin_out(P_VANA, false);
++	pin_out(P_CUSTOM1, false);
++
++	/* GCC's camera XO branch (camcc's clocks start from it), then titan_top */
++	xo = cam_rd(gcc, CAM_GCC_XO);
++	if (xo & CBCR_OFF) {
++		xo_was_off = true;
++		cam_wr(gcc, CAM_GCC_XO, xo | CBCR_ENABLE);
++		if (!wait_clear(gcc, CAM_GCC_XO, CBCR_OFF, 500)) {
++			cam_say("GCC CAMERA_XO did not start (%#x)", cam_rd(gcc, CAM_GCC_XO));
++			goto down;
++		}
++	}
++	cam_say("GCC CAMERA_XO %#x", cam_rd(gcc, CAM_GCC_XO));
++	gd = cam_rd(camcc, CC_TITAN_GDSCR);
++	if (!(gd & GDSC_PWR_ON)) {
++		gdsc_was_off = true;
++		cam_wr(camcc, CC_TITAN_GDSCR, gd & ~GDSC_SW_COLLAPSE);
++		if (!wait_set(camcc, CC_TITAN_GDSCR, GDSC_PWR_ON, 10000)) {
++			cam_say("titan_top did not power on (GDSCR %#x, CFG %#x)", cam_rd(camcc, CC_TITAN_GDSCR),
++			    cam_rd(camcc, CC_TITAN_GDSCR + 4));
++			goto down;
++		}
++	}
++	cam_say("titan_top GDSCR %#x (CFG %#x)", cam_rd(camcc, CC_TITAN_GDSCR), cam_rd(camcc, CC_TITAN_GDSCR + 4));
++
++	/* the module file's power-up */
++	powered = true;
++	pin_out(P_VANA, true);
++	delay(1000);
++	pin_out(P_CUSTOM1, true);
++	delay(1000);
++	pin_out(P_VIO, true);
++	delay(1000);
++	pin_out(P_VDIG, true);
++	delay(1000);
++	pin_out(P_RESET, true);
++	delay(12000);
++	/* MCLK0 from XO (CFG 0: source 0, no divider, no M/N), its branch, the pin to cam_mclk */
++	cam_wr(camcc, CC_MCLK0_CFG, 0);
++	cam_wr(camcc, CC_MCLK0_CMD, cam_rd(camcc, CC_MCLK0_CMD) | RCG_UPDATE);
++	if (!wait_clear(camcc, CC_MCLK0_CMD, RCG_UPDATE, 500)) {
++		cam_say("MCLK0 generator did not take its configuration (CMD %#x)", cam_rd(camcc, CC_MCLK0_CMD));
++		goto down;
++	}
++	cam_wr(camcc, CC_MCLK0_CBCR, cam_rd(camcc, CC_MCLK0_CBCR) | CBCR_ENABLE);
++	mclk_on = true;
++	if (!wait_clear(camcc, CC_MCLK0_CBCR, CBCR_OFF, 500)) {
++		cam_say("MCLK0 branch did not start (CBCR %#x, CMD %#x)", cam_rd(camcc, CC_MCLK0_CBCR), cam_rd(camcc, CC_MCLK0_CMD));
++		goto down;
++	}
++	{
++		vm_offset_t b = pin_base(c2_pins[P_MCLK].tile, c2_pins[P_MCLK].gpio);
++		cam_wr(b, 0, PIN_CFG(1, PULL_NONE, 4, 0));
++	}
++	cam_say("powered: VANA, CUSTOM1, VIO, VDIG, RESET high; MCLK0 %#x (CMD %#x CFG %#x) on GPIO 13", cam_rd(camcc, CC_MCLK0_CBCR),
++	    cam_rd(camcc, CC_MCLK0_CMD), cam_rd(camcc, CC_MCLK0_CFG));
++	delay(10000);
++
++	/* the chip ID over the CCI master 0 pins */
++	i2c_line(P_SCL, true);
++	i2c_line(P_SDA, true);
++	delay(100);
++	cam_say("I2C lines idle: SDA %d SCL %d", i2c_get(P_SDA), i2c_get(P_SCL));
++	got = i2c_read16(0x34, 0x0016, id, 2);
++	if (got == 2) {
++		unsigned v = (unsigned)id[0] << 8 | id[1];
++		cam_say("chip ID at 0x0016: %#06x%s", v, v == 0x0363 ? " = IMX363" : " (expected 0x0363)");
++	} else {
++		cam_say("chip ID read failed: %s", got == -1 ? "no ACK for the address 0x34" : got == -2 ? "no ACK for the register" :
++		    "no ACK for the read address");
++	}
++
++down:
++	/* the module file's power-down, then everything as found */
++	if (powered) {
++		pin_out(P_RESET, false);
++		delay(1000);
++		pin_out(P_VDIG, false);
++		delay(1000);
++		pin_out(P_VIO, false);
++		delay(1000);
++		pin_out(P_CUSTOM1, false);
++		delay(1000);
++		pin_out(P_VANA, false);
++		delay(1000);
++	}
++	if (mclk_on) {
++		cam_wr(camcc, CC_MCLK0_CBCR, cam_rd(camcc, CC_MCLK0_CBCR) & ~CBCR_ENABLE);
++		(void)wait_set(camcc, CC_MCLK0_CBCR, CBCR_OFF, 500);
++		delay(1000);
++	}
++	pins_restore();
++	if (gdsc_was_off) {
++		cam_wr(camcc, CC_TITAN_GDSCR, cam_rd(camcc, CC_TITAN_GDSCR) | GDSC_SW_COLLAPSE);
++		(void)wait_clear(camcc, CC_TITAN_GDSCR, GDSC_PWR_ON, 10000);
++	}
++	if (xo_was_off) {
++		cam_wr(gcc, CAM_GCC_XO, cam_rd(gcc, CAM_GCC_XO) & ~CBCR_ENABLE);
++	}
++	cam_say("powered down: MCLK0 CBCR %#x, titan_top GDSCR %#x, GCC CAMERA_XO %#x, pins as found", cam_rd(camcc, CC_MCLK0_CBCR),
++	    cam_rd(camcc, CC_TITAN_GDSCR), cam_rd(gcc, CAM_GCC_XO));
++}
++
+ static int
+ cam_sysctl SYSCTL_HANDLER_ARGS
+ {
+@@ -188,7 +596,7 @@ cam_sysctl SYSCTL_HANDLER_ARGS
+ 	if (error || !req->newptr) {
+ 		return error;
+ 	}
+-	if (v != 1) {
++	if (v != 1 && v != 2) {
+ 		return EINVAL;
+ 	}
+ 	if (!sweet_board_is("xiaomi,dipper")) {
+@@ -199,13 +607,17 @@ cam_sysctl SYSCTL_HANDLER_ARGS
+ 		cam_status = kalloc_data(CAM_STATUS_LEN, Z_WAITOK | Z_ZERO);
+ 	}
+ 	if (cam_status) {
+-		cam_look();
++		if (v == 1) {
++			cam_look();
++		} else {
++			cam_c2();
++		}
+ 	}
+ 	lck_mtx_unlock(&cam_lock);
+ 	return cam_status ? 0 : ENOMEM;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_cam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, cam_sysctl, "I",
+-    "3075: 1 = a read-only look at the camera hardware (kern.sweet_cam_status)");
++    "3075: 1 = a read-only look at the camera hardware, 2 (3075b) = the rear main sensor powered, its chip ID read, powered down (kern.sweet_cam_status)");
+ 
+ static int
+ cam_status_sysctl SYSCTL_HANDLER_ARGS
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 9195e05..bc7d3fc 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -179,7 +179,8 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		    (sid == 3 && (peripheral == 0xd8 || peripheral == 0xd9 || peripheral == 0xc0 ||  /* 0xc0: haptics */
+ 		    peripheral == 0xd3)) ||        /* 0xd3: flash LED block (the torch, dipper_haptics.c) */
+ 		    (sid == 2 && addr == 0x09f3u) ||   /* MISC clock trim error, the haptics' period (dipper_haptics.c) */
+-		    (sid == 0 && (peripheral == 0x08 || peripheral == 0x60 || peripheral == 0x61));  /* 0x60/0x61: PM8998 RTC, alarm (sweet_rtc_*) */
++		    (sid == 0 && (peripheral == 0x08 || peripheral == 0x60 || peripheral == 0x61 ||  /* 0x60/0x61: PM8998 RTC, alarm (sweet_rtc_*) */
++		    peripheral == 0x55 || peripheral == 0xca));   /* 3075b, reads only: LDO22 (the camera's VANA, the panel's vdda), GPIO 11 */
+ 	} else {
+ 		allowed = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 ||
+ 		    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
