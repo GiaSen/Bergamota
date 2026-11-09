@@ -1,0 +1,180 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6d29009..ce17afa 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -67,6 +67,11 @@ extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet
+ extern "C" int sweet_fb_hud;
+ extern "C" int sweet_fb_gatepoll;               /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_gatepoll (3006) */
+ extern "C" int sweet_fb_display_off;            /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_display_off (3023) */
++/*
++ * 3087: the hardware scaler's panel rectangle (x, y, w, h; w 0 = not scaling in hardware), for SweetHID's touch mapping:
++ * it moves with the pixel orbit (sweetfb_orbit), so touches are mapped through the rectangle actually on the panel.
++ */
++extern "C" { volatile uint32_t sweet_fb_hw_dst[4]; }
+ extern "C" int sweet_fb_bl, sweet_fb_bl_now;    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_bl, kern.sweet_fb_bl_now (3017, 3019) */
+ extern "C" int sweet_fb_swaplog;                /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_swaplog (3038) */
+ extern "C" int sweet_fb_keepolder, sweet_fb_older_shown; /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_keepolder, kern.sweet_fb_older_shown (3020) */
+@@ -376,6 +381,17 @@ public:
+ 	 */
+ 	bool          fHw, fHwOn, fHwPE, fBorderFix, fLmPending;
+ 	uint32_t      fHwStride, fHwDstW, fHwDstH, fHwDstX, fHwDstY;
++	/*
++	 * 3087 pixel orbit (AMOLED burn-in, Mi 8): the scaled picture is fOrbitN px smaller than the panel on every side's
++	 * total (2N per axis) and its origin walks one pixel at a time over the (2N+1)^2 positions of that margin, one step
++	 * every fOrbitUS microseconds of display-on time, so static UI (status bar, dock, home indicator) never keeps its
++	 * edges on the same pixels for long. fOrbitX/Y: the next origin, applied by scanAddr() with the next frame's flush.
++	 */
++	uint32_t      fOrbitN, fOrbitIdx, fOrbitBaseX, fOrbitBaseY, fOrbitX, fOrbitY;
++	uint64_t      fOrbitPeriod, fOrbitLast;
++	volatile bool fOrbitDirty;
++	void          orbitTick(uint64_t now);
++	void          publishDst(void);
+ 	uint32_t      fQseedVer, fLastFlush;
+ 	uint32_t      fHwFilter;        /* sweetfb_hwfilter: QSEED3 Y/RGB filter mode, see hwProgram */
+ 	bool          fHwDump;          /* sweetfb_hwdump=1: read the scaler registers back */
+@@ -1095,6 +1111,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
++	if (!fb->fPowerOff) {
++		fb->orbitTick(now);     /* 3087 */
++	} else {
++		fb->fOrbitLast = now;   /* 3087: the orbit counts display-on time only */
++	}
+ 	if (fb->fPowerOff) {
+ 		/*
+ 		 * Backlight ramp down (WLED over SPMI), one step per vsync; if that
+@@ -1758,6 +1779,35 @@ AppleCLCD::hwSetup(void)
+ 	fHwDstH = (uint32_t)dh;
+ 	fHwDstX = (uint32_t)(fPadX < 0 ? 0 : fPadX);
+ 	fHwDstY = (uint32_t)(fPadY < 0 ? 0 : fPadY);
++	/*
++	 * 3087: the pixel orbit, on by default on the Mi 8 (its AMOLED; the Poco F1's panel is an LCD): sweetfb_orbit=N
++	 * pixels (0 off, at most 8; default 2), sweetfb_orbit_s seconds a step (default 120). The picture shrinks only where
++	 * it has no margin of 2N already (with sweetfb_scale=2 it fills the panel: 1080x2248 -> 1076x2244, 0.4 %).
++	 */
++	int on = sweet_board_is("xiaomi,dipper") ? 2 : 0, per = 120;
++	PE_parse_boot_argn("sweetfb_orbit", &on, sizeof(on));
++	PE_parse_boot_argn("sweetfb_orbit_s", &per, sizeof(per));
++	fOrbitN = on < 0 ? 0u : on > 8 ? 8u : (uint32_t)on;
++	if (fOrbitN) {
++		uint32_t n2 = 2 * fOrbitN;
++		if (fHwDstW + n2 > fWidth) {
++			fHwDstW = fWidth - n2;
++		}
++		if (fHwDstH + n2 > fHeight) {
++			fHwDstH = fHeight - n2;
++		}
++		/* the margin's corner where offset 0 puts the picture; offset N centres it */
++		fOrbitBaseX = (fWidth - fHwDstW - n2) / 2;
++		fOrbitBaseY = (fHeight - fHwDstH - n2) / 2;
++		/* start on the centre cell of the walk (row N, column N whichever way the row runs): every move is 1 px */
++		fOrbitIdx = fOrbitN * (2 * fOrbitN + 1) + fOrbitN;
++		fHwDstX = fOrbitBaseX + fOrbitN;
++		fHwDstY = fOrbitBaseY + fOrbitN;
++		nanoseconds_to_absolutetime((uint64_t)(per < 10 ? 10 : per) * NSEC_PER_SEC, &fOrbitPeriod);
++		fOrbitLast = mach_absolute_time();
++		IOLog("SWEET FB: pixel orbit: %u px, picture %ux%u, a 1 px step every %d s of display-on time\n", fOrbitN,
++		    fHwDstW, fHwDstH, per < 10 ? 10 : per);
++	}
+ 	fHwStride = (fLogicalW * 4 + 63) & ~63u;
+ 	int pe = 1;
+ 	PE_parse_boot_argn("sweetfb_hwpe", &pe, sizeof(pe));
+@@ -1784,6 +1834,39 @@ AppleCLCD::hwSetup(void)
+ 	return true;
+ }
+ 
++/* 3087: the rectangle on the panel, for SweetHID */
++void
++AppleCLCD::publishDst(void)
++{
++	sweet_fb_hw_dst[0] = fHwDstX;
++	sweet_fb_hw_dst[1] = fHwDstY;
++	sweet_fb_hw_dst[2] = fHwDstW;
++	__atomic_store_n(&sweet_fb_hw_dst[3], fHwDstH, __ATOMIC_RELEASE);
++}
++
++/*
++ * 3087: the next orbit position, from the vsync timer while the display is on. The origin follows a serpentine over the
++ * (2N+1) x (2N+1) offsets (rows of x, alternating direction, then back up the same way: every move is one pixel).
++ */
++void
++AppleCLCD::orbitTick(uint64_t now)
++{
++	if (fOrbitN == 0 || !fHw || now - fOrbitLast < fOrbitPeriod) {
++		return;
++	}
++	fOrbitLast = now;
++	uint32_t side = 2 * fOrbitN + 1, cells = side * side;
++	fOrbitIdx = (fOrbitIdx + 1) % (2 * cells - 2);
++	uint32_t k = fOrbitIdx < cells ? fOrbitIdx : 2 * cells - 2 - fOrbitIdx;   /* there and back: no jump at the end */
++	uint32_t row = k / side, col = k % side;
++	if (row & 1) {
++		col = side - 1 - col;
++	}
++	fOrbitX = fOrbitBaseX + col;
++	fOrbitY = fOrbitBaseY + row;
++	__atomic_store_n(&fOrbitDirty, true, __ATOMIC_RELEASE);
++}
++
+ /*
+  * Program the source pipe to scan a canvas-sized buffer and scale it into the
+  * panel rectangle. Nothing takes effect before the CTL flush that scanAddr()
+@@ -1844,6 +1927,7 @@ AppleCLCD::hwProgram(void)
+ 		op |= (1u << 10) | (fQseedVer == 0x1002 ? (1u << 30) : (1u << 29));     /* alpha scaling, bilinear */
+ 	}
+ 	mdp_wr(q, QSEED3_OP_MODE, op);
++	publishDst();
+ 	if (fBorderFix) {
+ 		mdp_wr(fMdp + SWEET_MDP_LM0, SWEET_MDP_LM_BORDER0, 0);
+ 		mdp_wr(fMdp + SWEET_MDP_LM0, SWEET_MDP_LM_BORDER1, 0);
+@@ -2013,6 +2097,19 @@ AppleCLCD::scanAddr(uint32_t pa, uint32_t stride, bool hwFrame)
+ {
+ 	volatile uint32_t *p = (volatile uint32_t *)(fMdp + sweet_mdp_pipes[fPipe].off);
+ 
++	if (hwFrame && __atomic_load_n(&fOrbitDirty, __ATOMIC_ACQUIRE)) {
++		/* 3087: the orbit's next origin goes out with this frame (OUT_XY latched by the same flush) */
++		fOrbitDirty = false;
++		fHwDstX = fOrbitX;
++		fHwDstY = fOrbitY;
++		if (fHwOn) {
++			hwProgram();
++		}
++		static uint32_t moves;
++		if (moves++ < 50) {
++			IOLog("SWEET FB: pixel orbit step %u: picture at %u,%u\n", fOrbitIdx, fHwDstX, fHwDstY);
++		}
++	}
+ 	if (hwFrame && !fHwOn) {
+ 		hwProgram();
+ 		fHwOn = true;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 0ef748a..abcd7bc 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -423,6 +423,7 @@ private:
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
+ static SweetHIDButtons *gSweetButtons;
++extern "C" { extern volatile uint32_t sweet_fb_hw_dst[4]; }  /* 3087: SweetFramebuffer.cpp */
+ static SweetHIDTouch *gSweetTouch;
+ 
+ bool
+@@ -546,7 +547,16 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	bool was = fDown[finger];
+ 	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+ 	IOFixed nx, ny;
+-	if (fScale != 0) {
++	uint32_t dh = __atomic_load_n(&sweet_fb_hw_dst[3], __ATOMIC_ACQUIRE), dw = sweet_fb_hw_dst[2];
++	if (fScale != 0 && dw != 0 && dh != 0) {
++		/* 3087: through the hardware scaler's rectangle as it is on the panel now (it moves with the pixel orbit) */
++		int64_t lx = (int64_t)(x - (int)sweet_fb_hw_dst[0]) * fLogicalW / (int64_t)dw;
++		int64_t ly = (int64_t)(y - (int)sweet_fb_hw_dst[1]) * fLogicalH / (int64_t)dh;
++		lx = lx < 0 ? 0 : (lx >= fLogicalW ? fLogicalW - 1 : lx);
++		ly = ly < 0 ? 0 : (ly >= fLogicalH ? fLogicalH - 1 : ly);
++		nx = (IOFixed)((lx << 16) / fLogicalW);
++		ny = (IOFixed)((ly << 16) / fLogicalH);
++	} else if (fScale != 0) {
+ 		/* inverse of AppleCLCD::presentScaled: panel -> logical, normalised */
+ 		int64_t lx = (int64_t)(x - fPadX) * fScaleXDen / fScaleXNum;
+ 		int64_t ly = (int64_t)(y - fPadY) * fScaleYDen / fScaleYNum;
