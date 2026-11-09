@@ -775,6 +775,10 @@ def torch(root):
 # gpu/metal 7fc5206 or later (RENEGADE_CHL=1 from research/chl-work/out-metal).
 CAMERA_DYLIB = '/usr/local/lib/sweetcam.dylib'
 CAM_SEQ = '/usr/local/share/sweetcam/imx363-mode2.seq'
+# cameracaptured idle (no app using the camera): InactiveHard 50 MB -> 384. With sweetcam and Chlorophyll in-process it sits at
+# about 205 MB idle, so jetsam ended it ~5 s after every use, and SpringBoard's flashlight (AVFlashlight) relaunched it: a cycle
+# every 7-10 s from boot (NOTES 2026-11-09, "PHOTO QUALITY, STEP 3" / flashlight loop).
+CAMERA_JETSAM = (('Daemon', 'com.apple.cameracaptured', 384),)
 CAMERA_PREFS = {'CAMUserPreferenceDesiredIrisMode': 0, 'CAMUserPreferenceCaptureEncodingBehavior': 1}
 
 
@@ -798,6 +802,7 @@ def camera(root):
         print('camera: %s; RENEGADE_CAM_SEQ not set: no sensor sequence, the camera will not stream' % CAMERA_DYLIB)
         note_skip('camera', 'RENEGADE_CAM_SEQ not set: no sensor sequence')
     merge_pref(root, 'com.apple.camera', CAMERA_PREFS)
+    inactive_jetsam(root, CAMERA_JETSAM, 'camera')
 
 
 # Daemons that only crash-loop or quit at once on this bring-up while containermanagerd refuses every container lookup
@@ -1310,18 +1315,23 @@ def chlorophyll_link(root, rel, add_uc, create_uc):
     return True
 
 
-def chlorophyll_jetsam(root):
+def inactive_jetsam(root, entries, who):
+    """Raise InactiveHardMemoryLimit (MB) to at least mb for each (category, label, mb) in every jetsamproperties plist."""
     for path in sorted(glob.glob(os.path.join(root, 'System/Library/LaunchDaemons/com.apple.jetsamproperties.*.plist'))):
         st = os.stat(path)
         data = load(path)
         props = data.get('Version4')
         if not isinstance(props, dict):
             continue
-        for cat, label, mb in CHL_JETSAM:
+        for cat, label, mb in entries:
             ent = props.setdefault(cat, {}).setdefault('Override', {}).setdefault(label, {})
             ent['InactiveHardMemoryLimit'] = max(ent.get('InactiveHardMemoryLimit', 0), mb)
-            print('chlorophyll: %s: %s InactiveHard %d MB' % (os.path.relpath(path, root), label, ent['InactiveHardMemoryLimit']))
+            print('%s: %s: %s InactiveHard %d MB' % (who, os.path.relpath(path, root), label, ent['InactiveHardMemoryLimit']))
         save(path, data, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+
+
+def chlorophyll_jetsam(root):
+    inactive_jetsam(root, CHL_JETSAM, 'chlorophyll')
 
 
 def chlorophyll(root):

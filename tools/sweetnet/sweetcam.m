@@ -2152,7 +2152,16 @@ device_request_streams(CMBaseObjectRef o, CFArrayRef streams, CFDictionaryRef op
 			say_once("device: RequestStreams options", CFSTR("options"), options);
 		}
 	}
-	/* (HakiOS: the graph configures the stream, then reserves it here; the frames start from here and from Start) */
+	/*
+	 * (HakiOS: the graph configures the stream, then reserves it here; the frames start from here and from Start.) Here the
+	 * frames start at Start only (2026-11-09): SpringBoard's flashlight (AVFlashlight) has the device made and its streams
+	 * requested at every cameracaptured launch, with no Start; starting the sensor here powered it for the device's 5 s close
+	 * timer each time, then jetsam ended the idle cameracaptured (about 205 MB) and the flashlight relaunched it: a cycle every
+	 * 7-10 s whenever no app kept the camera. /private/var/tmp/sweetcam.eager: start here as well (the old way).
+	 */
+	if (access("/private/var/tmp/sweetcam.eager", F_OK) != 0) {
+		return 0;
+	}
 	for (CFIndex i = 0; streams && i < CFArrayGetCount(streams); i++) {
 		(void)stream_start_worker((CMBaseObjectRef)CFArrayGetValueAtIndex(streams, i));
 	}
