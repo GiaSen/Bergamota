@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
-index fa0a9dc..094f706 100644
+index fa0a9dc..2c654c8 100644
 --- a/bsd/dev/dipper_camera.c
 +++ b/bsd/dev/dipper_camera.c
 @@ -81,6 +81,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
@@ -10,7 +10,36 @@ index fa0a9dc..094f706 100644
  extern int sweet_smmu_map32(uint64_t pa, uint64_t len, uint32_t *iova);  /* 3080 */
  extern void delay(int usec);
  extern int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);     /* sweet_rpmh.c */
-@@ -1817,7 +1818,12 @@ c4_up(struct c4_run *r, unsigned min_fll)
+@@ -1393,20 +1394,19 @@ c4_buffer(void)
+ 		if (c4_va[i]) {
+ 			continue;
+ 		}
++		/*
++		 * 3086b: any wired pages (the write master reaches them through sweet_smmu_map32_pages, page by page, since 3086):
++		 * with the sensor started only when an app starts the camera (sweetcam, 2026-11-09) the first stream can come many
++		 * minutes after boot, when 2.8 MB of contiguous memory was no longer there ("no contiguous memory for buffer 1")
++		 */
+ 		vm_offset_t v = 0;
+-		if (kmem_alloc_contig(kernel_map, &v, round_page(C4_BUF), PAGE_MASK, 0, 0, KMA_DATA | KMA_PERMANENT,
+-		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-			cam_say("no contiguous memory for buffer %u (%u bytes)", i, C4_BUF);
++		if (kmem_alloc(kernel_map, &v, round_page(C4_BUF), KMA_DATA | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			cam_say("no memory for buffer %u (%u bytes)", i, C4_BUF);
+ 			return false;
+ 		}
+ 		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)v);
+-		uint64_t pa = pn ? ptoa_64(pn) : 0;
+-		if (!pa || pa < 0x80000000ull || pa + round_page(C4_BUF) > 0x280000000ull) {
+-			cam_say("buffer %u at %#llx: outside the identity map, not used", i, pa);
+-			return false;
+-		}
+ 		c4_va[i] = v;
+-		c4_pa[i] = pa;
++		c4_pa[i] = pn ? ptoa_64(pn) : 0;       /* the first page's, for the log */
+ 	}
+ 	return true;
+ }
+@@ -1817,7 +1817,12 @@ c4_up(struct c4_run *r, unsigned min_fll)
  			}
  		}
  		for (unsigned i = 0; ok && i < C4_NBUF; i++) {
@@ -24,7 +53,7 @@ index fa0a9dc..094f706 100644
  		}
  		if (!ok) {
  			cam_say("SMMU streams or window NOT set: no streaming");
-@@ -2319,6 +2325,7 @@ static uint32_t st_iova;
+@@ -2319,6 +2324,7 @@ static uint32_t st_iova;
  static struct cam_seq_rec *cam_seq0;
  static unsigned cam_seq0_n;
  static volatile bool cam_still_req, cam_still_busy;
@@ -32,7 +61,7 @@ index fa0a9dc..094f706 100644
  static volatile int cam_still_result;
  static uint32_t cam_still_seq;
  static struct cam_live_hdr cam_still_hdr;
-@@ -2329,49 +2336,41 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_cam_still_half, CTLFLAG_RW | CTLFLAG_LOCKED,
+@@ -2329,49 +2335,41 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_cam_still_half, CTLFLAG_RW | CTLFLAG_LOCKED,
  SYSCTL_UINT(_kern, OID_AUTO, sweet_cam_still_frames, CTLFLAG_RW | CTLFLAG_LOCKED, &cam_still_frames, 0,
      "3085: mode 0 frames a still (2-8, the last kept)");
  
@@ -108,7 +137,7 @@ index fa0a9dc..094f706 100644
  	return true;
  }
  
-@@ -2481,7 +2480,7 @@ s0_halt(unsigned frame_ms, const char *when)
+@@ -2481,7 +2479,7 @@ s0_halt(unsigned frame_ms, const char *when)
  		c0 = s0_read8(0x0005);
  		delay((int)((frame_ms + 10u) * 1000u));
  		c1 = s0_read8(0x0005);
@@ -117,7 +146,7 @@ index fa0a9dc..094f706 100644
  			if (t) {
  				cam_say("still: sensor stopped %s at try %d", when, t + 1);
  			}
-@@ -2528,7 +2527,26 @@ c4_guards_changed(void)
+@@ -2528,7 +2526,26 @@ c4_guards_changed(void)
  	return changed;
  }
  
@@ -144,7 +173,7 @@ index fa0a9dc..094f706 100644
   * The still, from the stream thread right after a frame done (the write master armed with c4_iova[target] for the frame now
   * coming): that frame finishes in mode 2, then mode 0's frames go to the still buffer, then mode 2 again. 0 or an errno.
   */
-@@ -2538,7 +2556,7 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
+@@ -2538,7 +2555,7 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
  	const bool half = cam_still_half != 0;
  	const unsigned line_ns = half ? ST_LINE_NS_HALF : ST_LINE_NS_FULL, settle = half ? 16u : 15u;
  	const unsigned frame_ms = (unsigned)((uint64_t)ST_FLL * line_ns / 1000000u) + 1;
@@ -153,7 +182,7 @@ index fa0a9dc..094f706 100644
  	int err = 0;
  	uint64_t t0 = mach_absolute_time();
  	struct cam_exp e;
-@@ -2554,6 +2572,10 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
+@@ -2554,6 +2571,10 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
  		memset((void *)st_va[k], C3_FILL, ST_CHUNK);
  		sweet_dma_sync_va((const void *)st_va[k], ST_CHUNK);
  	}
@@ -164,7 +193,7 @@ index fa0a9dc..094f706 100644
  	/* mode 2's frame in flight lands where it was going; then the sensor is quiet (3085c: checked, or no still) */
  	size_t g0 = c4_guards_changed();
  	if (!s0_halt(34u, "before the still")) {
-@@ -2565,9 +2587,14 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
+@@ -2565,9 +2586,14 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
  	cam_wr(csid0, CSID_IRQ_CMD, 1);
  
  	/* mode 0 */
@@ -180,7 +209,7 @@ index fa0a9dc..094f706 100644
  	st_settle(settle);
  	unsigned bad = s0_write_seq(cam_seq0, cam_seq0_n, half);
  	/* the same exposure time and gain: integration lines by the line times */
-@@ -2585,20 +2612,40 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
+@@ -2585,20 +2611,40 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
  		err = EIO;
  	}
  	for (unsigned f = 0; !err && f < nframes; f++) {
@@ -226,7 +255,7 @@ index fa0a9dc..094f706 100644
  				err = EIO;
  				break;
  			}
-@@ -2616,8 +2663,8 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
+@@ -2616,8 +2662,8 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
  		}
  		if (f + 1 == nframes) {
  			(void)s0_stream(false);
@@ -237,7 +266,7 @@ index fa0a9dc..094f706 100644
  			}
  		}
  	}
-@@ -2629,11 +2676,14 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
+@@ -2629,11 +2675,14 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
  	 */
  	unsigned efll_ms = (unsigned)((uint64_t)(e.fll > ST_FLL ? e.fll : ST_FLL) * line_ns / 1000000u) + 1;
  	bool halted = s0_halt(efll_ms, "after the still");
@@ -253,7 +282,7 @@ index fa0a9dc..094f706 100644
  		delay((int)(efll_ms * 1000u));
  	}
  	if (!halted) {
-@@ -2646,9 +2696,11 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
+@@ -2646,9 +2695,11 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
  		sweet_dma_sync_va(st_at(o), 1);
  		guard += *st_at(o) != C3_FILL;
  	}
@@ -268,7 +297,7 @@ index fa0a9dc..094f706 100644
  	if (got && !err) {
  		struct cam_live_hdr *h = &cam_still_hdr;
  		bzero(h, sizeof(*h));
-@@ -2670,9 +2722,12 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
+@@ -2670,9 +2721,12 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
  		h->timestamp_ns = c4_ns(mach_absolute_time());
  	}
  
@@ -283,7 +312,7 @@ index fa0a9dc..094f706 100644
  	cam_wr(vfe0, VFE_REG_UPDATE, 1u << 1);
  	cam_wr(csid0, CSID_RDI0_CLEAR, cam_rd(csid0, CSID_RDI0_STATUS));
  	cam_wr(csid0, CSID_IRQ_CMD, 1);
-@@ -2694,6 +2749,7 @@ cam_stream_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -2694,6 +2748,7 @@ cam_stream_thread(void *arg __unused, wait_result_t wr __unused)
  	struct c4_af af;
  	unsigned target = 0, since = 0, frames = 0, af_state = 0;     /* af_state: 0 not yet, 1 sweeping, 2 done */
  	unsigned last_mean = 0, still_check = 0;
@@ -291,7 +320,7 @@ index fa0a9dc..094f706 100644
  	bool ae_on = false;
  	uint64_t t_prev = 0;
  
-@@ -2722,6 +2778,15 @@ cam_stream_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -2722,6 +2777,15 @@ cam_stream_thread(void *arg __unused, wait_result_t wr __unused)
  			continue;
  		}
  		uint64_t now = mach_absolute_time();
@@ -307,7 +336,7 @@ index fa0a9dc..094f706 100644
  		unsigned done = target;
  		lck_spin_lock(&cam_live_spin);
  		cam_live_latest = (int)done;
-@@ -2756,7 +2821,9 @@ cam_stream_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -2756,7 +2820,9 @@ cam_stream_thread(void *arg __unused, wait_result_t wr __unused)
  		}
  		target = next;
  		lck_spin_unlock(&cam_live_spin);
@@ -318,7 +347,7 @@ index fa0a9dc..094f706 100644
  		cam_wr(vfe0, VFE_BUS_CLEAR(1), 1u);
  		cam_wr(vfe0, VFE_BUS_CLEAR_GLOBAL, 1);
  		thread_wakeup((event_t)&cam_live_seq);
-@@ -2767,7 +2834,7 @@ cam_stream_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -2767,7 +2833,7 @@ cam_stream_thread(void *arg __unused, wait_result_t wr __unused)
  			size_t gc = c4_guards_changed();
  			cam_say("still: mode 2's guards 5 frames after the still: %zu changed%s", gc, gc ? " (a frame ran past its buffer)" : "");
  		}
@@ -327,7 +356,7 @@ index fa0a9dc..094f706 100644
  			still_check = 5;
  			cam_still_busy = true;
  			cam_still_result = c4_still(r, target, last_mean);
-@@ -3003,6 +3070,12 @@ cam_still_sysctl SYSCTL_HANDLER_ARGS
+@@ -3003,6 +3069,12 @@ cam_still_sysctl SYSCTL_HANDLER_ARGS
  		if (cam_still_req || cam_still_busy) {
  			return EBUSY;
  		}

@@ -1,8 +1,11 @@
 #!/bin/sh
 # Boot image of the Mi 8 with its current boot-args: tools/dipper-mkboot.sh KERNEL OUT.img [ADT]
-# Default ADT enxerto/out/dipper-n104-2x-wlan-gpu-hap-cam.adt (dipper-n104-2x-wlan-gpu.adt + /product/haptics,
-# /product/camera "flash" and /arm-io/isp "camera-rear", made by tools/adt-haptics.py --rear-camera; images up to 130f
-# used dipper-n104-2x-wlan-gpu-hap.adt, the same without the isp node). The boot-args field holds 607 bytes: the default line is 606.
+# Default ADT enxerto/out/dipper-n104-2x-wlan-gpu-hap-cam-862.adt (dipper-n104-2x-wlan-gpu.adt + /product/haptics,
+# /product/camera "flash" and /arm-io/isp "camera-rear", made by tools/adt-haptics.py --rear-camera, then the canvas
+# 414x862 points at @2x = 828x1724, the panel's own shape, by tools/adt-canvas.py; images up to 130f used
+# dipper-n104-2x-wlan-gpu-hap.adt, 131 -hap-cam.adt: the iPhone 11's 414x896, a ~20 px black band at each side).
+# sweetfb_scale=2 (SWEETFB_SCALE): the display scaler stretches the canvas onto the whole 1080x2248 panel (with the
+# 862-point canvas the two axes differ by 0.03 %); 1 = fit with bars (the default before image 132). The boot-args field holds 607 bytes: the default line is 606.
 #   sweetwlan=5 ... sweet80211=3    Wi-Fi service
 #   sweetbt=1 sweetbtfast=1 sweetbtibs=1   Bluetooth next to it (xnu 3011, firmware in /usr/standalone/firmware/sweet)
 #   sweetcharger=2 sweetcharger_fcc=1700   charger control, 0.5 C of 3400 mAh
@@ -13,9 +16,9 @@
 # Nothing is booted or flashed here: fastboot -s bergamota0001 boot OUT.img
 cd "$(dirname "$0")/.." || exit 1
 [ $# -ge 2 ] || { echo "usage: $0 KERNEL OUT.img [ADT]" >&2; exit 1; }
-CMDLINE="debug=0xc serial=1 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 sweetfb_vsync=1 sweetfb_scale=1 sweetfb_flip=1 sweetusb=2 sweetbattery=1 sweetfb_hw=1 sweetarm64e=1 launchd_disable_all_timeouts=1 ufslogsecs=1 sweettouchdelay=0 sweetwlan=5 sweetwlandelay=60 sweet80211=3 sweetgpu=8 sweetgpufreq=gov sweetgpuhb=10 sweetgpuboost=7 sweetgpuubwc=1 sweetamp_yield=1 sweetbt=1 sweetbtfast=1 sweetbtibs=1 sweetcharger=2 sweetcharger_fcc=1700 sweetaudio=3 sweethap=3"
+CMDLINE="debug=0xc serial=1 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 sweetfb_vsync=1 sweetfb_scale=${SWEETFB_SCALE:-2} sweetfb_flip=1 sweetusb=2 sweetbattery=1 sweetfb_hw=1 sweetarm64e=1 launchd_disable_all_timeouts=1 ufslogsecs=1 sweettouchdelay=0 sweetwlan=5 sweetwlandelay=60 sweet80211=3 sweetgpu=8 sweetgpufreq=gov sweetgpuhb=10 sweetgpuboost=7 sweetgpuubwc=1 sweetamp_yield=1 sweetbt=1 sweetbtfast=1 sweetbtibs=1 sweetcharger=2 sweetcharger_fcc=1700 sweetaudio=3 sweethap=3"
 # EXTRA_ARGS: appended for a test boot (e.g. EXTRA_ARGS="sweetaudio=1"), nothing by default
 CMDLINE="$CMDLINE${EXTRA_ARGS:+ $EXTRA_ARGS}"
 [ "${#CMDLINE}" -le 607 ] || { echo "boot-args are ${#CMDLINE} bytes, the field holds 607" >&2; exit 1; }
 RENEGADE_TARGET=ios26 BOARD=dipper DTB="$PWD/dtb/dipper/dtb" CMDLINE="$CMDLINE" \
-	exec tools/renegade/mkboot-full.sh "$1" "${3:-enxerto/out/dipper-n104-2x-wlan-gpu-hap-cam.adt}" "$2"
+	exec tools/renegade/mkboot-full.sh "$1" "${3:-enxerto/out/dipper-n104-2x-wlan-gpu-hap-cam-862.adt}" "$2"
