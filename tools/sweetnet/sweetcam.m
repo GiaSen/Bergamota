@@ -287,7 +287,12 @@ struct isp {
 	float wb[3];                    /* red, green, blue gains (grey world, smoothed) */
 	float mean;                     /* the last frame's mean green above black, 0-1 of the range (for the metadata) */
 	uint8_t gamma[4096];            /* linear (0-4095 over the sensor's range above black) to sRGB 8 bits */
+	uint16_t gamma10[4096];         /* ... the same curve to 10 bits (the still, developed at full size) */
 	uint8_t *rgb;                   /* HW x HH x 3 */
+	float m[9];                     /* the colour matrix of the last frame (white balance and scale folded in) */
+	const uint8_t *raw;             /* the frame being delivered, RAW10, and its header (for the still) */
+	const struct cam_live_hdr *hdr;
+	const struct output *still_out; /* the still output (developed from raw, not from rgb) */
 	bool ready;
 };
 
@@ -301,6 +306,7 @@ isp_init(struct isp *p)
 		double x = i / 4095.0, s = x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1 / 2.4) - 0.055;
 		s = s + 0.12 * s * (1 - s) * (2 * s - 1) * -1;  /* a gentle S */
 		p->gamma[i] = (uint8_t)(s < 0 ? 0 : s > 1 ? 255 : s * 255 + 0.5);
+		p->gamma10[i] = (uint16_t)(s < 0 ? 0 : s > 1 ? 1023 : s * 1023 + 0.5);
 	}
 	p->rgb = malloc(HW * HH * 3);
 	p->ready = p->rgb != NULL;
@@ -369,6 +375,7 @@ isp_half(struct isp *p, const struct cam_live_hdr *h, const uint8_t *raw)
 			j.m[r * 3 + c] = ccm[r * 3 + c] * p->wb[c] * scale;
 		}
 	}
+	memcpy(p->m, j.m, sizeof(p->m));
 	dispatch_apply_f(16, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &j, half_piece);
 	uint64_t s[3] = { 0, 0, 0 };
 	for (int i = 0; i < 16; i++) {
@@ -465,6 +472,392 @@ render_piece_pf20(const struct render_job *j, unsigned y0, unsigned y1)
 		}
 	}
 	free(yv);
+}
+
+/*
+ * The still at full size (2026-11-09): the 4:3 centre of the 1920x1080 RAW10 frame demosaiced pixel by pixel (Malvar, He and
+ * Cutler's 5x5 linear filters on the RGGB mosaic), through the preview's white balance and colour matrix and the same tone
+ * curve to 10 bits, then scaled to the still's size (bilinear) into 'pf20'. Before, the still was scaled up from the preview's
+ * half-size picture (960x540, 8 bits: a quarter of the frame's detail). /private/var/tmp/sweetcam.halfstill: the old way.
+ */
+struct full_job {
+	const struct isp *p;
+	const struct cam_live_hdr *hd;
+	uint16_t *u;                    /* the frame unpacked, 16 bits a sample, W x H */
+	uint16_t *d;                    /* the crop demosaiced and toned, 10-bit R G B, cw x ch */
+	uint16_t *y, *y2;               /* its luma (10 bits), and after the noise filter */
+	int16_t *cb, *cr, *t;           /* its chroma (signed, 10-bit scale), and a row-blurred copy */
+	unsigned thr;                   /* the luma filter's threshold (from the frame's measured noise) */
+	unsigned W, H, cx, cy, cw, ch;
+	CVPixelBufferRef pb;
+	unsigned w, h, pieces;
+};
+
+static void
+full_unpack(void *ctx, size_t piece)
+{
+	struct full_job *j = ctx;
+	unsigned rows = (j->H + j->pieces - 1) / j->pieces, y0 = (unsigned)piece * rows, y1 = MIN(j->H, y0 + rows);
+	for (unsigned y = y0; y < y1; y++) {
+		const uint8_t *r = j->p->raw + (size_t)y * j->hd->stride;
+		uint16_t *o = j->u + (size_t)y * j->W;
+		for (unsigned x = 0; x + 3 < j->W; x += 4, r += 5) {
+			o[x] = (uint16_t)(r[0] << 2 | (r[4] & 3));
+			o[x + 1] = (uint16_t)(r[1] << 2 | (r[4] >> 2 & 3));
+			o[x + 2] = (uint16_t)(r[2] << 2 | (r[4] >> 4 & 3));
+			o[x + 3] = (uint16_t)(r[3] << 2 | (r[4] >> 6 & 3));
+		}
+	}
+}
+
+/* the mosaic at (x, y), mirrored at the frame's edges (two away keeps the Bayer colour) */
+static inline int
+mos(const struct full_job *j, int x, int y)
+{
+	if (x < 0) x = -x;
+	if (y < 0) y = -y;
+	if (x >= (int)j->W) x = 2 * (int)j->W - 2 - x;
+	if (y >= (int)j->H) y = 2 * (int)j->H - 2 - y;
+	return j->u[(size_t)y * j->W + (unsigned)x];
+}
+
+static void
+full_demosaic(void *ctx, size_t piece)
+{
+	struct full_job *j = ctx;
+	const struct isp *p = j->p;
+	const int black = j->hd->black;
+	unsigned rows = (j->ch + j->pieces - 1) / j->pieces, y0 = (unsigned)piece * rows, y1 = MIN(j->ch, y0 + rows);
+	for (unsigned yy = y0; yy < y1; yy++) {
+		int y = (int)(yy + j->cy);
+		uint16_t *o = j->d + (size_t)yy * j->cw * 3;
+		bool inner_y = y >= 2 && y + 2 < (int)j->H;
+		for (unsigned xx = 0; xx < j->cw; xx++) {
+			int x = (int)(xx + j->cx), c, n, s, e, w, nn, ss, ee, ww, ne, nw, se, sw;
+			if (inner_y && x >= 2 && x + 2 < (int)j->W) {
+				const uint16_t *r = j->u + (size_t)y * j->W + x;
+				const int W = (int)j->W;
+				c = r[0]; n = r[-W]; s = r[W]; e = r[1]; w = r[-1]; nn = r[-2 * W]; ss = r[2 * W]; ee = r[2]; ww = r[-2];
+				ne = r[-W + 1]; nw = r[-W - 1]; se = r[W + 1]; sw = r[W - 1];
+			} else {
+				c = mos(j, x, y); n = mos(j, x, y - 1); s = mos(j, x, y + 1); e = mos(j, x + 1, y); w = mos(j, x - 1, y);
+				nn = mos(j, x, y - 2); ss = mos(j, x, y + 2); ee = mos(j, x + 2, y); ww = mos(j, x - 2, y);
+				ne = mos(j, x + 1, y - 1); nw = mos(j, x - 1, y - 1); se = mos(j, x + 1, y + 1); sw = mos(j, x - 1, y + 1);
+			}
+			/* Malvar-He-Cutler, numerators doubled (the 1/2 and 3/2 weights), over 16 */
+			int R, G, B;
+			int cross = 8 * c + 4 * (n + s + e + w) - 2 * (nn + ss + ee + ww);                      /* G at R or B */
+			int diag = 12 * c + 4 * (ne + nw + se + sw) - 3 * (nn + ss + ee + ww);                  /* B at R, R at B */
+			int horiz = 10 * c + 8 * (e + w) - 2 * (ee + ww + ne + nw + se + sw) + (nn + ss);     /* the colour left/right of a G */
+			int vert = 10 * c + 8 * (n + s) - 2 * (nn + ss + ne + nw + se + sw) + (ee + ww);      /* the colour above/below a G */
+			bool odd_y = y & 1, odd_x = x & 1;
+			if (!odd_y && !odd_x) {         /* R */
+				R = 16 * c; G = cross; B = diag;
+			} else if (odd_y && odd_x) {    /* B */
+				B = 16 * c; G = cross; R = diag;
+			} else if (!odd_y) {            /* G on an R row: R left and right, B above and below */
+				G = 16 * c; R = horiz; B = vert;
+			} else {                        /* G on a B row: B left and right, R above and below */
+				G = 16 * c; B = horiz; R = vert;
+			}
+			float fr = (float)(R - 16 * black) / 16.f, fg = (float)(G - 16 * black) / 16.f, fb = (float)(B - 16 * black) / 16.f;
+			fr = fr < 0 ? 0 : fr;
+			fg = fg < 0 ? 0 : fg;
+			fb = fb < 0 ? 0 : fb;
+			int lr = (int)(p->m[0] * fr + p->m[1] * fg + p->m[2] * fb), lg = (int)(p->m[3] * fr + p->m[4] * fg + p->m[5] * fb),
+			    lb = (int)(p->m[6] * fr + p->m[7] * fg + p->m[8] * fb);
+			o[0] = p->gamma10[lr < 0 ? 0 : lr > 4095 ? 4095 : lr];
+			o[1] = p->gamma10[lg < 0 ? 0 : lg > 4095 ? 4095 : lg];
+			o[2] = p->gamma10[lb < 0 ? 0 : lb > 4095 ? 4095 : lb];
+			o += 3;
+		}
+	}
+}
+
+/* the developed crop into luma and chroma (BT.601, full range: the still's attachments say 601) */
+static void
+full_ycc(void *ctx, size_t piece)
+{
+	struct full_job *j = ctx;
+	unsigned rows = (j->ch + j->pieces - 1) / j->pieces, y0 = (unsigned)piece * rows, y1 = MIN(j->ch, y0 + rows);
+	for (unsigned y = y0; y < y1; y++) {
+		const uint16_t *d = j->d + (size_t)y * j->cw * 3;
+		size_t o = (size_t)y * j->cw;
+		for (unsigned x = 0; x < j->cw; x++, d += 3) {
+			int R = d[0], G = d[1], B = d[2];
+			j->y[o + x] = (uint16_t)((77 * R + 150 * G + 29 * B) >> 8);
+			j->cb[o + x] = (int16_t)((-43 * R - 85 * G + 128 * B) >> 8);
+			j->cr[o + x] = (int16_t)((128 * R - 107 * G - 21 * B) >> 8);
+		}
+	}
+}
+
+/*
+ * Luma noise: an outlier (more than 3 sigmas from its 3x3 median) is replaced by that median, then a 5x5 bilateral filter
+ * (spatial 1 4 6 4 1 weights, range weights a Gaussian of thr = the filter's range sigma). A hard-threshold sigma filter
+ * before it left ragged edges and isolated dark dots in low light (2026-11-09).
+ */
+static float bil_range[1024];
+static unsigned bil_range_thr;
+
+static inline void
+sort2(int *a, int *b)
+{
+	int x = *a, y = *b;
+	*a = x < y ? x : y;
+	*b = x < y ? y : x;
+}
+
+static inline int
+median9(int *p)
+{
+	sort2(&p[1], &p[2]); sort2(&p[4], &p[5]); sort2(&p[7], &p[8]); sort2(&p[0], &p[1]); sort2(&p[3], &p[4]); sort2(&p[6], &p[7]);
+	sort2(&p[1], &p[2]); sort2(&p[4], &p[5]); sort2(&p[7], &p[8]); sort2(&p[0], &p[3]); sort2(&p[5], &p[8]); sort2(&p[4], &p[7]);
+	sort2(&p[3], &p[6]); sort2(&p[1], &p[4]); sort2(&p[2], &p[5]); sort2(&p[4], &p[7]); sort2(&p[4], &p[2]); sort2(&p[6], &p[4]);
+	sort2(&p[4], &p[2]);
+	return p[4];
+}
+
+static void
+full_luma_nr(void *ctx, size_t piece)
+{
+	struct full_job *j = ctx;
+	unsigned rows = (j->ch + j->pieces - 1) / j->pieces, y0 = (unsigned)piece * rows, y1 = MIN(j->ch, y0 + rows);
+	const int W = (int)j->cw, H = (int)j->ch, out3 = (int)(3 * j->thr / 2);   /* thr is 1.5 sigma: 3 sigma = 2 thr */
+	static const float sw[5] = { 1, 4, 6, 4, 1 };
+	for (unsigned yy = y0; yy < y1; yy++) {
+		int y = (int)yy;
+		const uint16_t *rows5[5];
+		for (int dy = -2; dy <= 2; dy++) {
+			int ry = y + dy < 0 ? 0 : y + dy >= H ? H - 1 : y + dy;
+			rows5[dy + 2] = j->y + (size_t)ry * W;
+		}
+		for (int x = 0; x < W; x++) {
+			int v[5][5];
+			for (int dy = 0; dy < 5; dy++)
+				for (int dx = -2; dx <= 2; dx++) {
+					int rx = x + dx < 0 ? 0 : x + dx >= W ? W - 1 : x + dx;
+					v[dy][dx + 2] = rows5[dy][rx];
+				}
+			int c = v[2][2], m9[9] = { v[1][1], v[1][2], v[1][3], v[2][1], v[2][2], v[2][3], v[3][1], v[3][2], v[3][3] };
+			int med = median9(m9);
+			if (c - med > 2 * out3 || med - c > 2 * out3) c = med;
+			float sum = 0, wsum = 0;
+			for (int dy = 0; dy < 5; dy++)
+				for (int dx = 0; dx < 5; dx++) {
+					int d = v[dy][dx] - c;
+					float wgt = sw[dy] * sw[dx] * bil_range[d < 0 ? -d : d];
+					sum += wgt * v[dy][dx];
+					wsum += wgt;
+				}
+			int o = wsum > 0 ? (int)(sum / wsum + 0.5f) : c;
+			j->y2[(size_t)y * W + x] = (uint16_t)(o < 0 ? 0 : o > 1023 ? 1023 : o);
+		}
+	}
+}
+
+/* Chroma noise: a 13x13 box (rows, then columns), on chroma that the eye resolves far less finely than luma */
+#define CNR 6
+static void
+full_chroma_rows(void *ctx, size_t piece)
+{
+	struct full_job *j = ctx;
+	unsigned rows = (j->ch + j->pieces - 1) / j->pieces, y0 = (unsigned)piece * rows, y1 = MIN(j->ch, y0 + rows);
+	const int W = (int)j->cw;
+	for (int plane = 0; plane < 2; plane++) {
+		int16_t *src = plane ? j->cr : j->cb, *dst = j->t + (size_t)plane * j->cw * j->ch;
+		for (unsigned y = y0; y < y1; y++) {
+			const int16_t *r = src + (size_t)y * W;
+			int16_t *o = dst + (size_t)y * W;
+			int sum = 0;
+			for (int x = -CNR; x <= CNR; x++) sum += r[x < 0 ? 0 : x];
+			for (int x = 0; x < W; x++) {
+				o[x] = (int16_t)(sum / (2 * CNR + 1));
+				int add = x + CNR + 1 >= W ? W - 1 : x + CNR + 1, sub = x - CNR < 0 ? 0 : x - CNR;
+				sum += r[add] - r[sub];
+			}
+		}
+	}
+}
+
+static void
+full_chroma_cols(void *ctx, size_t piece)
+{
+	struct full_job *j = ctx;
+	unsigned cols = (j->cw + j->pieces - 1) / j->pieces, x0 = (unsigned)piece * cols, x1 = MIN(j->cw, x0 + cols);
+	const int W = (int)j->cw, H = (int)j->ch;
+	for (int plane = 0; plane < 2; plane++) {
+		const int16_t *src = j->t + (size_t)plane * j->cw * j->ch;
+		int16_t *dst = plane ? j->cr : j->cb;
+		for (unsigned x = x0; x < x1; x++) {
+			int sum = 0;
+			for (int y = -CNR; y <= CNR; y++) sum += src[(size_t)(y < 0 ? 0 : y) * W + x];
+			for (int y = 0; y < H; y++) {
+				dst[(size_t)y * W + x] = (int16_t)(sum / (2 * CNR + 1));
+				int add = y + CNR + 1 >= H ? H - 1 : y + CNR + 1, sub = y - CNR < 0 ? 0 : y - CNR;
+				sum += src[(size_t)add * W + x] - src[(size_t)sub * W + x];
+			}
+		}
+	}
+}
+
+/* the frame's luma noise: the median absolute difference of horizontal neighbours (most of a picture is smooth), as a sigma */
+static unsigned
+full_noise(const struct full_job *j)
+{
+	static uint32_t hist[1024];
+	memset(hist, 0, sizeof(hist));
+	uint32_t n = 0;
+	for (unsigned y = 0; y < j->ch; y += 3) {
+		const uint16_t *r = j->y + (size_t)y * j->cw;
+		for (unsigned x = 0; x + 1 < j->cw; x += 2, n++) hist[abs((int)r[x + 1] - (int)r[x])]++;
+	}
+	uint32_t acc = 0, med = 0;
+	while (med < 1023 && (acc += hist[med]) < n / 2) med++;
+	return med;     /* for neighbours of the same noise sigma s the median |difference| is about 0.95 s */
+}
+
+static inline int
+plane_sample16(const uint16_t *pl, unsigned W, unsigned H, float sx, float sy)
+{
+	int x0 = (int)sx, y0 = (int)sy;
+	float fx = sx - x0, fy = sy - y0;
+	x0 = x0 < 0 ? 0 : x0 > (int)W - 2 ? (int)W - 2 : x0;
+	y0 = y0 < 0 ? 0 : y0 > (int)H - 2 ? (int)H - 2 : y0;
+	const uint16_t *a = pl + (size_t)y0 * W + x0, *b = a + W;
+	float t = a[0] + (a[1] - a[0]) * fx, u = b[0] + (b[1] - b[0]) * fx;
+	return (int)(t + (u - t) * fy + 0.5f);
+}
+
+static inline int
+plane_sample_s16(const int16_t *pl, unsigned W, unsigned H, float sx, float sy)
+{
+	int x0 = (int)sx, y0 = (int)sy;
+	float fx = sx - x0, fy = sy - y0;
+	x0 = x0 < 0 ? 0 : x0 > (int)W - 2 ? (int)W - 2 : x0;
+	y0 = y0 < 0 ? 0 : y0 > (int)H - 2 ? (int)H - 2 : y0;
+	const int16_t *a = pl + (size_t)y0 * W + x0, *b = a + W;
+	float t = a[0] + (a[1] - a[0]) * fx, u = b[0] + (b[1] - b[0]) * fx;
+	return (int)lrintf(t + (u - t) * fy);
+}
+
+/* luma at the still's size from the filtered luma, chroma at half that from the blurred chroma, packed into 'pf20' */
+static void
+full_pf20(void *ctx, size_t piece)
+{
+	struct full_job *j = ctx;
+	unsigned rows = (j->h + j->pieces - 1) / j->pieces, y0 = (unsigned)piece * rows, y1 = y0 + rows;
+	y0 &= ~1u;
+	y1 = piece + 1 == j->pieces ? j->h : (y1 & ~1u);
+	y1 = MIN(y1, j->h);
+	unsigned w = j->w, cw2 = (w + 1) / 2;
+	uint16_t *v = malloc(sizeof(uint16_t) * (w + 3 + 2 * (cw2 + 3)));
+	if (!v) {
+		return;
+	}
+	uint16_t *cv = v + w + 3;
+	uint8_t *yb = CVPixelBufferGetBaseAddressOfPlane(j->pb, 0), *cb = CVPixelBufferGetBaseAddressOfPlane(j->pb, 1);
+	size_t ys = CVPixelBufferGetBytesPerRowOfPlane(j->pb, 0), cs = CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1);
+	float kx = (float)j->cw / j->w, ky = (float)j->ch / j->h;
+	for (unsigned y = y0; y < y1; y++) {
+		memset(v, 0, sizeof(uint16_t) * (w + 3));
+		for (unsigned x = 0; x < w; x++) {
+			int Y = plane_sample16(j->y2, j->cw, j->ch, (x + 0.5f) * kx - 0.5f, (y + 0.5f) * ky - 0.5f);
+			v[x] = (uint16_t)(Y < 0 ? 0 : Y > 1023 ? 1023 : Y);
+		}
+		uint32_t *o = (uint32_t *)(yb + y * ys);
+		for (unsigned x = 0; x < w; x += 3) {
+			*o++ = v[x] | (uint32_t)v[x + 1] << 10 | (uint32_t)v[x + 2] << 20;
+		}
+		if (y & 1) {
+			continue;
+		}
+		memset(cv, 0, sizeof(uint16_t) * 2 * (cw2 + 3));
+		for (unsigned k = 0; k < cw2; k++) {
+			float sx = (2 * k + 1.0f) * kx - 0.5f, sy = (y + 1.0f) * ky - 0.5f;   /* the centre of the 2x2 block */
+			int U = plane_sample_s16(j->cb, j->cw, j->ch, sx, sy) + 512, V = plane_sample_s16(j->cr, j->cw, j->ch, sx, sy) + 512;
+			cv[2 * k] = (uint16_t)(U < 0 ? 0 : U > 1023 ? 1023 : U);
+			cv[2 * k + 1] = (uint16_t)(V < 0 ? 0 : V > 1023 ? 1023 : V);
+		}
+		uint32_t *oc = (uint32_t *)(cb + (y / 2) * cs);
+		for (unsigned x = 0; x < 2 * cw2; x += 3) {
+			*oc++ = cv[x] | (uint32_t)cv[x + 1] << 10 | (uint32_t)cv[x + 2] << 20;
+		}
+	}
+	free(v);
+}
+
+/* the still (pf20, w x h) from the frame being delivered; false when it cannot (the caller falls back to the half-size picture) */
+static bool
+render_still_full(const struct isp *p, CVPixelBufferRef pb, unsigned w, unsigned h)
+{
+	const struct cam_live_hdr *hd = p->hdr;
+	if (!p->raw || !hd || hd->format != 1 || hd->width < 64 || hd->height < 64 || hd->stride < hd->width * 5 / 4 ||
+	    access("/private/var/tmp/sweetcam.halfstill", F_OK) == 0) {
+		return false;
+	}
+	struct full_job j = { .p = p, .hd = hd, .W = hd->width & ~3u, .H = hd->height & ~1u, .pb = pb, .w = w, .h = h, .pieces = 16 };
+	/* the centre of the 16:9 frame cut to the still's shape, on even coordinates (the Bayer phase) */
+	float aspect = (float)w / (float)h;
+	if (aspect < (float)j.W / j.H) {
+		j.ch = j.H;
+		j.cw = (unsigned)(j.H * aspect) & ~1u;
+	} else {
+		j.cw = j.W;
+		j.ch = (unsigned)(j.W / aspect) & ~1u;
+	}
+	j.cx = ((j.W - j.cw) / 2) & ~1u;
+	j.cy = ((j.H - j.ch) / 2) & ~1u;
+	size_t px = (size_t)j.cw * j.ch;
+	j.u = malloc((size_t)j.W * j.H * 2);
+	j.d = malloc(px * 6);
+	j.y = malloc(px * 2);
+	j.y2 = malloc(px * 2);
+	j.cb = malloc(px * 2);
+	j.cr = malloc(px * 2);
+	j.t = malloc(px * 4);
+	if (!j.u || !j.d || !j.y || !j.y2 || !j.cb || !j.cr || !j.t) {
+		free(j.u); free(j.d); free(j.y); free(j.y2); free(j.cb); free(j.cr); free(j.t);
+		return false;
+	}
+	uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+	dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+	dispatch_apply_f(j.pieces, q, &j, full_unpack);
+	dispatch_apply_f(j.pieces, q, &j, full_demosaic);
+	dispatch_apply_f(j.pieces, q, &j, full_ycc);
+	unsigned sigma = full_noise(&j);
+	/* /private/var/tmp/sweetcam.nr: a number, the luma filter's range sigma in tenths of the measured noise (15 by default; 0: off) */
+	static int nr10 = -1;
+	static time_t nr_read;
+	if (nr10 < 0 || time(NULL) != nr_read) {
+		FILE *nf = fopen("/private/var/tmp/sweetcam.nr", "r");
+		nr10 = 15;
+		if (nf) {
+			if (fscanf(nf, "%d", &nr10) != 1 || nr10 < 0) nr10 = 15;
+			fclose(nf);
+		}
+		nr_read = time(NULL);
+	}
+	j.thr = (unsigned)((sigma * nr10 + 5) / 10);
+	if (j.thr) {
+		if (bil_range_thr != j.thr) {
+			for (int d = 0; d < 1024; d++) bil_range[d] = expf(-(float)(d * d) / (2.f * j.thr * j.thr));
+			bil_range_thr = j.thr;
+		}
+		dispatch_apply_f(j.pieces, q, &j, full_luma_nr);
+	} else {
+		memcpy(j.y2, j.y, px * 2);
+	}
+	dispatch_apply_f(j.pieces, q, &j, full_chroma_rows);
+	dispatch_apply_f(j.pieces, q, &j, full_chroma_cols);
+	dispatch_apply_f(j.pieces, q, &j, full_pf20);
+	free(j.u); free(j.d); free(j.y); free(j.y2); free(j.cb); free(j.cr); free(j.t);
+	static unsigned said;
+	if (said++ < 6) {
+		say("still: %ux%u developed from the frame's %ux%u centre (of %ux%u) in %.1f ms; luma noise %u, filter threshold %u",
+		    w, h, j.cw, j.ch, j.W, j.H, (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1e6, sigma, j.thr);
+	}
+	return true;
 }
 
 static void
@@ -1220,7 +1613,9 @@ deliver(struct output *out, const struct isp *p, CMTime pts, CFDictionaryRef md)
 	}
 	j.cx = (HW - j.cw) / 2;
 	j.cy = (HH - j.ch) / 2;
-	dispatch_apply_f(j.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &j, render_piece);
+	if (!(pf == PF_PF20 && out == p->still_out && render_still_full(p, pb, (unsigned)w, (unsigned)h))) {
+		dispatch_apply_f(j.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &j, render_piece);
+	}
 	CVPixelBufferUnlockBaseAddress(pb, 0);
 	CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVAttachmentMode_ShouldPropagate);
 	CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
@@ -1283,6 +1678,9 @@ worker(void *ctx)
 		last = h->seq;
 		s->frames++;
 		isp_half(&isp, h, buf + h->hdr_size);
+		isp.raw = buf + h->hdr_size;   /* for the still's full-size development, during this frame's deliveries */
+		isp.hdr = h;
+		isp.still_out = &s->out[2];
 		uint64_t host = h->timestamp_ns * tb.denom / tb.numer;
 		CMTime pts = CMClockMakeHostTimeFromSystemUnits(host);
 		CFDictionaryRef md = frame_metadata(h, &isp, host);
