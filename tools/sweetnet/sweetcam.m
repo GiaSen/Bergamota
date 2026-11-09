@@ -36,6 +36,7 @@
 #include <CoreVideo/CoreVideo.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <CoreGraphics/CoreGraphics.h>
+#include <Accelerate/Accelerate.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -107,7 +108,7 @@ static void *(*derived_storage)(CMBaseObjectRef);
 static CMBaseClassID (*device_class_id)(void);
 static CMBaseClassID (*stream_class_id)(void);
 static CMBaseClassID (*session_class_id)(void);
-static CFStringRef port_back;
+static CFStringRef port_back, port_front;
 static CFStringRef md_attachment;       /* kFigCaptureSampleBufferAttachmentKey_MetadataDictionary */
 
 /* ---- small helpers ------------------------------------------------------------------------------------------------------ */
@@ -206,6 +207,8 @@ find_functions(void)
 	session_class_id = dlsym(RTLD_DEFAULT, "FigCaptureISPProcessingSessionGetClassID");
 	CFStringRef *port = dlsym(RTLD_DEFAULT, "kFigCapturePortType_BackFacingCamera");
 	port_back = port ? *port : NULL;
+	port = dlsym(RTLD_DEFAULT, "kFigCapturePortType_FrontFacingCamera");
+	port_front = port ? *port : NULL;
 	CFStringRef *mda = dlsym(RTLD_DEFAULT, "kFigCaptureSampleBufferAttachmentKey_MetadataDictionary");
 	md_attachment = mda ? *mda : NULL;
 	if (!derived_create || !derived_storage || !device_class_id || !stream_class_id || !port_back) {
@@ -237,9 +240,37 @@ kernel_has_camera(void)
 	return sysctlbyname("kern.sweet_cam_stream", &v, &len, NULL, 0) == 0;
 }
 
+/*
+ * the kernel's stream on or off. sensor (xnu 3090+, kern.sweet_cam_sensor): 0 the rear main, 1 the rear tele, 2 the front;
+ * each has its own register sequence file. An older kernel has the main one only.
+ */
 static int
-kernel_stream(int on)
+kernel_stream(int on, int sensor)
 {
+	static const char *const seqs[3][2] = {
+		{ "/usr/local/share/sweetcam/imx363-mode2.seq", "/var/root/imx363-mode2.seq" },
+		{ "/usr/local/share/sweetcam/s5k3m3-mode1.seq", "/var/root/s5k3m3-mode1.seq" },
+		{ "/usr/local/share/sweetcam/s5k3t1-mode1.seq", "/var/root/s5k3t1-mode1.seq" },
+	};
+	if (on) {
+		if (sensor < 0 || sensor > 2) {
+			return EINVAL;
+		}
+		/* another stream's worker may still be stopping the kernel (a switch between the cameras): up to 4 s */
+		for (int i = 0; i < 200; i++) {
+			int st = 0;
+			size_t sl = sizeof(st);
+			if (sysctlbyname("kern.sweet_cam_stream", &st, &sl, NULL, 0) != 0 || st == 0) {
+				break;
+			}
+			usleep(20000);
+		}
+		if (sysctlbyname("kern.sweet_cam_sensor", NULL, NULL, &sensor, sizeof(sensor)) != 0 && sensor != 0) {
+			int e = errno;
+			say("kern.sweet_cam_sensor=%d: %{public}s", sensor, strerror(e));
+			return e;
+		}
+	}
 	if (sysctlbyname("kern.sweet_cam_stream", NULL, NULL, &on, sizeof(on)) == 0) {
 		return 0;
 	}
@@ -249,7 +280,7 @@ kernel_stream(int on)
 		 * no sensor sequence loaded yet (it is the phone vendor's, kept out of the image): loaded from a file on the phone
 		 * (xnu 3082+ lets cameracaptured write kern.sweet_cam_seq; before, only root could)
 		 */
-		static const char *const paths[] = { "/usr/local/share/sweetcam/imx363-mode2.seq", "/var/root/imx363-mode2.seq" };
+		const char *const *paths = seqs[sensor];
 		for (unsigned i = 0; i < 2; i++) {
 			FILE *f = fopen(paths[i], "rb");
 			if (!f) {
@@ -362,8 +393,8 @@ take_full_still(void)
 
 /* ---- pictures from RAW10 ------------------------------------------------------------------------------------------------ */
 
-#define HW 960                          /* half of 1920x1080: one RGB value per 2x2 Bayer cell */
-#define HH 540
+/* the preview picture: half the frame, one RGB value per 2x2 Bayer cell (the main's 1920x1080 at first; isp_half follows the frame) */
+static unsigned HW = 960, HH = 540;
 
 struct isp {
 	float wb[3];                    /* red, green, blue gains (grey world, smoothed) */
@@ -372,6 +403,10 @@ struct isp {
 	uint16_t gamma10[4096];         /* ... the same curve to 10 bits (the still, developed at full size) */
 	uint8_t *rgb;                   /* HW x HH x 3 */
 	float m[9];                     /* the colour matrix of the last frame (white balance and scale folded in) */
+	float crop;                     /* the part of the picture shown, 0-1 of its width and height about the centre (the zoom) */
+	float gain;                     /* gain applied here, 1-4: the sensor at its limit and the picture still dark */
+	uint8_t *ty, *tc;               /* render_420's luma and chroma of the part shown (tcap pixels) */
+	size_t tcap;
 	const uint8_t *raw;             /* the frame being delivered, RAW10, and its header (for the still) */
 	const struct cam_live_hdr *hdr;
 	const struct output *still_out; /* the still output (developed from raw, not from rgb) */
@@ -390,7 +425,11 @@ isp_init(struct isp *p)
 		p->gamma[i] = (uint8_t)(s < 0 ? 0 : s > 1 ? 255 : s * 255 + 0.5);
 		p->gamma10[i] = (uint16_t)(s < 0 ? 0 : s > 1 ? 1023 : s * 1023 + 0.5);
 	}
-	p->rgb = malloc(HW * HH * 3);
+	p->rgb = malloc((size_t)HW * HH * 3);
+	p->crop = 1;
+	p->gain = 1;
+	p->ty = p->tc = NULL;
+	p->tcap = 0;
 	p->ready = p->rgb != NULL;
 }
 
@@ -405,6 +444,7 @@ struct half_job {
 	struct isp *p;
 	const uint8_t *raw;
 	unsigned stride, black;
+	unsigned cfa;                   /* 0 RGGB, 1 GRBG (the frame header's flags) */
 	float m[9];                     /* colour matrix with the white balance and the scale to 0-4095 folded in */
 	uint64_t sum[16][3];            /* per piece: R, G, B above black (for the next white balance) */
 };
@@ -413,15 +453,23 @@ static void
 half_piece(void *ctx, size_t piece)
 {
 	struct half_job *j = ctx;
-	unsigned y0 = (unsigned)piece * (HH / 16), y1 = y0 + HH / 16;
+	unsigned rows = (HH + 15) / 16, y0 = (unsigned)piece * rows, y1 = MIN(HH, y0 + rows);
 	uint64_t sr = 0, sg = 0, sb = 0;
 	for (unsigned y = y0; y < y1; y++) {
 		const uint8_t *r0 = j->raw + (size_t)(2 * y) * j->stride, *r1 = r0 + j->stride;
 		uint8_t *o = j->p->rgb + (size_t)y * HW * 3;
 		for (unsigned x = 0; x < HW; x++) {
-			int R = (int)raw10_at(r0, 2 * x) - (int)j->black;
-			int G = (((int)raw10_at(r0, 2 * x + 1) + (int)raw10_at(r1, 2 * x)) >> 1) - (int)j->black;
-			int B = (int)raw10_at(r1, 2 * x + 1) - (int)j->black;
+			int c00 = (int)raw10_at(r0, 2 * x), c01 = (int)raw10_at(r0, 2 * x + 1), c10 = (int)raw10_at(r1, 2 * x),
+			    c11 = (int)raw10_at(r1, 2 * x + 1), R, G, B;
+			if (j->cfa == 1) {      /* GRBG (the Mi 8's tele and front sensors) */
+				R = c01 - (int)j->black;
+				G = ((c00 + c11) >> 1) - (int)j->black;
+				B = c10 - (int)j->black;
+			} else {
+				R = c00 - (int)j->black;
+				G = ((c01 + c10) >> 1) - (int)j->black;
+				B = c11 - (int)j->black;
+			}
 			R = R < 0 ? 0 : R;
 			G = G < 0 ? 0 : G;
 			B = B < 0 ? 0 : B;
@@ -450,8 +498,22 @@ static void
 isp_half(struct isp *p, const struct cam_live_hdr *h, const uint8_t *raw)
 {
 	static const float ccm[9] = { 1.55f, -0.40f, -0.15f, -0.25f, 1.45f, -0.20f, -0.05f, -0.45f, 1.50f };
-	struct half_job j = { .p = p, .raw = raw, .stride = h->stride, .black = h->black };
-	float scale = 4095.0f / (float)(h->white - h->black);
+	struct half_job j = { .p = p, .raw = raw, .stride = h->stride, .black = h->black, .cfa = h->flags & 3 };
+	float scale = 4095.0f / (float)(h->white - h->black) * (p->gain >= 1 ? p->gain : 1);
+	unsigned hw = h->width / 2, hh = h->height / 2;
+	if (hw != HW || hh != HH || !p->rgb) {
+		/* another sensor's frames (the tele's 2104x1560, the front's 2592x1940) */
+		free(p->rgb);
+		p->rgb = malloc((size_t)hw * hh * 3);
+		p->ready = p->rgb != NULL;
+		if (!p->ready) {
+			return;
+		}
+		HW = hw;
+		HH = hh;
+		say("frames of %ux%u (sensor %u, colour order %u): the preview picture is %ux%u", h->width, h->height,
+		    (h->flags >> 8) & 3, h->flags & 3, HW, HH);
+	}
 	for (int r = 0; r < 3; r++) {
 		for (int c = 0; c < 3; c++) {
 			j.m[r * 3 + c] = ccm[r * 3 + c] * p->wb[c] * scale;
@@ -466,6 +528,20 @@ isp_half(struct isp *p, const struct cam_live_hdr *h, const uint8_t *raw)
 		}
 	}
 	p->mean = (float)s[1] / ((float)HW * HH * (float)(h->white - h->black));
+	/*
+	 * the sensor at its analog limit and the picture under the kernel's exposure target (0.156 of the range): the rest as
+	 * gain here, up to 4x, eased in (the front sensor has 16x analog gain and no digital gain; the tele's digital is 2x)
+	 */
+	{
+		/* the true mean: the sums take every 8th pixel of a row (p->mean above divides by all of them, so it is 1/8 of this;
+		 * left as it is: the photo pipeline has only been run with that value in its metadata) */
+		float tm = (float)s[1] / ((float)((HW + 7) / 8) * HH * (float)(h->white - h->black)), want = 1;
+		if (tm > 0.002f && h->again_x256 >= 15 * 256 && tm < 0.125f) {
+			want = 0.156f / tm;
+			want = want > 4.f ? 4.f : want;
+		}
+		p->gain = 0.9f * p->gain + 0.1f * want;
+	}
 	if (s[0] > 1000 && s[1] > 1000 && s[2] > 1000) {
 		float gr = (float)s[1] / (float)s[0], gb = (float)s[1] / (float)s[2];
 		gr = gr < 0.5f ? 0.5f : gr > 4.f ? 4.f : gr;
@@ -495,8 +571,8 @@ sample(const uint8_t *rgb, float sx, float sy, int out[3])
 {
 	int x0 = (int)sx, y0 = (int)sy;
 	float fx = sx - x0, fy = sy - y0;
-	x0 = x0 < 0 ? 0 : x0 > HW - 2 ? HW - 2 : x0;
-	y0 = y0 < 0 ? 0 : y0 > HH - 2 ? HH - 2 : y0;
+	x0 = x0 < 0 ? 0 : x0 > (int)HW - 2 ? (int)HW - 2 : x0;
+	y0 = y0 < 0 ? 0 : y0 > (int)HH - 2 ? (int)HH - 2 : y0;
 	const uint8_t *a = rgb + ((size_t)y0 * HW + x0) * 3, *b = a + HW * 3;
 	for (int c = 0; c < 3; c++) {
 		float t = a[c] + (a[c + 3] - a[c]) * fx, u = b[c] + (b[c + 3] - b[c]) * fx;
@@ -566,12 +642,14 @@ struct full_job {
 	const struct isp *p;
 	const struct cam_live_hdr *hd;
 	uint16_t *u;                    /* the frame unpacked, 16 bits a sample, W x H */
+	uint16_t *u0;                   /* ... as it came, before full_dpc put the corrected samples into u */
 	uint16_t *d;                    /* the crop demosaiced and toned, 10-bit R G B, cw x ch */
 	uint16_t *y, *y2;               /* its luma (10 bits), and after the noise filter */
 	int16_t *cb, *cr, *t;           /* its chroma (signed, 10-bit scale), and a row-blurred copy */
 	unsigned thr;                   /* the luma filter's threshold (from the frame's measured noise) */
 	unsigned W, H, cx, cy, cw, ch;
 	bool cells;                     /* cw x ch are 2x2 cells of the frame from (cx, cy), not pixels */
+	unsigned xo;                    /* 1: GRBG, the mosaic taken one column over is RGGB's */
 	CVPixelBufferRef pb;
 	unsigned w, h, pieces;
 };
@@ -589,6 +667,42 @@ full_unpack(void *ctx, size_t piece)
 			o[x + 1] = (uint16_t)(r[1] << 2 | (r[4] >> 2 & 3));
 			o[x + 2] = (uint16_t)(r[2] << 2 | (r[4] >> 4 & 3));
 			o[x + 3] = (uint16_t)(r[3] << 2 | (r[4] >> 6 & 3));
+		}
+	}
+}
+
+/*
+ * Defective pixels (2026-11-09): a sample well outside its eight same-colour neighbours two away is brought back to their
+ * range. The front sensor at 16x gain has hot pixels all over, and the demosaic's negative lobes turned each into dark
+ * dots around it (the vendor's ISP corrects them; the IMX363 showed none).
+ */
+static void
+full_dpc(void *ctx, size_t piece)
+{
+	struct full_job *j = ctx;
+	unsigned rows = (j->H + j->pieces - 1) / j->pieces, y0 = (unsigned)piece * rows, y1 = MIN(j->H, y0 + rows);
+	const int W = (int)j->W;
+	for (unsigned y = y0; y < y1; y++) {
+		const uint16_t *r = j->u0 + (size_t)y * j->W;
+		uint16_t *o = j->u + (size_t)y * j->W;
+		if (y < 2 || y + 2 >= j->H) {
+			memcpy(o, r, (size_t)j->W * sizeof(uint16_t));
+			continue;
+		}
+		o[0] = r[0];
+		o[1] = r[1];
+		o[W - 2] = r[W - 2];
+		o[W - 1] = r[W - 1];
+		for (int x = 2; x < W - 2; x++) {
+			int a[8] = { r[x - 2], r[x + 2], r[x - 2 * W], r[x + 2 * W], r[x - 2 * W - 2], r[x - 2 * W + 2], r[x + 2 * W - 2],
+				     r[x + 2 * W + 2] };
+			int lo = a[0], hi = a[0], v = r[x];
+			for (int k = 1; k < 8; k++) {
+				lo = a[k] < lo ? a[k] : lo;
+				hi = a[k] > hi ? a[k] : hi;
+			}
+			int t = 24 + (hi >> 3);
+			o[x] = (uint16_t)(v > hi + t ? hi : v < lo - t ? lo : v);
 		}
 	}
 }
@@ -633,7 +747,7 @@ full_demosaic(void *ctx, size_t piece)
 			int diag = 12 * c + 4 * (ne + nw + se + sw) - 3 * (nn + ss + ee + ww);                  /* B at R, R at B */
 			int horiz = 10 * c + 8 * (e + w) - 2 * (ee + ww + ne + nw + se + sw) + (nn + ss);     /* the colour left/right of a G */
 			int vert = 10 * c + 8 * (n + s) - 2 * (nn + ss + ne + nw + se + sw) + (ee + ww);      /* the colour above/below a G */
-			bool odd_y = y & 1, odd_x = x & 1;
+			bool odd_y = y & 1, odd_x = (x + (int)j->xo) & 1;
 			if (!odd_y && !odd_x) {         /* R */
 				R = 16 * c; G = cross; B = diag;
 			} else if (odd_y && odd_x) {    /* B */
@@ -670,8 +784,16 @@ full_cells(void *ctx, size_t piece)
 		uint16_t *o = j->d + (size_t)yy * j->cw * 3;
 		for (unsigned xx = 0; xx < j->cw; xx++, o += 3) {
 			unsigned x = 2 * (xx + j->cx);
-			float R = (float)((int)raw10_at(r0, x) - black), G = (float)((int)(raw10_at(r0, x + 1) + raw10_at(r1, x)) / 2 - black),
-			      B = (float)((int)raw10_at(r1, x + 1) - black);
+			float R, G, B;
+			if (j->xo) {
+				R = (float)((int)raw10_at(r0, x + 1) - black);
+				G = (float)((int)(raw10_at(r0, x) + raw10_at(r1, x + 1)) / 2 - black);
+				B = (float)((int)raw10_at(r1, x) - black);
+			} else {
+				R = (float)((int)raw10_at(r0, x) - black);
+				G = (float)((int)(raw10_at(r0, x + 1) + raw10_at(r1, x)) / 2 - black);
+				B = (float)((int)raw10_at(r1, x + 1) - black);
+			}
 			R = R < 0 ? 0 : R;
 			G = G < 0 ? 0 : G;
 			B = B < 0 ? 0 : B;
@@ -906,9 +1028,11 @@ render_still_full(const struct isp *p, CVPixelBufferRef pb, unsigned w, unsigned
 	    access("/private/var/tmp/sweetcam.halfstill", F_OK) == 0) {
 		return false;
 	}
-	struct full_job j = { .p = p, .hd = hd, .W = hd->width & ~3u, .H = hd->height & ~1u, .pb = pb, .w = w, .h = h, .pieces = 16 };
-	/* a frame at least twice the still's size (mode 0's 4032x3024 for a 2016x1512 still): one RGB pixel a 2x2 Bayer cell */
-	j.cells = j.W >= 2 * w && j.H >= 2 * h && access("/private/var/tmp/sweetcam.nocells", F_OK) != 0;
+	struct full_job j = { .p = p, .hd = hd, .W = hd->width & ~3u, .H = hd->height & ~1u, .pb = pb, .w = w, .h = h, .pieces = 16,
+		              .xo = (hd->flags & 3) == 1 };
+	float crop = p->crop > 0.02f && p->crop < 1.f ? p->crop : 1.f;         /* the zoom: the centre part */
+	/* the part shown at least twice the still's size (mode 0's 4032x3024 for a 2016x1512 still): one RGB pixel a 2x2 Bayer cell */
+	j.cells = j.W * crop >= 2 * w && j.H * crop >= 2 * h && access("/private/var/tmp/sweetcam.nocells", F_OK) != 0;
 	/* the centre of the 16:9 frame cut to the still's shape, on even coordinates (the Bayer phase) */
 	float aspect = (float)w / (float)h;
 	unsigned FW = j.cells ? j.W / 2 : j.W, FH = j.cells ? j.H / 2 : j.H;     /* in cells or pixels */
@@ -919,18 +1043,21 @@ render_still_full(const struct isp *p, CVPixelBufferRef pb, unsigned w, unsigned
 		j.cw = FW;
 		j.ch = (unsigned)(FW / aspect) & ~1u;
 	}
+	j.cw = MAX(64u, (unsigned)(j.cw * crop) & ~1u);
+	j.ch = MAX(64u, (unsigned)(j.ch * crop) & ~1u);
 	j.cx = ((FW - j.cw) / 2) & ~1u;
 	j.cy = ((FH - j.ch) / 2) & ~1u;
 	size_t px = (size_t)j.cw * j.ch;
 	j.u = j.cells ? malloc(2) : malloc((size_t)j.W * j.H * 2);
+	j.u0 = j.cells ? malloc(2) : malloc((size_t)j.W * j.H * 2);
 	j.d = malloc(px * 6);
 	j.y = malloc(px * 2);
 	j.y2 = malloc(px * 2);
 	j.cb = malloc(px * 2);
 	j.cr = malloc(px * 2);
 	j.t = malloc(px * 4);
-	if (!j.u || !j.d || !j.y || !j.y2 || !j.cb || !j.cr || !j.t) {
-		free(j.u); free(j.d); free(j.y); free(j.y2); free(j.cb); free(j.cr); free(j.t);
+	if (!j.u || !j.u0 || !j.d || !j.y || !j.y2 || !j.cb || !j.cr || !j.t) {
+		free(j.u); free(j.u0); free(j.d); free(j.y); free(j.y2); free(j.cb); free(j.cr); free(j.t);
 		return false;
 	}
 	uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
@@ -938,7 +1065,12 @@ render_still_full(const struct isp *p, CVPixelBufferRef pb, unsigned w, unsigned
 	if (j.cells) {
 		dispatch_apply_f(j.pieces, q, &j, full_cells);
 	} else {
+		/* unpacked into u0, defective pixels corrected into u */
+		uint16_t *keep = j.u;
+		j.u = j.u0;
 		dispatch_apply_f(j.pieces, q, &j, full_unpack);
+		j.u = keep;
+		dispatch_apply_f(j.pieces, q, &j, full_dpc);
 		dispatch_apply_f(j.pieces, q, &j, full_demosaic);
 	}
 	dispatch_apply_f(j.pieces, q, &j, full_ycc);
@@ -968,7 +1100,7 @@ render_still_full(const struct isp *p, CVPixelBufferRef pb, unsigned w, unsigned
 	dispatch_apply_f(j.pieces, q, &j, full_chroma_rows);
 	dispatch_apply_f(j.pieces, q, &j, full_chroma_cols);
 	dispatch_apply_f(j.pieces, q, &j, full_pf20);
-	free(j.u); free(j.d); free(j.y); free(j.y2); free(j.cb); free(j.cr); free(j.t);
+	free(j.u); free(j.u0); free(j.d); free(j.y); free(j.y2); free(j.cb); free(j.cr); free(j.t);
 	static unsigned said;
 	if (said++ < 6) {
 		say("still: %ux%u developed from the frame's %ux%u %{public}s centre (of %ux%u) in %.1f ms; luma noise %u, filter threshold %u",
@@ -1042,6 +1174,94 @@ render_piece(void *ctx, size_t piece)
 			cl[x + 1] = (uint8_t)(V < 0 ? 0 : V > 255 ? 255 : V);
 		}
 	}
+}
+
+/*
+ * 4:2:0 outputs through vImage (2026-11-09): the part of the preview picture shown goes to a luma plane and a CbCr plane
+ * at its own size (integer BT.601, 8 pieces), and vImage scales each into the output's planes. The loop in render_piece
+ * (a float bilinear sample of three channels for every output pixel) made 9 frames a second of the front camera's
+ * 3308x2482 preview with nearly six cores busy. /private/var/tmp/sweetcam.slow420: that loop again. false: not done
+ * (the caller falls back to it).
+ */
+struct conv_job {
+	const uint8_t *rgb;
+	uint8_t *ty, *tc;
+	int x0, y0, cw, ch;
+	bool video;
+};
+
+static void
+conv_piece(void *ctx, size_t piece)
+{
+	struct conv_job *c = ctx;
+	int rows = (c->ch + 7) / 8, ya = (int)piece * rows, yb = MIN(c->ch, ya + rows);
+	for (int y = ya; y < yb; y++) {
+		const uint8_t *r = c->rgb + ((size_t)(c->y0 + y) * HW + (size_t)c->x0) * 3;
+		uint8_t *oy = c->ty + (size_t)y * (size_t)c->cw, *oc = c->tc + (size_t)y * (size_t)c->cw * 2;
+		for (int x = 0; x < c->cw; x++, r += 3) {
+			int R = r[0], G = r[1], B = r[2];
+			int Y = (77 * R + 150 * G + 29 * B) >> 8, U = (-43 * R - 85 * G + 128 * B) >> 8, V = (128 * R - 107 * G - 21 * B) >> 8;
+			if (c->video) {
+				Y = 16 + (Y * 219 >> 8);
+				U = U * 224 >> 8;
+				V = V * 224 >> 8;
+			}
+			U += 128;
+			V += 128;
+			oy[x] = (uint8_t)Y;
+			oc[2 * x] = (uint8_t)(U < 0 ? 0 : U > 255 ? 255 : U);
+			oc[2 * x + 1] = (uint8_t)(V < 0 ? 0 : V > 255 ? 255 : V);
+		}
+	}
+}
+
+static bool
+render_420(const struct render_job *j)
+{
+	struct isp *p = (struct isp *)(uintptr_t)j->p;         /* its scratch planes only */
+	int x0 = (int)j->cx, y0 = (int)j->cy, cw = (int)(j->cw + 0.5f), ch = (int)(j->ch + 0.5f);
+
+	if (access("/private/var/tmp/sweetcam.slow420", F_OK) == 0) {
+		return false;
+	}
+	x0 = x0 < 0 ? 0 : x0;
+	y0 = y0 < 0 ? 0 : y0;
+	cw = x0 + cw > (int)HW ? (int)HW - x0 : cw;
+	ch = y0 + ch > (int)HH ? (int)HH - y0 : ch;
+	if (cw < 2 || ch < 2) {
+		return false;
+	}
+	size_t need = (size_t)cw * (size_t)ch;
+	if (need > p->tcap) {
+		free(p->ty);
+		free(p->tc);
+		p->ty = malloc(need);
+		p->tc = malloc(need * 2);
+		p->tcap = p->ty && p->tc ? need : 0;
+		if (!p->tcap) {
+			return false;
+		}
+	}
+	struct conv_job c = { .rgb = p->rgb, .ty = p->ty, .tc = p->tc, .x0 = x0, .y0 = y0, .cw = cw, .ch = ch, .video = j->pf == PF_420V };
+	dispatch_apply_f(8, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &c, conv_piece);
+	vImage_Buffer sy = { p->ty, (vImagePixelCount)ch, (vImagePixelCount)cw, (size_t)cw };
+	vImage_Buffer sc = { p->tc, (vImagePixelCount)ch, (vImagePixelCount)cw, (size_t)cw * 2 };
+	vImage_Buffer dy = { CVPixelBufferGetBaseAddressOfPlane(j->pb, 0), CVPixelBufferGetHeightOfPlane(j->pb, 0),
+		             CVPixelBufferGetWidthOfPlane(j->pb, 0), CVPixelBufferGetBytesPerRowOfPlane(j->pb, 0) };
+	vImage_Buffer dc = { CVPixelBufferGetBaseAddressOfPlane(j->pb, 1), CVPixelBufferGetHeightOfPlane(j->pb, 1),
+		             CVPixelBufferGetWidthOfPlane(j->pb, 1), CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1) };
+	if (!dy.data || !dc.data) {
+		return false;
+	}
+	vImage_Error e1 = vImageScale_Planar8(&sy, &dy, NULL, kvImageNoFlags), e2 = vImageScale_CbCr8(&sc, &dc, NULL, kvImageNoFlags);
+	if (e1 != kvImageNoError || e2 != kvImageNoError) {
+		static unsigned said;
+		if (said++ < 3) {
+			say("render_420: vImage %ld %ld (%dx%d -> %ux%u): the slow loop", (long)e1, (long)e2, cw, ch, j->w, j->h);
+		}
+		return false;
+	}
+	return true;
 }
 
 /* ---- the stream --------------------------------------------------------------------------------------------------------- */
@@ -1127,13 +1347,15 @@ output_info(int64_t w, int64_t h)
  * format says
  */
 static CFDictionaryRef
-format_from(CFStringRef name, CFDictionaryRef entry)
+format_from(CFStringRef name, CFDictionaryRef entry, bool front)
 {
 	CFMutableDictionaryRef f = CFDictionaryCreateMutableCopy(NULL, 0, entry);
 	CFDictionaryRemoveValue(f, CFSTR("DepthCompanionFormat"));
 	CFDictionaryRemoveValue(f, CFSTR("FESCompanionFormats"));
 	CFDictionaryRemoveValue(f, CFSTR("NonSIFRCompanionFormat"));
 	int64_t sw = get_i(entry, "SensorWidth", 4032), sh = get_i(entry, "SensorHeight", 3024);
+	/* (the front camera's formats must stay at the plist's sizes: halved, CMCapture's "Front Camera" source "is missing
+	 * formats" and Camera could not switch to it, 2026-11-09) */
 	int64_t fps = get_i(entry, "MaxFrameRate", 30);
 	bool binned = get_i(entry, "Binned", 0) != 0;
 	CMVideoFormatDescriptionRef fd = NULL;
@@ -1159,6 +1381,7 @@ format_from(CFStringRef name, CFDictionaryRef entry)
 		put(f, "SensorCropWidth", num_i(sw));
 		put(f, "SensorCropHeight", num_i(sh));
 	}
+	(void)entry;
 	put(f, "PreGDCSensorCropWidth", num_i(sw));
 	put(f, "PreGDCSensorCropHeight", num_i(sh));
 	put(f, "PostGDCCropWidth", num_i(sw));
@@ -1176,8 +1399,12 @@ format_from(CFStringRef name, CFDictionaryRef entry)
 	if (ow > 2048) {
 		ow /= 2;
 		oh /= 2;
-		put(f, "HighQualitySensorWidth", num_i(ow));
-		put(f, "HighQualitySensorHeight", num_i(oh));
+		/* the front camera's entries have no such keys: with them at half the sensor's size its photos came out at a quarter
+		 * (1008x756), tried without (2026-11-09) */
+		if (!front || access("/private/var/tmp/sweetcam.fronthq", F_OK) == 0) {
+			put(f, "HighQualitySensorWidth", num_i(ow));
+			put(f, "HighQualitySensorHeight", num_i(oh));
+		}
 	}
 	put(outputs, "PrimaryScaler", output_info(sw, sh));
 	put(outputs, "SecondaryScaler", output_info(sw, sh));
@@ -1195,9 +1422,10 @@ format_from(CFStringRef name, CFDictionaryRef entry)
 	return f;
 }
 
-/* the back camera's stream formats of the model's AVCaptureSession.plist (the device entry with "Photo" and autofocus) */
+/* a camera's stream formats of the model's AVCaptureSession.plist: the back camera's (the device entry with "Photo" and
+ * autofocus) or the "Front Camera" entry's */
 static CFArrayRef
-formats_of_model(void)
+formats_of_model(bool front)
 {
 	CFMutableArrayRef all = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
 	@autoreleasepool {
@@ -1212,15 +1440,15 @@ formats_of_model(void)
 	NSDictionary *plist = model ? [NSDictionary dictionaryWithContentsOfFile:model] : nil;
 	for (NSDictionary *dev in plist[@"AVCaptureDevices"]) {
 		NSDictionary *fs = dev[@"MultiStream"][@"FigCaptureStreamFormats"];
-		if (![dev[@"hasAutoFocus"] boolValue] || !fs[@"Photo"]) {
+		if (front ? ![dev[@"uniqueName"] isEqual:@"Front Camera"] || !fs[@"Photo"] : ![dev[@"hasAutoFocus"] boolValue] || !fs[@"Photo"]) {
 			continue;
 		}
 		for (NSString *name in [[fs allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
-			CFDictionaryRef f = format_from((__bridge CFStringRef)name, (__bridge CFDictionaryRef)fs[name]);
+			CFDictionaryRef f = format_from((__bridge CFStringRef)name, (__bridge CFDictionaryRef)fs[name], front);
 			CFArrayAppendValue(all, f);
 			CFRelease(f);
 		}
-		say("%ld stream formats from %{public}@", (long)CFArrayGetCount(all), model);
+		say("%ld %{public}s stream formats from %{public}@", (long)CFArrayGetCount(all), front ? "front" : "back", model);
 		break;
 	}
 	}
@@ -1229,7 +1457,7 @@ formats_of_model(void)
 		put(e, "SensorWidth", num_i(4032));
 		put(e, "SensorHeight", num_i(3024));
 		put(e, "MaxFrameRate", num_i(30));
-		CFDictionaryRef f = format_from(CFSTR("Photo"), e);
+		CFDictionaryRef f = format_from(CFSTR("Photo"), e, false);
 		CFArrayAppendValue(all, f);
 		CFRelease(f);
 		CFRelease(e);
@@ -1258,6 +1486,9 @@ struct stream {
 	volatile bool running, delivering, worker_started;
 	uint64_t frames;
 	volatile int still_pending;     /* still output pictures still to give after StillImageCaptureNow */
+	bool front;                     /* the front camera's stream (the kernel's sensor 2), else the back's (0, or 1 the tele) */
+	volatile float zoom;            /* ZoomFactor as CMCapture set it (1 = none) */
+	volatile bool tele;             /* the back camera on the telephoto sensor: from zoom 2 up, back below 1.9 */
 };
 
 static struct stream *
@@ -1285,11 +1516,12 @@ stream_copy_property_real(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef all
 
 	(void)allocator;
 	if (key_is(key, "PortType")) {
-		value = CFRetain(port_back);
+		value = CFRetain(s->front ? port_front : port_back);
 	} else if (key_is(key, "ModuleInfo")) {
-		/* the iPhone 11's back camera in N104/CameraSetup.plist: sensor 0x0503, FocalLengthCharacterization LensID 1, ActuatorID 1 */
+		/* the iPhone 11's cameras in N104/CameraSetup.plist (DefaultSensorIDs): back 0x0503 (FocalLengthCharacterization LensID
+		 * 1, ActuatorID 1), front 0x0514 */
 		CFMutableDictionaryRef info = new_dict();
-		put(info, "sensorID", num_i(0x0503));
+		put(info, "sensorID", num_i(s->front ? 0x0514 : 0x0503));
 		put(info, "ModuleLensID", num_i(1));
 		put(info, "ModuleActuatorID", num_i(1));
 		put(info, "ModuleIntegratorID", num_i(1));
@@ -1297,9 +1529,10 @@ stream_copy_property_real(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef all
 		put(info, "ModuleIDSchemeVersion", num_i(1));
 		value = info;
 	} else if (key_is(key, "UniqueID") || key_is(key, "ModelID")) {
-		value = CFRetain(CFSTR("com.apple.avfoundation.avcapturedevice.built-in_video:0"));
+		value = CFRetain(s->front ? CFSTR("com.apple.avfoundation.avcapturedevice.built-in_video:1") :
+		    CFSTR("com.apple.avfoundation.avcapturedevice.built-in_video:0"));
 	} else if (key_is(key, "NonLocalizedName") || key_is(key, "LocalizedName")) {
-		value = CFRetain(CFSTR("Back Camera"));
+		value = CFRetain(s->front ? CFSTR("Front Camera") : CFSTR("Back Camera"));
 	} else if (key_is(key, "Manufacturer")) {
 		value = CFRetain(CFSTR("Apple Inc."));
 	} else if (key_is(key, "SupportedFormatsArray")) {
@@ -1351,15 +1584,15 @@ stream_copy_property_real(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef all
 	} else if (key_is(key, "SupportedPropertiesDictionary")) {
 		value = CFRetain(s->supported);
 	} else if (key_is(key, "FocalLength")) {
-		value = num_f(4.25);            /* the iPhone 11 wide camera's, millimetres */
+		value = num_f(s->front ? 2.71 : 4.25);  /* the iPhone 11's wide and front cameras', millimetres */
 	} else if (key_is(key, "LensFNumber")) {
-		value = num_f(1.8);
+		value = num_f(s->front ? 2.2 : 1.8);
 	} else if (key_is(key, "PixelSize")) {
-		value = num_f(1.4);             /* required (BWFigVideoCaptureStream's init); the IMX363's pitch in micrometres */
+		value = num_f(s->front ? 0.9 : 1.4);    /* required (BWFigVideoCaptureStream's init); the sensors' pitch in micrometres */
 	} else if (key_is(key, "MaxZoomFactor")) {
 		value = num_f(16);
 	} else if (key_is(key, "ZoomFactor")) {
-		value = num_f(1);
+		value = num_f(s->zoom >= 1 ? s->zoom : 1);
 	} else if (key_is(key, "SupportedColorSpaces")) {
 		CFNumberRef srgb = num_i(0);
 		value = CFArrayCreate(NULL, (const void **)&srgb, 1, &kCFTypeArrayCallBacks);
@@ -1478,6 +1711,30 @@ stream_set_property_real(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		free(keys);
 		free(values);
 		pthread_mutex_unlock(&s->lock);
+		return 0;
+	}
+	if (key_is(key, "ZoomFactor")) {
+		/*
+		 * the zoom is the stream's to apply (CMCapture ramps this property): the centre 1/zoom of the picture, and for the
+		 * back camera the telephoto sensor from 2x (worker). /private/var/tmp/sweetcam.notele: the main sensor at any zoom
+		 */
+		double z = 1;
+		if (value && CFGetTypeID(value) == CFNumberGetTypeID()) {
+			CFNumberGetValue(value, kCFNumberDoubleType, &z);
+		}
+		z = z < 1 ? 1 : z > 16 ? 16 : z;
+		s->zoom = (float)z;
+		if (!s->front) {
+			bool was = s->tele;
+			if (z >= 2.0 && access("/private/var/tmp/sweetcam.notele", F_OK) != 0) {
+				s->tele = true;
+			} else if (z < 1.9) {
+				s->tele = false;
+			}
+			if (was != s->tele) {
+				say("stream: zoom %.2f: the %{public}s sensor", z, s->tele ? "telephoto" : "main");
+			}
+		}
 		return 0;
 	}
 	if (key_is(key, "StillImageCaptureNow")) {
@@ -1620,7 +1877,7 @@ md_v(CFMutableDictionaryRef d, const char *name, CFTypeRef v)
 }
 
 static CFDictionaryRef
-frame_metadata(const struct cam_live_hdr *h, const struct isp *p, uint64_t host_time)
+frame_metadata(const struct cam_live_hdr *h, const struct isp *p, uint64_t host_time, bool front)
 {
 	CFMutableDictionaryRef d = new_dict();
 	double exposure = h->exposure_lines * (double)h->line_ns / 1e9, again = h->again_x256 / 256.0, dgain = h->dgain_x256 / 256.0;
@@ -1649,11 +1906,11 @@ frame_metadata(const struct cam_live_hdr *h, const struct isp *p, uint64_t host_
 	md_i(d, "FocusLensPosition", (int64_t)(h->lens >> 2));
 	md_i(d, "CurrentFocusPosition", (int64_t)(h->lens >> 2));
 	md_i(d, "LogicalFocusLensPosition", (int64_t)(h->lens >> 2));
-	md_f(d, "FocalLength", 4.25);
-	md_f(d, "Fnumber", 1.8);
-	md_i(d, "FocalLenIn35mmFilm", 26);
-	md_v(d, "PortType", port_back);
-	md_i(d, "SensorID", 0x0503);
+	md_f(d, "FocalLength", front ? 2.71 : 4.25);
+	md_f(d, "Fnumber", front ? 2.2 : 1.8);
+	md_i(d, "FocalLenIn35mmFilm", front ? 23 : 26);
+	md_v(d, "PortType", front ? port_front : port_back);
+	md_i(d, "SensorID", front ? 0x0514 : 0x0503);
 	md_i(d, "Timestamp", (int64_t)host_time);
 	md_f(d, "CurrentFrameRate", fps);
 	md_f(d, "PreviousFrameDurationInSec", 1 / fps);
@@ -1728,9 +1985,15 @@ deliver(struct output *out, const struct isp *p, CMTime pts, CFDictionaryRef md)
 		j.cw = HW;
 		j.ch = HW / aspect;
 	}
+	if (p->crop > 0.02f && p->crop < 1.f) {         /* the zoom: the centre part */
+		j.cw *= p->crop;
+		j.ch *= p->crop;
+	}
 	j.cx = (HW - j.cw) / 2;
 	j.cy = (HH - j.ch) / 2;
-	if (!(pf == PF_PF20 && out == p->still_out && render_still_full(p, pb, (unsigned)w, (unsigned)h))) {
+	if ((pf == PF_420F || pf == PF_420V) && render_420(&j)) {
+		/* done through vImage */
+	} else if (!(pf == PF_PF20 && out == p->still_out && render_still_full(p, pb, (unsigned)w, (unsigned)h))) {
 		dispatch_apply_f(j.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &j, render_piece);
 	}
 	CVPixelBufferUnlockBaseAddress(pb, 0);
@@ -1771,23 +2034,50 @@ worker(void *ctx)
 	pthread_setname_np("sweetcam");
 	mach_timebase_info(&tb);
 	isp_init(&isp);
-	int e = kernel_stream(1);
-	if (e || !isp.ready || sysctlbyname("kern.sweet_cam_live", NULL, &cap, NULL, 0) != 0) {
-		say("the kernel's camera does not stream (%{public}s): no frames", strerror(e ? e : errno));
-		free(isp.rgb);
-		return NULL;
-	}
-	uint8_t *buf = malloc(cap);
-	say("worker: streaming (%zu-byte frames)", cap);
-	bool full_still = load_seq0();
+	int cur = -1;                   /* the kernel's sensor now streaming: 0 the rear main, 1 the rear tele, 2 the front */
+	uint8_t *buf = NULL;
+	bool full_still = false, tele_failed = false;
 	unsigned fails = 0;
-	while (s->running && buf && fails < 20) {
+	while (s->running && isp.ready && fails < 20) {
+		int want = s->front ? 2 : (s->tele && !tele_failed) ? 1 : 0;
+		if (want != cur) {
+			/* the first start, or the back camera between its main and telephoto sensors (the zoom): the kernel's stream again */
+			if (cur >= 0) {
+				(void)kernel_stream(0, cur);
+			}
+			int e = kernel_stream(1, want);
+			size_t ncap = 0;
+			if (e || sysctlbyname("kern.sweet_cam_live", NULL, &ncap, NULL, 0) != 0 || !ncap) {
+				say("the kernel's camera does not stream sensor %d (%{public}s)", want, strerror(e ? e : errno));
+				cur = -1;
+				if (want == 1) {
+					tele_failed = true;     /* the main sensor again, the zoom as a crop of it */
+					continue;
+				}
+				break;
+			}
+			if (ncap > cap) {
+				free(buf);
+				buf = malloc(ncap);
+				cap = buf ? ncap : 0;
+			}
+			if (!buf) {
+				break;
+			}
+			cur = want;
+			last = 0;
+			full_still = cur == 0 && load_seq0();
+			say("worker: streaming sensor %d (%zu-byte frames)", cur, ncap);
+			continue;
+		}
 		size_t len = cap;
+		uint64_t t_a = clock_gettime_nsec_np(CLOCK_MONOTONIC);
 		if (sysctlbyname("kern.sweet_cam_live", buf, &len, &last, sizeof(last)) != 0) {
 			fails++;
 			usleep(20000);
 			continue;
 		}
+		uint64_t t_b = clock_gettime_nsec_np(CLOCK_MONOTONIC);
 		const struct cam_live_hdr *h = (const void *)buf;
 		if (h->magic != 0x4d414353u || h->seq == last || len < h->hdr_size + (size_t)h->stride * h->height) {
 			continue;
@@ -1796,12 +2086,25 @@ worker(void *ctx)
 		last = h->seq;
 		s->frames++;
 		isp_half(&isp, h, buf + h->hdr_size);
+		if (!isp.ready) {
+			break;
+		}
+		uint64_t t_c = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+		/*
+		 * the zoom: the centre 1/zoom of the picture. On the telephoto (twice the main lens) the part that shows what the
+		 * main sensor's preview would at this zoom: that preview is the 4:3 middle of the main's 16:9 mode, 0.714 of its
+		 * sensor's width, so the telephoto's whole frame is zoom 1.43 and at 2x it shows 0.714 of its own
+		 */
+		{
+			float z = s->zoom >= 1 ? s->zoom : 1;
+			isp.crop = cur == 1 ? MIN(1.f, 1.428f / z) : 1.f / z;
+		}
 		isp.raw = buf + h->hdr_size;   /* for the still's full-size development, during this frame's deliveries */
 		isp.hdr = h;
 		isp.still_out = &s->out[2];
 		uint64_t host = h->timestamp_ns * tb.denom / tb.numer;
 		CMTime pts = CMClockMakeHostTimeFromSystemUnits(host);
-		CFDictionaryRef md = frame_metadata(h, &isp, host);
+		CFDictionaryRef md = frame_metadata(h, &isp, host, s->front);
 		const struct cam_live_hdr *fs = NULL;
 		if (full_still && s->still_pending > 0 && access("/private/var/tmp/sweetcam.nofullstill", F_OK) != 0) {
 			fs = take_full_still();     /* outside the lock: the kernel takes about 0.8 s */
@@ -1836,6 +2139,21 @@ worker(void *ctx)
 		}
 		pthread_mutex_unlock(&s->lock);
 		CFRelease(md);
+		{
+			/* where a frame's time goes here: the wait for it and its copy, the preview picture, the outputs (every 150 frames) */
+			static uint64_t acc[3];
+			static unsigned nacc;
+			uint64_t t_d = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+			acc[0] += t_b - t_a;
+			acc[1] += t_c - t_b;
+			acc[2] += t_d - t_c;
+			if (++nacc == 150) {
+				say("timing over 150 frames: frame wait and copy %.1f ms, preview picture %.1f ms, outputs %.1f ms (%ux%u, zoom crop %.2f, gain %.2f)",
+				    acc[0] / 150e6, acc[1] / 150e6, acc[2] / 150e6, h->width, h->height, isp.crop, isp.gain);
+				acc[0] = acc[1] = acc[2] = 0;
+				nacc = 0;
+			}
+		}
 		/*
 		 * a guard while the still pipeline is brought up: past 1200 MiB of the kernel's 1536 MiB of surfaces (xnu 3083's
 		 * kern.sweet_surface_list) cameracaptured ends itself, with the list in the log, rather than starve the phone (it did
@@ -1860,7 +2178,11 @@ worker(void *ctx)
 	}
 	free(buf);
 	free(isp.rgb);
-	(void)kernel_stream(0);
+	free(isp.ty);
+	free(isp.tc);
+	if (cur >= 0) {
+		(void)kernel_stream(0, cur);
+	}
 	say("worker: stopped after %llu frames", s->frames);
 	return NULL;
 }
@@ -1955,8 +2277,8 @@ stream_finalize(CMBaseObjectRef o)
 static CFStringRef
 stream_description(CMBaseObjectRef o)
 {
-	(void)o;
-	return CFRetain(CFSTR("<SweetCaptureStream: the Mi 8's rear main camera>"));
+	return CFRetain(stream_of(o)->front ? CFSTR("<SweetCaptureStream: the Mi 8's front camera>") :
+	    CFSTR("<SweetCaptureStream: the Mi 8's rear cameras>"));
 }
 
 static const struct base_class stream_base = {
@@ -1967,7 +2289,7 @@ static const struct stream_class stream_derived = { 2, stream_start, stream_stop
 static const struct vtable stream_vtable = { NULL, &stream_base, &stream_derived };
 
 static CMBaseObjectRef
-stream_create(CFAllocatorRef allocator)
+stream_create(CFAllocatorRef allocator, bool front)
 {
 	CMBaseObjectRef o = NULL;
 	if (derived_create(allocator, &stream_vtable, stream_class_id(), &o) != 0 || !o) {
@@ -1982,7 +2304,9 @@ stream_create(CFAllocatorRef allocator)
 	for (int i = 0; i < OUTPUTS; i++) {
 		s->out[i].name = output_names[i];
 	}
-	s->formats = formats_of_model();
+	s->front = front;
+	s->zoom = 1;
+	s->formats = formats_of_model(front);
 	s->supported = supported(stream_props, sizeof(stream_props) / sizeof(stream_props[0]));
 	return o;
 }
@@ -2245,22 +2569,32 @@ sweetcam_device_create(CFAllocatorRef allocator, CFDictionaryRef options, CMBase
 		return gAppleCreate ? gAppleCreate(allocator, options, out) : ERR_UNSUPPORTED;
 	}
 	say_once("device create: options", CFSTR("options"), options);
-	CMBaseObjectRef stream = stream_create(allocator), device = NULL;
+	/* the back camera's stream (the main sensor, the telephoto from 2x) and the front camera's
+	 * (/private/var/tmp/sweetcam.nofront: the back one only) */
+	CMBaseObjectRef stream = stream_create(allocator, false), device = NULL;
 	if (!stream) {
 		return ERR_UNSUPPORTED;
 	}
+	CMBaseObjectRef front = port_front && access("/private/var/tmp/sweetcam.nofront", F_OK) != 0 ? stream_create(allocator, true) : NULL;
 	if (derived_create(allocator, &device_vtable, device_class_id(), &device) != 0 || !device) {
 		CFRelease(stream);
+		if (front) {
+			CFRelease(front);
+		}
 		say("the device cannot be made");
 		return ERR_UNSUPPORTED;
 	}
 	struct device *d = derived_storage(device);
 	memset(d, 0, sizeof(*d));
-	d->streams = CFArrayCreate(NULL, (const void **)&stream, 1, &kCFTypeArrayCallBacks);
+	const void *both[2] = { stream, front };
+	d->streams = CFArrayCreate(NULL, both, front ? 2 : 1, &kCFTypeArrayCallBacks);
 	d->supported = supported(device_props, sizeof(device_props) / sizeof(device_props[0]));
 	CFRelease(stream);
+	if (front) {
+		CFRelease(front);
+	}
 	*out = device;
-	say("device made: one stream, the back camera");
+	say("device made: %{public}s", front ? "two streams, the back camera and the front camera" : "one stream, the back camera");
 	return 0;
 }
 

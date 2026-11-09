@@ -9,7 +9,8 @@ properties are left out on purpose: they describe cameras and features this phon
 MobileGestalt's rear-facing-camera and still-camera come from IODeviceTree:/arm-io/isp "camera-rear" (its property names
 are hashed like its keys: base64(md5("MGCopyAnswer" + name))). Without them SpringBoard hides Camera.app (SBAppTags
 still-camera) and the lock screen's camera button is dimmed. The Mi 8's rear main camera works (xnu 3075+, sweetcam.dylib):
---rear-camera adds the node with that one property (no compatible: nothing matches it; no front camera).
+--rear-camera adds the node with that one property (no compatible: nothing matches it). --front-camera (2026-11-09, the
+front S5K3T1 streams since xnu 3090) adds "camera-front" = 1 to it: MobileGestalt's front-facing-camera.
 MobileGestalt reads DeviceSupportsClosedLoopHaptics from /product/haptics "closed-loop": with it iOS plays the system's
 vibrations and feedbacks as waveforms on the audio HAL's "Actuator" device (SweetSpeaker.driver), without it it looks
 for an old vibration motor in IOKit (found by HakiOS, xnuloader/mkidentity.py; docs/FORKS_SURVEY.md G9). The node's
@@ -51,6 +52,7 @@ def main():
     ap.add_argument('out')
     ap.add_argument('--from', dest='src', default=N104)
     ap.add_argument('--rear-camera', action='store_true', help='add /arm-io/isp "camera-rear" = 1')
+    ap.add_argument('--front-camera', action='store_true', help='add /arm-io/isp "camera-front" = 1')
     a = ap.parse_args()
     root, _ = adt.parse(adt.load(a.inp))
     src, _ = adt.parse(adt.load(a.src))
@@ -82,7 +84,7 @@ def main():
     product.children.append(cam)
     print('%s: /product/camera with only "flash" %s, phandle %#x%s' % (a.out, flash.hex(), ph + 1,
           ', replacing the old one' if oldcam is not None else ''))
-    if a.rear_camera:
+    if a.rear_camera or a.front_camera:
         armio = child(root, 'arm-io')
         if armio is None:
             sys.exit('%s: no /arm-io' % a.inp)
@@ -90,10 +92,14 @@ def main():
         if oldisp is not None:
             armio.children.remove(oldisp)
         isp = adt.Node()
-        isp.props = [('name', 0, b'isp\0'), ('camera-rear', 0, struct.pack('<I', 1)), ('AAPL,phandle', 0, struct.pack('<I', ph + 2))]
+        isp.props = [('name', 0, b'isp\0')] + \
+            ([('camera-rear', 0, struct.pack('<I', 1))] if a.rear_camera else []) + \
+            ([('camera-front', 0, struct.pack('<I', 1))] if a.front_camera else []) + \
+            [('AAPL,phandle', 0, struct.pack('<I', ph + 2))]
         isp.children = []
         armio.children.append(isp)
-        print('%s: /arm-io/isp with only "camera-rear" 1, phandle %#x%s' % (a.out, ph + 2,
+        print('%s: /arm-io/isp with only %s, phandle %#x%s' % (a.out, ' and '.join(
+              n for n, on in (('"camera-rear" 1', a.rear_camera), ('"camera-front" 1', a.front_camera)) if on), ph + 2,
               ', replacing the old one' if oldisp is not None else ''))
     open(a.out, 'wb').write(adt.serialize(root))
     print('%s: /product/haptics (%s) from %s, phandle %#x%s' % (a.out, ', '.join(k for k, f, v in n.props if k not in ('name', 'AAPL,phandle')),
