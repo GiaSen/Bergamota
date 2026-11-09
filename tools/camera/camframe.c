@@ -6,6 +6,8 @@
  *                         a newer one), says their timing, exposure and lens, writes the last frame's RAW10 to OUT, stops
  *   camframe -s FILE      loads FILE into kern.sweet_cam_seq (3077+: the rear main sensor's register sequence, made on
  *                         the Mac by tools/camera/camx_v1.py --seq from the phone's own module file; never in git)
+ *   camframe -c N ...     3090+: first selects the sensor (kern.sweet_cam_sensor: 0 rear main, 1 rear tele, 2 front); -s and
+ *                         -l then load that sensor's sequence and stream it
  *   camframe -S FILE      3085+: loads FILE into kern.sweet_cam_seq0 (mode 0, 4032x3024, for full-resolution stills)
  *   camframe -t N OUT     3085+: streams, reads N frames (auto exposure settles), takes a full-resolution still
  *                         (kern.sweet_cam_still), writes its RAW10 to OUT (frame2png.py --raw10 --size 4032x3024), stops
@@ -102,6 +104,8 @@ live(int n, const char *out)
 		}
 		if (!t0) {
 			t0 = h->timestamp_ns;
+			fprintf(stderr, "frames: %ux%u, %u bytes a line, format %u, flags %#x (colour order %u, sensor %u), black %u\n", h->width,
+			    h->height, h->stride, h->format, h->flags, h->flags & 3, (h->flags >> 8) & 3, h->black);
 		}
 		if (i < 3 || i % 30 == 0 || i == n - 1) {
 			fprintf(stderr, "seq %u t %+.1f ms (%+.1f) frame %u us, exposure %u lines x %.2f x %.2f, lens %u af %u\n", h->seq,
@@ -194,6 +198,16 @@ still(int n, const char *out)
 int
 main(int argc, char **argv)
 {
+	if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
+		if (set_int("kern.sweet_cam_sensor", atoi(argv[2]))) {
+			return 1;
+		}
+		argv += 2;
+		argc -= 2;
+		if (argc < 2) {
+			return 0;
+		}
+	}
 	if (argc == 3 && strcmp(argv[1], "-S") == 0) {
 		return load_seq_to(argv[2], "kern.sweet_cam_seq0");
 	}

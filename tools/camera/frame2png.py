@@ -24,16 +24,18 @@ def png(path, w, h, rows, colour):
         f.write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b''))
 
 
-def unpack_raw10(data, w, h):
-    """MIPI RAW10: 4 pixels in 5 bytes (4 high bytes, then the 4 low 2-bit pairs); lines w * 5 / 4 bytes"""
-    stride = w * 5 // 4
+def unpack_raw10(data, w, h, stride=0):
+    """MIPI RAW10: 4 pixels in 5 bytes (4 high bytes, then the 4 low 2-bit pairs); lines w * 5 / 4 bytes, or --stride
+    bytes apart (the Mi 8's tele: 2104 pixels = 2630 bytes in lines of 2632)"""
+    used = w * 5 // 4
+    stride = stride or used
     if len(data) < stride * h:
         raise SystemExit('dump too short for %dx%d RAW10 (%d < %d bytes)' % (w, h, len(data), stride * h))
     rows = []
     for y in range(h):
-        r = data[y * stride:(y + 1) * stride]
+        r = data[y * stride:y * stride + used]
         line = []
-        for o in range(0, stride, 5):
+        for o in range(0, used, 5):
             lo = r[o + 4]
             line += [(r[o] << 2) | (lo & 3), (r[o + 1] << 2) | ((lo >> 2) & 3), (r[o + 2] << 2) | ((lo >> 4) & 3),
                      (r[o + 3] << 2) | ((lo >> 6) & 3)]
@@ -42,7 +44,7 @@ def unpack_raw10(data, w, h):
 
 
 def raw10_png(a, data, w, h):
-    px = unpack_raw10(data, w, h)
+    px = unpack_raw10(data, w, h, a.stride)
     pos = {c: i for i, c in enumerate(a.order)}
     greens = [i for i, c in enumerate(a.order) if c == 'G']
     cells = []                                                  # (R, G, B) per 2x2 cell, black level off
@@ -81,6 +83,7 @@ def main():
     ap.add_argument('--raw10', action='store_true')
     ap.add_argument('--size', default=None)
     ap.add_argument('--slot', type=int, default=0)
+    ap.add_argument('--stride', type=int, default=0)
     ap.add_argument('--black', type=int, default=64)
     ap.add_argument('--wb', action='store_true')
     ap.add_argument('--order', default='RGGB', choices=['RGGB', 'BGGR', 'GRBG', 'GBRG'])
