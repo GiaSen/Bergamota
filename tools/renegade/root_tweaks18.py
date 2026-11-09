@@ -815,6 +815,47 @@ def camera(root):
         note_skip('camera', 'RENEGADE_CAM_SEQ not set: no sensor sequence')
     merge_pref(root, 'com.apple.camera', CAMERA_PREFS)
     inactive_jetsam(root, CAMERA_JETSAM, 'camera')
+    camera_zoom(root)
+
+
+# Camera's zoom button (2026-11-10, NOTES "A TAP ON 1x GOES TO 2x"): as an iPhone 11 Camera asks for a super wide camera when
+# its zoom button is tapped at 1x; tools/sweetnet/sweetzoom.dylib, weak-linked into Camera.app's binary, makes that tap the
+# zoom to 2x, where sweetcam uses the telephoto. /usr/local/lib/sweetzoom.dylib, ONE more LC_LOAD_WEAK_DYLIB in
+# /Applications/Camera.app/Camera, re-signed ad hoc keeping identifier, CS flags and entitlements (weak_link_file: the build
+# stops if any changes); the Camera it found goes to /private/var/root/camera-orig/Camera (once). The same as the by-hand
+# install on the phone (2026-11-10, link_weak.py). Off switch on the phone: /private/var/tmp/sweetzoom.off.
+ZOOM_DYLIB = '/usr/local/lib/sweetzoom.dylib'
+ZOOM_ORIG = 'private/var/root/camera-orig'
+ZOOM_TARGET = 'Applications/Camera.app/Camera'
+
+
+def camera_zoom(root):
+    src = find_sweetnet('ios18/sweetzoom.dylib')
+    binp = os.path.join(root, ZOOM_TARGET)
+    if not src or not os.path.exists(binp):
+        why = not_built() if not src else 'no ' + ZOOM_TARGET
+        print('camera: zoom button: %s: skipped (a tap at 1x does nothing)' % why)
+        note_skip('camera zoom button', why)
+        return False
+    install_file(src, os.path.join(root, ZOOM_DYLIB.lstrip('/')), 0o755)     # first: Camera never names a missing dylib
+    if macho_has_dylib(binp, ZOOM_DYLIB):
+        print('camera: Camera.app already links', ZOOM_DYLIB)
+        return True
+    mode = os.stat(binp).st_mode & 0o7777
+    orig = os.path.join(root, ZOOM_ORIG, 'Camera')
+    if not os.path.exists(orig):
+        install_file(binp, orig, mode)
+    import tempfile
+    tmpd = tempfile.mkdtemp(prefix='renegade-zoom-')
+    try:
+        out = os.path.join(tmpd, 'Camera')
+        ident, ents = weak_link_file(binp, ZOOM_DYLIB, out, 'camera zoom button')
+        install_file(out, binp, mode)
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+    print('camera: Camera.app weak-links %s (re-signed ad hoc as %s, flags %#x, %d entitlements; original in /%s)' % (
+        ZOOM_DYLIB, ident[0], ident[2], len(ents), ZOOM_ORIG))
+    return True
 
 
 # Daemons that only crash-loop or quit at once on this bring-up while containermanagerd refuses every container lookup

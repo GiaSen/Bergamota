@@ -101,6 +101,11 @@ if [ "${IOS18:-1}" = 1 ]; then
 		"$here/sweetcam.m" -o "$out18/sweetcam.dylib"
 	codesign -s - -f "$out18/sweetcam.dylib"
 	python3 -I "$pacstrip" --sign "$out18/sweetcam.dylib"
+	# iOS 26: in Camera.app (weak-linked into its binary), a tap on the zoom button at 1x goes to 2x (sweetcam: the telephoto)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -fno-objc-arc \
+		-dynamiclib -install_name /usr/local/lib/sweetzoom.dylib -framework Foundation "$here/sweetzoom.m" -o "$out18/sweetzoom.dylib"
+	codesign -s - -f "$out18/sweetzoom.dylib"
+	python3 -I "$pacstrip" --sign "$out18/sweetzoom.dylib"
 	b18 sweeticonstyle sweeticonstyle.m iconstyle.entitlements -framework UIKit
 	b18 sweetopen sweetopen.m uicache.entitlements
 	# remote testing over SSH: screenshot of the panel (PNG) and synthetic touch/buttons
