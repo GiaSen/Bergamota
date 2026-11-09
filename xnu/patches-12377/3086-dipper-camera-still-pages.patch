@@ -1,0 +1,317 @@
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+index fa0a9dc..d572553 100644
+--- a/bsd/dev/dipper_camera.c
++++ b/bsd/dev/dipper_camera.c
+@@ -81,6 +81,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern int sweet_smmu_map_sid(unsigned sid);                                    /* sweet_smmu.c */
+ extern int sweet_smmu_bank_fault(uint32_t *fsr, uint64_t *far, bool clear);
++extern int sweet_smmu_map32_pages(vm_offset_t va, uint64_t len, uint32_t *iova);    /* 3085d */
+ extern int sweet_smmu_map32(uint64_t pa, uint64_t len, uint32_t *iova);  /* 3080 */
+ extern void delay(int usec);
+ extern int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);     /* sweet_rpmh.c */
+@@ -2329,49 +2330,37 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_cam_still_half, CTLFLAG_RW | CTLFLAG_LOCKED,
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_cam_still_frames, CTLFLAG_RW | CTLFLAG_LOCKED, &cam_still_frames, 0,
+     "3085: mode 0 frames a still (2-8, the last kept)");
+ 
+-/* the still buffer: 8 pieces of 2 MiB, physically aligned to 2 MiB, mapped in order into the 32-bit window (once a boot) */
++/*
++ * the still buffer: 16 MiB of wired kernel pages (3085d: any pages, mapped page by page into the 32-bit window; 3085-3085c
++ * wanted eight 2 MiB-aligned contiguous pieces, which a phone up for a few minutes no longer had: "no 2 MiB piece 3"), once
++ * a boot. Only these pages are mapped: a frame running past the buffer faults instead of writing over kernel memory.
++ */
+ static bool
+ st_buffer(void)
+ {
+ 	if (st_iova) {
+ 		return true;
+ 	}
+-	for (unsigned k = 0; k < ST_NCHUNK; k++) {
+-		if (st_va[k]) {
+-			continue;
+-		}
+-		vm_offset_t v = 0;
+-		if (kmem_alloc_contig(kernel_map, &v, ST_CHUNK, PAGE_MASK, 0, (ppnum_t)((ST_CHUNK >> PAGE_SHIFT) - 1),
+-		    KMA_DATA | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-			cam_say("still: no 2 MiB piece %u", k);
+-			return false;
+-		}
+-		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)v);
+-		uint64_t pa = pn ? ptoa_64(pn) : 0;
+-		if (!pa || (pa & (ST_CHUNK - 1)) || pa < 0x80000000ull || pa + ST_CHUNK > 0x280000000ull) {
+-			cam_say("still: piece %u at %#llx: not 2 MiB aligned or outside the identity map", k, pa);
+-			return false;
+-		}
+-		st_va[k] = v;
+-		st_pa[k] = pa;
++	static vm_offset_t v;
++	if (!v && kmem_alloc(kernel_map, &v, (vm_size_t)ST_NCHUNK * ST_CHUNK, KMA_DATA | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) !=
++	    KERN_SUCCESS) {
++		v = 0;
++		cam_say("still: no 16 MiB buffer");
++		return false;
++	}
++	uint32_t io = 0;
++	int e = sweet_smmu_map32_pages(v, (uint64_t)ST_NCHUNK * ST_CHUNK, &io);
++	if (e != 0) {
++		cam_say("still: buffer not mapped (%d)", e);
++		return false;
+ 	}
+-	uint32_t base = 0;
+ 	for (unsigned k = 0; k < ST_NCHUNK; k++) {
+-		uint32_t io = 0;
+-		int e = sweet_smmu_map32(st_pa[k], ST_CHUNK, &io);
+-		if (e != 0) {
+-			cam_say("still: piece %u not mapped (%d)", k, e);
+-			return false;
+-		}
+-		if (k == 0) {
+-			base = io;
+-		} else if (io != base + k * ST_CHUNK) {
+-			cam_say("still: piece %u at IOVA %#x, not after the others (%#x): no still buffer", k, io, base + k * ST_CHUNK);
+-			return false;
+-		}
++		st_va[k] = v + (vm_offset_t)k * ST_CHUNK;
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)st_va[k]);
++		st_pa[k] = pn ? ptoa_64(pn) : 0;
+ 	}
+-	st_iova = base;
+-	cam_say("still buffer: %u x 2 MiB at IOVA %#x (PA %#llx ... %#llx)", ST_NCHUNK, st_iova, st_pa[0], st_pa[ST_NCHUNK - 1]);
++	st_iova = io;
++	cam_say("still buffer: 16 MiB of pages at IOVA %#x (first page PA %#llx)", st_iova, st_pa[0]);
+ 	return true;
+ }
+ 
+@@ -2554,6 +2543,10 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
+ 		memset((void *)st_va[k], C3_FILL, ST_CHUNK);
+ 		sweet_dma_sync_va((const void *)st_va[k], ST_CHUNK);
+ 	}
++	/* 3085d: the shared bank's fault state before (cleared) and after: a context fault's address says where a frame went */
++	uint32_t fsr0 = 0, fsr1 = 0;
++	uint64_t far0 = 0, far1 = 0;
++	(void)sweet_smmu_bank_fault(&fsr0, &far0, true);
+ 	/* mode 2's frame in flight lands where it was going; then the sensor is quiet (3085c: checked, or no still) */
+ 	size_t g0 = c4_guards_changed();
+ 	if (!s0_halt(34u, "before the still")) {
+@@ -2597,8 +2590,11 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
+ 			/* 3085c: the frame went to the still buffer; if not, where it went is unknown: stop at once */
+ 			unsigned wr = st_written();
+ 			if (wr < ST_NCHUNK) {
+-				cam_say("still: frame 0 NOT in the still buffer (%u of %u pieces written; mode 2 guards changed %zu, before %zu)",
+-				    wr, ST_NCHUNK, c4_guards_changed(), g0);
++				uint32_t fsr = 0;
++				uint64_t far = 0;
++				(void)sweet_smmu_bank_fault(&fsr, &far, false);
++				cam_say("still: frame 0 NOT in the still buffer (%u of %u pieces written; mode 2 guards changed %zu, before %zu; "
++				    "SMMU FSR %#x FAR %#llx)", wr, ST_NCHUNK, c4_guards_changed(), g0, fsr, far);
+ 				err = EIO;
+ 				break;
+ 			}
+@@ -2646,9 +2642,11 @@ c4_still(struct c4_run *r, unsigned target, unsigned preview_mean)
+ 		sweet_dma_sync_va(st_at(o), 1);
+ 		guard += *st_at(o) != C3_FILL;
+ 	}
++	(void)sweet_smmu_bank_fault(&fsr1, &far1, true);
+ 	cam_say("still: %u frames in %llu ms, kept mean %u, pieces written %u of %u, guard %s, mode 2 guards changed %zu (before %zu), "
+-	    "CSID RDI0 status %#x%s", got, c4_ns(mach_absolute_time() - t0) / 1000000u, mean, st_written(), ST_NCHUNK,
+-	    guard ? "WRITTEN" : "untouched", c4_guards_changed(), g0, csid, err ? " (failed)" : "");
++	    "CSID RDI0 status %#x, SMMU FSR %#x FAR %#llx (before %#x)%s", got, c4_ns(mach_absolute_time() - t0) / 1000000u, mean,
++	    st_written(), ST_NCHUNK, guard ? "WRITTEN" : "untouched", c4_guards_changed(), g0, csid, fsr1, far1, fsr0,
++	    err ? " (failed)" : "");
+ 	if (got && !err) {
+ 		struct cam_live_hdr *h = &cam_still_hdr;
+ 		bzero(h, sizeof(*h));
+diff --git a/bsd/dev/sweet_smmu.c b/bsd/dev/sweet_smmu.c
+index b1088e7..968dfaf 100644
+--- a/bsd/dev/sweet_smmu.c
++++ b/bsd/dev/sweet_smmu.c
+@@ -151,7 +151,12 @@ smmu_bank_create(void)
+ 	for (int t = 0; t < 100000 && (smmu_rd(cb + 0x7f4) & 1); t++) {
+ 		delay(1);
+ 	}
+-	smmu_wr(cb + 0x0, 1u << 6 | 1u << 5 | 1u << 2 | 1u << 1 | 1); /* CFIE CFRE AFE TRE M */
++	/*
++	 * 3085d: HUPCF 1 here too (as the IPA's bank since 3073c): with 0 one context fault of any master on this bank (the
++	 * camera's write master, USB 0x740, the Wi-Fi copy engine 0x40/0x41, the codec) terminates every later transaction of
++	 * all of them until the FSR is cleared: the phone drops off USB and Wi-Fi at once (likely the 2026-11-09 16:16 "hang")
++	 */
++	smmu_wr(cb + 0x0, 1u << 8 | 1u << 6 | 1u << 5 | 1u << 2 | 1u << 1 | 1); /* HUPCF CFIE CFRE AFE TRE M */
+ 	if (!(smmu_rd(cb + 0x0) & 1)) {
+ 		printf("SWEET SMMU: context bank %d did not enable\n", smmu_cb);
+ 		smmu_cb = -1;
+@@ -299,6 +304,49 @@ static unsigned smmu_w32_next;
+ static struct { uint64_t pa; uint64_t len; uint32_t iova; } smmu_w32_maps[16];
+ static unsigned smmu_w32_nmaps;
+ 
++/* the window's level-2 table (GiB 1 of the bank's level-1 table), made once; with smmu_lock held */
++static int
++smmu_w32_table(void)
++{
++	if (smmu_w32_l2v) {
++		return 0;
++	}
++	vm_offset_t l2v = 0;
++	if (kmem_alloc_contig(kernel_map, &l2v, L1_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)l2v);
++	if (!pn) {
++		return ENOMEM;
++	}
++	sweet_dma_sync_va((const void *)l2v, L1_SIZE);
++	smmu_w32_l2v = l2v;
++	((volatile uint64_t *)smmu_l1v)[1] = ptoa_64(pn) | 3;   /* table */
++	sweet_dma_sync_va((const void *)smmu_l1v, L1_SIZE);
++	return 0;
++}
++
++/* both banks' TLBs after a window change; with smmu_lock held */
++static void
++smmu_w32_tlbi(void)
++{
++	uint32_t id1 = smmu_rd(0x24);
++	unsigned pgshift = (id1 >> 31) ? 16 : 12;
++	for (int b = 0; b < 2; b++) {
++		int bank = b ? smmu_cb2 : smmu_cb;
++		if (bank < 0) {
++			continue;
++		}
++		uint32_t cb = ((1u << (((id1 >> 28) & 7) + 1)) << pgshift) + ((uint32_t)bank << pgshift);
++		smmu_wr(cb + 0x618, 0);                 /* TLBIALL */
++		smmu_wr(cb + 0x7f0, 0);                 /* TLBSYNC */
++		for (int t = 0; t < 100000 && (smmu_rd(cb + 0x7f4) & 1); t++) {
++			delay(1);
++		}
++	}
++}
++
+ int sweet_smmu_map32(uint64_t pa, uint64_t len, uint32_t *iova);
+ int
+ sweet_smmu_map32(uint64_t pa, uint64_t len, uint32_t *iova)
+@@ -327,45 +375,15 @@ sweet_smmu_map32(uint64_t pa, uint64_t len, uint32_t *iova)
+ 		error = ENOSPC;
+ 		goto out;
+ 	}
+-	volatile uint64_t *l1 = (volatile uint64_t *)smmu_l1v;
+-	if (smmu_w32_l2v == 0) {
+-		vm_offset_t l2v = 0;
+-		if (kmem_alloc_contig(kernel_map, &l2v, L1_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+-		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-			error = ENOMEM;
+-			goto out;
+-		}
+-		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)l2v);
+-		if (!pn) {
+-			error = ENOMEM;
+-			goto out;
+-		}
+-		sweet_dma_sync_va((const void *)l2v, L1_SIZE);
+-		smmu_w32_l2v = l2v;
+-		l1[1] = ptoa_64(pn) | 3;                        /* table */
+-		sweet_dma_sync_va((const void *)smmu_l1v, L1_SIZE);
++	if ((error = smmu_w32_table()) != 0) {
++		goto out;
+ 	}
+ 	volatile uint64_t *l2 = (volatile uint64_t *)smmu_w32_l2v;
+ 	for (unsigned k = 0; k < nb; k++) {
+ 		l2[smmu_w32_next + k] = (first + ((uint64_t)k << 21)) | 1u << 10 | 2u << 8 | 1u << 6 | 1;     /* block, AF, OSH, RW, Normal NC */
+ 	}
+ 	sweet_dma_sync_va((const void *)smmu_w32_l2v, L1_SIZE);
+-	{
+-		uint32_t id1 = smmu_rd(0x24);
+-		unsigned pgshift = (id1 >> 31) ? 16 : 12;
+-		for (int b = 0; b < 2; b++) {
+-			int bank = b ? smmu_cb2 : smmu_cb;
+-			if (bank < 0) {
+-				continue;
+-			}
+-			uint32_t cb = ((1u << (((id1 >> 28) & 7) + 1)) << pgshift) + ((uint32_t)bank << pgshift);
+-			smmu_wr(cb + 0x618, 0);                 /* TLBIALL */
+-			smmu_wr(cb + 0x7f0, 0);                 /* TLBSYNC */
+-			for (int t = 0; t < 100000 && (smmu_rd(cb + 0x7f4) & 1); t++) {
+-				delay(1);
+-			}
+-		}
+-	}
++	smmu_w32_tlbi();
+ 	uint32_t base = 0x40000000u + (smmu_w32_next << 21);
+ 	smmu_w32_maps[smmu_w32_nmaps].pa = first;
+ 	smmu_w32_maps[smmu_w32_nmaps].len = (uint64_t)nb << 21;
+@@ -379,6 +397,76 @@ out:
+ 	return error;
+ }
+ 
++/*
++ * 3085d: a wired kernel buffer of any pages (not physically contiguous) in the same 32-bit window, page by page: level-3
++ * tables (4 KiB pages, one table a 2 MiB slot) under the window's level-2 slots. Only the buffer's own pages are mapped, so
++ * a write master running past its end meets unmapped addresses (a context fault, terminated; with HUPCF the bank's other
++ * masters go on) instead of the kernel memory that shares the buffer's 2 MiB blocks. va page aligned, len a multiple of
++ * 2 MiB; the buffer must stay wired for good (it is never unmapped). *iova = va's address in the window.
++ */
++int sweet_smmu_map32_pages(vm_offset_t va, uint64_t len, uint32_t *iova);
++int
++sweet_smmu_map32_pages(vm_offset_t va, uint64_t len, uint32_t *iova)
++{
++	int error = 0;
++	vm_offset_t l3v = 0;
++
++	if (!iova || !va || (va & PAGE_MASK) || len == 0 || (len & 0x1fffffull) || len > (64ull << 20)) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&smmu_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	if (smmu_cb < 0 || smmu_base == 0 || smmu_l1v == 0) {
++		error = ENODEV;
++		goto out;
++	}
++	unsigned nb = (unsigned)(len >> 21);
++	if (smmu_w32_next + nb > 512) {
++		error = ENOSPC;
++		goto out;
++	}
++	if ((error = smmu_w32_table()) != 0) {
++		goto out;
++	}
++	if (kmem_alloc_contig(kernel_map, &l3v, round_page((vm_size_t)nb * L1_SIZE), PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		error = ENOMEM;
++		goto out;
++	}
++	ppnum_t tpn = pmap_find_phys(kernel_pmap, (addr64_t)l3v);
++	if (!tpn) {
++		error = ENOMEM;
++		goto out;
++	}
++	uint64_t l3pa = ptoa_64(tpn);
++	volatile uint64_t *l3 = (volatile uint64_t *)l3v;
++	for (uint64_t off = 0; off < len; off += PAGE_SIZE) {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(va + off));
++		if (!pn) {
++			error = EFAULT;         /* not wired: nothing mapped (the tables are permanent, unused) */
++			goto out;
++		}
++		uint64_t pa = ptoa_64(pn);
++		for (uint64_t s4 = 0; s4 < PAGE_SIZE; s4 += 0x1000u) {
++			l3[(off + s4) >> 12] = (pa + s4) | 1u << 10 | 2u << 8 | 1u << 6 | 3;     /* page, AF, OSH, RW, Normal NC */
++		}
++	}
++	sweet_dma_sync_va((const void *)l3v, (size_t)nb * L1_SIZE);
++	volatile uint64_t *l2 = (volatile uint64_t *)smmu_w32_l2v;
++	for (unsigned k = 0; k < nb; k++) {
++		l2[smmu_w32_next + k] = (l3pa + (uint64_t)k * L1_SIZE) | 3;     /* table */
++	}
++	sweet_dma_sync_va((const void *)smmu_w32_l2v, L1_SIZE);
++	smmu_w32_tlbi();
++	*iova = 0x40000000u + (smmu_w32_next << 21);
++	smmu_w32_next += nb;
++	printf("SWEET SMMU: bank %d: %llu MiB of pages at 32-bit IOVA %#x (level-3 tables at %#llx)\n", smmu_cb, len >> 20, *iova, l3pa);
++out:
++	__atomic_store_n(&smmu_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ /* 3058c: the shared bank's fault status (FSR, FAR) for callers that want to see context faults; -1 without a bank */
+ int sweet_smmu_bank_fault(uint32_t *fsr, uint64_t *far, bool clear);
+ int

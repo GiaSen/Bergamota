@@ -338,6 +338,23 @@ take_full_still(void)
 	if (h->magic != 0x4d414353u || len < h->hdr_size + (size_t)h->stride * h->height) {
 		return NULL;
 	}
+	/*
+	 * the kernel fills the buffer with 0xa5 before a still: a frame that never arrived reads as that fill (two pink photos,
+	 * 2026-11-09 16:16). Sixteen rows across the frame, 64 bytes each: mostly fill = no still (the preview's frame then)
+	 */
+	unsigned fill_rows = 0;
+	for (unsigned k = 0; k < 16; k++) {
+		const uint8_t *row = sb + h->hdr_size + (size_t)h->stride * ((h->height - 1) * k / 15) + h->stride / 2;
+		unsigned same = 0;
+		for (unsigned i = 0; i < 64; i++) {
+			same += row[i] == 0xa5;
+		}
+		fill_rows += same > 48;
+	}
+	if (fill_rows > 4) {
+		say("still: the kernel's frame is its fill in %u of 16 rows: not used", fill_rows);
+		return NULL;
+	}
 	say("still: %ux%u from the kernel in %.0f ms (%u lines of %u ns x %.2f x %.2f)", h->width, h->height,
 	    (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1e6, h->exposure_lines, h->line_ns, h->again_x256 / 256.0, h->dgain_x256 / 256.0);
 	return h;
