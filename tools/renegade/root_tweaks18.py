@@ -618,6 +618,8 @@ def audio(root):
         speaker(root)
         if enabled('torch'):       # the flashlight (cameracaptured); RENEGADE_NO_TORCH=1 opts out
             torch(root)
+            if enabled('camera'):  # the rear camera through sweetcam, loaded by sweettorch; RENEGADE_NO_CAMERA=1 opts out
+                camera(root)
 
 
 # The Mi 8's loudspeaker (NOTES.md 2026-11-04): tools/audio/SweetSpeaker/SweetSpeaker.driver in the HAL's plug-in folder
@@ -761,6 +763,41 @@ def torch(root):
         shutil.rmtree(tmpd, ignore_errors=True)
     print('torch: cameracaptured weak-links %s (re-signed ad hoc as %s, %d entitlements; original in /%s)' % (
         TORCH_DYLIB, ident[0], len(ents), TORCH_ORIG))
+
+
+# The rear main camera for iOS's Camera (Mi 8: xnu 3075-3084, test image 129; NOTES.md "CAMERA IN iOS", "CAMERA PHOTOS WORK"):
+# tools/sweetnet/sweetcam.dylib, which sweettorch.dylib (above) dlopens in cameracaptured when it is there, gives CMCapture a
+# capture device fed by the kernel's stream. cameracaptured loads the sensor's register sequence into the kernel itself from
+# CAM_SEQ: a file made from the phone's own camera module file (tools/camera/camx_v1.py), vendor-derived and never in git,
+# given as RENEGADE_CAM_SEQ=FILE; without it sweetcam is installed but the camera does not stream (it logs the missing file).
+# Camera's settings for this phone: Live Photo off (it records a movie and there is no video encoder) and "Most Compatible"
+# (JPEG: HEIC needs the HEVC encoder); both stay changeable in Camera and Settings. Photos also need the Chlorophyll of
+# gpu/metal 7fc5206 or later (RENEGADE_CHL=1 from research/chl-work/out-metal).
+CAMERA_DYLIB = '/usr/local/lib/sweetcam.dylib'
+CAM_SEQ = '/usr/local/share/sweetcam/imx363-mode2.seq'
+CAMERA_PREFS = {'CAMUserPreferenceDesiredIrisMode': 0, 'CAMUserPreferenceCaptureEncodingBehavior': 1}
+
+
+def camera(root):
+    if not macho_has_dylib(os.path.join(root, TORCH_BIN), TORCH_DYLIB):
+        print('camera: cameracaptured does not load sweettorch.dylib (it loads sweetcam): skipped')
+        note_skip('camera', 'cameracaptured without sweettorch.dylib')
+        return
+    dylib = find_sweetnet('ios18/sweetcam.dylib')
+    if not dylib:
+        print('camera: sweetcam.dylib not built (tools/sweetnet/build.sh): skipped')
+        note_skip('camera', not_built())
+        return
+    install_file(dylib, os.path.join(root, CAMERA_DYLIB.lstrip('/')), 0o755)
+    seq = os.environ.get('RENEGADE_CAM_SEQ')
+    if seq and os.path.isfile(seq):
+        install_file(seq, os.path.join(root, CAM_SEQ.lstrip('/')), 0o644)
+        os.chmod(os.path.dirname(os.path.join(root, CAM_SEQ.lstrip('/'))), 0o755)
+        print('camera: %s and the sensor sequence %s (%d bytes)' % (CAMERA_DYLIB, CAM_SEQ, os.path.getsize(seq)))
+    else:
+        print('camera: %s; RENEGADE_CAM_SEQ not set: no sensor sequence, the camera will not stream' % CAMERA_DYLIB)
+        note_skip('camera', 'RENEGADE_CAM_SEQ not set: no sensor sequence')
+    merge_pref(root, 'com.apple.camera', CAMERA_PREFS)
 
 
 # Daemons that only crash-loop or quit at once on this bring-up while containermanagerd refuses every container lookup
