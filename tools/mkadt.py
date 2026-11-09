@@ -76,7 +76,9 @@ BOARDS = {
 # stays in the list so the kernel's SDM845 drivers (sweet_board_beryllium(): USB, UFS, battery, charger, cpufreq,
 # RTC, ...) run; its Poco F1 touch drivers are kept off with the boot-arg sweettouch=0 until the ST FTS one exists.
 BOARDS['dipper'] = dict(BOARDS['beryllium'], fb_wh=(1080, 2248),
-                        compat=['xiaomi,dipper', 'xiaomi,beryllium', 'xiaomi,sweet', 'qcom,sdm845'])
+                        compat=['xiaomi,dipper', 'xiaomi,beryllium', 'xiaomi,sweet', 'qcom,sdm845'],
+                        # the rear main camera (xnu 3075+, sweetcam.dylib): /arm-io/isp "camera-rear" (see ISP_NOTE)
+                        rear_camera=True)
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -309,6 +311,13 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
         # otherwise crashes trying to set the PMU boot stage (customer builds
         # ignore the -wdt_no_pmu boot-arg).
         node('wdt', [ph(), ('no-pmu', u32(1))]),
+    ] + ([
+        # ISP_NOTE: MobileGestalt's rear-facing-camera and still-camera come from IODeviceTree:/arm-io/isp "camera-rear"
+        # (found 2026-11-09 by hashing the property names MobileGestalt keeps obfuscated); without it SpringBoard hides
+        # Camera.app (SBAppTags still-camera) and the lock screen's camera button is dimmed. Only that property: no
+        # compatible, so nothing matches the node (the kernel has no Apple ISP driver anyway), and no front camera.
+        node('isp', [ph(), ('camera-rear', u32(1))]),
+    ] if b.get('rear_camera') and not qemu else []) + [
         # Main display: IOMobileFramebuffer.framework counts /arm-io children
         # with this device_type and reads the canvas size from the node
         # (the presented iPhone X size, see SweetFramebuffer.cpp);
