@@ -278,6 +278,71 @@ kernel_stream(int on)
 	return e;
 }
 
+/*
+ * xnu 3085+: full-resolution stills. Mode 0's sequence (4032x3024) goes into kern.sweet_cam_seq0 from the phone's file (vendor
+ * data, kept out of the image's git); at a photo kern.sweet_cam_still=1 makes the kernel switch the sensor to mode 0 for one
+ * frame and back (about 0.8 s), and kern.sweet_cam_still reads it. /private/var/tmp/sweetcam.nofullstill: stills from the
+ * preview's frames as before.
+ */
+static bool
+load_seq0(void)
+{
+	static const char *const path = "/usr/local/share/sweetcam/imx363-mode0.seq";
+	size_t probe = 0;
+	if (sysctlbyname("kern.sweet_cam_still", NULL, &probe, NULL, 0) != 0) {
+		say("still: the kernel takes no full-resolution stills (%{public}s)", strerror(errno));
+		return false;
+	}
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		say("still: %{public}s: %{public}s: stills from the preview's frames", path, strerror(errno));
+		return false;
+	}
+	static char seq[2048 * 8];
+	size_t n = fread(seq, 1, sizeof(seq), f);
+	fclose(f);
+	if (!n || n % 8 || sysctlbyname("kern.sweet_cam_seq0", NULL, NULL, seq, n) != 0) {
+		say("still: mode 0's sequence not loaded (%zu bytes, %{public}s)", n, strerror(errno));
+		return false;
+	}
+	say("still: mode 0's sequence loaded (%zu records): full-resolution stills", n / 8);
+	return true;
+}
+
+/* one full-resolution still: header + RAW10 in a buffer of its own (kept between photos); NULL on a failure */
+static const struct cam_live_hdr *
+take_full_still(void)
+{
+	static uint8_t *sb;
+	static size_t scap;
+	int one = 1;
+	uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+	if (sysctlbyname("kern.sweet_cam_still", NULL, NULL, &one, sizeof(one)) != 0) {
+		say("still: kern.sweet_cam_still=1: %{public}s", strerror(errno));
+		return NULL;
+	}
+	size_t len = 0;
+	if (sysctlbyname("kern.sweet_cam_still", NULL, &len, NULL, 0) != 0 || !len) {
+		return NULL;
+	}
+	if (len > scap) {
+		free(sb);
+		sb = malloc(len);
+		scap = sb ? len : 0;
+	}
+	if (!sb || sysctlbyname("kern.sweet_cam_still", sb, &len, NULL, 0) != 0) {
+		say("still: read: %{public}s", strerror(errno));
+		return NULL;
+	}
+	const struct cam_live_hdr *h = (const void *)sb;
+	if (h->magic != 0x4d414353u || len < h->hdr_size + (size_t)h->stride * h->height) {
+		return NULL;
+	}
+	say("still: %ux%u from the kernel in %.0f ms (%u lines of %u ns x %.2f x %.2f)", h->width, h->height,
+	    (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1e6, h->exposure_lines, h->line_ns, h->again_x256 / 256.0, h->dgain_x256 / 256.0);
+	return h;
+}
+
 /* ---- pictures from RAW10 ------------------------------------------------------------------------------------------------ */
 
 #define HW 960                          /* half of 1920x1080: one RGB value per 2x2 Bayer cell */
@@ -489,6 +554,7 @@ struct full_job {
 	int16_t *cb, *cr, *t;           /* its chroma (signed, 10-bit scale), and a row-blurred copy */
 	unsigned thr;                   /* the luma filter's threshold (from the frame's measured noise) */
 	unsigned W, H, cx, cy, cw, ch;
+	bool cells;                     /* cw x ch are 2x2 cells of the frame from (cx, cy), not pixels */
 	CVPixelBufferRef pb;
 	unsigned w, h, pieces;
 };
@@ -570,6 +636,33 @@ full_demosaic(void *ctx, size_t piece)
 			o[1] = p->gamma10[lg < 0 ? 0 : lg > 4095 ? 4095 : lg];
 			o[2] = p->gamma10[lb < 0 ? 0 : lb > 4095 ? 4095 : lb];
 			o += 3;
+		}
+	}
+}
+
+/* the crop at one RGB pixel a 2x2 Bayer cell (RGGB, the two greens averaged): the full-resolution frame at half its size */
+static void
+full_cells(void *ctx, size_t piece)
+{
+	struct full_job *j = ctx;
+	const struct isp *p = j->p;
+	const int black = j->hd->black;
+	unsigned rows = (j->ch + j->pieces - 1) / j->pieces, y0 = (unsigned)piece * rows, y1 = MIN(j->ch, y0 + rows);
+	for (unsigned yy = y0; yy < y1; yy++) {
+		const uint8_t *r0 = p->raw + (size_t)(2 * (yy + j->cy)) * j->hd->stride, *r1 = r0 + j->hd->stride;
+		uint16_t *o = j->d + (size_t)yy * j->cw * 3;
+		for (unsigned xx = 0; xx < j->cw; xx++, o += 3) {
+			unsigned x = 2 * (xx + j->cx);
+			float R = (float)((int)raw10_at(r0, x) - black), G = (float)((int)(raw10_at(r0, x + 1) + raw10_at(r1, x)) / 2 - black),
+			      B = (float)((int)raw10_at(r1, x + 1) - black);
+			R = R < 0 ? 0 : R;
+			G = G < 0 ? 0 : G;
+			B = B < 0 ? 0 : B;
+			int lr = (int)(p->m[0] * R + p->m[1] * G + p->m[2] * B), lg = (int)(p->m[3] * R + p->m[4] * G + p->m[5] * B),
+			    lb = (int)(p->m[6] * R + p->m[7] * G + p->m[8] * B);
+			o[0] = p->gamma10[lr < 0 ? 0 : lr > 4095 ? 4095 : lr];
+			o[1] = p->gamma10[lg < 0 ? 0 : lg > 4095 ? 4095 : lg];
+			o[2] = p->gamma10[lb < 0 ? 0 : lb > 4095 ? 4095 : lb];
 		}
 	}
 }
@@ -797,19 +890,22 @@ render_still_full(const struct isp *p, CVPixelBufferRef pb, unsigned w, unsigned
 		return false;
 	}
 	struct full_job j = { .p = p, .hd = hd, .W = hd->width & ~3u, .H = hd->height & ~1u, .pb = pb, .w = w, .h = h, .pieces = 16 };
+	/* a frame at least twice the still's size (mode 0's 4032x3024 for a 2016x1512 still): one RGB pixel a 2x2 Bayer cell */
+	j.cells = j.W >= 2 * w && j.H >= 2 * h && access("/private/var/tmp/sweetcam.nocells", F_OK) != 0;
 	/* the centre of the 16:9 frame cut to the still's shape, on even coordinates (the Bayer phase) */
 	float aspect = (float)w / (float)h;
-	if (aspect < (float)j.W / j.H) {
-		j.ch = j.H;
-		j.cw = (unsigned)(j.H * aspect) & ~1u;
+	unsigned FW = j.cells ? j.W / 2 : j.W, FH = j.cells ? j.H / 2 : j.H;     /* in cells or pixels */
+	if (aspect < (float)FW / FH) {
+		j.ch = FH;
+		j.cw = (unsigned)(FH * aspect) & ~1u;
 	} else {
-		j.cw = j.W;
-		j.ch = (unsigned)(j.W / aspect) & ~1u;
+		j.cw = FW;
+		j.ch = (unsigned)(FW / aspect) & ~1u;
 	}
-	j.cx = ((j.W - j.cw) / 2) & ~1u;
-	j.cy = ((j.H - j.ch) / 2) & ~1u;
+	j.cx = ((FW - j.cw) / 2) & ~1u;
+	j.cy = ((FH - j.ch) / 2) & ~1u;
 	size_t px = (size_t)j.cw * j.ch;
-	j.u = malloc((size_t)j.W * j.H * 2);
+	j.u = j.cells ? malloc(2) : malloc((size_t)j.W * j.H * 2);
 	j.d = malloc(px * 6);
 	j.y = malloc(px * 2);
 	j.y2 = malloc(px * 2);
@@ -822,8 +918,12 @@ render_still_full(const struct isp *p, CVPixelBufferRef pb, unsigned w, unsigned
 	}
 	uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
 	dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
-	dispatch_apply_f(j.pieces, q, &j, full_unpack);
-	dispatch_apply_f(j.pieces, q, &j, full_demosaic);
+	if (j.cells) {
+		dispatch_apply_f(j.pieces, q, &j, full_cells);
+	} else {
+		dispatch_apply_f(j.pieces, q, &j, full_unpack);
+		dispatch_apply_f(j.pieces, q, &j, full_demosaic);
+	}
 	dispatch_apply_f(j.pieces, q, &j, full_ycc);
 	unsigned sigma = full_noise(&j);
 	/* /private/var/tmp/sweetcam.nr: a number, the luma filter's range sigma in tenths of the measured noise (15 by default; 0: off) */
@@ -854,8 +954,8 @@ render_still_full(const struct isp *p, CVPixelBufferRef pb, unsigned w, unsigned
 	free(j.u); free(j.d); free(j.y); free(j.y2); free(j.cb); free(j.cr); free(j.t);
 	static unsigned said;
 	if (said++ < 6) {
-		say("still: %ux%u developed from the frame's %ux%u centre (of %ux%u) in %.1f ms; luma noise %u, filter threshold %u",
-		    w, h, j.cw, j.ch, j.W, j.H, (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1e6, sigma, j.thr);
+		say("still: %ux%u developed from the frame's %ux%u %{public}s centre (of %ux%u) in %.1f ms; luma noise %u, filter threshold %u",
+		    w, h, j.cw, j.ch, j.cells ? "2x2-cell" : "pixel", j.W, j.H, (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1e6, sigma, j.thr);
 	}
 	return true;
 }
@@ -1662,6 +1762,7 @@ worker(void *ctx)
 	}
 	uint8_t *buf = malloc(cap);
 	say("worker: streaming (%zu-byte frames)", cap);
+	bool full_still = load_seq0();
 	unsigned fails = 0;
 	while (s->running && buf && fails < 20) {
 		size_t len = cap;
@@ -1684,7 +1785,22 @@ worker(void *ctx)
 		uint64_t host = h->timestamp_ns * tb.denom / tb.numer;
 		CMTime pts = CMClockMakeHostTimeFromSystemUnits(host);
 		CFDictionaryRef md = frame_metadata(h, &isp, host);
+		const struct cam_live_hdr *fs = NULL;
+		if (full_still && s->still_pending > 0 && access("/private/var/tmp/sweetcam.nofullstill", F_OK) != 0) {
+			fs = take_full_still();     /* outside the lock: the kernel takes about 0.8 s */
+		}
 		pthread_mutex_lock(&s->lock);
+		if (fs && s->still_pending > 0 && s->out[2].handler && s->out[2].config) {
+			/* the full-resolution frame for every still picture asked for (CMCapture asks three: NRF keeps one) */
+			isp.raw = (const uint8_t *)fs + fs->hdr_size;
+			isp.hdr = fs;
+			for (int k = 0; s->still_pending > 0; k++) {
+				s->still_pending--;
+				deliver(&s->out[2], &isp, CMTimeAdd(pts, CMTimeMake(k, 1000)), md);
+			}
+			isp.raw = buf + h->hdr_size;
+			isp.hdr = h;
+		}
 		for (int i = 0; i < OUTPUTS; i++) {
 			struct output *out = &s->out[i];
 			if (!out->handler || !out->config || !(out->enabled || (i == 0 && s->delivering))) {

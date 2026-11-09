@@ -6,6 +6,9 @@
  *                         a newer one), says their timing, exposure and lens, writes the last frame's RAW10 to OUT, stops
  *   camframe -s FILE      loads FILE into kern.sweet_cam_seq (3077+: the rear main sensor's register sequence, made on
  *                         the Mac by tools/camera/camx_v1.py --seq from the phone's own module file; never in git)
+ *   camframe -S FILE      3085+: loads FILE into kern.sweet_cam_seq0 (mode 0, 4032x3024, for full-resolution stills)
+ *   camframe -t N OUT     3085+: streams, reads N frames (auto exposure settles), takes a full-resolution still
+ *                         (kern.sweet_cam_still), writes its RAW10 to OUT (frame2png.py --raw10 --size 4032x3024), stops
  *   xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=18.0 camframe.c -o camframe && codesign -s - -f camframe
  *   cat camframe | ssh root@192.168.7.2 'cat > /var/root/camframe && chmod 755 /var/root/camframe'
  */
@@ -17,7 +20,7 @@
 #include <unistd.h>
 
 static int
-load_seq(const char *path)
+load_seq_to(const char *path, const char *name)
 {
 	FILE *f = fopen(path, "rb");
 	if (!f) {
@@ -31,12 +34,18 @@ load_seq(const char *path)
 		fprintf(stderr, "%s: %zu bytes, not 8-byte records\n", path, n);
 		return 1;
 	}
-	if (sysctlbyname("kern.sweet_cam_seq", NULL, NULL, buf, n) != 0) {
-		perror("kern.sweet_cam_seq");
+	if (sysctlbyname(name, NULL, NULL, buf, n) != 0) {
+		perror(name);
 		return 1;
 	}
 	fprintf(stderr, "%zu records loaded\n", n / 8);
 	return 0;
+}
+
+static int
+load_seq(const char *path)
+{
+	return load_seq_to(path, "kern.sweet_cam_seq");
 }
 
 /* 3080: the kernel's stream header (kern.sweet_cam_live) */
@@ -119,9 +128,78 @@ live(int n, const char *out)
 	return got ? 0 : 1;
 }
 
+/* camframe -t N OUT: stream, N live frames, then a full-resolution still to OUT, stop */
+static int
+still(int n, const char *out)
+{
+	size_t cap = 0;
+	if (set_int("kern.sweet_cam_stream", 1)) {
+		return 1;
+	}
+	if (sysctlbyname("kern.sweet_cam_live", NULL, &cap, NULL, 0) != 0) {
+		perror("kern.sweet_cam_live size");
+		set_int("kern.sweet_cam_stream", 0);
+		return 1;
+	}
+	char *buf = malloc(cap);
+	uint32_t last = 0;
+	for (int i = 0; buf && i < n; i++) {
+		size_t len = cap;
+		if (sysctlbyname("kern.sweet_cam_live", buf, &len, &last, sizeof(last)) != 0) {
+			perror("kern.sweet_cam_live");
+			break;
+		}
+		last = ((const struct cam_live_hdr *)buf)->seq;
+	}
+	const struct cam_live_hdr *lh = (const void *)buf;
+	if (buf) {
+		fprintf(stderr, "preview: seq %u, %u lines x %.2f x %.2f\n", lh->seq, lh->exposure_lines, lh->again_x256 / 256.0, lh->dgain_x256 / 256.0);
+	}
+	int rc = set_int("kern.sweet_cam_still", 1);
+	size_t len = 0;
+	if (!rc && sysctlbyname("kern.sweet_cam_still", NULL, &len, NULL, 0) == 0 && len) {
+		char *b = malloc(len);
+		if (b && sysctlbyname("kern.sweet_cam_still", b, &len, NULL, 0) == 0) {
+			const struct cam_live_hdr *h = (const void *)b;
+			fprintf(stderr, "still: seq %u, %ux%u stride %u, %u lines (line %u ns) x %.2f x %.2f, lens %u\n", h->seq, h->width, h->height,
+			    h->stride, h->exposure_lines, h->line_ns, h->again_x256 / 256.0, h->dgain_x256 / 256.0, h->lens);
+			FILE *f = fopen(out, "wb");
+			if (f) {
+				fwrite(b + h->hdr_size, 1, (size_t)h->stride * h->height, f);
+				fclose(f);
+			}
+		} else {
+			perror("kern.sweet_cam_still read");
+			rc = 1;
+		}
+		free(b);
+	}
+	/* the preview after the still: does it run again */
+	unsigned more = 0;
+	for (int i = 0; buf && i < 10; i++) {
+		size_t l2 = cap;
+		if (sysctlbyname("kern.sweet_cam_live", buf, &l2, &last, sizeof(last)) != 0) {
+			break;
+		}
+		if (((const struct cam_live_hdr *)buf)->seq != last) {
+			more++;
+		}
+		last = ((const struct cam_live_hdr *)buf)->seq;
+	}
+	fprintf(stderr, "preview after the still: %u new frames of 10 reads\n", more);
+	set_int("kern.sweet_cam_stream", 0);
+	return rc;
+}
+
 int
 main(int argc, char **argv)
 {
+	if (argc == 3 && strcmp(argv[1], "-S") == 0) {
+		return load_seq_to(argv[2], "kern.sweet_cam_seq0");
+	}
+	if (argc == 4 && strcmp(argv[1], "-t") == 0) {
+		return still(atoi(argv[2]), argv[3]);
+	}
 	if (argc == 3 && strcmp(argv[1], "-s") == 0) {
 		return load_seq(argv[2]);
 	}
