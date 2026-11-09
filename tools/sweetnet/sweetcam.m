@@ -41,8 +41,11 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <math.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach-o/dyld.h>
+#include <libkern/OSCacheControl.h>
+#include <mach-o/loader.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <os/log.h>
@@ -1890,7 +1893,7 @@ md_v(CFMutableDictionaryRef d, const char *name, CFTypeRef v)
 }
 
 static CFDictionaryRef
-frame_metadata(const struct cam_live_hdr *h, const struct isp *p, uint64_t host_time, bool front)
+frame_metadata(const struct cam_live_hdr *h, const struct isp *p, uint64_t host_time, bool front, double zoom, int64_t sw, int64_t sh)
 {
 	CFMutableDictionaryRef d = new_dict();
 	double exposure = h->exposure_lines * (double)h->line_ns / 1e9, again = h->again_x256 / 256.0, dgain = h->dgain_x256 / 256.0;
@@ -1928,6 +1931,22 @@ frame_metadata(const struct cam_live_hdr *h, const struct isp *p, uint64_t host_
 	md_f(d, "CurrentFrameRate", fps);
 	md_f(d, "PreviousFrameDurationInSec", 1 / fps);
 	md_i(d, "BlackLevel", (int64_t)h->black);
+	/*
+	 * the zoom this frame was made with, and the part of the format's sensor it shows (2026-11-09): CMCapture's preview
+	 * stage (BWPreviewStitcherNode) compares the zoom it asked for with the frame's, and without these it tried to zoom the
+	 * preview itself after the first ZoomFactor change, through a VTPixelRotationSession that cannot scale on this phone
+	 * (-12914 on every frame: the viewfinder froze while frames kept coming)
+	 */
+	if (zoom >= 1 && sw > 0 && sh > 0) {
+		double cw = (double)sw / zoom, ch = (double)sh / zoom;
+		CFDictionaryRef r = CGRectCreateDictionaryRepresentation(CGRectMake(((double)sw - cw) / 2, ((double)sh - ch) / 2, cw, ch));
+		CFDictionaryRef full = CGRectCreateDictionaryRepresentation(CGRectMake(0, 0, (double)sw, (double)sh));
+		md_f(d, "ZoomFactor", zoom);
+		md_v(d, "TotalSensorCropRect", r);
+		md_v(d, "SensorRawValidBufferRect", full);
+		CFRelease(r);
+		CFRelease(full);
+	}
 	return d;
 }
 
@@ -2020,6 +2039,15 @@ deliver(struct output *out, const struct isp *p, CMTime pts, CFDictionaryRef md)
 		 * a SIGSEGV in CFDictionaryGetValue)
 		 */
 		CFMutableDictionaryRef mine = CFDictionaryCreateMutableCopy(NULL, 0, md);
+		{
+			/* this output's whole buffer is picture */
+			CFDictionaryRef vr = CGRectCreateDictionaryRepresentation(CGRectMake(0, 0, (double)w, (double)h));
+			CFStringRef vk = md_key("ValidBufferRect");
+			if (vk) {
+				CFDictionarySetValue(mine, vk, vr);
+			}
+			CFRelease(vr);
+		}
 		CVBufferSetAttachment(pb, SWEET_MD, mine, kCVAttachmentMode_ShouldNotPropagate);
 		if (md_attachment) {
 			CVBufferSetAttachment(pb, md_attachment, mine, kCVAttachmentMode_ShouldNotPropagate);
@@ -2123,7 +2151,13 @@ worker(void *ctx)
 		isp.still_out = &s->out[2];
 		uint64_t host = h->timestamp_ns * tb.denom / tb.numer;
 		CMTime pts = CMClockMakeHostTimeFromSystemUnits(host);
-		CFDictionaryRef md = frame_metadata(h, &isp, host, s->front);
+		int64_t fsw = 0, fsh = 0;
+		if (s->format_index >= 0 && s->format_index < CFArrayGetCount(s->formats)) {
+			CFDictionaryRef fmt = CFArrayGetValueAtIndex(s->formats, s->format_index);
+			fsw = get_i(fmt, "SensorWidth", 0);
+			fsh = get_i(fmt, "SensorHeight", 0);
+		}
+		CFDictionaryRef md = frame_metadata(h, &isp, host, s->front, s->zoom >= 1 ? (double)s->zoom : 1.0, fsw, fsh);
 		const struct cam_live_hdr *fs = NULL;
 		if (full_still && s->still_pending > 0 && access("/private/var/tmp/sweetcam.nofullstill", F_OK) != 0) {
 			fs = take_full_still();     /* outside the lock: the kernel takes about 0.8 s */
@@ -3448,6 +3482,540 @@ hook_m2m(void)
 	say("m2m: FigM2MController falls back to the CPU");
 }
 
+/*
+ * ---- VTPixelRotationSession without the scaler hardware (2026-11-09) ----
+ * CMCapture's preview stage (BWPreviewStitcherNode: 1734x1300 in, 828x1792 turned 90 degrees out) makes the zoomed
+ * viewfinder picture with VTPixelRotationSessionRotateSubImage: a turn, a crop and a scale in one call. VideoToolbox does
+ * that on Apple's scaler ("VTRotationCeleste"); here it fails with -12914 on every frame as soon as the zoom is not 1, and
+ * the viewfinder froze at the first tap on a zoom button (the user, on the front camera's expand button; the back
+ * camera's 1x/2x the same). CMCapture's calls are direct branches inside the shared cache (its pointer table entries for
+ * the two functions are not on their way: rebinding them changed nothing), so the functions' entries are rewritten to
+ * come here: Apple's first, and when it fails the same on the CPU (turn_scale_420; m2m_scale when nothing turns).
+ * /private/var/tmp/sweetcam.norot leaves VideoToolbox alone.
+ */
+static OSStatus (*gRotSub)(void *, CVPixelBufferRef, CGRect, CVPixelBufferRef, CGRect);
+static OSStatus (*gRot)(void *, CVPixelBufferRef, CVPixelBufferRef);
+static _Atomic int gStitchTurn = -1, gStitchFlips;      /* the preview stage's own, for a session that does not say */
+
+/* the session's turn (0, 90 clockwise, 180, 270 = 90 counter-clockwise) and flips (1 horizontal, 2 vertical); -1 not known */
+static int
+rot_session_turn(void *session, int *flips)
+{
+	static OSStatus (*copy)(void *, CFStringRef, CFAllocatorRef, void *);
+	static CFStringRef *k_rot, *k_fh, *k_fv, *v_0, *v_cw, *v_180, *v_ccw;
+	static bool looked;
+	if (!looked) {
+		looked = true;
+		copy = dlsym(RTLD_DEFAULT, "VTSessionCopyProperty");
+		k_rot = dlsym(RTLD_DEFAULT, "kVTPixelRotationPropertyKey_Rotation");
+		k_fh = dlsym(RTLD_DEFAULT, "kVTPixelRotationPropertyKey_FlipHorizontalOrientation");
+		k_fv = dlsym(RTLD_DEFAULT, "kVTPixelRotationPropertyKey_FlipVerticalOrientation");
+		v_0 = dlsym(RTLD_DEFAULT, "kVTRotation_0");
+		v_cw = dlsym(RTLD_DEFAULT, "kVTRotation_CW90");
+		v_180 = dlsym(RTLD_DEFAULT, "kVTRotation_180");
+		v_ccw = dlsym(RTLD_DEFAULT, "kVTRotation_CCW90");
+	}
+	*flips = 0;
+	if (!copy || !session || !k_rot) {
+		return -1;
+	}
+	int turn = -1;
+	CFTypeRef v = NULL;
+	if (copy(session, *k_rot, NULL, &v) == 0 && v) {
+		turn = v_cw && CFEqual(v, *v_cw) ? 90 : v_180 && CFEqual(v, *v_180) ? 180 : v_ccw && CFEqual(v, *v_ccw) ? 270 :
+		    v_0 && CFEqual(v, *v_0) ? 0 : -1;
+		CFRelease(v);
+	}
+	v = NULL;
+	if (k_fh && copy(session, *k_fh, NULL, &v) == 0 && v) {
+		*flips |= v == kCFBooleanTrue ? 1 : 0;
+		CFRelease(v);
+	}
+	v = NULL;
+	if (k_fv && copy(session, *k_fv, NULL, &v) == 0 && v) {
+		*flips |= v == kCFBooleanTrue ? 2 : 0;
+		CFRelease(v);
+	}
+	return turn;
+}
+
+/*
+ * A turn, flips, a crop and a scale of an 8-bit 4:2:0 picture in one pass (bilinear, fixed point). A point of the output
+ * at (u, v) of its rectangle comes from (s, t) of the source rectangle: turned 90 clockwise s = v, t = 1 - u; 180: 1 - u,
+ * 1 - v; 270: 1 - v, u; the flips are of the output. The map is affine, so a line of the output is a walk through the
+ * source in equal steps.
+ */
+struct turn_job {
+	const uint8_t *sy, *sc;
+	uint8_t *dy, *dc;
+	size_t sys, scs, dys, dcs;
+	int sw, sh;                     /* the source picture */
+	int X0, Y0, W, H;               /* the output rectangle */
+	double x0, y0;                  /* the source point of the output rectangle's first pixel */
+	double xX, yX, xY, yY;          /* its steps for a pixel across and a line down */
+};
+
+static bool gTurnFlipsSource;    /* the self-test's: the flips taken as of the source picture instead */
+
+static void
+turn_point(int turn, int flips, CGRect r, double u, double v, double *x, double *y)
+{
+	if (!gTurnFlipsSource) {
+		if (flips & 1) u = 1 - u;
+		if (flips & 2) v = 1 - v;
+	}
+	double s = turn == 90 ? v : turn == 180 ? 1 - u : turn == 270 ? 1 - v : u;
+	double t = turn == 90 ? 1 - u : turn == 180 ? 1 - v : turn == 270 ? u : v;
+	if (gTurnFlipsSource) {
+		if (flips & 1) s = 1 - s;
+		if (flips & 2) t = 1 - t;
+	}
+	*x = r.origin.x + s * r.size.width - 0.5;
+	*y = r.origin.y + t * r.size.height - 0.5;
+}
+
+static void
+turn_piece(void *ctx, size_t piece)
+{
+	const struct turn_job *j = ctx;
+	int rows = ((j->H + 15) / 16 + 1) & ~1, ya = (int)piece * rows, yb = MIN(j->H, ya + rows);
+	const int64_t xmax = ((int64_t)(j->sw - 1) << 16) - 1, ymax = ((int64_t)(j->sh - 1) << 16) - 1;
+	const int cw = j->sw / 2, ch = j->sh / 2;
+	const int64_t cxmax = ((int64_t)(cw - 1) << 16) - 1, cymax = ((int64_t)(ch - 1) << 16) - 1;
+	const int64_t sx = llround(j->xX * 65536), sy = llround(j->yX * 65536);
+	for (int Y = ya; Y < yb; Y++) {
+		uint8_t *o = j->dy + (size_t)(j->Y0 + Y) * j->dys + (size_t)j->X0;
+		int64_t fx = llround((j->x0 + Y * j->xY) * 65536), fy = llround((j->y0 + Y * j->yY) * 65536);
+		for (int X = 0; X < j->W; X++, fx += sx, fy += sy) {
+			int64_t cx = fx < 0 ? 0 : fx > xmax ? xmax : fx, cy = fy < 0 ? 0 : fy > ymax ? ymax : fy;
+			int ax = (int)(cx >> 8) & 255, ay = (int)(cy >> 8) & 255;
+			const uint8_t *a = j->sy + (size_t)(cy >> 16) * j->sys + (size_t)(cx >> 16), *b = a + j->sys;
+			int top = a[0] * (256 - ax) + a[1] * ax, bot = b[0] * (256 - ax) + b[1] * ax;
+			o[X] = (uint8_t)((top * (256 - ay) + bot * ay + 32768) >> 16);
+		}
+		if (Y & 1) {
+			continue;
+		}
+		/* the colour pair of these two lines: the middle of each 2x2 of the output, in the source's half-size plane */
+		uint8_t *oc = j->dc + (size_t)((j->Y0 + Y) / 2) * j->dcs + (size_t)j->X0;
+		fx = llround(((j->x0 + 0.5 * j->xX + (Y + 0.5) * j->xY) / 2 - 0.25) * 65536);
+		fy = llround(((j->y0 + 0.5 * j->yX + (Y + 0.5) * j->yY) / 2 - 0.25) * 65536);
+		for (int X = 0; X + 1 < j->W + 1; X += 2, fx += sx, fy += sy) {
+			int64_t cx = fx < 0 ? 0 : fx > cxmax ? cxmax : fx, cy = fy < 0 ? 0 : fy > cymax ? cymax : fy;
+			int ax = (int)(cx >> 8) & 255, ay = (int)(cy >> 8) & 255;
+			const uint8_t *a = j->sc + (size_t)(cy >> 16) * j->scs + (size_t)(cx >> 16) * 2, *b = a + j->scs;
+			for (int c = 0; c < 2; c++) {
+				int top = a[c] * (256 - ax) + a[c + 2] * ax, bot = b[c] * (256 - ax) + b[c + 2] * ax;
+				oc[X + c] = (uint8_t)((top * (256 - ay) + bot * ay + 32768) >> 16);
+			}
+		}
+	}
+}
+
+static int
+turn_scale_420(CVPixelBufferRef src, CGRect sr, CVPixelBufferRef dst, CGRect dr, int turn, int flips)
+{
+	OSType sf = CVPixelBufferGetPixelFormatType(src), df = CVPixelBufferGetPixelFormatType(dst);
+	if ((sf != PF_420F && sf != PF_420V) || (df != PF_420F && df != PF_420V)) {
+		return -12905;
+	}
+	size_t sw = CVPixelBufferGetWidth(src), sh = CVPixelBufferGetHeight(src), dw = CVPixelBufferGetWidth(dst), dh = CVPixelBufferGetHeight(dst);
+	if (CGRectIsEmpty(sr) || CGRectIsNull(sr)) {
+		sr = CGRectMake(0, 0, sw, sh);
+	}
+	if (CGRectIsEmpty(dr) || CGRectIsNull(dr)) {
+		dr = CGRectMake(0, 0, dw, dh);
+	}
+	struct turn_job j = { .sw = (int)sw, .sh = (int)sh, .X0 = (int)dr.origin.x & ~1, .Y0 = (int)dr.origin.y & ~1,
+		              .W = (int)dr.size.width & ~1, .H = (int)dr.size.height & ~1 };
+	if (j.W < 2 || j.H < 2 || sw < 4 || sh < 4 || j.X0 < 0 || j.Y0 < 0 || j.X0 + j.W > (int)dw || j.Y0 + j.H > (int)dh) {
+		return -12902;
+	}
+	double x1, y1, x2, y2;
+	turn_point(turn, flips, sr, 0.5 / j.W, 0.5 / j.H, &j.x0, &j.y0);
+	turn_point(turn, flips, sr, 1.5 / j.W, 0.5 / j.H, &x1, &y1);
+	turn_point(turn, flips, sr, 0.5 / j.W, 1.5 / j.H, &x2, &y2);
+	j.xX = x1 - j.x0;
+	j.yX = y1 - j.y0;
+	j.xY = x2 - j.x0;
+	j.yY = y2 - j.y0;
+	CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+	CVPixelBufferLockBaseAddress(dst, 0);
+	j.sy = CVPixelBufferGetBaseAddressOfPlane(src, 0);
+	j.sc = CVPixelBufferGetBaseAddressOfPlane(src, 1);
+	j.dy = CVPixelBufferGetBaseAddressOfPlane(dst, 0);
+	j.dc = CVPixelBufferGetBaseAddressOfPlane(dst, 1);
+	j.sys = CVPixelBufferGetBytesPerRowOfPlane(src, 0);
+	j.scs = CVPixelBufferGetBytesPerRowOfPlane(src, 1);
+	j.dys = CVPixelBufferGetBytesPerRowOfPlane(dst, 0);
+	j.dcs = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
+	int err = j.sy && j.sc && j.dy && j.dc ? 0 : -12902;
+	if (!err) {
+		dispatch_apply_f(16, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &j, turn_piece);
+	}
+	CVPixelBufferUnlockBaseAddress(dst, 0);
+	CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+	return err;
+}
+
+/* the same on the CPU: 0, or why not */
+static int
+rot_cpu(void *session, CVPixelBufferRef src, CGRect sr, CVPixelBufferRef dst, CGRect dr, OSStatus apple)
+{
+	static unsigned said;
+	if (!src || !dst) {
+		return -12902;
+	}
+	int flips = 0, turn = rot_session_turn(session, &flips);
+	bool asked = turn >= 0;
+	if (!asked) {
+		/* the session does not say: the preview stage's own turn when the picture changes from lying to standing */
+		bool sl = CVPixelBufferGetWidth(src) >= CVPixelBufferGetHeight(src), dl = CVPixelBufferGetWidth(dst) >= CVPixelBufferGetHeight(dst);
+		turn = sl == dl ? 0 : atomic_load(&gStitchTurn);
+		flips = atomic_load(&gStitchFlips);
+	}
+	uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+	int e = turn < 0 ? -12914 : (turn == 0 && flips == 0) ? m2m_scale(src, sr, dst, dr) : turn_scale_420(src, sr, dst, dr, turn, flips);
+	if (said++ < 6 || said % 900 == 0) {
+		OSType sf = CVPixelBufferGetPixelFormatType(src), df = CVPixelBufferGetPixelFormatType(dst);
+		say("rotation session: Apple's %d; on the CPU, turn %d (%{public}s) flips %d, %c%c%c%c %zux%zu rect %.1f,%.1f %.1fx%.1f -> %c%c%c%c %zux%zu rect %.1f,%.1f %.1fx%.1f: %d in %.1f ms",
+		    (int)apple, turn, asked ? "the session's" : "the preview stage's", flips, sf >> 24, sf >> 16 & 255, sf >> 8 & 255, sf & 255,
+		    CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src), sr.origin.x, sr.origin.y, sr.size.width, sr.size.height, df >> 24,
+		    df >> 16 & 255, df >> 8 & 255, df & 255, CVPixelBufferGetWidth(dst), CVPixelBufferGetHeight(dst), dr.origin.x, dr.origin.y,
+		    dr.size.width, dr.size.height, e, (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1e6);
+	}
+	if (e == 0) {
+		CVBufferPropagateAttachments(src, dst);
+	}
+	return e;
+}
+
+/*
+ * Apple's first; once it has failed three times and the CPU has done the work each time, the CPU first (each failure of
+ * Apple's is three error lines in the log and a wasted try) and Apple's only for what the CPU path does not do.
+ */
+static OSStatus
+rot_either(void *session, CVPixelBufferRef src, CGRect sr, CVPixelBufferRef dst, CGRect dr, bool sub)
+{
+	static _Atomic unsigned apple_failed;
+	OSStatus e = -12914;
+	if (atomic_load(&apple_failed) >= 3) {
+		if (rot_cpu(session, src, sr, dst, dr, 1) == 0) {
+			return 0;
+		}
+		return sub ? gRotSub(session, src, sr, dst, dr) : gRot(session, src, dst);
+	}
+	e = sub ? gRotSub(session, src, sr, dst, dr) : gRot(session, src, dst);
+	if (e == 0) {
+		return 0;
+	}
+	if (rot_cpu(session, src, sr, dst, dr, e) != 0) {
+		return e;
+	}
+	atomic_fetch_add(&apple_failed, 1);
+	return 0;
+}
+
+static OSStatus
+rot_sub_image(void *session, CVPixelBufferRef src, CGRect sr, CVPixelBufferRef dst, CGRect dr)
+{
+	return rot_either(session, src, sr, dst, dr, true);
+}
+
+static OSStatus
+rot_image(void *session, CVPixelBufferRef src, CVPixelBufferRef dst)
+{
+	return rot_either(session, src, CGRectNull, dst, CGRectNull, false);
+}
+
+/*
+ * A function's entry rewritten to go elsewhere: ldr x16, [pc, #8]; br x16; the address (16 bytes). The four instructions
+ * it replaces move to a landing in this library, followed by the same jump to the function's fifth: Apple's function
+ * stays callable through the landing. Only for entries whose first four instructions do not depend on where they run.
+ * Heartwood lets a process write its own copy of shared cache pages (xnu patch 1004) and does not enforce code signing
+ * per process; a page is not executable while it is written, so the landings have a page of their own (the code doing the
+ * writing must not lie in it), and the hooks go in before any camera thread runs.
+ */
+__asm__(".section __TEXT,__sweetland,regular,pure_instructions\n"
+        ".p2align 14\n"
+        ".private_extern _sweet_landings\n"
+        "_sweet_landings:\n"
+        ".rept 16\n"
+        "nop\n"
+        ".endr\n"
+        ".p2align 14\n"
+        ".text\n");
+extern uint32_t sweet_landings[16] __asm__("_sweet_landings") __attribute__((visibility("hidden")));
+
+static bool
+text_write(void *addr, const void *bytes, size_t len)
+{
+	vm_address_t a = (vm_address_t)addr & ~(vm_address_t)(vm_page_size - 1);
+	vm_size_t n = (((vm_address_t)addr + len + vm_page_size - 1) & ~(vm_address_t)(vm_page_size - 1)) - a;
+	kern_return_t kr = vm_protect(mach_task_self(), a, n, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+	if (kr != KERN_SUCCESS) {
+		say("rotation session: the code at %p cannot be made writable (%d)", addr, kr);
+		return false;
+	}
+	memcpy(addr, bytes, len);
+	kr = vm_protect(mach_task_self(), a, n, false, VM_PROT_READ | VM_PROT_EXECUTE);
+	sys_icache_invalidate(addr, len);
+	if (kr != KERN_SUCCESS) {
+		say("rotation session: the code at %p cannot be made executable again (%d)", addr, kr);
+	}
+	return kr == KERN_SUCCESS;
+}
+
+static bool
+insn_moves(uint32_t i)
+{
+	return !((i & 0x1f000000u) == 0x10000000u ||    /* adr, adrp */
+	       (i & 0x7c000000u) == 0x14000000u ||      /* b, bl */
+	       (i & 0xff000010u) == 0x54000000u ||      /* b.cond */
+	       (i & 0x7e000000u) == 0x34000000u ||      /* cbz, cbnz */
+	       (i & 0x7e000000u) == 0x36000000u ||      /* tbz, tbnz */
+	       (i & 0x3b000000u) == 0x18000000u ||      /* ldr of a literal */
+	       (i & 0xfe000000u) == 0xd6000000u);       /* br, blr, ret */
+}
+
+/* fn's entry goes to replacement; the way to the original function, or NULL (nothing changed) */
+static void *
+entry_hook(const char *name, void *fn, void *replacement, unsigned landing)
+{
+	const uintptr_t mask = 0x0000ffffffffffffull;   /* the address (no pointer authentication on this CPU) */
+	uint32_t *entry = (uint32_t *)((uintptr_t)fn & mask), *land = &sweet_landings[landing * 8];
+	uint32_t old[4], jump[8];
+	memcpy(old, entry, sizeof(old));
+	if (old[0] == 0x58000050u && old[1] == 0xd61f0200u) {
+		say("rotation session: %{public}s is already rewritten", name);
+		return NULL;
+	}
+	for (unsigned i = 0; i < 4; i++) {
+		if (!insn_moves(old[i])) {
+			say("rotation session: %{public}s begins %08x %08x %08x %08x: not movable, left alone", name, old[0], old[1], old[2], old[3]);
+			return NULL;
+		}
+	}
+	uint64_t on = (uint64_t)(uintptr_t)(entry + 4), to = (uint64_t)((uintptr_t)replacement & mask);
+	memcpy(jump, old, sizeof(old));
+	jump[4] = 0x58000050u;          /* ldr x16, [pc, #8] */
+	jump[5] = 0xd61f0200u;          /* br x16 */
+	memcpy(&jump[6], &on, 8);
+	if (!text_write(land, jump, sizeof(jump))) {
+		return NULL;
+	}
+	jump[0] = 0x58000050u;
+	jump[1] = 0xd61f0200u;
+	memcpy(&jump[2], &to, 8);
+	if (!text_write(entry, jump, 16)) {
+		return NULL;
+	}
+	say("rotation session: %{public}s (began %08x %08x %08x %08x) comes here first", name, old[0], old[1], old[2], old[3]);
+	return land;
+}
+
+/* both functions; how many were rewritten */
+static unsigned
+rot_entries(void)
+{
+	static bool done;
+	void *sub = dlsym(RTLD_DEFAULT, "VTPixelRotationSessionRotateSubImage"), *img = dlsym(RTLD_DEFAULT, "VTPixelRotationSessionRotateImage");
+	if (done || !sub || !img) {
+		return 0;
+	}
+	done = true;
+	unsigned n = 0;
+	void *l = entry_hook("VTPixelRotationSessionRotateSubImage", sub, (void *)rot_sub_image, 0);
+	gRotSub = l ? (OSStatus (*)(void *, CVPixelBufferRef, CGRect, CVPixelBufferRef, CGRect))l : NULL;
+	n += l != NULL;
+	l = entry_hook("VTPixelRotationSessionRotateImage", img, (void *)rot_image, 1);
+	gRot = l ? (OSStatus (*)(void *, CVPixelBufferRef, CVPixelBufferRef))l : NULL;
+	n += l != NULL;
+	return n;
+}
+
+/* what the preview stage is set up to do, said when it changes: its output size, turn and flips against the picture it
+ * is given (and kept for a rotation session that does not say its own) */
+static IMP gStitchRender;
+
+static void
+stitch_render(id self, SEL sel, CMSampleBufferRef sb, id input)
+{
+	static unsigned n;
+	static int lw, lh, lr = -1, lf, liw, lih;
+	struct dims2 { int w, h; };
+	struct dims2 od = ((struct dims2 (*)(id, SEL))objc_msgSend)(self, sel_registerName("outputDimensions"));
+	int r = ((int (*)(id, SEL))objc_msgSend)(self, sel_registerName("rotationDegrees"));
+	int f = (((BOOL (*)(id, SEL))objc_msgSend)(self, sel_registerName("flipHorizontal")) ? 1 : 0) |
+	    (((BOOL (*)(id, SEL))objc_msgSend)(self, sel_registerName("flipVertical")) ? 2 : 0);
+	CVImageBufferRef ib = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
+	int iw = ib ? (int)CVPixelBufferGetWidth(ib) : 0, ih = ib ? (int)CVPixelBufferGetHeight(ib) : 0;
+	if (od.w != lw || od.h != lh || r != lr || f != lf || iw != liw || ih != lih) {
+		say("stitcher: frame %u: input %dx%d, output %dx%d, rotation %d, flips %d", n, iw, ih, od.w, od.h, r, f);
+		lw = od.w; lh = od.h; lr = r; lf = f; liw = iw; lih = ih;
+		atomic_store(&gStitchTurn, r == 0 || r == 90 || r == 180 || r == 270 ? r : -1);
+		atomic_store(&gStitchFlips, f);
+	}
+	n++;
+	((void (*)(id, SEL, CMSampleBufferRef, id))gStitchRender)(self, sel, sb, input);
+}
+
+static void
+hook_rotation(void)
+{
+	Class c = objc_getClass("BWPreviewStitcherNode");
+	if (access("/private/var/tmp/sweetcam.norot", F_OK) == 0) {
+		say("rotation session: left alone (sweetcam.norot)");
+		return;
+	}
+	say("rotation session: %u of VideoToolbox's two functions fall back to the CPU", rot_entries());
+	Method rm = c ? class_getInstanceMethod(c, sel_registerName("renderSampleBuffer:forInput:")) : NULL;
+	if (rm && !gStitchRender) {
+		gStitchRender = method_setImplementation(rm, (IMP)stitch_render);
+	}
+}
+
+/*
+ * tools/camera/rottest.c runs this on the phone, outside cameracaptured: the two entries rewritten, then a test picture
+ * (1734x1300: brightness rising to the right, a white square top left, a black bar bottom right, colour changing at the
+ * middle) through VTPixelRotationSessionRotateSubImage turned 90 degrees clockwise into 828x1792, whole and a crop; the
+ * outputs to PATH.0 and PATH.1 (width, height as two 32-bit numbers, the Y plane, the CbCr plane).
+ */
+__attribute__((visibility("default"))) int
+sweetcam_rot_selftest(const char *path)
+{
+	dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW);
+	OSStatus (*create)(CFAllocatorRef, void **) = dlsym(RTLD_DEFAULT, "VTPixelRotationSessionCreate");
+	OSStatus (*setp)(void *, CFStringRef, CFTypeRef) = dlsym(RTLD_DEFAULT, "VTSessionSetProperty");
+	OSStatus (*sub)(void *, CVPixelBufferRef, CGRect, CVPixelBufferRef, CGRect) = dlsym(RTLD_DEFAULT, "VTPixelRotationSessionRotateSubImage");
+	CFStringRef *k_rot = dlsym(RTLD_DEFAULT, "kVTPixelRotationPropertyKey_Rotation"), *v_cw = dlsym(RTLD_DEFAULT, "kVTRotation_CW90");
+	if (!create || !setp || !sub || !k_rot || !v_cw) {
+		fprintf(stderr, "VideoToolbox's functions are not there\n");
+		return 1;
+	}
+	unsigned hooked = rot_entries();
+	fprintf(stderr, "entries rewritten: %u (landings %p)\n", hooked, (void *)sweet_landings);
+	void *ses = NULL;
+	if (create(NULL, &ses) != 0 || !ses) {
+		fprintf(stderr, "no session\n");
+		return 1;
+	}
+	fprintf(stderr, "rotation set: %d\n", (int)setp(ses, *k_rot, *v_cw));
+	int flips = -1, turn = rot_session_turn(ses, &flips);
+	fprintf(stderr, "the session says: turn %d flips %d\n", turn, flips);
+	NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+	CVPixelBufferRef a = NULL;
+	CVPixelBufferCreate(NULL, 1734, 1300, PF_420F, (__bridge CFDictionaryRef)attrs, &a);
+	if (!a) {
+		return 1;
+	}
+	CVPixelBufferLockBaseAddress(a, 0);
+	uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(a, 0), *c = CVPixelBufferGetBaseAddressOfPlane(a, 1);
+	size_t ys = CVPixelBufferGetBytesPerRowOfPlane(a, 0), cs = CVPixelBufferGetBytesPerRowOfPlane(a, 1);
+	for (int r = 0; r < 1300; r++) {
+		for (int x = 0; x < 1734; x++) {
+			y[r * ys + x] = (x < 200 && r < 200) ? 255 : (x >= 1434 && r >= 1200) ? 0 : (uint8_t)(40 + x * 160 / 1734);
+		}
+	}
+	for (int r = 0; r < 650; r++) {
+		for (int x = 0; x < 867; x++) {
+			c[r * cs + 2 * x] = x < 433 ? 90 : 170;
+			c[r * cs + 2 * x + 1] = r < 325 ? 100 : 160;
+		}
+	}
+	CVPixelBufferUnlockBaseAddress(a, 0);
+	const CGRect rects[2] = { CGRectMake(0, 0, 1734, 1300), CGRectMake(1, 250, 1731, 800) };
+	for (int t = 0; t < 2; t++) {
+		CVPixelBufferRef b = NULL;
+		CVPixelBufferCreate(NULL, 828, 1792, PF_420F, (__bridge CFDictionaryRef)attrs, &b);
+		if (!b) {
+			return 1;
+		}
+		OSStatus through = gRotSub ? gRotSub(ses, a, rects[t], b, CGRectMake(0, 0, 828, 1792)) : 1;
+		uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+		OSStatus e = sub(ses, a, rects[t], b, CGRectMake(0, 0, 828, 1792));
+		fprintf(stderr, "test %d: Apple's alone %d; through the entry %d in %.1f ms\n", t, (int)through, (int)e,
+		    (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1e6);
+		char name[512];
+		snprintf(name, sizeof(name), "%s.%d", path, t);
+		FILE *f = fopen(name, "wb");
+		if (f) {
+			uint32_t wh[2] = { 828, 1792 };
+			fwrite(wh, 4, 2, f);
+			CVPixelBufferLockBaseAddress(b, kCVPixelBufferLock_ReadOnly);
+			const uint8_t *p = CVPixelBufferGetBaseAddressOfPlane(b, 0), *q = CVPixelBufferGetBaseAddressOfPlane(b, 1);
+			size_t ps = CVPixelBufferGetBytesPerRowOfPlane(b, 0), qs = CVPixelBufferGetBytesPerRowOfPlane(b, 1);
+			for (int r = 0; r < 1792; r++) {
+				fwrite(p + r * ps, 1, 828, f);
+			}
+			for (int r = 0; r < 896; r++) {
+				fwrite(q + r * qs, 1, 828, f);
+			}
+			CVPixelBufferUnlockBaseAddress(b, kCVPixelBufferLock_ReadOnly);
+			fclose(f);
+		}
+		CVPixelBufferRelease(b);
+	}
+	/* Apple's own (it does a whole picture without the scaler) against the CPU's, per turn and flips: mean difference of Y */
+	CFStringRef *k_fh = dlsym(RTLD_DEFAULT, "kVTPixelRotationPropertyKey_FlipHorizontalOrientation");
+	CFStringRef *k_fv = dlsym(RTLD_DEFAULT, "kVTPixelRotationPropertyKey_FlipVerticalOrientation");
+	static const char *const turns[] = { "kVTRotation_0", "kVTRotation_CW90", "kVTRotation_180", "kVTRotation_CCW90" };
+	for (int k = 0; k_fh && k_fv && gRotSub && k < 16; k++) {
+		CFStringRef *tv = dlsym(RTLD_DEFAULT, turns[k & 3]);
+		int fl = k >> 2, deg = (k & 3) * 90;
+		bool stands = deg == 90 || deg == 270;
+		void *s2 = NULL;
+		if (!tv || create(NULL, &s2) != 0 || !s2) {
+			continue;
+		}
+		setp(s2, *k_rot, *tv);
+		setp(s2, *k_fh, (fl & 1) ? kCFBooleanTrue : kCFBooleanFalse);
+		setp(s2, *k_fv, (fl & 2) ? kCFBooleanTrue : kCFBooleanFalse);
+		int qf = -1, qt = rot_session_turn(s2, &qf);
+		CVPixelBufferRef b1 = NULL, b2 = NULL;
+		CVPixelBufferCreate(NULL, stands ? 650 : 866, stands ? 866 : 650, PF_420F, (__bridge CFDictionaryRef)attrs, &b1);
+		CVPixelBufferCreate(NULL, stands ? 650 : 866, stands ? 866 : 650, PF_420F, (__bridge CFDictionaryRef)attrs, &b2);
+		OSStatus ea = gRot ? gRot(s2, a, b1) : 1;
+		double diff[2] = { -1, -1 };
+		for (int v = 0; ea == 0 && v < 2; v++) {
+			gTurnFlipsSource = v == 1;
+			if (turn_scale_420(a, CGRectNull, b2, CGRectNull, deg, fl) != 0) {
+				continue;
+			}
+			CVPixelBufferLockBaseAddress(b1, kCVPixelBufferLock_ReadOnly);
+			CVPixelBufferLockBaseAddress(b2, kCVPixelBufferLock_ReadOnly);
+			size_t w = CVPixelBufferGetWidth(b1), h = CVPixelBufferGetHeight(b1);
+			const uint8_t *p1 = CVPixelBufferGetBaseAddressOfPlane(b1, 0), *p2 = CVPixelBufferGetBaseAddressOfPlane(b2, 0);
+			const uint8_t *c1 = CVPixelBufferGetBaseAddressOfPlane(b1, 1), *c2 = CVPixelBufferGetBaseAddressOfPlane(b2, 1);
+			size_t s1 = CVPixelBufferGetBytesPerRowOfPlane(b1, 0), s2b = CVPixelBufferGetBytesPerRowOfPlane(b2, 0);
+			size_t t1 = CVPixelBufferGetBytesPerRowOfPlane(b1, 1), t2 = CVPixelBufferGetBytesPerRowOfPlane(b2, 1);
+			uint64_t sum = 0;
+			for (size_t r = 0; r < h; r++) {
+				for (size_t x = 0; x < w; x++) {
+					sum += (uint64_t)abs((int)p1[r * s1 + x] - (int)p2[r * s2b + x]);
+				}
+			}
+			for (size_t r = 0; r < h / 2; r++) {
+				for (size_t x = 0; x < (w & ~(size_t)1); x++) {
+					sum += (uint64_t)abs((int)c1[r * t1 + x] - (int)c2[r * t2 + x]);
+				}
+			}
+			diff[v] = (double)sum / (double)(w * h * 3 / 2);
+			CVPixelBufferUnlockBaseAddress(b2, kCVPixelBufferLock_ReadOnly);
+			CVPixelBufferUnlockBaseAddress(b1, kCVPixelBufferLock_ReadOnly);
+		}
+		gTurnFlipsSource = false;
+		fprintf(stderr, "turn %3d flips %d (the session says %d, %d): Apple's %d; mean difference, flips of the output %.2f, of the source %.2f\n",
+		    deg, fl, qt, qf, (int)ea, diff[0], diff[1]);
+		if (b1) CVPixelBufferRelease(b1);
+		if (b2) CVPixelBufferRelease(b2);
+		CFRelease(s2);
+	}
+	CVPixelBufferRelease(a);
+	CFRelease(ses);
+	return 0;
+}
+
 /* the methods of a class (name and type encoding), once, for reading on the Mac */
 static void
 say_methods(const char *cls_name)
@@ -3512,9 +4080,24 @@ hook(void)
 	hook_nrf();
 	hook_styles();
 	hook_m2m();
+	hook_rotation();
 	say_imps();
 	if (access("/private/var/tmp/sweetcam.nilwatch", F_OK) == 0)
 		say_methods("FigM2MController");
+	{
+		/* /private/var/tmp/sweetcam.methods: class names, one a line: their methods and ivars into the log */
+		FILE *mf = fopen("/private/var/tmp/sweetcam.methods", "r");
+		char line[128];
+		while (mf && fgets(line, sizeof(line), mf)) {
+			line[strcspn(line, "\r\n ")] = 0;
+			if (line[0]) {
+				say_methods(line);
+			}
+		}
+		if (mf) {
+			fclose(mf);
+		}
+	}
 	static const ptrdiff_t ub_offs[] = { 144, 240, 248, 280 };
 	say_ivars("BWUBNode", ub_offs, 4);
 	nil_watch();
