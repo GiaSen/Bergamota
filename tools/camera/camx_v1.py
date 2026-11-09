@@ -73,7 +73,7 @@ class Module:
             w = struct.unpack_from('<10I', self.d, self.pool + base + REG_SIZE * i)
             _sae, _said, addr, dcnt, did, at, dt, op, due, duid = w
             data = [self.u32(self.at(did) + 4 * k) for k in range(dcnt)] if dcnt else []
-            delay = self.u32(self.at(duid)) if due else 0
+            delay = self.u32(self.at(duid)) if due and duid in self.syms else 0   # S5K3M3: a delay flag with no symbol (id 0)
             out.append((addr, data, at, dt, op, delay))
         return out
 
@@ -115,6 +115,10 @@ class Module:
         for off in range(0, self.pool_size - 8):
             cnt, sid = struct.unpack_from('<2I', self.d, self.pool + off)
             if sid in reg_ids and 0 < cnt < 4096:
+                try:
+                    self.regs(cnt, sid)
+                except (KeyError, struct.error):
+                    continue        # a (count, id) look-alike whose data does not resolve (S5K3M3 file)
                 found.append((off, cnt, sid))
         return found
 
@@ -172,6 +176,8 @@ def main():
             sys.exit('no initSettings found')
         out = bytearray()
         for addr, data, at, dt, op, delay in init + modes[idx]['regs']:
+            if addr == 0x0100 and op == 0:
+                continue        # mode_select (stream on/off) is the kernel's: its sequence loader refuses it
             if op != 0:
                 sys.exit('register %#x: operation %d not handled' % (addr, op))
             if at != 2 or dt not in (1, 2):
