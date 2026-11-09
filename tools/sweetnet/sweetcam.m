@@ -34,6 +34,7 @@
 #import <Foundation/Foundation.h>
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
@@ -915,10 +916,31 @@ stream_set_property_real(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 			}
 			struct output *out = &s->out[k];
 			if (configs) {
+				/*
+				 * merged into what the output had: at a photo CMCapture sends the still output only
+				 * { RetainedBufferCount = 3 }, and taken as the whole configuration that left it with no size, format or
+				 * pool (deliver gave nothing and the photo never came, 2026-11-09)
+				 */
+				CFDictionaryRef nc = CFGetTypeID(values[i]) == CFDictionaryGetTypeID() ? values[i] : NULL;
+				CFDictionaryRef merged = NULL;
+				if (nc && out->config) {
+					CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, out->config);
+					CFIndex cn = CFDictionaryGetCount(nc);
+					const void **ck = calloc((size_t)cn + 1, sizeof(void *)), **cv = calloc((size_t)cn + 1, sizeof(void *));
+					CFDictionaryGetKeysAndValues(nc, ck, cv);
+					for (CFIndex j = 0; j < cn; j++) {
+						CFDictionarySetValue(m, ck[j], cv[j]);
+					}
+					free(ck);
+					free(cv);
+					merged = m;
+				} else if (nc) {
+					merged = CFRetain(nc);
+				}
 				if (out->config) {
 					CFRelease(out->config);
 				}
-				out->config = CFGetTypeID(values[i]) == CFDictionaryGetTypeID() ? CFRetain(values[i]) : NULL;
+				out->config = merged;
 			} else if (enabled) {
 				int64_t on = 1;
 				if (CFGetTypeID(values[i]) == CFBooleanGetTypeID()) {
@@ -2044,6 +2066,148 @@ nil_watch_class(Class cls, const char *cn)
 	free(ms);
 }
 
+/*
+ * CMImaging's helpers that make a Metal texture over a pixel buffer's plane (bindPixelBufferToMTL2DTexture:..., NRF's input
+ * luma among them): a nil answer is said with what was asked (Metal pixel format, usage, plane) and the buffer's own format
+ * and size. With the nil watch.
+ */
+static void
+bind_watch_methods(Class cls, const char *cn, bool meta)
+{
+	unsigned n = 0;
+	Method *ms = class_copyMethodList(cls, &n);
+	for (unsigned i = 0; i < n; i++) {
+		SEL sel = method_getName(ms[i]);
+		const char *sn = sel_getName(sel);
+		if (strncmp(sn, "bindPixelBufferToMTL2DTexture:", 30) != 0) {
+			continue;
+		}
+		/*
+		 * at most 6 arguments: the wrapper passes x2-x7 on, and a 7th is on the caller's stack, which it does not copy
+		 * (wrapped, ...slice:widthAlignmentFactor:heightAlignmentFactor: read its height alignment from the wrapper's frame:
+		 * 0, so every texture over a plane came out 0 rows high, 2026-11-09)
+		 */
+		unsigned colons = 0;
+		for (const char *q = sn; *q; q++) {
+			colons += *q == ':';
+		}
+		if (colons > 6) {
+			continue;
+		}
+		IMP orig = method_getImplementation(ms[i]);
+		IMP nimp = imp_implementationWithBlock(^id(id self, void *a, void *b, void *c, void *d, void *e, void *f) {
+			id r = ((id(*)(id, SEL, void *, void *, void *, void *, void *, void *))orig)(self, sel, a, b, c, d, e, f);
+			static unsigned said;
+			if (!r && said++ < 40) {
+				CVPixelBufferRef pb = (CVPixelBufferRef)a;
+				OSType pf = pb && CFGetTypeID(pb) == CVPixelBufferGetTypeID() ? CVPixelBufferGetPixelFormatType(pb) : 0;
+				say("bindwatch: %{public}s[%{public}s %{public}s] answered nil: args %#lx %#lx %#lx %#lx; buffer %c%c%c%c %zux%zu, %zu planes",
+				    meta ? "+" : "-", cn, sn, (unsigned long)b, (unsigned long)c, (unsigned long)d, (unsigned long)e,
+				    (char)(pf >> 24), (char)(pf >> 16), (char)(pf >> 8), (char)pf, pf ? CVPixelBufferGetWidth(pb) : 0,
+				    pf ? CVPixelBufferGetHeight(pb) : 0, pf ? CVPixelBufferGetPlaneCount(pb) : 0);
+				if (pf) {
+					size_t l = 0, rr = 0, t = 0, bt = 0;
+					CVPixelBufferGetExtendedPixels(pb, &l, &rr, &t, &bt);
+					IOSurfaceRef sf = CVPixelBufferGetIOSurface(pb);
+					size_t pl = (size_t)c;
+					say("bindwatch:   extended pixels l %zu r %zu t %zu b %zu; surface %u, plane %zu: %zux%zu, element %zux%zu, %zu bytes a row; "
+					    "alignment args %#lx %#lx",
+					    l, rr, t, bt, sf ? IOSurfaceGetID(sf) : 0, pl, sf ? IOSurfaceGetWidthOfPlane(sf, pl) : 0,
+					    sf ? IOSurfaceGetHeightOfPlane(sf, pl) : 0, sf ? IOSurfaceGetElementWidth(sf) : 0, sf ? IOSurfaceGetElementHeight(sf) : 0,
+					    sf ? IOSurfaceGetBytesPerRowOfPlane(sf, pl) : 0, (unsigned long)e, (unsigned long)f);
+				}
+			}
+			return r;
+		});
+		method_setImplementation(ms[i], nimp);
+		Dl_info di;
+		unsigned long off = dladdr((void *)orig, &di) && di.dli_fbase ? (unsigned long)orig - (unsigned long)di.dli_fbase : 0;
+		say("bindwatch: %{public}s[%{public}s %{public}s] watched (+%#lx in its image)", meta ? "+" : "-", cn, sn, off);
+	}
+	free(ms);
+}
+
+/*
+ * What a call in a shared-cache image goes to, from the image's unslid address of the stub (the Mac's split copy): an
+ * Objective-C stub (adrp/ldr x1 = the selector) or a C stub (adrp/ldr x16, or adrp/add x17 + ldr x16). For reading
+ * disassembly of CMImaging on the Mac. base = the image's unslid __TEXT address.
+ */
+static void
+say_stub(void *any_fn_in_image, unsigned long base, unsigned long stub)
+{
+	Dl_info di;
+	if (!dladdr(any_fn_in_image, &di) || !di.dli_fbase) {
+		return;
+	}
+	unsigned long slide = (unsigned long)di.dli_fbase - base;
+	const uint32_t *ins = (const uint32_t *)(stub + slide);
+	uint32_t i0 = ins[0], i1 = ins[1], i2 = ins[2];
+	if ((i0 & 0x9f000000) != 0x90000000) {
+		say("stub %#lx: not an adrp (%08x)", stub, i0);
+		return;
+	}
+	long imm = (long)((((i0 >> 5) & 0x7ffff) << 2) | ((i0 >> 29) & 3));
+	if (imm & (1l << 20)) {
+		imm -= 1l << 21;
+	}
+	unsigned long page = ((unsigned long)ins & ~0xffful) + (unsigned long)(imm << 12), at = 0;
+	unsigned reg = i0 & 31;
+	if ((i1 & 0xff800000) == 0x91000000 && i2 == 0xd61f0200) {
+		/* a branch island: adrp x16; add x16, x16, #off; br x16 */
+		Dl_info t;
+		void *fn = (void *)(page + ((i1 >> 10) & 0xfff));
+		say("stub %#lx: %{public}s", stub, dladdr(fn, &t) && t.dli_sname ? t.dli_sname : "?");
+		return;
+	}
+	if ((i1 & 0xffc00000) == 0xf9400000) {
+		at = page + ((i1 >> 10) & 0xfff) * 8;
+		reg = i1 & 31;
+	} else if ((i1 & 0xff800000) == 0x91000000 && (i2 & 0xffc00000) == 0xf9400000) {
+		at = page + ((i1 >> 10) & 0xfff) + ((i2 >> 10) & 0xfff) * 8;
+		reg = i2 & 31;
+	}
+	if (!at) {
+		say("stub %#lx: %08x %08x %08x not read", stub, i0, i1, i2);
+		return;
+	}
+	uintptr_t v = *(const uintptr_t *)at;
+	if (reg == 1) {
+		say("stub %#lx: objc_msgSend %{public}s", stub, sel_getName((SEL)v));
+		return;
+	}
+	v &= 0x0000007fffffffffull;   /* the PAC bits off */
+	Dl_info t;
+	say("stub %#lx: %{public}s", stub, dladdr((void *)v, &t) && t.dli_sname ? t.dli_sname : "?");
+}
+
+static void
+bind_watch(void)
+{
+	if (access("/private/var/tmp/sweetcam.stubs", F_OK) == 0) {
+		/* the calls of -[FigMetalContext bindPixelBufferToMTL2DTexture:pixelFormat:usage:plane:slice:widthAlignmentFactor:
+		 * heightAlignmentFactor:] (CMImaging 26.6.2, __TEXT at 0x234a7c000 unslid) */
+		static const unsigned long stubs[] = { 0x23a842ae0, 0x23a842af0, 0x23a842d60, 0x23a842b30, 0x23a842df0, 0x23a842d80,
+			0x23a842d70, 0x23a842e30, 0x23a842dc0, 0x23a842d90, 0x23a842dd0, 0x23a843780, 0x234c94a60, 0x234c94a80,
+			0x234c99ba0, 0x234c929a0, 0x234c98a00, 0x234c98180, 0x234c998c0, 0x234c98c20, 0x234c96aa0 };
+		Class fmc = objc_getClass("FigMetalContext");
+		Method m = fmc ? class_getInstanceMethod(fmc, sel_registerName("bindPixelBufferToMTL2DTexture:pixelFormat:usage:plane:")) : NULL;
+		for (unsigned i = 0; m && i < sizeof(stubs) / sizeof(stubs[0]); i++) {
+			say_stub((void *)method_getImplementation(m), 0x234a7c000ul, stubs[i]);
+		}
+	}
+	unsigned n = 0;
+	Class *cs = objc_copyClassList(&n);
+	for (unsigned i = 0; i < n; i++) {
+		const char *img = class_getImageName(cs[i]);
+		if (!img || (!strstr(img, "CMImaging") && !strstr(img, "CMCapture.framework"))) {
+			continue;
+		}
+		bind_watch_methods(cs[i], class_getName(cs[i]), false);
+		bind_watch_methods(object_getClass(cs[i]), class_getName(cs[i]), true);
+	}
+	free(cs);
+}
+
 static void
 nil_watch(void)
 {
@@ -2062,6 +2226,7 @@ nil_watch(void)
 	}
 	free(cs);
 	say("nilwatch: %u classes of CMCapture watched", watched);
+	bind_watch();
 	/* +[BWVideoFormat formatByResolvingRequirements:] and the formats it gives: _setupProcessorCoordinator compares their
 	 * extended (aligned) sizes with the format it asked for and gives up on a difference */
 	Class vf = objc_getClass("BWVideoFormat");
@@ -2617,13 +2782,18 @@ metal_device(void)
 	 * the preview stages that the camera's pipeline does without, refused as they were before Chlorophyll could build them:
 	 * the Metal stand-in for the missing rotation hardware (VTPixelRotationSession's transform shaders) and the colour cube;
 	 * built, they ran every preview frame at about 6 a second here and the frames waiting for them filled the surfaces.
+	 * VTMTSComputeFunction: VideoToolbox's Metal pixel transfer (each 1734x1300 preview frame to the 828x1792 portrait one
+	 * the screen shows) wrote luma-like values into the chroma plane (green and magenta preview, 2026-11-09) and spent 80 ms
+	 * a frame decoding its source on the CPU; refused, VideoToolbox converts on the CPU as with the phone's own driver.
+	 * VTMTSComputeFunction1x1: its scaler for the photo (NRF's 2016x1512 output to the 1924x1444 picture and the thumbnails)
+	 * asks for 2048 threads a threadgroup, past the GPU's 1024: nothing was written and the JPEG came out green.
 	 * /private/var/tmp/sweetcam.allstages: nothing refused
 	 */
 	if (access("/private/var/tmp/sweetcam.allstages", F_OK) != 0)
 	{
 		/* the list: /private/var/tmp/sweetcam.deny (one line, comma-separated) when present, else these */
 		char deny[1024] = "fragmentTransformYUV,fragmentTransformRGBA,fragmentTransformY,fragmentTransformUV,fragmentTransformYY,"
-		                  "colorCubeFragment2D,VCPRender,VCPDownsample";
+		                  "colorCubeFragment2D,VCPRender,VCPDownsample,VTMTSComputeFunction,VTMTSComputeFunction1x1";
 		FILE *df = fopen("/private/var/tmp/sweetcam.deny", "r");
 		if (df) {
 			if (fgets(deny, sizeof(deny), df)) {

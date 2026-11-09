@@ -97,7 +97,7 @@ if [ "${IOS18:-1}" = 1 ]; then
 	python3 -I "$pacstrip" --sign "$out18/sweettorch.dylib"
 	# iOS 26: the rear main camera in cameracaptured (loaded by sweettorch.dylib; frames from the kernel's kern.sweet_cam_live)
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -Wno-objc-designated-initializers -Wno-four-char-constants -Wno-arc-performSelector-leaks -fno-objc-arc \
-		-dynamiclib -install_name /usr/local/lib/sweetcam.dylib -framework Foundation -framework CoreMedia -framework CoreVideo -framework Accelerate -framework CoreGraphics \
+		-dynamiclib -install_name /usr/local/lib/sweetcam.dylib -framework Foundation -framework CoreMedia -framework CoreVideo -framework Accelerate -framework CoreGraphics -framework IOSurface \
 		"$here/sweetcam.m" -o "$out18/sweetcam.dylib"
 	codesign -s - -f "$out18/sweetcam.dylib"
 	python3 -I "$pacstrip" --sign "$out18/sweetcam.dylib"

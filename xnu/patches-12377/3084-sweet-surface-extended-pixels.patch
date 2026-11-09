@@ -1,0 +1,56 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index f31becb..b218658 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -720,6 +720,17 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
+ 			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
+ 			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));
++			/* 3084: the padding a client asked for around the plane (CoreVideo's extended pixels: the camera's 10-bit
++			 * still frames have 8 rows below), given back by IOSurfaceGetExtendedPixelsOfPlane: CMImaging sizes the
++			 * Metal textures it lays over a plane by it and refused the photo's input with zeros */
++			p->extLeft = sweet_dict_u32(pd, "IOSurfacePlaneExtendedPixelsOnLeft", 0);
++			p->extRight = sweet_dict_u32(pd, "IOSurfacePlaneExtendedPixelsOnRight", 0);
++			p->extTop = sweet_dict_u32(pd, "IOSurfacePlaneExtendedPixelsOnTop", 0);
++			p->extBottom = sweet_dict_u32(pd, "IOSurfacePlaneExtendedPixelsOnBottom", 0);
++			if (p->extLeft > SWEET_SURFACE_MAX_DIM || p->extRight > SWEET_SURFACE_MAX_DIM ||
++			    p->extTop > SWEET_SURFACE_MAX_DIM || p->extBottom > SWEET_SURFACE_MAX_DIM) {
++				p->extLeft = p->extRight = p->extTop = p->extBottom = 0;
++			}
+ 			next = round_page((uint64_t)p->offset + p->size);
+ 			if ((uint64_t)p->offset + p->size > end) {
+ 				end = (uint64_t)p->offset + p->size;
+@@ -974,7 +985,9 @@ put64(uint8_t *p, uint32_t off, uint64_t v)
+  *   0x48 pixelFormat u32 0x58 planeCount u32  0x60 bytesPerElement u16  0x62 elementWidth u8  0x63 elementHeight u8
+  *   0x64 cacheMode u32   0x70 parentID u32    0x74 slice count (u32, <= 1 means 1)
+  *   0x88 + i * 0x98: plane i: +0 width u64, +8 height u64, +0x18 offset u64, +0x20 bytesPerRow u64, +0x28 size u64,
+- *                    +0x30 bytesPerElement u16, +0x32 elementWidth u8, +0x33 elementHeight u8, +0x6c u8 compressed flag
++ *                    +0x30 bytesPerElement u16, +0x32 elementWidth u8, +0x33 elementHeight u8, +0x6c u8 compressed flag,
++ *                    +0x88 extended pixels right u32, +0x8c bottom, +0x90 left, +0x94 top (3084; iOS 26
++ *                    IOSurfaceClientGetExtendedPixelsOfPlane)
+  * The iOS 16 layout put 32-bit fields at 0x1c.., so the client read width/height/rowbytes as garbage and CoreUI wrote
+  * past the surface (SpringBoard SIGSEGV in vImageDeepmap2Decode, destination = base + bytesPerElement).
+  */
+@@ -1010,6 +1023,10 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		memcpy(p + 0x30, &pl->bytesPerElement, 2);
+ 		p[0x32] = pl->elementWidth;
+ 		p[0x33] = pl->elementHeight;
++		put32(p, 0x88, pl->extRight);
++		put32(p, 0x8c, pl->extBottom);
++		put32(p, 0x90, pl->extLeft);
++		put32(p, 0x94, pl->extTop);
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index e63086f..df10cf9 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -23,6 +23,7 @@ struct sweet_surface_plane {
+ 	uint32_t width, height, bytesPerRow, offset, size;
+ 	uint16_t bytesPerElement;
+ 	uint8_t  elementWidth, elementHeight;
++	uint32_t extLeft, extRight, extTop, extBottom;   /* 3084: IOSurfacePlaneExtendedPixelsOn* (padding past the plane) */
+ };
+ 
+ class SweetSurface : public OSObject {
