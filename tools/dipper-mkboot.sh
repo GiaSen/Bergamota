@@ -1,11 +1,12 @@
 #!/bin/sh
 # Boot image of the Mi 8 with its current boot-args: tools/dipper-mkboot.sh KERNEL OUT.img [ADT]
-# Default ADT enxerto/out/dipper-n104-2x-wlan-gpu-hap-cam-862.adt (dipper-n104-2x-wlan-gpu.adt + /product/haptics,
-# /product/camera "flash" and /arm-io/isp "camera-rear", made by tools/adt-haptics.py --rear-camera, then the canvas
-# 414x862 points at @2x = 828x1724, the panel's own shape, by tools/adt-canvas.py; images up to 130f used
-# dipper-n104-2x-wlan-gpu-hap.adt, 131 -hap-cam.adt: the iPhone 11's 414x896, a ~20 px black band at each side).
-# sweetfb_scale=2 (SWEETFB_SCALE): the display scaler stretches the canvas onto the whole 1080x2248 panel (with the
-# 862-point canvas the two axes differ by 0.03 %); 1 = fit with bars (the default before image 132). The boot-args field holds 607 bytes: the default line is 606.
+# Default ADT enxerto/out/dipper-n104-2x-wlan-gpu-hap-cam.adt (dipper-n104-2x-wlan-gpu.adt + /product/haptics,
+# /product/camera "flash" and /arm-io/isp "camera-rear", made by tools/adt-haptics.py --rear-camera; images up to 130f
+# used dipper-n104-2x-wlan-gpu-hap.adt, the same without the isp node). Its canvas is the iPhone 11's, 414x896 points at @2x.
+# sweetfb_scale=2 (SWEETFB_SCALE, since image 133): the display scaler stretches that canvas onto the whole 1080x2248
+# panel (1.304 across, 1.254 down: 4 % wider than tall); 1 = fit with bars (~20 px black at each side, up to image 131).
+# A canvas of the panel's own shape (tools/adt-canvas.py --points 414x862, image 132) filled it without the 4 %, but iOS
+# then laid the status bar out for another screen, its icons pushed into the notch (user, 2026-11-09). The boot-args field holds 607 bytes: the default line is 606.
 #   sweetwlan=5 ... sweet80211=3    Wi-Fi service
 #   sweetbt=1 sweetbtfast=1 sweetbtibs=1   Bluetooth next to it (xnu 3011, firmware in /usr/standalone/firmware/sweet)
 #   sweetcharger=2 sweetcharger_fcc=1700   charger control, 0.5 C of 3400 mAh
@@ -21,4 +22,4 @@ CMDLINE="debug=0xc serial=1 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled
 CMDLINE="$CMDLINE${EXTRA_ARGS:+ $EXTRA_ARGS}"
 [ "${#CMDLINE}" -le 607 ] || { echo "boot-args are ${#CMDLINE} bytes, the field holds 607" >&2; exit 1; }
 RENEGADE_TARGET=ios26 BOARD=dipper DTB="$PWD/dtb/dipper/dtb" CMDLINE="$CMDLINE" \
-	exec tools/renegade/mkboot-full.sh "$1" "${3:-enxerto/out/dipper-n104-2x-wlan-gpu-hap-cam-862.adt}" "$2"
+	exec tools/renegade/mkboot-full.sh "$1" "${3:-enxerto/out/dipper-n104-2x-wlan-gpu-hap-cam.adt}" "$2"

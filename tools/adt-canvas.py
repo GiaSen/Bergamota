@@ -4,8 +4,9 @@
 The kernel (SweetFramebuffer.cpp) presents that canvas to iOS and its display scaler maps it onto the panel; touches are
 mapped back with the same transform (SweetHID.cpp). A canvas with the panel's own aspect fills the panel without bars
 or distortion: the Mi 8's 1080x2248 panel is 414x862 points at @2x (828x1724, 1.3043x on both axes), where the
-iPhone 11's 414x896 left a ~20 px black band at each side (2026-11-09). The source tree is an Apple artifact: keep it and
-the output out of git.
+iPhone 11's 414x896 left a ~20 px black band at each side (2026-11-09). Not the default: iOS has no status bar layout for
+a 414x862 screen and moved its icons into the notch; the default stretches the 414x896 canvas instead (sweetfb_scale=2,
+tools/dipper-mkboot.sh). The source tree is an Apple artifact: keep it and the output out of git.
 """
 import argparse
 import os
