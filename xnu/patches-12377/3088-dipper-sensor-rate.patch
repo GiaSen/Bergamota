@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/dipper_sensors.c b/bsd/dev/dipper_sensors.c
+index 2bd33ff..955586c 100644
+--- a/bsd/dev/dipper_sensors.c
++++ b/bsd/dev/dipper_sensors.c
+@@ -2903,6 +2903,16 @@ sc_step(void)
+ 			msg = 10;
+ 		} else if (sc_on_change[k]) {
+ 			msg = 514;
++		} else if (sc.have_us[k] != 0) {
++			/*
++			 * 3088: a new rate on a running stream: stop it first, the new rate goes out on the next round (one request per
++			 * stream, not a second 513 on top of the first). Observed (image 135): the SLPI then still sends ~50 samples a
++			 * second for a fresh 10 Hz request, so that is its floor for the accelerometer; SweetHIDSensor::sample is what
++			 * holds iOS to the interval it asked.
++			 */
++			msg = 10;
++			want = 0;
++			SG_LOG("sensors: %s stopped for its new rate\n", sc_type[k]);
+ 		} else {
+ 			uint32_t hz = MAX(1u, MIN(200u, 1000000u / MAX(want, 1u)));     /* integer Hz as an IEEE float */
+ 			uint32_t e = 127 + 31 - (uint32_t)__builtin_clz(hz), bits = (e << 23) | ((hz << (23 - (e - 127))) & 0x7fffff);
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index abcd7bc..235b934 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -774,6 +774,7 @@ private:
+ 	UInt32 fSeq;
+ 	unsigned fPropLogs, fSampleLogs;
+ 	UInt32 fInterval;               /* ReportInterval from a client, us; 0 = not asked */
++	uint64_t fLastTs;               /* 3088: the last streamed sample handed on (absolute time) */
+ 	bool fAsked;                    /* proximity: a client asked for detection */
+ 	UInt32 fMode;                   /* proximity: backboardd's DetectionMode (IOHIDProximityDetectionMask bits), 3072c */
+ 	unsigned fOpen;
+@@ -944,6 +945,18 @@ SweetHIDSensor::sample(uint64_t ts, const int32_t *v, int n)
+ 		IOLog("SWEET HID: %s sample %d %d %d (%d values, %u clients)\n", sweet_sensor_names[fKind], n > 0 ? v[0] : 0,
+ 		    n > 1 ? v[1] : 0, n > 2 ? v[2] : 0, n, _clients ? _clients->getCount() : 0);
+ 	}
++	/*
++	 * 3088: streamed kinds no faster than the interval iOS asked (3/4 of it, for jitter): the SLPI can deliver more
++	 * than asked, and every sample is an event backboardd and locationd handle
++	 */
++	if ((fKind == kSweetSensorAccel || fKind == kSweetSensorGyro || fKind == kSweetSensorMag) && fInterval != 0) {
++		uint64_t gap;
++		nanoseconds_to_absolutetime((uint64_t)fInterval * 750u, &gap);
++		if (fLastTs != 0 && ts > fLastTs && ts - fLastTs < gap) {
++			return;
++		}
++		fLastTs = ts;
++	}
+ 	switch (fKind) {
+ 	case kSweetSensorAccel:
+ 		e = n >= 3 ? IOHIDEvent::accelerometerEvent(ts, v[0], v[1], v[2], 0, 0, fSeq++) : NULL;

@@ -837,12 +837,21 @@ QUIET_REMOVE = ('com.apple.sirittsd',)
 # are enumerated and abort at once without audio hardware; removing sirittsd did not stop them (log dipper-ios26-6c:
 # 81 crashes each in 17.5 min, ReportCrash 184 s of CPU). Taken out of launchd's AppExtensions cache and renamed to
 # NAME.appex.quiet-off (rename back and drop the flag to undo).
+# 2026-11-09 (Mi 8, image 134): three more that only crash and are launched again and again (ReportCrash ~6 % of a core):
+# the Spotlight index extensions of Wallet, Notes and Reminders (an ObjC exception inside PlugInKit at start, before their
+# code runs: very likely "plugin has invalid sandbox or container") and MessagesBlastDoorService, launched from
+# callservicesd's coalition, which stops in BlastDoor/Sandbox.swift: "BlastDoor cannot run unsandboxed." (this kernel
+# applies no sandbox profiles). Their Spotlight results and BlastDoor's parsing never worked here.
 QUIET_EXT_OFF = (
     'System/Library/ExtensionKit/Extensions/SiriAUSP.appex',
     'System/Library/ExtensionKit/Extensions/MauiAUSP.appex',
     'System/Library/ExtensionKit/Extensions/MacinTalkAUSP.appex',
     'System/Library/ExtensionKit/Extensions/KonaSynthesizer.appex',
     'System/Library/PrivateFrameworks/MacinTalk.framework/PlugIns/MacinTalkAUSP.appex',
+    'System/Library/Frameworks/PassKit.framework/PlugIns/PassKitSpotlightIndexExtension.appex',
+    'Applications/MobileNotes.app/PlugIns/com.apple.mobilenotes.SpotlightIndexExtension.appex',
+    'Applications/Reminders.app/PlugIns/RemindersSpotlightIndexExtension.appex',
+    'System/Library/PrivateFrameworks/MessagesBlastDoorSupport.framework/XPCServices/MessagesBlastDoorService.xpc',
 )
 QUIET_JETSAM_MB = 48
 # usernotificationsd alone: 96 kills in 16 min (2026-10-30), each with a ReportCrash run, about 11% of one core.
@@ -902,7 +911,7 @@ def quiet(root):
             os.rename(src, src + '.quiet-off')
             renamed += 1
     print(f'quiet: removed {len(gone)} job(s) {QUIET_REMOVE}, ThrottleInterval set on {n}, '
-          f'{len(ext_gone)} speech extension(s) out of the AppExtensions cache, {renamed} renamed .quiet-off')
+          f'{len(ext_gone)} crash-looping extension(s) out of the AppExtensions cache, {renamed} renamed .quiet-off')
     quiet_jetsam(root)
 
 
