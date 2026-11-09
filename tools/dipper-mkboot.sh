@@ -1,7 +1,8 @@
 #!/bin/sh
 # Boot image of the Mi 8 with its current boot-args: tools/dipper-mkboot.sh KERNEL OUT.img [ADT]
-# Default ADT enxerto/out/dipper-n104-2x-wlan-gpu-hap.adt (dipper-n104-2x-wlan-gpu.adt + /product/haptics and
-# /product/camera "flash", made by tools/adt-haptics.py). The boot-args field holds 607 bytes: the default line is 606.
+# Default ADT enxerto/out/dipper-n104-2x-wlan-gpu-hap-cam.adt (dipper-n104-2x-wlan-gpu.adt + /product/haptics,
+# /product/camera "flash" and /arm-io/isp "camera-rear", made by tools/adt-haptics.py --rear-camera; images up to 130f
+# used dipper-n104-2x-wlan-gpu-hap.adt, the same without the isp node). The boot-args field holds 607 bytes: the default line is 606.
 #   sweetwlan=5 ... sweet80211=3    Wi-Fi service
 #   sweetbt=1 sweetbtfast=1 sweetbtibs=1   Bluetooth next to it (xnu 3011, firmware in /usr/standalone/firmware/sweet)
 #   sweetcharger=2 sweetcharger_fcc=1700   charger control, 0.5 C of 3400 mAh
@@ -17,4 +18,4 @@ CMDLINE="debug=0xc serial=1 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled
 CMDLINE="$CMDLINE${EXTRA_ARGS:+ $EXTRA_ARGS}"
 [ "${#CMDLINE}" -le 607 ] || { echo "boot-args are ${#CMDLINE} bytes, the field holds 607" >&2; exit 1; }
 RENEGADE_TARGET=ios26 BOARD=dipper DTB="$PWD/dtb/dipper/dtb" CMDLINE="$CMDLINE" \
-	exec tools/renegade/mkboot-full.sh "$1" "${3:-enxerto/out/dipper-n104-2x-wlan-gpu-hap.adt}" "$2"
+	exec tools/renegade/mkboot-full.sh "$1" "${3:-enxerto/out/dipper-n104-2x-wlan-gpu-hap-cam.adt}" "$2"

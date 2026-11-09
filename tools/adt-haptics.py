@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Copy the real iPhone's /product/haptics node into an Apple Device Tree that has a /product node without it, and add a
-/product/camera node holding only the iPhone's "flash" property.
+"""Copy the real iPhone's /product/haptics node into an Apple Device Tree that has a /product node without it, add a
+/product/camera node holding only the iPhone's "flash" property, and (--rear-camera, 2026-11-09) an /arm-io/isp node
+holding only "camera-rear" = 1.
   adt-haptics.py IN.adt OUT.adt [--from research/ios26/n104ap.adt]
 MobileGestalt's camera-flash comes from /product/camera "flash": with it Control Center shows the flashlight button and
 FigFlashlight (cameracaptured) offers a torch (the Mi 8's: xnu 3050 + sweettorch.dylib). The iPhone's other camera
-properties are left out on purpose: this phone has no camera for them to describe.
+properties are left out on purpose: they describe cameras and features this phone does not have.
+MobileGestalt's rear-facing-camera and still-camera come from IODeviceTree:/arm-io/isp "camera-rear" (its property names
+are hashed like its keys: base64(md5("MGCopyAnswer" + name))). Without them SpringBoard hides Camera.app (SBAppTags
+still-camera) and the lock screen's camera button is dimmed. The Mi 8's rear main camera works (xnu 3075+, sweetcam.dylib):
+--rear-camera adds the node with that one property (no compatible: nothing matches it; no front camera).
 MobileGestalt reads DeviceSupportsClosedLoopHaptics from /product/haptics "closed-loop": with it iOS plays the system's
 vibrations and feedbacks as waveforms on the audio HAL's "Actuator" device (SweetSpeaker.driver), without it it looks
 for an old vibration motor in IOKit (found by HakiOS, xnuloader/mkidentity.py; docs/FORKS_SURVEY.md G9). The node's
@@ -45,6 +50,7 @@ def main():
     ap.add_argument('inp')
     ap.add_argument('out')
     ap.add_argument('--from', dest='src', default=N104)
+    ap.add_argument('--rear-camera', action='store_true', help='add /arm-io/isp "camera-rear" = 1')
     a = ap.parse_args()
     root, _ = adt.parse(adt.load(a.inp))
     src, _ = adt.parse(adt.load(a.src))
@@ -76,6 +82,19 @@ def main():
     product.children.append(cam)
     print('%s: /product/camera with only "flash" %s, phandle %#x%s' % (a.out, flash.hex(), ph + 1,
           ', replacing the old one' if oldcam is not None else ''))
+    if a.rear_camera:
+        armio = child(root, 'arm-io')
+        if armio is None:
+            sys.exit('%s: no /arm-io' % a.inp)
+        oldisp = child(armio, 'isp')
+        if oldisp is not None:
+            armio.children.remove(oldisp)
+        isp = adt.Node()
+        isp.props = [('name', 0, b'isp\0'), ('camera-rear', 0, struct.pack('<I', 1)), ('AAPL,phandle', 0, struct.pack('<I', ph + 2))]
+        isp.children = []
+        armio.children.append(isp)
+        print('%s: /arm-io/isp with only "camera-rear" 1, phandle %#x%s' % (a.out, ph + 2,
+              ', replacing the old one' if oldisp is not None else ''))
     open(a.out, 'wb').write(adt.serialize(root))
     print('%s: /product/haptics (%s) from %s, phandle %#x%s' % (a.out, ', '.join(k for k, f, v in n.props if k not in ('name', 'AAPL,phandle')),
           os.path.basename(a.src), ph, ', replacing the old one' if old is not None else ''))
