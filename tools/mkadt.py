@@ -316,7 +316,8 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
         # (found 2026-11-09 by hashing the property names MobileGestalt keeps obfuscated); without it SpringBoard hides
         # Camera.app (SBAppTags still-camera) and the lock screen's camera button is dimmed. Only that property: no
         # compatible, so nothing matches the node (the kernel has no Apple ISP driver anyway), and no front camera.
-        node('isp', [ph(), ('camera-rear', u32(1))]),
+        # camera-front (2026-11-09): MobileGestalt's front-facing-camera; the front S5K3T1 streams since xnu 3090
+        node('isp', [ph(), ('camera-rear', u32(1)), ('camera-front', u32(1))]),
     ] if b.get('rear_camera') and not qemu else []) + [
         # Main display: IOMobileFramebuffer.framework counts /arm-io children
         # with this device_type and reads the canvas size from the node

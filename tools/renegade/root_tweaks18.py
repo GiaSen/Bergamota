@@ -770,6 +770,9 @@ def torch(root):
 # capture device fed by the kernel's stream. cameracaptured loads the sensor's register sequence into the kernel itself from
 # CAM_SEQ: a file made from the phone's own camera module file (tools/camera/camx_v1.py), vendor-derived and never in git,
 # given as RENEGADE_CAM_SEQ=FILE; without it sweetcam is installed but the camera does not stream (it logs the missing file).
+# RENEGADE_CAM_SEQ=DIRECTORY (2026-11-09, three cameras): every *.seq in it goes to /usr/local/share/sweetcam/ under its own
+# name: imx363-mode2.seq (the rear main's preview), imx363-mode0.seq (its 12 MP stills), s5k3m3-mode1.seq (the rear tele),
+# s5k3t1-mode1.seq (the front); a camera without its file does not stream.
 # Camera's settings for this phone: Live Photo off (it records a movie and there is no video encoder) and "Most Compatible"
 # (JPEG: HEIC needs the HEVC encoder); both stay changeable in Camera and Settings. Photos also need the Chlorophyll of
 # gpu/metal 7fc5206 or later (RENEGADE_CHL=1 from research/chl-work/out-metal).
@@ -794,7 +797,16 @@ def camera(root):
         return
     install_file(dylib, os.path.join(root, CAMERA_DYLIB.lstrip('/')), 0o755)
     seq = os.environ.get('RENEGADE_CAM_SEQ')
-    if seq and os.path.isfile(seq):
+    if seq and os.path.isdir(seq):
+        names = sorted(n for n in os.listdir(seq) if n.endswith('.seq'))
+        for n in names:
+            install_file(os.path.join(seq, n), os.path.join(root, os.path.dirname(CAM_SEQ).lstrip('/'), n), 0o644)
+        if names:
+            os.chmod(os.path.dirname(os.path.join(root, CAM_SEQ.lstrip('/'))), 0o755)
+        print('camera: %s and %d sensor sequence(s) from %s: %s' % (CAMERA_DYLIB, len(names), seq, ' '.join(names)))
+        if os.path.basename(CAM_SEQ) not in names:
+            note_skip('camera', 'no %s in RENEGADE_CAM_SEQ: the rear main camera will not stream' % os.path.basename(CAM_SEQ))
+    elif seq and os.path.isfile(seq):
         install_file(seq, os.path.join(root, CAM_SEQ.lstrip('/')), 0o644)
         os.chmod(os.path.dirname(os.path.join(root, CAM_SEQ.lstrip('/'))), 0o755)
         print('camera: %s and the sensor sequence %s (%d bytes)' % (CAMERA_DYLIB, CAM_SEQ, os.path.getsize(seq)))
