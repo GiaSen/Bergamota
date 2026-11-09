@@ -405,6 +405,7 @@ struct isp {
 	float m[9];                     /* the colour matrix of the last frame (white balance and scale folded in) */
 	float crop;                     /* the part of the picture shown, 0-1 of its width and height about the centre (the zoom) */
 	float gain;                     /* gain applied here, 1-4: the sensor at its limit and the picture still dark */
+	bool rot180;                    /* the picture turned half a turn (the front camera: its sensor reads out upside down for iOS) */
 	uint8_t *ty, *tc;               /* render_420's luma and chroma of the part shown (tcap pixels) */
 	size_t tcap;
 	const uint8_t *raw;             /* the frame being delivered, RAW10, and its header (for the still) */
@@ -428,6 +429,7 @@ isp_init(struct isp *p)
 	p->rgb = malloc((size_t)HW * HH * 3);
 	p->crop = 1;
 	p->gain = 1;
+	p->rot180 = false;
 	p->ty = p->tc = NULL;
 	p->tcap = 0;
 	p->ready = p->rgb != NULL;
@@ -445,6 +447,7 @@ struct half_job {
 	const uint8_t *raw;
 	unsigned stride, black;
 	unsigned cfa;                   /* 0 RGGB, 1 GRBG (the frame header's flags) */
+	bool rot;                       /* written from the last pixel backwards: half a turn */
 	float m[9];                     /* colour matrix with the white balance and the scale to 0-4095 folded in */
 	uint64_t sum[16][3];            /* per piece: R, G, B above black (for the next white balance) */
 };
@@ -457,7 +460,8 @@ half_piece(void *ctx, size_t piece)
 	uint64_t sr = 0, sg = 0, sb = 0;
 	for (unsigned y = y0; y < y1; y++) {
 		const uint8_t *r0 = j->raw + (size_t)(2 * y) * j->stride, *r1 = r0 + j->stride;
-		uint8_t *o = j->p->rgb + (size_t)y * HW * 3;
+		uint8_t *o = j->rot ? j->p->rgb + ((size_t)(HH - 1 - y) * HW + (HW - 1)) * 3 : j->p->rgb + (size_t)y * HW * 3;
+		const int step = j->rot ? -3 : 3;
 		for (unsigned x = 0; x < HW; x++) {
 			int c00 = (int)raw10_at(r0, 2 * x), c01 = (int)raw10_at(r0, 2 * x + 1), c10 = (int)raw10_at(r1, 2 * x),
 			    c11 = (int)raw10_at(r1, 2 * x + 1), R, G, B;
@@ -485,7 +489,7 @@ half_piece(void *ctx, size_t piece)
 			o[0] = j->p->gamma[ir < 0 ? 0 : ir > 4095 ? 4095 : ir];
 			o[1] = j->p->gamma[ig < 0 ? 0 : ig > 4095 ? 4095 : ig];
 			o[2] = j->p->gamma[ib < 0 ? 0 : ib > 4095 ? 4095 : ib];
-			o += 3;
+			o += step;
 		}
 	}
 	j->sum[piece][0] = sr;
@@ -498,7 +502,7 @@ static void
 isp_half(struct isp *p, const struct cam_live_hdr *h, const uint8_t *raw)
 {
 	static const float ccm[9] = { 1.55f, -0.40f, -0.15f, -0.25f, 1.45f, -0.20f, -0.05f, -0.45f, 1.50f };
-	struct half_job j = { .p = p, .raw = raw, .stride = h->stride, .black = h->black, .cfa = h->flags & 3 };
+	struct half_job j = { .p = p, .raw = raw, .stride = h->stride, .black = h->black, .cfa = h->flags & 3, .rot = p->rot180 };
 	float scale = 4095.0f / (float)(h->white - h->black) * (p->gain >= 1 ? p->gain : 1);
 	unsigned hw = h->width / 2, hh = h->height / 2;
 	if (hw != HW || hh != HH || !p->rgb) {
@@ -994,7 +998,12 @@ full_pf20(void *ctx, size_t piece)
 	for (unsigned y = y0; y < y1; y++) {
 		memset(v, 0, sizeof(uint16_t) * (w + 3));
 		for (unsigned x = 0; x < w; x++) {
-			int Y = plane_sample16(j->y2, j->cw, j->ch, (x + 0.5f) * kx - 0.5f, (y + 0.5f) * ky - 0.5f);
+			float sx = (x + 0.5f) * kx - 0.5f, sy = (y + 0.5f) * ky - 0.5f;
+			if (j->p->rot180) {
+				sx = (float)(j->cw - 1) - sx;
+				sy = (float)(j->ch - 1) - sy;
+			}
+			int Y = plane_sample16(j->y2, j->cw, j->ch, sx, sy);
 			v[x] = (uint16_t)(Y < 0 ? 0 : Y > 1023 ? 1023 : Y);
 		}
 		uint32_t *o = (uint32_t *)(yb + y * ys);
@@ -1007,6 +1016,10 @@ full_pf20(void *ctx, size_t piece)
 		memset(cv, 0, sizeof(uint16_t) * 2 * (cw2 + 3));
 		for (unsigned k = 0; k < cw2; k++) {
 			float sx = (2 * k + 1.0f) * kx - 0.5f, sy = (y + 1.0f) * ky - 0.5f;   /* the centre of the 2x2 block */
+			if (j->p->rot180) {
+				sx = (float)(j->cw - 1) - sx;
+				sy = (float)(j->ch - 1) - sy;
+			}
 			int U = plane_sample_s16(j->cb, j->cw, j->ch, sx, sy) + 512, V = plane_sample_s16(j->cr, j->cw, j->ch, sx, sy) + 512;
 			cv[2 * k] = (uint16_t)(U < 0 ? 0 : U > 1023 ? 1023 : U);
 			cv[2 * k + 1] = (uint16_t)(V < 0 ? 0 : V > 1023 ? 1023 : V);
@@ -2066,6 +2079,12 @@ worker(void *ctx)
 			}
 			cur = want;
 			last = 0;
+			/*
+			 * the front camera's picture half a turn round (user, 2026-11-09: "selfie is upside down"): its sequence sets no
+			 * flip and CMCapture asks for none, so the sensor's readout is the other way up from an iPhone's front sensor.
+			 * /private/var/tmp/sweetcam.frontnorot: as read out
+			 */
+			isp.rot180 = cur == 2 && access("/private/var/tmp/sweetcam.frontnorot", F_OK) != 0;
 			full_still = cur == 0 && load_seq0();
 			say("worker: streaming sensor %d (%zu-byte frames)", cur, ncap);
 			continue;
