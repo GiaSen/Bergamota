@@ -1,6 +1,7 @@
 /*
- * sweetzoom.dylib: in Camera.app (weak-linked into /Applications/Camera.app/Camera), a tap on the zoom button at 1x goes
- * to 2x, where sweetcam.dylib (in cameracaptured) switches the back camera to the Mi 8's telephoto.
+ * sweetzoom.dylib: in Camera.app (weak-linked into /Applications/Camera.app/Camera), the back camera opens at 1x and a
+ * tap on the zoom button at 1x goes to 2x, where sweetcam.dylib (in cameracaptured) switches the back camera to the Mi 8's
+ * telephoto.
  *
  * Why (CameraUI of iOS 26.6.2 read with ipsw, 2026-11-10): as an iPhone 11 (N104) Camera wants the back "dual wide"
  * camera (0.5x + 1x), does not find it ("Failed to find device BackWideDual for mode Photo. Falling back to BackWide")
@@ -15,7 +16,14 @@
  * zoom change to 2 (the call its other tap handlers make), which Camera ramps as it does a drag.
  * The front camera's button (-[... _toggleBetweenFrontFacingZoomFactorsForZoomControl:]) is left as it is.
  *
- * /private/var/tmp/sweetzoom.off: Apple's behaviour. Log: subsystem com.sweet.zoom.
+ * Opening at 1x (user, 2026-11-10: "Yes, open at 1x"): the zoom factor 2 at the start is -[CAMCaptureCapabilities
+ * defaultZoomFactorForMode:device:...] answering the dual wide camera's switch-over factor because [self
+ * resolvedDeviceForDesiredDevice:...] says BackWideDual (6). That answer, and preferredDeviceForPosition:...'s, become
+ * BackWide (2) when they are BackWideDual or BackSuperWide (5): Camera asks for the camera that is there (no failed
+ * lookup, no fallback) and starts it at its own default, 1. What Camera does once it runs on BackWide is what it did
+ * after its fallback before.
+ *
+ * /private/var/tmp/sweetzoom.off (looked at when Camera starts): Apple's behaviour. Log: subsystem com.sweet.zoom.
  * iOS 26, arm64e + pacstrip (tools/sweetnet/build.sh); installed by tools/renegade/link_weak.py (by hand) or the root
  * image build (root_tweaks18.camera_zoom).
  */
@@ -23,10 +31,41 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <os/log.h>
+#include <stdatomic.h>
 #include <unistd.h>
 
 static os_log_t gLog;
-static IMP gOrig;
+static IMP gOrig, gOrigResolved, gOrigPreferred;
+
+/* CameraUI's camera numbers (CAMCaptureDevice), as its logs name them */
+enum { DEV_BACK_WIDE = 2, DEV_BACK_SUPER_WIDE = 5, DEV_BACK_WIDE_DUAL = 6 };
+
+static long
+the_back_camera(long device, const char *asked_by)
+{
+	static _Atomic unsigned said;
+	if (device != DEV_BACK_WIDE_DUAL && device != DEV_BACK_SUPER_WIDE) {
+		return device;
+	}
+	if (said++ < 2) {
+		os_log(gLog, "sweetzoom: %{public}s said camera %ld (the iPhone 11's dual wide or super wide): the back wide camera instead", asked_by, device);
+	}
+	return DEV_BACK_WIDE;
+}
+
+static long
+resolved_device(id self, SEL sel, long device, long mode, long video, long strength, BOOL front_rear)
+{
+	return the_back_camera(((long (*)(id, SEL, long, long, long, long, BOOL))gOrigResolved)(self, sel, device, mode, video, strength, front_rear),
+	           "resolvedDeviceForDesiredDevice");
+}
+
+static long
+preferred_device(id self, SEL sel, long position, long mode, long video, long strength, BOOL front_rear)
+{
+	return the_back_camera(((long (*)(id, SEL, long, long, long, long, BOOL))gOrigPreferred)(self, sel, position, mode, video, strength, front_rear),
+	           "preferredDeviceForPosition");
+}
 
 #define TELE_ZOOM 2.0   /* where sweetcam's back stream goes to the telephoto sensor */
 
@@ -36,7 +75,7 @@ zoom_toggle(id self, SEL sel, id control)
 	SEL pos = sel_registerName("_currentDevicePosition"), set = sel_registerName("_setZoomFactor:interactionType:shouldNotifyDelegate:animated:");
 	SEL max = sel_registerName("maximumZoomFactor");
 	bool back = [self respondsToSelector:pos] && ((long (*)(id, SEL))objc_msgSend)(self, pos) == 0;
-	if (!back || access("/private/var/tmp/sweetzoom.off", F_OK) == 0 || ![control respondsToSelector:set] || ![control respondsToSelector:max] ||
+	if (!back || ![control respondsToSelector:set] || ![control respondsToSelector:max] ||
 	    ((double (*)(id, SEL))objc_msgSend)(control, max) < TELE_ZOOM) {
 		((void (*)(id, SEL, id))gOrig)(self, sel, control);
 		return;
@@ -50,12 +89,23 @@ __attribute__((constructor)) static void
 sweetzoom_init(void)
 {
 	gLog = os_log_create("com.sweet.zoom", "camera");
-	Class c = objc_getClass("CAMViewfinderViewController");
-	Method m = c ? class_getInstanceMethod(c, sel_registerName("toggleBetweenZoomFactorsForZoomControl:")) : NULL;
-	if (!m) {
-		os_log(gLog, "sweetzoom: no -[CAMViewfinderViewController toggleBetweenZoomFactorsForZoomControl:] here: nothing changed");
+	if (access("/private/var/tmp/sweetzoom.off", F_OK) == 0) {
+		os_log(gLog, "sweetzoom: /private/var/tmp/sweetzoom.off: nothing changed");
 		return;
 	}
-	gOrig = method_setImplementation(m, (IMP)zoom_toggle);
-	os_log(gLog, "sweetzoom: loaded into %{public}s: a tap on the back camera's zoom button at 1x goes to %.1fx", getprogname(), TELE_ZOOM);
+	Class c = objc_getClass("CAMViewfinderViewController"), caps = objc_getClass("CAMCaptureCapabilities");
+	Method m = c ? class_getInstanceMethod(c, sel_registerName("toggleBetweenZoomFactorsForZoomControl:")) : NULL;
+	Method r = caps ? class_getInstanceMethod(caps, sel_registerName(
+		    "resolvedDeviceForDesiredDevice:mode:videoConfiguration:videoStabilizationStrength:frontRearSimultaneousVideoEnabled:")) : NULL;
+	Method p = caps ? class_getInstanceMethod(caps, sel_registerName(
+		    "preferredDeviceForPosition:mode:videoConfiguration:videoStabilizationStrength:frontRearSimultaneousVideoEnabled:")) : NULL;
+	if (m) {
+		gOrig = method_setImplementation(m, (IMP)zoom_toggle);
+	}
+	if (r && p) {
+		gOrigResolved = method_setImplementation(r, (IMP)resolved_device);
+		gOrigPreferred = method_setImplementation(p, (IMP)preferred_device);
+	}
+	os_log(gLog, "sweetzoom: loaded into %{public}s: a tap on the back camera's zoom button at 1x goes to %.1fx (%{public}s), the back camera is the wide one and opens at 1x (%{public}s)",
+	    getprogname(), TELE_ZOOM, m ? "yes" : "no such method here", r && p ? "yes" : "no such methods here");
 }
