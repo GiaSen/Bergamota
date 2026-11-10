@@ -1,0 +1,114 @@
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+index 0b3f99c..8d868f0 100644
+--- a/bsd/dev/dipper_camera.c
++++ b/bsd/dev/dipper_camera.c
+@@ -1147,6 +1147,12 @@ extern kern_return_t thread_terminate(thread_t);
+  * 8, gave a sheared picture). settle: Linux's
+  * csiphy_settle_cnt_calc at the lane rate with the 240 MHz PHY timer. fll_max: twice the mode's frame length (half its
+  * frame rate in the dark).
++ * 3092: fll_min, the stream's shortest frame. Until now the stream held every sensor at fll_max: right for the main (its
++ * mode is 60 fps, so a steady 30), but the tele and the front ran at 15 fps in any light, and with the time taken before
++ * any gain the tele exposed 56 ms in a lit office (3815 lines at gain 1; the main 22 ms). Now their frame follows the
++ * exposure: the tele from its mode's own 2282 lines (30 fps); the front from 2430, not its mode's 2040: its 1940 picture
++ * lines leave 100 lines = 1.6 ms of vertical blank, and the stream loop, polling every 2 ms, must write the next buffer's
++ * address inside the blank (2430: 8 ms, 25 fps). The main stays at 2460.
+  */
+ struct cam_prof {
+ 	const char *name;
+@@ -1157,11 +1163,12 @@ struct cam_prof {
+ 	uint8_t settle, phy, cfa;       /* cfa: 0 RGGB, 1 GRBG */
+ 	bool smia_gain, af;
+ 	uint32_t line_ns;
++	uint16_t fll_min;               /* 3092: the stream's shortest frame length */
+ };
+ static const struct cam_prof cam_profs[] = {
+-	{ "rear main IMX363", 0x34, 0x0016, 0x0363, 1920, 1080, 2400, 2460, 480, 0x400, 17, 0, 0, false, true, 13530 },
+-	{ "rear tele S5K3M3", 0x20, 0x0002, 0xb001, 2104, 1560, 2640, 4564, 512, 0x200, 16, 1, 1, true, true, 14607 },
+-	{ "front S5K3T1", 0x5a, 0x0000, 0x3141, 2592, 1940, 3248, 4080, 512, 0x100, 16, 2, 1, true, false, 16340 },
++	{ "rear main IMX363", 0x34, 0x0016, 0x0363, 1920, 1080, 2400, 2460, 480, 0x400, 17, 0, 0, false, true, 13530, 2460 },
++	{ "rear tele S5K3M3", 0x20, 0x0002, 0xb001, 2104, 1560, 2640, 4564, 512, 0x200, 16, 1, 1, true, true, 14607, 2282 },
++	{ "front S5K3T1", 0x5a, 0x0000, 0x3141, 2592, 1940, 3248, 4080, 512, 0x100, 16, 2, 1, true, false, 16340, 2430 },
+ };
+ #define CAM_NSENS       3u
+ static unsigned cam_sel;        /* kern.sweet_cam_sensor; changed only with cam_lock held and no stream */
+@@ -1175,6 +1182,8 @@ static unsigned cam_sel;        /* kern.sweet_cam_sensor; changed only with cam_
+ #define C4_BUF          (C4_FRAME + C4_GUARD)   /* 3080: each buffer its own allocation (8.8 MB in one piece was refused) */
+ #define C4_BUF_ALLOC    (3248u * 1940u + C4_GUARD)      /* 3090: allocated for the biggest frame (the front's) */
+ #define C4_FLL_MAX      ((unsigned)CP->fll_max) /* 3078: frame length cap for longer exposures (the main: 2 x mode 2's 1230 lines) */
++#define C4_FLL_STREAM   ((unsigned)CP->fll_min) /* 3092: the stream's shortest frame length */
++#define C4_GAIN_KNEE    (4u * 256u)     /* 3092: gain up to here (x 256) before the frame is stretched past its shortest */
+ #define C4_MARGIN       20u     /* integration time <= frame length - 20 (the module files' vertical offset) */
+ #define C4_AGAIN_MAX    ((unsigned)CP->again_max)       /* analog gain code at 16x (the module files' maximum) */
+ #define C4_DGAIN_MAX    ((unsigned)CP->dgain_max)       /* digital gain 8.8 */
+@@ -1694,14 +1703,30 @@ again_x256(unsigned code)
+ 	return CP->smia_gain ? (uint64_t)code * 8u : 512ull * 256u / (512u - code);
+ }
+ 
+-/* a total exposure (lines x gain x 256) as integration lines (frame length stretched up to C4_FLL_MAX), then analog
+- * gain up to 16x, then digital gain up to 4x; e256 = what that gives. lines != 0 (3078b, manual): those lines, the rest
+- * as gain */
++/*
++ * a total exposure (lines x gain x 256) as integration lines, analog gain up to 16x, then digital gain up to 4x; e256 =
++ * what that gives. 3092: the time first, up to what the shortest frame fll_min holds (the full frame rate); then gain up to
++ * C4_GAIN_KNEE (4x); then the time again with the frame stretched, up to C4_FLL_MAX; then the rest of the gain. (Until
++ * now: the time up to C4_FLL_MAX before any gain. With fll_min = C4_FLL_MAX, the main sensor's stream, it is the same.)
++ * lines != 0 (3078b, manual): those lines, the rest as gain
++ */
+ static void
+-c4_exp_split(uint64_t e256, unsigned fll_mode, unsigned lines, struct cam_exp *a)
++c4_exp_split(uint64_t e256, unsigned fll_min, unsigned lines, struct cam_exp *a)
+ {
+-	uint64_t lmax = C4_FLL_MAX - C4_MARGIN, l = lines ? lines : e256 / 256;
++	uint64_t lmax = C4_FLL_MAX - C4_MARGIN, l1 = fll_min > C4_MARGIN + 4u ? fll_min - C4_MARGIN : lmax, l;
+ 
++	if (l1 > lmax) {
++		l1 = lmax;
++	}
++	if (lines) {
++		l = lines;
++	} else if (e256 <= l1 * 256u) {
++		l = e256 / 256u;                /* light enough: the time alone, at the full frame rate */
++	} else if (e256 <= l1 * C4_GAIN_KNEE) {
++		l = l1;                         /* the full rate's longest time, the rest as gain */
++	} else {
++		l = e256 / C4_GAIN_KNEE;        /* darker: the gain at its knee, the time and the frame stretched */
++	}
+ 	if (l < 4) {
+ 		l = 4;
+ 	}
+@@ -1726,7 +1751,7 @@ c4_exp_split(uint64_t e256, unsigned fll_mode, unsigned lines, struct cam_exp *a
+ 		dg = C4_DGAIN_MAX;
+ 	}
+ 	a->lines = (unsigned)l;
+-	a->fll = (unsigned)l + C4_MARGIN > fll_mode ? (unsigned)l + C4_MARGIN : fll_mode;
++	a->fll = (unsigned)l + C4_MARGIN > fll_min ? (unsigned)l + C4_MARGIN : fll_min;
+ 	a->acode = code;
+ 	a->dgain = (unsigned)dg;
+ 	a->e256 = l * ag_real * dg / 256u;
+@@ -1966,7 +1991,7 @@ c4_af_step(struct c4_af *a, const uint8_t *frame, bool say)
+ 	(void)af_move(a->code[a->i]);
+ }
+ 
+-/* everything up to the sensor streaming into buffer 0; min_fll: the frame length at least (C4_FLL_MAX: a steady 30 fps) */
++/* everything up to the sensor streaming into buffer 0; min_fll: the frame length at least (the stream: C4_FLL_STREAM) */
+ static bool
+ c4_up(struct c4_run *r, unsigned min_fll)
+ {
+@@ -3024,7 +3049,7 @@ cam_stream_thread(void *arg __unused, wait_result_t wr __unused)
+ 	lck_spin_lock(&cam_live_spin);
+ 	cam_live_latest = -1;
+ 	lck_spin_unlock(&cam_live_spin);
+-	if (!c4_up(r, C4_FLL_MAX)) {
++	if (!c4_up(r, C4_FLL_STREAM)) {
+ 		c4_down(r, true);
+ 		cam_stream_state = 0;
+ 		cam_say("stream: did not start");
+@@ -3126,7 +3151,7 @@ cam_stream_thread(void *arg __unused, wait_result_t wr __unused)
+ 			unsigned mean, sat;
+ 			c4_meter(fb, &mean, &sat);
+ 			last_mean = mean;
+-			bool on = c4_ae_step(r, mean, sat, C4_FLL_MAX);
++			bool on = c4_ae_step(r, mean, sat, C4_FLL_STREAM);
+ 			if (on && !ae_on) {
+ 				cam_say("stream: exposure on target at frame %u: %u lines, analog code %u, digital %#x", frames,
+ 				    r->exp.lines, r->exp.acode, r->exp.dgain);
