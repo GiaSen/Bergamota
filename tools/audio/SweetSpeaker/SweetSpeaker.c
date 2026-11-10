@@ -1237,24 +1237,56 @@ rec_op(uint32_t op, uint64_t pos, struct rec_hdr *h, int16_t **samples)
 
 /*
  * While the mic's IO runs: start the kernel capture (again when it stopped), read what it captured every 5 ms into
- * gMicRing and publish the position; stop the capture when IO stops.
+ * gMicRing and publish the position; stop the capture when IO has been off for kMicLinger.
+ *
+ * One reader at a time, and it decides its own end under gStateMutex (2026-11-10). Before, it left as soon as it saw no
+ * IO: it cleared gMicThreadRunning, then stopped the kernel capture (about a second) and only then cleared gMicLive. Camera
+ * stops and starts the input within 0.2 s when it sets a movie recording up (the back camera's: `mic stop IO`, `mic start
+ * IO` 188 ms later): the start found no reader, made a second one, that one started the capture and set gMicLive, and the
+ * first, coming out of its stop, cleared it. The new reader read on for the whole session and ReadInput gave zeros all
+ * the while (`mic stop IO: 1202 cycles, 1160 without the kernel capture (zeros)`): the back camera's movies were silent.
+ * Now the reader keeps the capture for a second after IO ends (a restart inside it costs nothing), and when IO comes
+ * back while it is stopping the capture it starts it again itself instead of leaving.
  */
+#define kMicLinger              48000.0         /* frames of host time the capture is kept after IO ends (1 s) */
 static void *
 mic_thread(void *arg)
 {
 	(void)arg;
 	unsigned tries = 0;
 	bool live = false;
-	uint64_t rpos = 0, w0 = 0, w1 = 0, h0 = 0, h1 = 0, hstart = 0;
+	uint64_t rpos = 0, w0 = 0, w1 = 0, h0 = 0, h1 = 0, hstart = 0, idle_since = 0;
 	for (;;) {
 		pthread_mutex_lock(&gStateMutex);
 		bool run = gMicIOCount > 0;
-		if (!run) {
-			gMicThreadRunning = false;
-		}
 		pthread_mutex_unlock(&gStateMutex);
-		if (!run) {
-			break;
+		if (run) {
+			idle_since = 0;
+		} else {
+			uint64_t now = mach_absolute_time();
+			if (!idle_since) {
+				idle_since = now;
+			}
+			if (!live || (double)(now - idle_since) / gHostTicksPerFrame >= kMicLinger) {
+				if (live) {
+					struct rec_hdr sh;
+					atomic_store(&gMicLive, false);
+					rec_op(REC_OP_STOP, 0, &sh, NULL);
+					live = false;
+				}
+				/* the end, unless IO came back meanwhile: then the capture is started again below, by this reader */
+				pthread_mutex_lock(&gStateMutex);
+				bool gone = gMicIOCount == 0;
+				if (gone) {
+					gMicThreadRunning = false;
+				}
+				pthread_mutex_unlock(&gStateMutex);
+				if (gone) {
+					break;
+				}
+				idle_since = 0;
+			}
+			/* else: IO ended a moment ago; the capture is kept and read on */
 		}
 		struct rec_hdr h;
 		int16_t *smp = NULL;
@@ -1310,11 +1342,6 @@ mic_thread(void *arg)
 			usleep(5000);
 		}
 	}
-	if (live) {
-		struct rec_hdr h;
-		rec_op(REC_OP_STOP, 0, &h, NULL);
-	}
-	atomic_store(&gMicLive, false);
 	double frames = h1 > h0 ? (double)(h1 - h0) / gHostTicksPerFrame : 0;
 	os_log(gLog, "SweetSpeaker: mic: reader stopped: %llu samples in %.2f s of host time (%+.0f ppm against 48 kHz), %llu lost, "
 	    "%u restarts", (unsigned long long)(w1 - w0), frames / kSampleRate, frames > 0 ? ((double)(w1 - w0) / frames - 1) * 1e6 : 0,
