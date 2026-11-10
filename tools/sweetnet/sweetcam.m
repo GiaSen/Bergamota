@@ -3709,6 +3709,35 @@ rot_cpu(void *session, CVPixelBufferRef src, CGRect sr, CVPixelBufferRef dst, CG
 		turn = sl == dl ? 0 : atomic_load(&gStitchTurn);
 		flips = atomic_load(&gStitchFlips);
 	}
+	{
+		/*
+		 * the part of the frame the viewfinder shows, for the movie encoder (sweetavc.dylib): in video mode the frames
+		 * stay 4:3 (1504x1128) and the viewfinder takes their 16:9 middle (0,141 1504x846); a part of the frame's own
+		 * shape (photo mode's small inset) counts as the whole frame
+		 */
+		static void (*tell)(int, int, int, int, int, int);
+		static bool looked;
+		static int last[6] = { -1, -1, -1, -1, -1, -1 };
+		if (!looked) {
+			looked = true;
+			tell = dlsym(RTLD_DEFAULT, "sweetavc_set_capture_rect");
+		}
+		int bw = (int)CVPixelBufferGetWidth(src), bh = (int)CVPixelBufferGetHeight(src);
+		int now[6] = { bw, bh, 0, 0, 0, 0 };
+		if (tell && !CGRectIsNull(sr) && !CGRectIsEmpty(sr) && bw > 0 && bh > 0 && sr.size.width > 0 && sr.size.height > 0) {
+			double whole = (double)bw / bh, part = sr.size.width / sr.size.height;
+			if (fabs(part / whole - 1) > 0.05) {
+				now[2] = (int)(sr.origin.x + 0.5);
+				now[3] = (int)(sr.origin.y + 0.5);
+				now[4] = (int)(sr.size.width + 0.5);
+				now[5] = (int)(sr.size.height + 0.5);
+			}
+		}
+		if (tell && memcmp(now, last, sizeof(now))) {
+			memcpy(last, now, sizeof(now));
+			tell(now[0], now[1], now[2], now[3], now[4], now[5]);
+		}
+	}
 	uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
 	int e = turn < 0 ? -12914 : (turn == 0 && flips == 0) ? m2m_scale(src, sr, dst, dr) : turn_scale_420(src, sr, dst, dr, turn, flips);
 	if (said++ < 6 || said % 900 == 0) {
