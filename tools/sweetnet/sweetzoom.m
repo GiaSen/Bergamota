@@ -23,6 +23,14 @@
  * lookup, no fallback) and starts it at its own default, 1. What Camera does once it runs on BackWide is what it did
  * after its fallback before.
  *
+ * Movies in H.264 (2026-11-10, video recording): Camera set to "Most Compatible" wants avc1, but
+ * +[AVCaptureMovieFileOutput availableVideoCodecTypesForSourceDevice:sourceFormat:outputDimensions:fileType:
+ * videoCodecTypesAllowList:] leaves H.264 out when the camera says it supports HEVC and the format's size times its frame
+ * rate is over H.264's limit (the 12 MP "Photo" stream format that video mode runs on here), and Camera then records HEVC
+ * ("Failed to find desired codec avc1, using default of hvc1"). The phone's only encoder is H.264 (sweetavc.dylib, x264, in
+ * cameracaptured; Apple's HEVC and H.264 encoders are drivers for a chip it does not have), so that list is made to be
+ * H.264 first and no HEVC, unless an allow list leaves H.264 out.
+ *
  * /private/var/tmp/sweetzoom.off (looked at when Camera starts): Apple's behaviour. Log: subsystem com.sweet.zoom.
  * iOS 26, arm64e + pacstrip (tools/sweetnet/build.sh); installed by tools/renegade/link_weak.py (by hand) or the root
  * image build (root_tweaks18.camera_zoom).
@@ -35,7 +43,30 @@
 #include <unistd.h>
 
 static os_log_t gLog;
-static IMP gOrig, gOrigResolved, gOrigPreferred;
+static IMP gOrig, gOrigResolved, gOrigPreferred, gOrigCodecs;
+
+struct dims { int w, h; };
+
+static id
+movie_codecs(id self, SEL sel, id device, id format, struct dims d, id file_type, id allow)
+{
+	NSArray *apple = ((id (*)(id, SEL, id, id, struct dims, id, id))gOrigCodecs)(self, sel, device, format, d, file_type, allow);
+	if (!apple || (allow && ![allow containsObject:@"avc1"])) {
+		return apple;
+	}
+	NSMutableArray *ours = [NSMutableArray arrayWithObject:@"avc1"];
+	for (id c in apple) {
+		if (![c isEqual:@"avc1"] && ![c isEqual:@"hvc1"]) {
+			[ours addObject:c];
+		}
+	}
+	static _Atomic unsigned said;
+	if (said++ < 2) {
+		os_log(gLog, "sweetzoom: movie codecs for %dx%d: Apple's list %{public}@, ours %{public}@", d.w, d.h, [apple componentsJoinedByString:@" "],
+		    [ours componentsJoinedByString:@" "]);
+	}
+	return ours;
+}
 
 /* CameraUI's camera numbers (CAMCaptureDevice), as its logs name them */
 enum { DEV_BACK_WIDE = 2, DEV_BACK_SUPER_WIDE = 5, DEV_BACK_WIDE_DUAL = 6 };
@@ -106,6 +137,12 @@ sweetzoom_init(void)
 		gOrigResolved = method_setImplementation(r, (IMP)resolved_device);
 		gOrigPreferred = method_setImplementation(p, (IMP)preferred_device);
 	}
-	os_log(gLog, "sweetzoom: loaded into %{public}s: a tap on the back camera's zoom button at 1x goes to %.1fx (%{public}s), the back camera is the wide one and opens at 1x (%{public}s)",
-	    getprogname(), TELE_ZOOM, m ? "yes" : "no such method here", r && p ? "yes" : "no such methods here");
+	Class mfo = objc_getClass("AVCaptureMovieFileOutput");
+	Method cm = mfo ? class_getClassMethod(mfo, sel_registerName(
+		    "availableVideoCodecTypesForSourceDevice:sourceFormat:outputDimensions:fileType:videoCodecTypesAllowList:")) : NULL;
+	if (cm) {
+		gOrigCodecs = method_setImplementation(cm, (IMP)movie_codecs);
+	}
+	os_log(gLog, "sweetzoom: loaded into %{public}s: a tap on the back camera's zoom button at 1x goes to %.1fx (%{public}s), the back camera is the wide one and opens at 1x (%{public}s), movies in H.264 (%{public}s)",
+	    getprogname(), TELE_ZOOM, m ? "yes" : "no such method here", r && p ? "yes" : "no such methods here", cm ? "yes" : "no such method here");
 }

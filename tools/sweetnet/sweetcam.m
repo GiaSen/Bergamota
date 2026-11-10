@@ -4051,6 +4051,165 @@ sweetcam_rot_selftest(const char *path)
 	return 0;
 }
 
+/*
+ * /private/var/tmp/sweetcam.fcn (debug, video recording): what CMCapture's BWFileCoordinatorNode holds after it is told to
+ * stop a recording, once a second for eight seconds: its state and the times it compares (the stop time against the last
+ * video, audio and metadata it has seen)
+ */
+static IMP gFcnStop;
+
+static double
+fcn_time(id o, const char *name)
+{
+	Ivar iv = class_getInstanceVariable(object_getClass(o), name);
+	if (!iv) {
+		return -2;
+	}
+	CMTime t;
+	memcpy(&t, (const uint8_t *)(__bridge void *)o + ivar_getOffset(iv), sizeof(t));
+	return (t.flags & kCMTimeFlags_Valid) ? CMTimeGetSeconds(t) : -1;
+}
+
+static long
+fcn_int(id o, const char *name, size_t size)
+{
+	Ivar iv = class_getInstanceVariable(object_getClass(o), name);
+	long v = 0;
+	if (!iv) {
+		return -2;
+	}
+	memcpy(&v, (const uint8_t *)(__bridge void *)o + ivar_getOffset(iv), size);
+	return v;
+}
+
+static void
+fcn_say(id o, int k)
+{
+	Ivar wv = class_getInstanceVariable(object_getClass(o), "_videoSampleBuffersWaitingForMetadata");
+	Ivar iv = class_getInstanceVariable(object_getClass(o), "_idleInputIndicesWaitingForFlush");
+	id waiting = wv ? object_getIvar(o, wv) : nil, idle = iv ? object_getIvar(o, iv) : nil;
+	say("coordinator +%d s: state %ld, inputs video %ld audio %ld metadata %ld (master %ld); stop time %.3f (audio offset %.3f), master stopping %.3f, last master %.3f (ending %.3f), observed last video %.3f, largest audio %.3f, largest metadata %.3f, largest staged %.3f; %lu video waiting for metadata, idle inputs waiting for flush %{public}@, EOD messages %ld",
+	    k, fcn_int(o, "_recordingState", 4), fcn_int(o, "_numVideoInputs", 8), fcn_int(o, "_numAudioInputs", 8), fcn_int(o, "_numMetadataInputs", 8),
+	    fcn_int(o, "_masterInputIndex", 8), fcn_time(o, "_stopRecordingPTS"), fcn_time(o, "_stopRecordingAudioOffset"), fcn_time(o, "_masterStoppingPTS"),
+	    fcn_time(o, "_lastMasterPTS"), fcn_time(o, "_lastMasterEndingPTS"), fcn_time(o, "_stopRecordingObservedLastVideoPTS"),
+	    fcn_time(o, "_largestAudioPTS"), fcn_time(o, "_largestMetadataPTS"), fcn_time(o, "_largestStagedSupportingAudioVideoStagedPTS"),
+	    (unsigned long)[waiting count], [idle description], fcn_int(o, "_numEODMessagesReceived", 4));
+}
+
+static void
+fcn_stop(id self, SEL sel, int code, BOOL wait)
+{
+	say("coordinator: stopRecordingWithErrorCode:%d setupToAllowWaitingForRecordingToStop:%d", code, wait);
+	fcn_say(self, 0);
+	((void (*)(id, SEL, int, BOOL))gFcnStop)(self, sel, code, wait);
+	for (int k = 1; k <= 8; k++) {
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)k * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+			fcn_say(self, k);
+		});
+	}
+}
+
+/*
+ * Movie recording: the audio put on the video's time (2026-11-10). CMCapture's BWFileCoordinatorNode ends a recording when
+ * its audio has reached the time of the last video frame. Here the two never meet: the coordinator probe above showed the
+ * video at 4117 s and the audio at 3092 s, each advancing in real time, so a stop would have taken 17 minutes, the movie
+ * file was never finished and audio went on being written (a first recording: mdat without moov, still growing minutes
+ * after the stop). Both times are on CMCapture's audio session clock, not host time (5183 s then): the video's is its host
+ * time converted through that clock, the audio's the sample count of the input unit, and on this phone the two count from
+ * different starts (the microphone is SweetSpeaker.driver behind audiomxd's virtual input device; where the 1025 s come
+ * from was not looked into). So: every audio buffer entering the coordinator is re-timed by the difference between the
+ * two, measured once from buffers of both kinds as they arrive (each one's time against the host clock at arrival, the
+ * least delayed of the first ones), and measured again only if it moves by more than two seconds. The pictures and the
+ * sound are then within the difference of their two delays to this node of each other (tens of milliseconds, not
+ * measured). /private/var/tmp/sweetcam.noavtime: audio as it comes.
+ */
+static IMP gFcnRender;
+
+static double
+host_seconds(void)
+{
+	return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()));
+}
+
+static void
+fcn_render(id self, SEL sel, CMSampleBufferRef sb, id input)
+{
+	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+	static double v_lead = -1e18, a_lead = -1e18, shift;    /* (time - host now), the largest seen: the least delayed buffer */
+	static unsigned nv, na;
+	static bool have;
+	CMSampleBufferRef out = NULL;
+	CMFormatDescriptionRef fd = sb ? CMSampleBufferGetFormatDescription(sb) : NULL;
+	CMTime pts = sb ? CMSampleBufferGetPresentationTimeStamp(sb) : kCMTimeInvalid;
+	if (fd && CMTIME_IS_NUMERIC(pts) && CMSampleBufferGetNumSamples(sb) > 0) {
+		CMMediaType mt = CMFormatDescriptionGetMediaType(fd);
+		double now = host_seconds(), t = CMTimeGetSeconds(pts);
+		pthread_mutex_lock(&lock);
+		if (mt == kCMMediaType_Video) {
+			double lead = t - now;
+			if (nv++ == 0 || lead > v_lead || lead < v_lead - 2) {
+				v_lead = lead;
+			}
+		} else if (mt == kCMMediaType_Audio) {
+			CMTime d = CMSampleBufferGetDuration(sb);
+			double lead = t + (CMTIME_IS_NUMERIC(d) ? CMTimeGetSeconds(d) : 0) - now;
+			if (na++ == 0 || lead > a_lead || lead < a_lead - 2) {
+				a_lead = lead;
+			}
+			if (nv >= 5 && na >= 5) {
+				double want = v_lead - a_lead;
+				if (!have || fabs(want - shift) > 2) {
+					say("recording: the audio's time is %.3f s from the video's (video %.3f s, audio %.3f s from the host clock): audio re-timed by that",
+					    -want, v_lead, a_lead);
+					shift = want;
+					have = true;
+				}
+			}
+			double by = have ? shift : 0;
+			pthread_mutex_unlock(&lock);
+			if (fabs(by) > 0.02) {
+				CMSampleTimingInfo ti[4];
+				CMItemCount n = 0;
+				if (CMSampleBufferGetSampleTimingInfoArray(sb, 4, ti, &n) == 0 && n >= 1 && n <= 4) {
+					CMTime add = CMTimeMakeWithSeconds(by, 1000000000);
+					for (CMItemCount i = 0; i < n; i++) {
+						if (CMTIME_IS_NUMERIC(ti[i].presentationTimeStamp)) {
+							ti[i].presentationTimeStamp = CMTimeAdd(ti[i].presentationTimeStamp, add);
+						}
+						if (CMTIME_IS_NUMERIC(ti[i].decodeTimeStamp)) {
+							ti[i].decodeTimeStamp = CMTimeAdd(ti[i].decodeTimeStamp, add);
+						}
+					}
+					if (CMSampleBufferCreateCopyWithNewTiming(NULL, sb, n, ti, &out) != 0) {
+						out = NULL;
+					}
+				}
+			}
+			pthread_mutex_lock(&lock);
+		}
+		pthread_mutex_unlock(&lock);
+	}
+	((void (*)(id, SEL, CMSampleBufferRef, id))gFcnRender)(self, sel, out ? out : sb, input);
+	if (out) {
+		CFRelease(out);
+	}
+}
+
+static void
+hook_fcn(void)
+{
+	Class c = objc_getClass("BWFileCoordinatorNode");
+	Method m = c ? class_getInstanceMethod(c, sel_registerName("stopRecordingWithErrorCode:setupToAllowWaitingForRecordingToStop:")) : NULL;
+	if (m && !gFcnStop && access("/private/var/tmp/sweetcam.fcn", F_OK) == 0) {
+		gFcnStop = method_setImplementation(m, (IMP)fcn_stop);
+		say("coordinator: its stop is watched (sweetcam.fcn)");
+	}
+	Method r = c ? class_getInstanceMethod(c, sel_registerName("renderSampleBuffer:forInput:")) : NULL;
+	if (r && !gFcnRender && access("/private/var/tmp/sweetcam.noavtime", F_OK) != 0) {
+		gFcnRender = method_setImplementation(r, (IMP)fcn_render);
+	}
+}
+
 /* the methods of a class (name and type encoding), once, for reading on the Mac */
 static void
 say_methods(const char *cls_name)
@@ -4116,6 +4275,15 @@ hook(void)
 	hook_styles();
 	hook_m2m();
 	hook_rotation();
+	/*
+	 * the H.264 encoder (tools/sweetnet/sweetavc.m, x264; a library of its own because x264 is GPL): its constructor
+	 * registers it with VideoToolbox in this process, where CMCapture's movie recording looks for one
+	 */
+	hook_fcn();
+	if (access("/private/var/tmp/sweetcam.noavc", F_OK) != 0) {
+		void *avc = dlopen("/usr/local/lib/sweetavc.dylib", RTLD_NOW);
+		say("video encoder: /usr/local/lib/sweetavc.dylib %{public}s", avc ? "loaded" : dlerror());
+	}
 	say_imps();
 	if (access("/private/var/tmp/sweetcam.nilwatch", F_OK) == 0)
 		say_methods("FigM2MController");
