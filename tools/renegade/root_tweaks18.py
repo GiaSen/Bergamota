@@ -776,6 +776,9 @@ def torch(root):
 # Camera's settings for this phone: Live Photo off (it records a movie and there is no video encoder) and "Most Compatible"
 # (JPEG: HEIC needs the HEVC encoder); both stay changeable in Camera and Settings. Photos also need the Chlorophyll of
 # gpu/metal 7fc5206 or later (RENEGADE_CHL=1 from research/chl-work/out-metal).
+# The format setting does not survive Camera's first run on a freshly flashed root (seen 2026-11-10: it became "High
+# Efficiency" again, photos were asked for as HEIC and none was saved). What keeps photos JPEG and movies H.264 is
+# sweetzoom.dylib telling Camera that the phone cannot encode HEVC (camera_zoom below); Live Photo off did survive.
 CAMERA_DYLIB = '/usr/local/lib/sweetcam.dylib'
 CAM_SEQ = '/usr/local/share/sweetcam/imx363-mode2.seq'
 # cameracaptured idle (no app using the camera): InactiveHard 50 MB -> 384. With sweetcam and Chlorophyll in-process it sits at
