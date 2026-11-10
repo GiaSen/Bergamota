@@ -25,6 +25,13 @@
  * it in, in order), sliced threads, the bit rate and key frame interval the session sets, NV12 input straight from the
  * pixel buffer's planes, 4-byte NAL lengths (avcC), no parameter sets in the stream (they are in the format description).
  *
+ * The part of the picture that is encoded (2026-11-10, "make 16:9"): iOS 26's Camera keeps the 4:3 photo format in video
+ * mode and CMCapture hands the movie the same 4:3 frames the viewfinder is made from (1504x1128), of which the viewfinder
+ * shows the 16:9 middle (its "primary capture rect": the preview stage crops 0,141 1504x846); on this phone nothing
+ * between the two crops the movie's frames, so the files came out 4:3. sweetcam, which sees the preview stage's crop,
+ * tells it here (sweetavc_set_capture_rect), and a session whose frames have that size encodes that part only: the movie
+ * is what the viewfinder showed, 1504x846. The size is fixed when x264 opens, at a recording's first frame.
+ *
  * Loaded by sweetcam.dylib into cameracaptured (dlopen; the constructor registers the encoder). Log: subsystem
  * com.sweet.avc. /private/var/tmp/sweetavc.off: not registered. iOS 18+, arm64e + pacstrip (tools/sweetnet/build.sh).
  * This library contains x264 and is therefore under the GPL (version 2 or later) as a whole.
@@ -96,9 +103,35 @@ static OSStatus (*set_pixel_attrs)(VTVideoEncoderSession, CFDictionaryRef);
 #define kVTAllocationFailedErr          (-12904)
 #define kVTVideoEncoderMalfunctionErr   (-12912)
 
+/* the part of a frame of bw x bh that the viewfinder shows (w == 0: all of it), from sweetcam */
+static struct { int bw, bh, x, y, w, h; } gRect;
+static pthread_mutex_t gRectLock = PTHREAD_MUTEX_INITIALIZER;
+
+__attribute__((visibility("default"))) void
+sweetavc_set_capture_rect(int bw, int bh, int x, int y, int w, int h)
+{
+	pthread_mutex_lock(&gRectLock);
+	bool changed = gRect.bw != bw || gRect.bh != bh || gRect.x != x || gRect.y != y || gRect.w != w || gRect.h != h;
+	gRect.bw = bw;
+	gRect.bh = bh;
+	gRect.x = x;
+	gRect.y = y;
+	gRect.w = w;
+	gRect.h = h;
+	pthread_mutex_unlock(&gRectLock);
+	if (changed) {
+		if (w > 0) {
+			os_log(gLog, "sweetavc: of %dx%d frames the viewfinder shows %dx%d at %d,%d: movies of such frames are that part", bw, bh, w, h, x, y);
+		} else {
+			os_log(gLog, "sweetavc: the viewfinder shows whole frames: movies are whole frames");
+		}
+	}
+}
+
 struct avc {
 	VTVideoEncoderSession session;
 	int w, h;
+	int cx, cy, cw, ch;             /* the part encoded (all of it: 0, 0, w, h), fixed when x264 opens */
 	x264_t *x;
 	CMVideoFormatDescriptionRef fd;
 	pthread_mutex_t lock;
@@ -197,9 +230,21 @@ avc_open(struct avc *a, bool full_range)
 		return kVTVideoEncoderMalfunctionErr;
 	}
 	double fps = a->fps >= 1 && a->fps <= 240 ? a->fps : 30;
-	int kbps = a->bitrate > 0 ? a->bitrate / 1000 : a->w * a->h * 4 / 1000;
-	p.i_width = a->w;
-	p.i_height = a->h;
+	a->cx = a->cy = 0;
+	a->cw = a->w;
+	a->ch = a->h;
+	pthread_mutex_lock(&gRectLock);
+	if (gRect.w >= 64 && gRect.h >= 64 && gRect.bw == a->w && gRect.bh == a->h && gRect.x >= 0 && gRect.y >= 0 &&
+	    gRect.x + gRect.w <= a->w && gRect.y + gRect.h <= a->h) {
+		a->cx = gRect.x & ~1;           /* even: the colour plane is at half size */
+		a->cy = gRect.y & ~1;
+		a->cw = gRect.w & ~1;
+		a->ch = gRect.h & ~1;
+	}
+	pthread_mutex_unlock(&gRectLock);
+	int kbps = a->bitrate > 0 ? a->bitrate / 1000 : a->cw * a->ch * 5 / 1000;
+	p.i_width = a->cw;
+	p.i_height = a->ch;
 	p.i_csp = X264_CSP_NV12;
 	p.i_bitdepth = 8;
 	p.i_threads = 4;
@@ -230,7 +275,7 @@ avc_open(struct avc *a, bool full_range)
 	x264_param_apply_profile(&p, a->baseline ? "baseline" : a->main_profile ? "main" : "high");
 	a->x = x264_encoder_open(&p);
 	if (!a->x) {
-		say("x264 did not open for %dx%d at %d kbit/s", a->w, a->h, kbps);
+		say("x264 did not open for %dx%d at %d kbit/s", a->cw, a->ch, kbps);
 		return kVTVideoEncoderMalfunctionErr;
 	}
 	x264_nal_t *nal = NULL;
@@ -252,8 +297,11 @@ avc_open(struct avc *a, bool full_range)
 		return kVTVideoEncoderMalfunctionErr;
 	}
 	OSStatus e = CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, sets, sizes, 4, &a->fd);
+	if (a->cw != a->w || a->ch != a->h) {
+		say("encoding %dx%d at %d,%d of the %dx%d frames (the viewfinder's part)", a->cw, a->ch, a->cx, a->cy, a->w, a->h);
+	}
 	say("x264 open (%{public}s): %dx%d, %d kbit/s, %.2f fps, a key frame every %d frames, %{public}s %{public}s, %{public}s range, 4 sliced threads, %d frames held back; format description %d",
-	    preset, a->w, a->h, kbps, fps, p.i_keyint_max, a->baseline ? "baseline" : a->main_profile ? "main" : "high", p.b_cabac ? "CABAC" : "CAVLC",
+	    preset, a->cw, a->ch, kbps, fps, p.i_keyint_max, a->baseline ? "baseline" : a->main_profile ? "main" : "high", p.b_cabac ? "CABAC" : "CAVLC",
 	    full_range ? "full" : "video", x264_encoder_maximum_delayed_frames(a->x), (int)e);
 	return e;
 }
@@ -317,6 +365,11 @@ avc_encode(VTVideoEncoderRef enc, VTVideoEncoderFrame frame, CVPixelBufferRef pb
 	in.img.plane[1] = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
 	in.img.i_stride[0] = (int)CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
 	in.img.i_stride[1] = (int)CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+	if (in.img.plane[0] && in.img.plane[1]) {
+		/* the part encoded: x264 is given the planes from its first pixel on */
+		in.img.plane[0] += (size_t)a->cy * (size_t)in.img.i_stride[0] + (size_t)a->cx;
+		in.img.plane[1] += (size_t)(a->cy / 2) * (size_t)in.img.i_stride[1] + (size_t)a->cx;
+	}
 	CMTime t90 = CMTimeConvertScale(*pts, 90000, kCMTimeRoundingMethod_RoundHalfAwayFromZero);
 	in.i_pts = t90.value;
 	CFTypeRef force = props ? CFDictionaryGetValue(props, CFSTR("ForceKeyFrame")) : NULL;
