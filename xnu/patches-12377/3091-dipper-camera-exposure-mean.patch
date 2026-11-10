@@ -1,0 +1,32 @@
+diff --git a/bsd/dev/dipper_camera.c b/bsd/dev/dipper_camera.c
+index affd946..0b3f99c 100644
+--- a/bsd/dev/dipper_camera.c
++++ b/bsd/dev/dipper_camera.c
+@@ -1880,7 +1880,16 @@ struct c4_run {
+ static bool
+ c4_ae_step(struct c4_run *r, unsigned mean, unsigned sat, unsigned min_fll)
+ {
+-	bool on_target = mean * 100u >= C4_AE_TARGET * 85u && mean * 100u <= C4_AE_TARGET * 118u && sat < 20u;
++	/*
++	 * 3091: the mean alone decides. Until now a frame with 2 % of its metered greens clipped was never on target and was
++	 * answered with 30 % less exposure whatever its mean. With lamps in the picture (an office ceiling: 2.7 % clipped at
++	 * a mean of 126) that never ended: down in 30 % steps until the mean was far under the target, back up in one step,
++	 * the lamps clipped again (1330, 933, 656, 461, 1233 ... lines every three frames; the telephoto 3548, 2494, 3548 ...),
++	 * the viewfinder's brightness pumping. A clipped pixel counts in the mean as what it reads, so a frame with much of it
++	 * clipped still comes down; a few lamps stay clipped, as they should.
++	 */
++	(void)sat;
++	bool on_target = mean * 100u >= C4_AE_TARGET * 85u && mean * 100u <= C4_AE_TARGET * 118u;
+ 	if (!on_target && r->exp.lines == C4_FLL_MAX - C4_MARGIN && r->exp.acode == C4_AGAIN_MAX && r->exp.dgain == C4_DGAIN_MAX &&
+ 	    mean < C4_AE_TARGET) {
+ 		on_target = true;                       /* as bright as it goes */
+@@ -1895,9 +1904,6 @@ c4_ae_step(struct c4_run *r, unsigned mean, unsigned sat, unsigned min_fll)
+ 	if (ratio < 32u) {
+ 		ratio = 32u;
+ 	}
+-	if (sat >= 20u && ratio > 180u) {
+-		ratio = 180u;                           /* clipped highlights: down by at least 30 % */
+-	}
+ 	uint64_t e = r->exp.e256 * ratio / 256u;
+ 	c4_exp_split(e < 4u * 256u ? 4u * 256u : e, min_fll > r->fll_mode ? min_fll : r->fll_mode, 0, &r->exp);
+ 	if (!s0_set_exposure(&r->exp)) {

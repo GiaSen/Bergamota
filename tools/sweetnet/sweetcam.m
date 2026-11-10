@@ -405,7 +405,7 @@ struct isp {
 	uint8_t gamma[4096];            /* linear (0-4095 over the sensor's range above black) to sRGB 8 bits */
 	uint16_t gamma10[4096];         /* ... the same curve to 10 bits (the still, developed at full size) */
 	uint8_t *rgb;                   /* HW x HH x 3 */
-	float m[9];                     /* the colour matrix of the last frame (white balance and scale folded in) */
+	float k[3];                     /* per channel: the last frame's white balance x its scale to 0-4095 (the gain in it) */
 	float crop;                     /* the part of the picture shown, 0-1 of its width and height about the centre (the zoom) */
 	float gain;                     /* gain applied here, 1-4: the sensor at its limit and the picture still dark */
 	bool rot180;                    /* the picture turned half a turn (the front camera: its sensor reads out upside down for iOS) */
@@ -445,14 +445,38 @@ raw10_at(const uint8_t *row, unsigned x)
 	return (unsigned)g[x & 3] << 2 | ((g[4] >> (2 * (x & 3))) & 3);
 }
 
+/*
+ * The colour matrix (rows sum to 1: grey stays grey). The white-balanced values are clamped to full scale before it
+ * (2026-11-10): a clipped pixel is R = G = B at the sensor's ceiling, the white balance lifts its red and blue above
+ * that, and the matrix's negative terms then took them off the green: every lamp in the picture came out pink (the user,
+ * in an office: "the lights ... are pink"). Clamped, a clipped pixel is white.
+ */
+static const float isp_ccm[9] = { 1.55f, -0.40f, -0.15f, -0.25f, 1.45f, -0.20f, -0.05f, -0.45f, 1.50f };
+
+static inline void
+isp_colour(const float *k, float R, float G, float B, int out[3])
+{
+	float r = R * k[0], g = G * k[1], b = B * k[2];
+	r = r > 4095.f ? 4095.f : r;
+	g = g > 4095.f ? 4095.f : g;
+	b = b > 4095.f ? 4095.f : b;
+	int ir = (int)(isp_ccm[0] * r + isp_ccm[1] * g + isp_ccm[2] * b), ig = (int)(isp_ccm[3] * r + isp_ccm[4] * g + isp_ccm[5] * b),
+	    ib = (int)(isp_ccm[6] * r + isp_ccm[7] * g + isp_ccm[8] * b);
+	out[0] = ir < 0 ? 0 : ir > 4095 ? 4095 : ir;
+	out[1] = ig < 0 ? 0 : ig > 4095 ? 4095 : ig;
+	out[2] = ib < 0 ? 0 : ib > 4095 ? 4095 : ib;
+}
+
 struct half_job {
 	struct isp *p;
 	const uint8_t *raw;
 	unsigned stride, black;
 	unsigned cfa;                   /* 0 RGGB, 1 GRBG (the frame header's flags) */
 	bool rot;                       /* written from the last pixel backwards: half a turn */
-	float m[9];                     /* colour matrix with the white balance and the scale to 0-4095 folded in */
-	uint64_t sum[16][3];            /* per piece: R, G, B above black (for the next white balance) */
+	float k[3];                     /* per channel: white balance x the scale to 0-4095 */
+	unsigned lim;                   /* a cell with a value from here up (above black) is near clipping: not in the white balance */
+	uint64_t sum[16][3];            /* per piece: R, G, B above black (the frame's mean) */
+	uint64_t wsum[16][3];           /* ... of the cells not near clipping (for the next white balance) */
 };
 
 static void
@@ -460,7 +484,8 @@ half_piece(void *ctx, size_t piece)
 {
 	struct half_job *j = ctx;
 	unsigned rows = (HH + 15) / 16, y0 = (unsigned)piece * rows, y1 = MIN(HH, y0 + rows);
-	uint64_t sr = 0, sg = 0, sb = 0;
+	uint64_t sr = 0, sg = 0, sb = 0, wr = 0, wg = 0, wb = 0;
+	const int lim = (int)j->lim;
 	for (unsigned y = y0; y < y1; y++) {
 		const uint8_t *r0 = j->raw + (size_t)(2 * y) * j->stride, *r1 = r0 + j->stride;
 		uint8_t *o = j->rot ? j->p->rgb + ((size_t)(HH - 1 - y) * HW + (HW - 1)) * 3 : j->p->rgb + (size_t)y * HW * 3;
@@ -484,28 +509,34 @@ half_piece(void *ctx, size_t piece)
 				sr += (unsigned)R;
 				sg += (unsigned)G;
 				sb += (unsigned)B;
+				if (R < lim && G < lim && B < lim) {
+					wr += (unsigned)R;
+					wg += (unsigned)G;
+					wb += (unsigned)B;
+				}
 			}
-			float fr = j->m[0] * R + j->m[1] * G + j->m[2] * B;
-			float fg = j->m[3] * R + j->m[4] * G + j->m[5] * B;
-			float fb = j->m[6] * R + j->m[7] * G + j->m[8] * B;
-			int ir = (int)fr, ig = (int)fg, ib = (int)fb;
-			o[0] = j->p->gamma[ir < 0 ? 0 : ir > 4095 ? 4095 : ir];
-			o[1] = j->p->gamma[ig < 0 ? 0 : ig > 4095 ? 4095 : ig];
-			o[2] = j->p->gamma[ib < 0 ? 0 : ib > 4095 ? 4095 : ib];
+			int c[3];
+			isp_colour(j->k, (float)R, (float)G, (float)B, c);
+			o[0] = j->p->gamma[c[0]];
+			o[1] = j->p->gamma[c[1]];
+			o[2] = j->p->gamma[c[2]];
 			o += step;
 		}
 	}
 	j->sum[piece][0] = sr;
 	j->sum[piece][1] = sg;
 	j->sum[piece][2] = sb;
+	j->wsum[piece][0] = wr;
+	j->wsum[piece][1] = wg;
+	j->wsum[piece][2] = wb;
 }
 
 /* the frame at half size into p->rgb; the white balance follows the frame (grey world, smoothed) */
 static void
 isp_half(struct isp *p, const struct cam_live_hdr *h, const uint8_t *raw)
 {
-	static const float ccm[9] = { 1.55f, -0.40f, -0.15f, -0.25f, 1.45f, -0.20f, -0.05f, -0.45f, 1.50f };
-	struct half_job j = { .p = p, .raw = raw, .stride = h->stride, .black = h->black, .cfa = h->flags & 3, .rot = p->rot180 };
+	struct half_job j = { .p = p, .raw = raw, .stride = h->stride, .black = h->black, .cfa = h->flags & 3, .rot = p->rot180,
+		              .lim = (unsigned)(h->white - h->black) * 15u / 16u };
 	float scale = 4095.0f / (float)(h->white - h->black) * (p->gain >= 1 ? p->gain : 1);
 	unsigned hw = h->width / 2, hh = h->height / 2;
 	if (hw != HW || hh != HH || !p->rgb) {
@@ -521,17 +552,16 @@ isp_half(struct isp *p, const struct cam_live_hdr *h, const uint8_t *raw)
 		say("frames of %ux%u (sensor %u, colour order %u): the preview picture is %ux%u", h->width, h->height,
 		    (h->flags >> 8) & 3, h->flags & 3, HW, HH);
 	}
-	for (int r = 0; r < 3; r++) {
-		for (int c = 0; c < 3; c++) {
-			j.m[r * 3 + c] = ccm[r * 3 + c] * p->wb[c] * scale;
-		}
+	for (int c = 0; c < 3; c++) {
+		j.k[c] = p->wb[c] * scale;
 	}
-	memcpy(p->m, j.m, sizeof(p->m));
+	memcpy(p->k, j.k, sizeof(p->k));
 	dispatch_apply_f(16, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &j, half_piece);
-	uint64_t s[3] = { 0, 0, 0 };
+	uint64_t s[3] = { 0, 0, 0 }, ws[3] = { 0, 0, 0 };
 	for (int i = 0; i < 16; i++) {
 		for (int c = 0; c < 3; c++) {
 			s[c] += j.sum[i][c];
+			ws[c] += j.wsum[i][c];
 		}
 	}
 	p->mean = (float)s[1] / ((float)HW * HH * (float)(h->white - h->black));
@@ -549,8 +579,13 @@ isp_half(struct isp *p, const struct cam_live_hdr *h, const uint8_t *raw)
 		}
 		p->gain = 0.9f * p->gain + 0.1f * want;
 	}
-	if (s[0] > 1000 && s[1] > 1000 && s[2] > 1000) {
-		float gr = (float)s[1] / (float)s[0], gb = (float)s[1] / (float)s[2];
+	/*
+	 * grey world over the cells that are not near clipping: a clipped cell is R = G = B whatever the light's colour, and a
+	 * few per cent of them (lamps) pulled both gains towards 1 (the office frame: R 1.59 with them, 1.75 without: a green
+	 * cast)
+	 */
+	if (ws[0] > 1000 && ws[1] > 1000 && ws[2] > 1000) {
+		float gr = (float)ws[1] / (float)ws[0], gb = (float)ws[1] / (float)ws[2];
 		gr = gr < 0.5f ? 0.5f : gr > 4.f ? 4.f : gr;
 		gb = gb < 0.5f ? 0.5f : gb > 4.f ? 4.f : gb;
 		p->wb[0] = 0.85f * p->wb[0] + 0.15f * gr;
@@ -768,11 +803,11 @@ full_demosaic(void *ctx, size_t piece)
 			fr = fr < 0 ? 0 : fr;
 			fg = fg < 0 ? 0 : fg;
 			fb = fb < 0 ? 0 : fb;
-			int lr = (int)(p->m[0] * fr + p->m[1] * fg + p->m[2] * fb), lg = (int)(p->m[3] * fr + p->m[4] * fg + p->m[5] * fb),
-			    lb = (int)(p->m[6] * fr + p->m[7] * fg + p->m[8] * fb);
-			o[0] = p->gamma10[lr < 0 ? 0 : lr > 4095 ? 4095 : lr];
-			o[1] = p->gamma10[lg < 0 ? 0 : lg > 4095 ? 4095 : lg];
-			o[2] = p->gamma10[lb < 0 ? 0 : lb > 4095 ? 4095 : lb];
+			int l[3];
+			isp_colour(p->k, fr, fg, fb, l);
+			o[0] = p->gamma10[l[0]];
+			o[1] = p->gamma10[l[1]];
+			o[2] = p->gamma10[l[2]];
 			o += 3;
 		}
 	}
@@ -804,11 +839,11 @@ full_cells(void *ctx, size_t piece)
 			R = R < 0 ? 0 : R;
 			G = G < 0 ? 0 : G;
 			B = B < 0 ? 0 : B;
-			int lr = (int)(p->m[0] * R + p->m[1] * G + p->m[2] * B), lg = (int)(p->m[3] * R + p->m[4] * G + p->m[5] * B),
-			    lb = (int)(p->m[6] * R + p->m[7] * G + p->m[8] * B);
-			o[0] = p->gamma10[lr < 0 ? 0 : lr > 4095 ? 4095 : lr];
-			o[1] = p->gamma10[lg < 0 ? 0 : lg > 4095 ? 4095 : lg];
-			o[2] = p->gamma10[lb < 0 ? 0 : lb > 4095 ? 4095 : lb];
+			int l[3];
+			isp_colour(p->k, R, G, B, l);
+			o[0] = p->gamma10[l[0]];
+			o[1] = p->gamma10[l[1]];
+			o[2] = p->gamma10[l[2]];
 		}
 	}
 }
