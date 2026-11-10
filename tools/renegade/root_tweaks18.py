@@ -796,6 +796,15 @@ def camera(root):
         note_skip('camera', not_built())
         return
     install_file(dylib, os.path.join(root, CAMERA_DYLIB.lstrip('/')), 0o755)
+    # movie recording (2026-11-10): the H.264 encoder sweetcam loads into cameracaptured, tools/sweetnet/sweetavc.m on x264
+    # (GPL; built by tools/x264-build.sh + tools/sweetnet/build.sh, never in git). Without it Camera records nothing.
+    avc = find_sweetnet('ios18/sweetavc.dylib')
+    if avc:
+        install_file(avc, os.path.join(root, 'usr/local/lib/sweetavc.dylib'), 0o755)
+        print('camera: /usr/local/lib/sweetavc.dylib (H.264 encoder on x264, GPL) for movie recording')
+    else:
+        print('camera: sweetavc.dylib not built (tools/x264-build.sh, then tools/sweetnet/build.sh): no movie recording')
+        note_skip('camera movies', 'sweetavc.dylib not built')
     seq = os.environ.get('RENEGADE_CAM_SEQ')
     if seq and os.path.isdir(seq):
         names = sorted(n for n in os.listdir(seq) if n.endswith('.seq'))

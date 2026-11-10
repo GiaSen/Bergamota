@@ -101,6 +101,19 @@ if [ "${IOS18:-1}" = 1 ]; then
 		"$here/sweetcam.m" -o "$out18/sweetcam.dylib"
 	codesign -s - -f "$out18/sweetcam.dylib"
 	python3 -I "$pacstrip" --sign "$out18/sweetcam.dylib"
+	# iOS 26: an H.264 encoder for VideoToolbox on x264 (movie recording; loaded by sweetcam.dylib into cameracaptured). x264
+	# is GPL and not in this repository: tools/x264-build.sh fetches and builds it into research/x264/out; without it this
+	# library is skipped and Camera cannot record movies
+	root=$(cd "$here/../.." && pwd)
+	if [ -f "$root/research/x264/out/lib/libx264.a" ]; then
+		xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -Wno-four-char-constants -fno-objc-arc \
+			-dynamiclib -install_name /usr/local/lib/sweetavc.dylib -I"$root/research/x264/out/include" -framework Foundation -framework CoreMedia \
+			-framework CoreVideo "$here/sweetavc.m" "$root/research/x264/out/lib/libx264.a" -o "$out18/sweetavc.dylib"
+		codesign -s - -f "$out18/sweetavc.dylib"
+		python3 -I "$pacstrip" --sign "$out18/sweetavc.dylib"
+	else
+		echo "sweetavc.dylib: research/x264/out/lib/libx264.a not built (tools/x264-build.sh): skipped, no movie recording"
+	fi
 	# iOS 26: in Camera.app (weak-linked into its binary), a tap on the zoom button at 1x goes to 2x (sweetcam: the telephoto)
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -fno-objc-arc \
 		-dynamiclib -install_name /usr/local/lib/sweetzoom.dylib -framework Foundation "$here/sweetzoom.m" -o "$out18/sweetzoom.dylib"
