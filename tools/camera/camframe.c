@@ -7,7 +7,9 @@
  *   camframe -s FILE      loads FILE into kern.sweet_cam_seq (3077+: the rear main sensor's register sequence, made on
  *                         the Mac by tools/camera/camx_v1.py --seq from the phone's own module file; never in git)
  *   camframe -g N [OUT]   as -l, of a stream somebody else runs (cameracaptured while Camera is open): it is neither started
- *                         nor stopped, the sensor is whichever streams; every frame's exposure is said (auto exposure's steps)
+ *                         nor stopped, the sensor is whichever streams; every frame's exposure is said (auto exposure's steps).
+ *                         Both also count frames whose middle line is byte for byte that of one of the four frames before: a
+ *                         frame published from a buffer the sensor did not write (the next buffer's address written too late)
  *   camframe -c N ...     3090+: first selects the sensor (kern.sweet_cam_sensor: 0 rear main, 1 rear tele, 2 front); -s and
  *                         -l then load that sensor's sequence and stream it
  *   camframe -S FILE      3085+: loads FILE into kern.sweet_cam_seq0 (mode 0, 4032x3024, for full-resolution stills)
@@ -89,8 +91,8 @@ live(int n, const char *out, int own)
 	}
 	char *buf = malloc(cap);
 	uint32_t last = 0;
-	uint64_t t0 = 0, tp = 0;
-	unsigned got = 0, dup = 0, skipped = 0;
+	uint64_t t0 = 0, tp = 0, sums[4] = { 0, 0, 0, 0 };
+	unsigned got = 0, dup = 0, skipped = 0, stale = 0;
 	for (int i = 0; buf && i < n; i++) {
 		size_t len = cap;
 		if (sysctlbyname("kern.sweet_cam_live", buf, &len, &last, sizeof(last)) != 0) {
@@ -115,13 +117,32 @@ live(int n, const char *out, int own)
 			    (h->timestamp_ns - t0) / 1e6, tp ? (h->timestamp_ns - tp) / 1e6 : 0.0, h->frame_us, h->exposure_lines,
 			    h->again_x256 / 256.0, h->dgain_x256 / 256.0, h->lens, h->af_state);
 		}
+		{
+			/* the middle line's bytes (FNV-1a): noise makes every frame's its own */
+			const unsigned char *row = (const unsigned char *)buf + h->hdr_size + (size_t)h->stride * (h->height / 2);
+			uint64_t sum = 1469598103934665603ull;
+			for (unsigned k = 0; k < h->stride; k++) {
+				sum = (sum ^ row[k]) * 1099511628211ull;
+			}
+			for (unsigned k = 0; k < 4 && k < got; k++) {
+				if (sums[k] == sum) {
+					stale++;
+					fprintf(stderr, "seq %u: the middle line is that of %u frame(s) before\n", h->seq, k + 1);
+					break;
+				}
+			}
+			sums[3] = sums[2];
+			sums[2] = sums[1];
+			sums[1] = sums[0];
+			sums[0] = sum;
+		}
 		tp = h->timestamp_ns;
 		last = h->seq;
 		got++;
 	}
 	if (got > 1) {
-		fprintf(stderr, "%u frames read, %u skipped, %u repeated; %.2f frames/s read\n", got, skipped, dup,
-		    (got - 1) * 1e9 / (double)(tp - t0));
+		fprintf(stderr, "%u frames read, %u skipped, %u repeated, %u with an earlier frame's picture; %.2f frames/s read\n", got, skipped,
+		    dup, stale, (got - 1) * 1e9 / (double)(tp - t0));
 	}
 	if (out && got) {
 		FILE *f = fopen(out, "wb");
