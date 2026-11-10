@@ -6,6 +6,8 @@
  *                         a newer one), says their timing, exposure and lens, writes the last frame's RAW10 to OUT, stops
  *   camframe -s FILE      loads FILE into kern.sweet_cam_seq (3077+: the rear main sensor's register sequence, made on
  *                         the Mac by tools/camera/camx_v1.py --seq from the phone's own module file; never in git)
+ *   camframe -g N [OUT]   as -l, of a stream somebody else runs (cameracaptured while Camera is open): it is neither started
+ *                         nor stopped, the sensor is whichever streams; every frame's exposure is said (auto exposure's steps)
  *   camframe -c N ...     3090+: first selects the sensor (kern.sweet_cam_sensor: 0 rear main, 1 rear tele, 2 front); -s and
  *                         -l then load that sensor's sequence and stream it
  *   camframe -S FILE      3085+: loads FILE into kern.sweet_cam_seq0 (mode 0, 4032x3024, for full-resolution stills)
@@ -72,12 +74,13 @@ set_int(const char *name, int v)
 	return 0;
 }
 
-/* camframe -l N OUT: stream, N frames through kern.sweet_cam_live (each waiting for a newer one), the last to OUT, stop */
+/* camframe -l N OUT: stream, N frames through kern.sweet_cam_live (each waiting for a newer one), the last to OUT, stop;
+ * own false (-g): the stream is somebody else's, left as it is, and every frame is said */
 static int
-live(int n, const char *out)
+live(int n, const char *out, int own)
 {
 	size_t cap = 0;
-	if (set_int("kern.sweet_cam_stream", 1)) {
+	if (own && set_int("kern.sweet_cam_stream", 1)) {
 		return 1;
 	}
 	if (sysctlbyname("kern.sweet_cam_live", NULL, &cap, NULL, 0) != 0) {
@@ -107,7 +110,7 @@ live(int n, const char *out)
 			fprintf(stderr, "frames: %ux%u, %u bytes a line, format %u, flags %#x (colour order %u, sensor %u), black %u\n", h->width,
 			    h->height, h->stride, h->format, h->flags, h->flags & 3, (h->flags >> 8) & 3, h->black);
 		}
-		if (i < 3 || i % 30 == 0 || i == n - 1) {
+		if (!own || i < 3 || i % 30 == 0 || i == n - 1) {
 			fprintf(stderr, "seq %u t %+.1f ms (%+.1f) frame %u us, exposure %u lines x %.2f x %.2f, lens %u af %u\n", h->seq,
 			    (h->timestamp_ns - t0) / 1e6, tp ? (h->timestamp_ns - tp) / 1e6 : 0.0, h->frame_us, h->exposure_lines,
 			    h->again_x256 / 256.0, h->dgain_x256 / 256.0, h->lens, h->af_state);
@@ -128,7 +131,9 @@ live(int n, const char *out)
 			fclose(f);
 		}
 	}
-	set_int("kern.sweet_cam_stream", 0);
+	if (own) {
+		set_int("kern.sweet_cam_stream", 0);
+	}
 	return got ? 0 : 1;
 }
 
@@ -217,8 +222,8 @@ main(int argc, char **argv)
 	if (argc == 3 && strcmp(argv[1], "-s") == 0) {
 		return load_seq(argv[2]);
 	}
-	if (argc >= 3 && strcmp(argv[1], "-l") == 0) {
-		return live(atoi(argv[2]), argc > 3 ? argv[3] : NULL);
+	if (argc >= 3 && (strcmp(argv[1], "-l") == 0 || strcmp(argv[1], "-g") == 0)) {
+		return live(atoi(argv[2]), argc > 3 ? argv[3] : NULL, argv[1][1] == 'l');
 	}
 	size_t len = 0;
 	if (sysctlbyname("kern.sweet_cam_frame", NULL, &len, NULL, 0) != 0 || len == 0) {
