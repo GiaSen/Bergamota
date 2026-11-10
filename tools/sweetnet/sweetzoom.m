@@ -31,6 +31,14 @@
  * cameracaptured; Apple's HEVC and H.264 encoders are drivers for a chip it does not have), so that list is made to be
  * H.264 first and no HEVC, unless an allow list leaves H.264 out.
  *
+ * No HEVC (2026-11-10, found on a freshly flashed root): the first time Camera runs it sets its format to "High
+ * Efficiency" whatever the settings file of the image said (CAMUserPreferenceCaptureEncodingBehavior 1 became 0, with a
+ * new ...BehaviorSource 3), because as an iPhone 11 it believes it can encode HEVC. Photos were then asked for as
+ * "hvc1(HEIC)", and since the phone has no HEVC encoder the still pipeline never finished one: no picture saved, the
+ * next ones waiting on its buffers ("Waited for over 20 seconds for a pixel buffer"). So Camera is told the truth:
+ * -[CAMCaptureCapabilities isHEVCEncodingSupported] is NO (the method, and the instance variable behind it right after
+ * -initWithHostProcess:), and photos are JPEG and movies H.264 on any setting.
+ *
  * /private/var/tmp/sweetzoom.off (looked at when Camera starts): Apple's behaviour. Log: subsystem com.sweet.zoom.
  * iOS 26, arm64e + pacstrip (tools/sweetnet/build.sh); installed by tools/renegade/link_weak.py (by hand) or the root
  * image build (root_tweaks18.camera_zoom).
@@ -43,7 +51,27 @@
 #include <unistd.h>
 
 static os_log_t gLog;
-static IMP gOrig, gOrigResolved, gOrigPreferred, gOrigCodecs;
+static IMP gOrig, gOrigResolved, gOrigPreferred, gOrigCodecs, gOrigCapsInit;
+
+/* the phone has no HEVC encoder: see "No HEVC" above */
+static BOOL
+hevc_encoding_supported(id self, SEL sel)
+{
+	return NO;
+}
+
+static id
+caps_init(id self, SEL sel, long host_process)
+{
+	id caps = ((id (*)(id, SEL, long))gOrigCapsInit)(self, sel, host_process);
+	Ivar v = caps ? class_getInstanceVariable(object_getClass(caps), "_HEVCEncodingSupported") : NULL;
+	if (v) {
+		BOOL *flag = (BOOL *)((char *)(void *)caps + ivar_getOffset(v));
+		os_log(gLog, "sweetzoom: Camera's capabilities said HEVC encoding %{public}s: no (photos JPEG, movies H.264)", *flag ? "yes" : "no");
+		*flag = NO;
+	}
+	return caps;
+}
 
 struct dims { int w, h; };
 
@@ -143,6 +171,16 @@ sweetzoom_init(void)
 	if (cm) {
 		gOrigCodecs = method_setImplementation(cm, (IMP)movie_codecs);
 	}
+	Method hv = caps ? class_getInstanceMethod(caps, sel_registerName("isHEVCEncodingSupported")) : NULL;
+	Method ci = caps ? class_getInstanceMethod(caps, sel_registerName("initWithHostProcess:")) : NULL;
+	if (hv) {
+		method_setImplementation(hv, (IMP)hevc_encoding_supported);
+	}
+	if (ci) {
+		gOrigCapsInit = method_setImplementation(ci, (IMP)caps_init);
+	}
+	os_log(gLog, "sweetzoom: no HEVC encoding for Camera (%{public}s, %{public}s)", hv ? "the answer" : "no such method here",
+	    ci ? "the capabilities' own flag" : "no initWithHostProcess: here");
 	os_log(gLog, "sweetzoom: loaded into %{public}s: a tap on the back camera's zoom button at 1x goes to %.1fx (%{public}s), the back camera is the wide one and opens at 1x (%{public}s), movies in H.264 (%{public}s)",
 	    getprogname(), TELE_ZOOM, m ? "yes" : "no such method here", r && p ? "yes" : "no such methods here", cm ? "yes" : "no such method here");
 }
