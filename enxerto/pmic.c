@@ -30,6 +30,15 @@
 /* PM8998 PON (SID 0, base 0x800) */
 #define PON_REASON1	0x0808
 #define PON_RT		0x0810
+/*
+ * What a falling PS_HOLD does (PM8998's PON is gen2; Linux pm8941-pwrkey.c pm8941_reboot_notify, downstream
+ * qpnp_pon_reset_config; the iOS kernel's xnu 3074): 0x85a PS_HOLD_RESET_CTL [3:0] the type (1 warm reset, as ABL
+ * leaves it, 4 shutdown, 7 hard reset), 0x85b PS_HOLD_RESET_CTL2 bit 7 enable, off around a change of the type.
+ */
+#define PON_PSHOLD_CTL	0x085a
+#define PON_PSHOLD_CTL2	0x085b
+#define PSHOLD_ENABLE	0x80u
+#define PSHOLD_TYPE	0x0fu
 
 /* PMI8998 WLED (SID 3): control 0xd800, sink 0xd900 */
 #define WLED_MOD_EN	0xd846
@@ -230,6 +239,8 @@ int pmic_pon_reason(void)
 
 static int write_allowed(unsigned sid, unsigned addr, unsigned len)
 {
+	if (sid == SID_PM8998)	/* power off (power.c): the PS_HOLD action, nothing else of the PON */
+		return len == 1 && (addr == PON_PSHOLD_CTL || addr == PON_PSHOLD_CTL2);
 	if (sid == SID_PMI8998) {
 		/*
 		 * SMB2 charger, single bytes: the seven registers xnu's sp_write_allowed lets sweetcharger=2
@@ -287,6 +298,38 @@ static int spmi_write_sid(unsigned sid, unsigned addr, uint32_t data, unsigned l
 static int spmi_write(unsigned addr, uint32_t data, unsigned len)
 {
 	return spmi_write_sid(SID_WLED, addr, data, len);
+}
+
+int pmic_usb_present(void)
+{
+	uint8_t v;
+
+	return spmi_read(SID_PMI8998, USBIN_RT, &v) ? -1 : !!(v & 0x10);
+}
+
+int pmic_pshold_type(unsigned type, int *old)
+{
+	uint8_t ctl, ctl2;
+
+	if (type > PSHOLD_TYPE || spmi_read(SID_PM8998, PON_PSHOLD_CTL, &ctl) ||
+	    spmi_read(SID_PM8998, PON_PSHOLD_CTL2, &ctl2))
+		return -1;
+	if (old)
+		*old = ctl & PSHOLD_TYPE;
+	if ((ctl & PSHOLD_TYPE) == type && (ctl2 & PSHOLD_ENABLE))
+		return 0;
+	if (spmi_write_sid(SID_PM8998, PON_PSHOLD_CTL2, ctl2 & ~PSHOLD_ENABLE, 1))
+		return -1;
+	udelay(1000);	/* "10 sleep clock cycles" for the PMIC to take the disable; 32 kHz, so 1 ms is ample */
+	if (spmi_write_sid(SID_PM8998, PON_PSHOLD_CTL, (ctl & ~PSHOLD_TYPE) | type, 1)) {
+		(void)spmi_write_sid(SID_PM8998, PON_PSHOLD_CTL2, ctl2, 1);
+		return -1;
+	}
+	if (spmi_write_sid(SID_PM8998, PON_PSHOLD_CTL2, ctl2 | PSHOLD_ENABLE, 1))
+		return -1;
+	if (spmi_read(SID_PM8998, PON_PSHOLD_CTL, &ctl) || spmi_read(SID_PM8998, PON_PSHOLD_CTL2, &ctl2))
+		return -1;
+	return (ctl & PSHOLD_TYPE) == type && (ctl2 & PSHOLD_ENABLE) ? 0 : -1;
 }
 
 int pmic_chg_read(unsigned addr, uint8_t *v)

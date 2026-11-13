@@ -11,6 +11,7 @@
 #include "bootui.h"
 #include "console.h"
 #include "mmu.h"
+#include "power.h"
 #include "loader.h"
 #include "bergamota.h"
 #include "charge_mode.h"
@@ -393,9 +394,10 @@ void enxerto_main(uint64_t dtb)
 	 * Shows the charging screen until Power is held ~2 s, then the normal flow below continues.
 	 * Without the flag this is one cmdline scan and nothing else.
 	 */
+	power_idle_init(dtb);	/* waits in WFE from here on (power.c), checked once; "bergamota.idle=0" = spin as before */
 	if (charge_wanted(dtb)) {
 		stage = "charge";
-		charge_run(dtb);
+		charge_run(dtb);	/* leaves on Power held 2 s; powers the phone off when the cable goes */
 	}
 
 	/* Cold power-on: ABL leaves USB off unless it entered fastboot. No-op when already alive. */

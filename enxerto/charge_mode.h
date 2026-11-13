@@ -7,7 +7,9 @@
  *   or the test flag "bergamota.charge=1"; "bergamota.charge=0" forbids it.
  * charge_run: show the charging screen and poll battery/keys. Returns when the user holds Power
  *   (~2 s) = continue with the normal boot flow. Volume Down enters Bergamota fastboot (and
- *   returns here if that could not start). Never returns otherwise.
+ *   returns here if that could not start). Since 2026-11 the
+ *   phone is powered off when the cable has been out for three seconds (docs/BERGAMOTA_POWER.md), and
+ *   the loop waits in WFE instead of spinning. Never returns otherwise.
  */
 int charge_wanted(uintptr_t dtb);
 void charge_run(uintptr_t dtb);

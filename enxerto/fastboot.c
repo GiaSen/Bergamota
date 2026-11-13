@@ -629,6 +629,14 @@ static void fb_oem(struct fb *fb, const char *a)
 		if (fb->p->display_info)
 			fb->p->display_info(fb->p->ctx, fb);
 		fb_resp(fb, "OKAY", "");
+	} else if (fb_eq(a, "poweroff")) {
+		if (fb->p->poweroff) {
+			fb_resp(fb, "OKAY", "powering off");
+			fb->p->poweroff(fb->p->ctx);
+			fb_copy(fb->last_resp, "power off failed", sizeof fb->last_resp);
+		} else {
+			fb_resp(fb, "FAIL", "no power off on this build");
+		}
 	} else {
 		fb_resp(fb, "FAIL", "unknown oem command");
 	}

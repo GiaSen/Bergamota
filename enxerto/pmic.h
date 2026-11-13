@@ -10,7 +10,8 @@
  * SID 0) except (a) the PMI8998 WLED backlight brightness (SID 3, peripheral 0xd9), which
  * pmic_wled_set() writes through the arbiter's write channel (the five registers of the kernel's
  * backlight fade) and (b) the seven SMB2 charger registers of the kernel's sweetcharger=2 control,
- * through pmic_chg_write() (charger.c). No other write is reachable.
+ * through pmic_chg_write() (charger.c), and (c) PM8998's PS_HOLD action, the two registers of
+ * pmic_pshold_type() (power.c: power off). No other write is reachable.
  */
 
 /* Charger state, from BATTERY_CHARGER_STATUS_1 + USBIN plug-in. */
@@ -44,6 +45,17 @@ void pmic_read_batt(struct pmic_batt *b);
 unsigned pmic_keys(void);
 /* PON_REASON1 (bit 4 = USB_CHG, bit 7 = KPDPWR), -1 when unreadable. Informational only. */
 int pmic_pon_reason(void);
+
+/* USBIN plugged (PMI8998 USBIN INT_RT_STS bit 4): 1, 0, or -1 when unreadable. */
+int pmic_usb_present(void);
+/*
+ * What PM8998 does when PS_HOLD falls: 1 warm reset (what ABL leaves), 4 shutdown, 7 hard reset. Sets it (enable off
+ * around the change, as Linux and the iOS kernel do) and reads it back; *old (may be NULL) gets the type found.
+ * 0 = in force, -1 = not readable / not writable (APID not owned by the apps EE) / read back differently.
+ */
+#define PMIC_PSHOLD_WARM	1
+#define PMIC_PSHOLD_SHUTDOWN	4
+int pmic_pshold_type(unsigned type, int *old);
 
 /* WLED backlight: raw 12-bit brightness of both strings. */
 int pmic_wled_get(uint16_t v[2]);

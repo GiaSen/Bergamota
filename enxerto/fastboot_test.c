@@ -153,6 +153,13 @@ static void p_reboot(void *ctx, int mode)
 	last_reboot_mode = mode;
 }
 
+static int poweroff_calls;
+static void p_poweroff(void *ctx)
+{
+	(void)ctx;
+	poweroff_calls++;
+}
+
 static void p_charger(void *ctx, int raw, char *buf, unsigned n)
 {
 	const char *s = raw == 2 ? "3652mV +1063mA 37%" : raw ? "st=02/00 apsd=04 je=1f aicl=1 w=3/0" : "applied CDP 1500/2000mA 4395mV FAST 37%";
@@ -1456,6 +1463,27 @@ int main(void)
 	cmd("reboot-bootloader");
 	fb = run_session(&r);
 	CHECK(r == FB_R_REBOOT_BL && reboot_calls == 1 && last_reboot_mode == 1 && resp_is(0, "OKAY"));
+
+	/* oem poweroff: OKAY first, then the platform's power off; FAIL on a platform without one */
+	{
+		struct fb_platform pp = platform;
+		const struct fb_platform *saved = cur_platform;
+
+		pp.poweroff = p_poweroff;
+		cur_platform = &pp;
+		poweroff_calls = 0;
+		reset_fake();
+		cmd("oem poweroff");
+		(void)run_session(&r);
+		CHECK(poweroff_calls == 1 && resp_starts(0, "OKAY") && n_resp == 1);
+		cur_platform = &platform;
+		poweroff_calls = 0;
+		reset_fake();
+		cmd("oem poweroff");
+		(void)run_session(&r);
+		CHECK(poweroff_calls == 0 && resp_starts(0, "FAIL"));
+		cur_platform = saved;
+	}
 	reset_fake();
 	cmd("continue");
 	fb = run_session(&r);
