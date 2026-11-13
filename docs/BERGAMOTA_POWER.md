@@ -2,7 +2,7 @@
 
 Files: `enxerto/power.c` (power off, WFE waits, storage idle), `enxerto/pmic.c` (`pmic_pshold_type`, `pmic_usb_present`), `enxerto/bergamota.c` (`power_tick`,
 `do_poweroff`, `oem load`, `oem tune`), `enxerto/charge_mode.c` (`unplugged_off`), `enxerto/ufs.c` (`ufs_auto_hibernate`), `oem poweroff` in `enxerto/fastboot.c`.
-Status (2026-11-13): **run on the Mi 8 from RAM** (`fastboot boot` from Xiaomi's fastboot; results below), host tests pass (525 checks). **Not flashed to `boot` yet.**
+Status (2026-11-13): run on the Mi 8 from RAM (`fastboot boot` from Xiaomi's fastboot; results below), host tests pass (525 checks), and **flashed to the Mi 8's `boot`** the same day (NOTES).
 Test images: `enxerto/out/bergamota-fastboot-power.img`, `enxerto/out/charge-test-power.img` (`BOARD=dipper IMGSUFFIX=-power enxerto/build.sh`);
 `research/helpers/enxerto-ramboot.sh IMG` loads one without hands (Bergamota fastboot -> iOS -> `sweetreboot fastboot` -> Xiaomi's fastboot -> `fastboot boot IMG`).
 
@@ -55,6 +55,9 @@ once a second; `dark` blackens the screen for the test. Fastboot, Mac's port, ba
 | waits in WFE | 256 mA | 231 mA |
 | WFE + storage link asleep (the final build; two runs each, the gauge wanders at these currents) | 109, 147 mA | 115, 87 mA |
 
+Those are from builds loaded out of Xiaomi's fastboot. **After a normal start from `boot` the same final build reads about 90 mA more:** storage link awake
+283 mA black, asleep 190-191 mA (three runs), lit 229 mA; what the normal start leaves on (or `usb_power_up` turns on) is not known. The charging screen starts
+no USB and is not measured.
 In one boot, in this order: black 185 mA, storage link asleep 105 mA. The readings drift down by tens of mA over minutes in a boot, so small steps cannot be
 told apart; the order of magnitude is what counts: about 1.2 W before, about 0.4-0.5 W now, in a state where the phone looks off.
 Storage after the link has slept: `oem gpt` (6 LUNs), `oem selftest:boot` OKAY, the same 16 MiB of userdata hashed three times with and without it: equal.
