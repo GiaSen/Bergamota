@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 2a8fed7..c879409 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -32,8 +32,16 @@ static IOLock *sp_lock;
+ static unsigned sp_count;
+ static bool sp_attempted, sp_ready;
+ static volatile uint32_t sp_init_lock;
+-/* Write channels mapped on demand (one 4 KiB page of the APID's 64 KiB window). */
+-#define SP_WCH_MAX 6
++/*
++ * Write channels mapped on demand (one 4 KiB page of the APID's 64 KiB window), one per peripheral that is ever written.
++ * 3094: 16, not 6. The Mi 8 writes nine by now: PON (reboot reason, power off), haptics, flash LEDs, WLED (the display's
++ * fade), the charger's CHGR and USBIN blocks, the RTC, and PM8998 GPIO 11 and 9, the rear and the front camera's VDIG
++ * switches. The seventh to ask got nothing and its write failed without a word: on 2026-11-13 that was GPIO 9, so the
++ * front sensor had no supply ("PM8998 VDIG switch NOT set", chip ID 000000, the stream "did not start", Camera's front
++ * camera dead), in a boot where the display had slept and the charger had been set before Camera was opened; in the
++ * boots of 2026-11-09/10 the front camera had asked earlier and worked. A full table now says so, once.
++ */
++#define SP_WCH_MAX 16
+ static struct { uint16_t apid; vm_offset_t va; } sp_wch[SP_WCH_MAX];
+ static unsigned sp_nwch;
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+@@ -346,6 +354,12 @@ sp_wch_map(uint16_t apid)
+ 		}
+ 	}
+ 	if (sp_nwch >= SP_WCH_MAX || sp_atomic) {
++		static bool told_full;
++		if (sp_nwch >= SP_WCH_MAX && !told_full) {
++			told_full = true;
++			printf("SWEET SPMI: all %u write channels are taken: APID %u gets none, its writes fail (raise SP_WCH_MAX)\n",
++			    SP_WCH_MAX, apid);
++		}
+ 		return 0;
+ 	}
+ 	vm_offset_t va = ml_io_map(SP_CHNL_PA + 0x10000u * apid, 0x1000);
