@@ -259,6 +259,7 @@ void charge_run(uintptr_t dtb)
 	int pw_woke = 0, keys_ok = 0, key_errs = 0, no_keys_told = 0, gone = 0, off_failed = 0;
 
 	con_str("ENXERTO", "off-mode charging");
+	power_storage_idle(1);	/* nothing here reads storage: let its link sleep */
 	pmic_rc = pmic_init();
 	backlight_init();
 	charge_ui_init();

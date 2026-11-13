@@ -7,6 +7,7 @@
 #include "charger.h"
 #include "fdt.h"
 #include "pmic.h"
+#include "ufs.h"
 
 #define PSCI_SYSTEM_OFF		0x84000008UL
 #define EVNT_BIT		13	/* CNTVCT bit whose 0 -> 1 edge is an event: every 2^14 ticks */
@@ -56,6 +57,11 @@ void power_idle_init(uintptr_t dtb)
 		__asm__ volatile("wfe" ::: "memory");
 	dt = (ticks() - t0) * 1000 / f;
 	idle_ok = dt >= 2 && dt <= 40;
+}
+
+void power_storage_idle(int on)
+{
+	(void)ufs_auto_hibernate(on ? POWER_UFS_IDLE_MS : 0);	/* refused while a request is outstanding: then as it was */
 }
 
 int power_idle_ok(void)

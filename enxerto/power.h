@@ -19,6 +19,14 @@
  *   power_nap is one event, under a millisecond: for polling loops.
  */
 void power_idle_init(uintptr_t dtb);
+/*
+ * The storage link asleep when idle (ufs.c auto-hibernate): about 80 mA less on the Mi 8 (`oem load`, 2026-11-13,
+ * docs/BERGAMOTA_POWER.md). power_storage_idle(1) at the start of the charging screen and of fastboot; fastboot turns
+ * it off for the length of a flash. (Stopping the MDP's frames while the screen is black was tried too: at most 20 mA,
+ * and the frames did not come back; not done.)
+ */
+#define POWER_UFS_IDLE_MS	10	/* as the iOS kernel (xnu 3054) */
+void power_storage_idle(int on);
 int power_idle_ok(void);
 void power_wait_ms(unsigned ms);
 void power_nap(void);
