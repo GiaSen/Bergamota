@@ -96,7 +96,8 @@ at block 0x2b8c00, 109643 MiB per the xnu driver log); `oem gpt` shows what was 
   the same 2 MiB (at the start, about a third and about two thirds of the partition) is read into both, the halves must be equal and must not hold the old pattern. `OKAYselftest passed` or a FAIL.
 - `oem ufsq:<1..8>`: commands kept in flight on UFS (default 8); `oem ufsq:1` turns pipelining off, a debugging knob if the multi-slot path misbehaves on hardware.
 - `reboot`, `reboot-bootloader`, `continue`: as before.
-- `oem poweroff` (2026-11-13, docs/BERGAMOTA_POWER.md, not yet run on a phone): OKAY, then the phone is powered off. So does Power held 3 s, and five minutes without a USB host on battery.
+- `oem poweroff` (2026-11-13, docs/BERGAMOTA_POWER.md): OKAY, then the phone is powered off (with a charger in, the PMIC starts it again into the charging screen). So does Power held 3 s, and five minutes without a USB host on battery (the last not yet tried).
+- `oem load[:<seconds>[:dark]]`: what the phone itself draws, measured on the battery with the USB input suspended for that long (INFO lines, a reading a second). `oem tune:ufsh8:<ms>`: the storage link's auto-hibernate idle time, 0 off.
 
 ### UFS driver (ufs.c) and DMA cache maintenance
 The SDM845 UFS host is **not cache coherent** (no `dma-coherent`; the kernel side had silent file corruption from exactly this, patch 0173 in docs/XNU11215_MIGRATION.md). The UFS node has

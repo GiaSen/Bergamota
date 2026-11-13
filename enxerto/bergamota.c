@@ -492,6 +492,107 @@ static void power_tick(void)
 	}
 }
 
+/*
+ * `oem load[:<seconds>[:dark]]`: what the phone itself draws while it waits. The charger's USB input is suspended
+ * (USBIN_CMD_IL bit 0, one of the charger registers pmic.c lets through), so the battery feeds the phone and the fuel
+ * gauge's current is the phone's own load; a reading a second, as INFO lines, then the input is put back. The wait
+ * between readings is the idle wait itself (WFE, or the spin with bergamota.idle=0), and "dark" blackens the screen for
+ * the test, so the four cases of docs/BERGAMOTA_POWER.md can be told apart on one port.
+ */
+#define R_USBIN_CMD_IL	0x1340u
+
+static const char *p_load_test(void *ctx, struct fb *fb, unsigned seconds, int dark)
+{
+	static char line[64];
+	struct pmic_batt b;
+	uint8_t il = 0;
+	int64_t sum = 0;
+	unsigned n = 0;
+
+	(void)ctx;
+	if (pmic_chg_read(R_USBIN_CMD_IL, &il))
+		return "charger not readable";
+	if (dark) {
+		con_rect(0, 0, FB_W, FB_H, 0xff000000U);
+		ui_dark = 1;
+	}
+	if (pmic_chg_write(R_USBIN_CMD_IL, il | 1u)) {
+		(void)pmic_chg_write(R_USBIN_CMD_IL, il);
+		ui_wake();
+		return "USB input not suspended";
+	}
+	{
+		struct sb l = { line, 0, 61 };
+		line[0] = 0;
+		sb_str(&l, "USB input suspended, waits ");
+		sb_str(&l, power_idle_ok() ? "in WFE" : "spinning");
+		sb_str(&l, dark ? ", screen black" : ", screen lit");
+		fb_info(fb, line);
+	}
+	power_wait_ms(2000);		/* the gauge's figure trails: let the charging current leave it */
+	for (unsigned s = 1; s <= seconds; s++) {
+		struct sb l = { line, 0, 61 };
+
+		power_wait_ms(1000);
+		pmic_read_batt(&b);
+		line[0] = 0;
+		sb_u(&l, s); sb_str(&l, " s: ");
+		if (b.valid && b.ma_valid) {
+			sb_str(&l, b.ma < 0 ? "-" : "+"); sb_u(&l, (uint64_t)(b.ma < 0 ? -b.ma : b.ma)); sb_str(&l, " mA ");
+			sb_u(&l, b.mv); sb_str(&l, " mV");
+			sum += b.ma;
+			n++;
+		} else {
+			sb_str(&l, "gauge not readable");
+		}
+		fb_info(fb, line);
+	}
+	int back = pmic_chg_write(R_USBIN_CMD_IL, il);
+	ui_wake();
+	enxerto_charger_tick(1);
+	if (n) {
+		struct sb l = { line, 0, 61 };
+		int64_t avg = sum / (int64_t)n;
+
+		line[0] = 0;
+		sb_str(&l, "mean "); sb_str(&l, avg < 0 ? "-" : "+"); sb_u(&l, (uint64_t)(avg < 0 ? -avg : avg));
+		sb_str(&l, " mA over "); sb_u(&l, n); sb_str(&l, " s");
+		fb_info(fb, line);
+	}
+	return back ? "USB input NOT put back: unplug and plug the cable" : 0;
+}
+
+/*
+ * `oem tune:<knob>:<value>`: knobs for measuring with `oem load` what each saving is worth.
+ *   ufsh8:<ms>    the storage link's auto-hibernate idle time, 0 off (ufs.c). Off does not wake a link that is
+ *                 already asleep: it stays so until the next storage command.
+ */
+static unsigned tune_num(const char *s)
+{
+	unsigned v = 0;
+
+	while (*s >= '0' && *s <= '9' && v < 100000)
+		v = v * 10 + (unsigned)(*s++ - '0');
+	return v;
+}
+
+static const char *p_tune(void *ctx, struct fb *fb, const char *arg)
+{
+	static char line[64];
+	struct sb l = { line, 0, 61 };
+
+	(void)ctx;
+	line[0] = 0;
+	if (starts(arg, "ufsh8:")) {
+		int rc = ufs_auto_hibernate(tune_num(arg + 6));
+
+		sb_str(&l, "AHIT "); sb_hex(&l, ufs_ahit());
+		fb_info(fb, line);
+		return rc ? "storage controller not ready or no auto-hibernate" : 0;
+	}
+	return "knobs: ufsh8:<ms>";
+}
+
 static void p_poweroff(void *ctx)
 {
 	(void)ctx;
@@ -719,6 +820,7 @@ static const char *p_flash_begin(void *ctx, const char *name, const uint8_t *img
 		return why;
 	last_summary[0] = 0;
 	fl_t0_ms = ms_now();
+	power_storage_idle(0);	/* a flash runs on the link as it always did: awake (p_flash_end lets it sleep again) */
 	if (g_stor.verify)
 		st_cached(0, 1, img, img + img_len);
 	return 0;
@@ -751,8 +853,10 @@ static const char *p_flash_end(void *ctx, const char *name, int ok)
 	(void)ctx;
 	if (g_stor.verify)
 		st_cached(0, 0, 0, 0);
-	if (!p)
+	if (!p) {
+		power_storage_idle(1);
 		return why;
+	}
 	if (ok)
 		e = stor_sync(&g_stor, p);	/* device write cache -> flash before anyone resets the phone */
 	if (ok && !e && fb) {
@@ -768,6 +872,7 @@ static const char *p_flash_end(void *ctx, const char *name, int ok)
 		for (unsigned i = 0; i < sizeof last_summary - 1 && line[i]; i++)
 			last_summary[i] = line[i], last_summary[i + 1] = 0;
 	}
+	power_storage_idle(1);
 	return e;
 }
 
@@ -937,6 +1042,7 @@ const char *bergamota_fastboot(uintptr_t dtb)
 
 	ui_start_ms = ms_now();
 	pw_armed = pw_down = ui_dark = 0;
+	power_storage_idle(1);	/* the storage link sleeps between commands (not during a flash) */
 	pw_poll_ms = host_ms = ui_start_ms;
 	(void)pmic_init();
 	con_str("USB", "starting controller...");
@@ -973,6 +1079,8 @@ const char *bergamota_fastboot(uintptr_t dtb)
 	pl.usb_speed = p_usb_speed;
 	pl.charger = p_charger;
 	pl.poweroff = p_poweroff;
+	pl.load_test = p_load_test;
+	pl.tune = p_tune;
 	fb_init(&fb, &tr, &pl);
 	g_fb = &fb;
 	ui_last_ms = ms_now();

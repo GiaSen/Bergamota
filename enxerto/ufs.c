@@ -99,6 +99,33 @@ static uint32_t be32(const uint8_t *p)
 	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
 }
 
+/*
+ * Auto-hibernate (UFSHCI 2.1 AHIT, as the iOS kernel's xnu 3054): after `ms` of idle the host puts the link into
+ * Hibern8 and wakes it by itself when the next doorbell is rung, so nothing else changes for the polled command path.
+ * On the Mi 8 the kernel measured about 100 mA less with it (screen off). 0 turns it off. Written only while no
+ * request is outstanding, whoever owns the request list (ABL's leftover state before ufs_init, ours after).
+ */
+#define REG_AHIT	0x18
+#define CAP_AUTOH8	(1u << 23)
+
+int ufs_auto_hibernate(unsigned ms)
+{
+	if (!(ufs_rd(REG_HCE) & 1) || !(ufs_rd(REG_HCS) & HCS_DP) || !(ufs_rd(REG_CAP) & CAP_AUTOH8))
+		return UFS_E_NOTREADY;
+	if (ufs_rd(REG_UTRLDBR))
+		return UFS_E_NOTREADY;
+	if (ms > 1023)
+		ms = 1023;
+	ufs_wr(REG_AHIT, ms ? ((3u << 10) | ms) : 0);	/* scale 3: 1 ms units */
+	__asm__ volatile("dsb sy" ::: "memory");
+	return 0;
+}
+
+uint32_t ufs_ahit(void)
+{
+	return ufs_rd(REG_AHIT);
+}
+
 int ufs_set_depth(int n)
 {
 	if (n < 1)

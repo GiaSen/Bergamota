@@ -1,8 +1,10 @@
 # Power off and idle power (Enxerto / Bergamota fastboot)
 
-Files: `enxerto/power.c` (power off, WFE waits), `enxerto/pmic.c` (`pmic_pshold_type`, `pmic_usb_present`), `enxerto/bergamota.c` (`power_tick`, `do_poweroff`),
-`enxerto/charge_mode.c` (`unplugged_off`), `oem poweroff` in `enxerto/fastboot.c`. Status (2026-11-13): builds for the Mi 8, host tests pass (525 checks);
-**nothing of this has run on a phone yet.** Test image: `enxerto/out/bergamota-fastboot-power.img`, `enxerto/out/charge-test-power.img` (`BOARD=dipper IMGSUFFIX=-power enxerto/build.sh`).
+Files: `enxerto/power.c` (power off, WFE waits, storage idle), `enxerto/pmic.c` (`pmic_pshold_type`, `pmic_usb_present`), `enxerto/bergamota.c` (`power_tick`,
+`do_poweroff`, `oem load`, `oem tune`), `enxerto/charge_mode.c` (`unplugged_off`), `enxerto/ufs.c` (`ufs_auto_hibernate`), `oem poweroff` in `enxerto/fastboot.c`.
+Status (2026-11-13): **run on the Mi 8 from RAM** (`fastboot boot` from Xiaomi's fastboot; results below), host tests pass (525 checks). **Not flashed to `boot` yet.**
+Test images: `enxerto/out/bergamota-fastboot-power.img`, `enxerto/out/charge-test-power.img` (`BOARD=dipper IMGSUFFIX=-power enxerto/build.sh`);
+`research/helpers/enxerto-ramboot.sh IMG` loads one without hands (Bergamota fastboot -> iOS -> `sweetreboot fastboot` -> Xiaomi's fastboot -> `fastboot boot IMG`).
 
 ## Why (user, 2026-11-13)
 "phone even with bergamota power off mode felt hot and battery was going down quickly; after turning off from twrp, it really got off".
@@ -11,8 +13,10 @@ their waits spinning one core (`while (ms_now() < end);`), the fastboot with its
 panel and the SoC still on, and neither looked at whether the cable was still in. A phone that ended up there on battery (iOS powered off and a charger put in
 later, a reset or a panic, a press of the power key away from the Mac) stayed on until the battery was empty. One measurement of old: in fastboot on a 1.5 A
 port the battery got +1.2 A (NOTES "BERGAMOTA FASTBOOT CHARGES AT +1.2 A"), so the phone itself took something like 2 W there.
-iOS's own power off (xnu 3074) is the PMIC sequence below and was seen to switch the phone off on 2026-11-07; with a charger in, the phone can come back by
-itself into the charging screen (ABL's charger path), which is where the heat was. TWRP's power off is Linux's same sequence; Linux only configures PM8998.
+iOS's own power off (xnu 3074) is the PMIC sequence below; TWRP's is Linux's same sequence (Linux only configures PM8998).
+**Seen on the phone, 2026-11-13:** a real power off with the cable in does not stay off: the PMIC starts the phone again (PON1: a charger is there) and ABL boots
+`boot` into the charging screen; the user: "bergamota power off mode with the charging screen and percentage". With the cable out the same power off stays off
+(Volume Down lights nothing). So a phone on a charger is never off, and the charging screen has to be cheap; a phone off the charger must be switched off.
 
 ## Power off (`power_off`)
 The charger registers back to what ABL left (`enxerto_charger_handoff`: while the phone is off the PMI8998 charges by itself, with its own limits, not our
@@ -37,14 +41,35 @@ on for every core) and checks it once: eight WFEs must take 2..40 ms. Then `powe
 two polls of the USB controller in fastboot's command wait) sit in WFE; if the check fails, or with `bergamota.idle=0` on the boot.img cmdline, the old spinning
 waits stay. Transfers and flashes do not nap.
 
-## To do on the phone (nothing below is done)
-1. RAM-boot the test image from Xiaomi's fastboot (`fastboot boot enxerto/out/bergamota-fastboot-power.img`; from iOS `sweetreboot bootloader` gets there):
-   does it start (a WFE that never returned would hang right here), `getvar`, a `boot` of an iOS image, a flash dry run.
-2. `fastboot oem poweroff` with the cable in: does the phone stay off, or does it come back into the charging screen (PM8998's PON1 was the reason of every
-   start seen so far, cable in)? Then Power held 3 s; then cable out and five minutes.
-3. `charge-test-power.img`: the screen, then pull the cable: off after 3 s?
-4. Battery current in fastboot and on the charging screen before and after (`getvar bergamota-battery`, the charging screen's own figure), and by hand: warm?
-5. iOS's power off on battery alone and with the cable in: which state the phone ends in, and `kern.sweet_pon_reasons` at the next start.
-6. Only then, with the user's word: flash it to `boot` (`tools/bergamota-flash.py`), and update README.
-Open, after measurements: stopping the MDP's autorefresh while the screen is black, lowering the CPU clock, switching the phone off for good once the charging
-screen has been shown (TWRP's night shows the PMI8998 charges a phone that is off; whether a power off with the cable in stays off is item 2).
+## Storage idle
+`power_storage_idle(1)` (UFSHCI auto-hibernate, AHIT = 10 ms, as xnu 3054) at the start of the charging screen and of fastboot: the link sleeps between commands
+and the host wakes it at the next doorbell. Off for the length of a flash (`p_flash_begin` / `p_flash_end`), so writes run on the link as they always did.
+
+## Measured on the Mi 8 (2026-11-13)
+`fastboot oem load[:<seconds>[:dark]]` suspends the charger's USB input (USBIN_CMD_IL bit 0) so the battery feeds the phone, and prints the fuel gauge's current
+once a second; `dark` blackens the screen for the test. Fastboot, Mac's port, battery 87-98 %:
+
+| build | screen lit | screen black |
+|---|---|---|
+| waits spinning (`bergamota.idle=0`: the old behaviour) | 311 mA | 277 mA |
+| waits in WFE | 256 mA | 231 mA |
+| WFE + storage link asleep (the final build; two runs each, the gauge wanders at these currents) | 109, 147 mA | 115, 87 mA |
+
+In one boot, in this order: black 185 mA, storage link asleep 105 mA. The readings drift down by tens of mA over minutes in a boot, so small steps cannot be
+told apart; the order of magnitude is what counts: about 1.2 W before, about 0.4-0.5 W now, in a state where the phone looks off.
+Storage after the link has slept: `oem gpt` (6 LUNs), `oem selftest:boot` OKAY, the same 16 MiB of userdata hashed three times with and without it: equal.
+**Tried and dropped:** stopping the MDP's autorefresh while the screen is black (PP_AUTOREFRESH_CONFIG = 0, then EN + CTL_START to resume): at most 20 mA, and the
+frames did not come back (black screen until the next start; the first try only looked fine because the panel still held the old picture). Linux turns the tear
+check off around the change and polls until the transfer has ended (`_sde_encoder_autorefresh_disable_seq1`); not attempted.
+
+## Tried on the phone (2026-11-13, RAM boots, the user at the phone)
+- The build starts (WFE check passes: "waits in WFE"), answers `getvar`, and RAM-boots iOS (`fastboot boot` of image 141, several times).
+- `fastboot oem poweroff`, cable in: OKAY, USB gone; the phone came back by itself into the (flashed, old) charging screen.
+- Fastboot, Power held 3 s: "POWERING OFF", then black.
+- Charging screen: dark after 20 s, Volume Down lights it again; cable out: "Unplugged: powering off", then black, and Volume Down lights nothing (really off).
+  Cable in again: the phone starts by itself into the charging screen.
+
+## Not tried
+The five minutes without a host (off on battery; black screen on a charger, then off when the charger goes); a wall charger; a flash through the new build (the
+storage link is awake for it, as before); iOS's own power off on battery alone; how warm the phone gets on the new charging screen over an hour.
+Open: lowering the CPU clock; the autorefresh stop done Linux's way; whether ABL's charger path can be told to keep the phone off.

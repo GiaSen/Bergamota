@@ -38,6 +38,9 @@ int ufs_init(void);
 const char *ufs_errstr(int rc);
 /* Commands in flight during a transfer: 1..8 (default 8). `oem ufsq:<n>`: 1 = no pipelining, for debugging on hardware. */
 int ufs_set_depth(int n);
+/* The link sleeps (Hibern8) after ms of idle and wakes at the next command; 0 = off. 0 or UFS_E_NOTREADY. */
+int ufs_auto_hibernate(unsigned ms);
+uint32_t ufs_ahit(void);	/* the AHIT register as it reads now */
 /* Called while waiting (screen refresh, USB keep-alive); may be NULL. */
 void ufs_set_idle(void (*fn)(void));
 

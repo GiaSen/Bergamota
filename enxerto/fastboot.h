@@ -68,6 +68,13 @@ struct fb_platform {
 	void (*display_info)(void *ctx, struct fb *fb);
 	/* getvar usb-speed: "high", "super", "full", ...; may be NULL */
 	const char *(*usb_speed)(void *ctx);
+	/*
+	 * `oem load[:<seconds>[:dark]]`: what the phone itself draws, measured on the battery with the USB input
+	 * suspended for that long (1..60 s, default 10); INFO lines through fb_info, NULL or an error text; may be NULL
+	 */
+	const char *(*load_test)(void *ctx, struct fb *fb, unsigned seconds, int dark);
+	/* `oem tune:<knob>:<value>`: measuring knobs (bergamota.c p_tune); NULL or an error text; may be NULL */
+	const char *(*tune)(void *ctx, struct fb *fb, const char *arg);
 	/* `oem poweroff`, after OKAY was sent: power the phone off (does not return on hardware); may be NULL */
 	void (*poweroff)(void *ctx);
 	/* getvar bergamota-charger (raw=0) / bergamota-charger-raw (raw=1) / bergamota-battery (raw=2): at most 47 characters into buf; may be NULL */

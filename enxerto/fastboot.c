@@ -629,6 +629,31 @@ static void fb_oem(struct fb *fb, const char *a)
 		if (fb->p->display_info)
 			fb->p->display_info(fb->p->ctx, fb);
 		fb_resp(fb, "OKAY", "");
+	} else if (fb_eq(a, "load") || fb_starts(a, "load:")) {
+		unsigned secs = 10;
+		int dark = 0, bad = 0;
+		const char *q = a + 4;
+
+		if (*q == ':') {
+			secs = 0;
+			for (q++; *q >= '0' && *q <= '9' && secs < 1000; q++)
+				secs = secs * 10 + (unsigned)(*q - '0');
+			if (*q == ':' && fb_eq(q + 1, "dark"))
+				dark = 1;
+			else if (*q)
+				bad = 1;
+		}
+		if (bad || secs < 1 || secs > 60) {
+			fb_resp(fb, "FAIL", "usage: oem load[:<1..60 s>[:dark]]");
+		} else if (!fb->p->load_test) {
+			fb_resp(fb, "FAIL", "no load test on this build");
+		} else {
+			const char *e = fb->p->load_test(fb->p->ctx, fb, secs, dark);
+			fb_resp(fb, e ? "FAIL" : "OKAY", e ? e : "");
+		}
+	} else if (fb_starts(a, "tune:")) {
+		const char *e = fb->p->tune ? fb->p->tune(fb->p->ctx, fb, a + 5) : "no knobs on this build";
+		fb_resp(fb, e ? "FAIL" : "OKAY", e ? e : "");
 	} else if (fb_eq(a, "poweroff")) {
 		if (fb->p->poweroff) {
 			fb_resp(fb, "OKAY", "powering off");
