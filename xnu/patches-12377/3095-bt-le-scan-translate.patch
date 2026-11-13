@@ -1,0 +1,277 @@
+diff --git a/bsd/dev/beryllium_bt_hci.c b/bsd/dev/beryllium_bt_hci.c
+index e6a377e..92a4deb 100644
+--- a/bsd/dev/beryllium_bt_hci.c
++++ b/bsd/dev/beryllium_bt_hci.c
+@@ -317,6 +317,233 @@ bt_hci_local_answer(const uint8_t *cmd, unsigned len)
+ 	return true;
+ }
+ 
++/*
++ * 3095: iOS 26's LE scanning. bluetoothd does not scan with the standard commands any more; with the Bluetooth page of
++ * Settings open (trace of 2026-11-13, sweetbtlog) the only scan traffic is Apple's Broadcom commands
++ *   0xfe37, 12 bytes:  01 00 01 02 CORE TYPE INTERVAL(2) WINDOW(2) 1e 00     scan parameters of one "core"
++ *                      (CORE 1 the main one, 2 the low power one; TYPE 1 active, 0 passive; 0.625 ms units:
++ *                      01 01 60 00 30 00 with "active scan (60.00ms/30.00ms)" in bluetoothd's log)
++ *   0xfe29, 9 bytes:   ENABLE 02 01 02 CORES 00 00 00 00                     scan on / off (CORES bit 0 main, bit 1 low
++ *                      power; 3 at a stop)
++ * The WCN3990 answers Unknown HCI Command, the compat layer above said success, and the controller never scanned: no LE
++ * Meta event at all, bluetoothd "0 Advertising Events", no LE device ever found by iOS (a Sony speaker that answers no
++ * classic inquiry, to the Mac's controller either, and advertises at -30 dBm: tools/sweetnet/hcitest -e heard it and 20
++ * others on the same controller). Now both are answered here and turned into the controller's own extended scan (it
++ * lists LE Extended Advertising; bluetoothd already uses the extended advertising commands, so the legacy scan commands
++ * would be refused): LE Set Extended Scan Parameters 0x2041 (own address random once bluetoothd has set one with 0x2005,
++ * every advertiser, the 1M PHY, the core's type, interval and window) and LE Set Extended Scan Enable 0x2042 (no
++ * duplicate filter, no duration). One scanner for the two cores: the main core's parameters while it is on, else the low
++ * power core's. A change is a short sequence (off, parameters, on), one command at a time; their Command Completes stay
++ * here, and bluetoothd gets its answer to 0xfe29 when the last one is in (or after BX_TIMEOUT_MS). HCI Reset forgets it all.
++ * The reports then come as the standard LE Extended Advertising Report (LE Meta 0x0d), which bluetoothd's event mask asks
++ * for. sweetbtlescan=0 keeps the old behaviour (both commands faked, nothing scans).
++ */
++#define BX_TIMEOUT_MS   1000u
++
++static struct {
++	unsigned mode;                  /* sweetbtlescan: 1 translate (default), 0 off */
++	struct { uint8_t type; uint16_t interval, window; bool have; } core[2];
++	uint8_t want;                   /* cores bluetoothd has on: bit 0 main, bit 1 low power */
++	uint8_t cur, target;            /* what the controller scans with: 0 nothing, 1 main, 2 low power */
++	bool random;                    /* a random address has been set (0x2005) */
++	uint8_t step[3][12];
++	uint8_t steplen[3];
++	unsigned nsteps, at;
++	bool busy, send;                /* a sequence runs; the RX thread sends step[at] at its next service */
++	uint8_t reply_p0;               /* the ENABLE byte of the 0xfe29 this sequence answers */
++	uint64_t t;
++	unsigned starts, stops, failed, timeouts;
++} bx = { .mode = 1 };
++
++static unsigned
++bt_fake_complete(uint8_t *ev, unsigned op, unsigned p0)
++{
++	ev[0] = 4;
++	ev[1] = 0x0e;
++	ev[2] = 4 + BT_COMPAT_PAD;
++	ev[3] = 1;
++	ev[4] = (uint8_t)op;
++	ev[5] = (uint8_t)(op >> 8);
++	ev[6] = 0;
++	ev[7] = (uint8_t)p0;
++	for (unsigned i = 8; i < 7 + BT_COMPAT_PAD; i++) {
++		ev[i] = 0;
++	}
++	return 7 + BT_COMPAT_PAD;
++}
++
++static void
++bx_send(void)
++{
++	bx.send = false;
++	bx.t = mach_absolute_time();
++	bt_log_pkt("TX (kernel)", bx.step[bx.at], bx.steplen[bx.at]);
++	if (!bt.ops->tx(bx.step[bx.at], bx.steplen[bx.at])) {
++		printf("SWEET BT: LE scan: UART transmit of opcode %#06x failed\n", bx.step[bx.at][1] | (bx.step[bx.at][2] << 8));
++	}
++}
++
++/* the steps from bx.cur to bx.target; false when there is nothing to do */
++static bool
++bx_plan(void)
++{
++	static const uint8_t off[10] = { 1, 0x42, 0x20, 6, 0, 0, 0, 0, 0, 0 };
++	unsigned n = 0;
++
++	if (bx.target == bx.cur) {
++		return false;
++	}
++	if (bx.cur != 0) {
++		memcpy(bx.step[n], off, sizeof(off));
++		bx.steplen[n++] = sizeof(off);
++	}
++	if (bx.target != 0) {
++		unsigned c = bx.target - 1;
++		unsigned interval = bx.core[c].have ? bx.core[c].interval : 0x60, window = bx.core[c].have ? bx.core[c].window : 0x30;
++		uint8_t *m = bx.step[n];
++
++		interval = interval < 4 ? 4 : interval;
++		window = window < 4 ? 4 : window > interval ? interval : window;
++		m[0] = 1; m[1] = 0x41; m[2] = 0x20; m[3] = 8;
++		m[4] = bx.random ? 1 : 0;       /* own address type */
++		m[5] = 0;                       /* every advertiser */
++		m[6] = 1;                       /* the 1M PHY */
++		m[7] = bx.core[c].have ? (bx.core[c].type & 1) : 1;
++		m[8] = (uint8_t)interval; m[9] = (uint8_t)(interval >> 8);
++		m[10] = (uint8_t)window; m[11] = (uint8_t)(window >> 8);
++		bx.steplen[n++] = 12;
++		memcpy(bx.step[n], off, sizeof(off));
++		bx.step[n][4] = 1;              /* enable; duplicates not filtered, no duration, no period */
++		bx.steplen[n++] = sizeof(off);
++	}
++	bx.nsteps = n;
++	bx.at = 0;
++	return true;
++}
++
++/* TX path: a command from bluetoothd. True when it was taken here (answered now or at the end of a sequence). */
++static bool
++bt_lescan_command(const uint8_t *cmd, unsigned len)
++{
++	uint8_t ev[7 + BT_COMPAT_PAD];
++	unsigned op;
++
++	if (!bt.compat || !bx.mode || len < 4 || cmd[0] != 1) {
++		return false;
++	}
++	op = cmd[1] | (cmd[2] << 8);
++	if (op == 0x0c03) {                     /* Reset: the controller forgets its scan, so do we */
++		bx.want = bx.cur = bx.target = 0;
++		bx.busy = bx.send = bx.random = false;
++		bx.core[0].have = bx.core[1].have = false;
++		return false;
++	}
++	if (op == 0x2005) {
++		bx.random = true;
++		return false;
++	}
++	if (op == 0xfe37 && len >= 16 && cmd[4] == 0x01 && (cmd[8] == 1 || cmd[8] == 2)) {
++		unsigned c = cmd[8] - 1;
++
++		bx.core[c].type = cmd[9];
++		bx.core[c].interval = (uint16_t)(cmd[10] | (cmd[11] << 8));
++		bx.core[c].window = (uint16_t)(cmd[12] | (cmd[13] << 8));
++		bx.core[c].have = true;
++		bt_hci_rx_packet(ev, bt_fake_complete(ev, op, cmd[4]));
++		return true;
++	}
++	if (op == 0xfe29 && len >= 9) {
++		uint8_t cores = cmd[8] & 3;
++
++		bx.want = cmd[4] ? (bx.want | cores) : (bx.want & (uint8_t)~cores);
++		if (bx.busy) {                  /* bluetoothd keeps one command in flight: not expected */
++			printf("SWEET BT: LE scan: 0xfe29 while a change is under way: answered at once\n");
++			bt_hci_rx_packet(ev, bt_fake_complete(ev, op, cmd[4]));
++			return true;
++		}
++		bx.target = (bx.want & 1) ? 1 : (bx.want & 2) ? 2 : 0;
++		if (!bx_plan()) {
++			bt_hci_rx_packet(ev, bt_fake_complete(ev, op, cmd[4]));
++			return true;
++		}
++		bx.reply_p0 = cmd[4];
++		bx.busy = true;
++		if (bx.target) {
++			bx.starts++;
++		} else {
++			bx.stops++;
++		}
++		if (bx.starts + bx.stops <= 8) {
++			unsigned c = bx.target ? bx.target - 1 : 0;
++			printf("SWEET BT: LE scan: bluetoothd's 0xfe29 %s cores %#x -> the controller scans %s%s (type %u, %u.%u ms every %u.%u ms)\n",
++			    cmd[4] ? "on" : "off", cores, bx.target == 0 ? "nothing" : bx.target == 1 ? "for the main core" :
++			    "for the low power core", bx.cur ? ", after stopping" : "", bx.core[c].type & 1,
++			    bx.core[c].window * 5 / 8, bx.core[c].window * 5 % 8 * 10 / 8, bx.core[c].interval * 5 / 8,
++			    bx.core[c].interval * 5 % 8 * 10 / 8);
++		}
++		bx_send();
++		return true;
++	}
++	return false;
++}
++
++/*
++ * RX path (under the UART lock): a Command Complete from the controller. False: not ours. True: it answers a step of the
++ * sequence; *len is 0 when it is to be dropped, or ev holds bluetoothd's answer to its 0xfe29 (the last step is in).
++ */
++static bool
++bt_lescan_event(const uint8_t *pkt, unsigned plen, uint8_t *ev, unsigned *len)
++{
++	unsigned op;
++
++	if (!bx.busy || plen < 7 || pkt[0] != 4 || pkt[1] != 0x0e) {
++		return false;
++	}
++	op = pkt[4] | (pkt[5] << 8);
++	if (op != (unsigned)(bx.step[bx.at][1] | (bx.step[bx.at][2] << 8))) {
++		return false;
++	}
++	if (pkt[6] != 0) {
++		bx.failed++;
++		printf("SWEET BT: LE scan: opcode %#06x status %#04x from the controller (%u so far)\n", op, pkt[6], bx.failed);
++	}
++	if (++bx.at < bx.nsteps && (pkt[6] == 0 || op == 0x2042)) {
++		bx.send = true;                 /* the RX thread sends the next one: no UART transmit under its lock */
++		*len = 0;
++		return true;
++	}
++	bx.cur = pkt[6] == 0 ? bx.target : 0;
++	bx.busy = false;
++	*len = bt_fake_complete(ev, 0xfe29, bx.reply_p0);
++	return true;
++}
++
++/* RX thread, no lock held: the next step of a sequence, or the end of one the controller did not answer */
++static void
++bt_lescan_service(void)
++{
++	uint64_t ns;
++
++	if (!bx.busy) {
++		return;
++	}
++	if (bx.send) {
++		bx_send();
++		return;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - bx.t, &ns);
++	if (ns >= (uint64_t)BX_TIMEOUT_MS * 1000000ull) {
++		uint8_t ev[7 + BT_COMPAT_PAD];
++
++		bx.timeouts++;
++		printf("SWEET BT: LE scan: opcode %#06x not answered in %u ms (%u so far): bluetoothd gets its answer anyway\n",
++		    bx.step[bx.at][1] | (bx.step[bx.at][2] << 8), BX_TIMEOUT_MS, bx.timeouts);
++		bx.busy = false;
++		bx.cur = 0;
++		bt_hci_rx_packet(ev, bt_fake_complete(ev, 0xfe29, bx.reply_p0));
++	}
++}
++
+ static unsigned
+ bt_hci_compat(uint8_t *p, unsigned len)
+ {
+@@ -417,7 +644,12 @@ bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
+ 		bt.rx_drop_nc++;
+ 		return;
+ 	}
+-	if (pkt[0] == 4 && len >= 7 && len <= 3 + 255 && (pkt[1] == 0x0e || pkt[1] == 0x0f)) {
++	if (bt_lescan_event(pkt, len, ev, &len)) {      /* 3095: a step of the kernel's own scan sequence */
++		if (len == 0) {
++			return;
++		}
++		pkt = ev;
++	} else if (pkt[0] == 4 && len >= 7 && len <= 3 + 255 && (pkt[1] == 0x0e || pkt[1] == 0x0f)) {
+ 		bt_pend_answered(pkt, len);
+ 		/* Command Complete / Status: bt_hci_compat may rewrite it (and make it longer) */
+ 		for (i = 0; i < len; i++) {
+@@ -455,6 +687,7 @@ void
+ bt_hci_rx_service(void)
+ {
+ 	bt_pend_check();
++	bt_lescan_service();
+ 	for (unsigned loops = 0; loops < 16; loops++) {
+ 		kern_ctl_ref ref;
+ 		uint32_t unit, rd;
+@@ -548,7 +781,7 @@ bt_tx_feed(const uint8_t *p, size_t n)
+ 		if (bt.txtotal != 0 && bt.txn == bt.txtotal) {
+ 			bt_log_pkt("TX", bt.txb, bt.txn);
+ 			bt_cmd_note(bt.txb, bt.txn);
+-			if (bt_hci_local_answer(bt.txb, bt.txn)) {
++			if (bt_lescan_command(bt.txb, bt.txn) || bt_hci_local_answer(bt.txb, bt.txn)) {
+ 				bt.tx_pkts++;
+ 			} else if ((bt_pend_set(bt.txb, bt.txn), bt.ops->tx(bt.txb, bt.txn))) {
+ 				bt.tx_pkts++;
+@@ -738,6 +971,7 @@ bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_bu
+ 	bt.compat = 2;
+ 	bt.err_budget = 64;
+ 	(void)PE_parse_boot_argn("sweetbtcompat", &bt.compat, sizeof(bt.compat));
++	(void)PE_parse_boot_argn("sweetbtlescan", &bx.mode, sizeof(bx.mode));
+ 	printf("SWEET BT: compat %u (unknown commands answered as success: %s)\n", bt.compat,
+ 	    bt.compat >= 2 ? "standard and Broadcom vendor" : bt.compat ? "standard only" : "off");
+ 	/* raw mode as bluetoothd would set it (cfmakeraw, 8N1, hw flow control); the speed is filled in on get */
