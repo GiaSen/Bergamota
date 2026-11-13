@@ -19,6 +19,8 @@
 #include "bootui.h"
 #include "cache.h"
 #include "charger.h"
+#include "pmic.h"
+#include "power.h"
 #include "console.h"
 #include "display.h"
 #include "fastboot.h"
@@ -368,6 +370,8 @@ static void ui_update(void)
 	ui_diag(st, st != USB_ST_CONFIGURED && now - ui_start_ms > 20000);
 }
 
+static int ui_dark;	/* the idle screen saver (power_tick below): nothing is drawn while it is set */
+
 /* Cheap enough to call from every wait loop: updates at most every 250 ms. */
 static void ui_tick(void)
 {
@@ -376,7 +380,8 @@ static void ui_tick(void)
 		return;
 	ui_last_ms = t;
 	enxerto_charger_tick(0);	/* re-plug / APSD / temperature re-check, at most every 5 s */
-	ui_update();
+	if (!ui_dark)		/* the idle screen saver (power_tick) */
+		ui_update();
 }
 
 /* ---- transport + platform callbacks ---- */
@@ -391,6 +396,107 @@ static void p_charger(void *ctx, int raw, char *buf, unsigned n)
 		enxerto_charger_raw(buf, n);
 	else
 		enxerto_charger_status(buf, n);
+}
+
+/*
+ * ---- power (docs/BERGAMOTA_POWER.md) ----
+ * Bergamota fastboot used to wait for ever, one core spinning and the screen lit, cable or not. Now, while it waits
+ * for a command (never during a transfer or a flash): Power held FB_OFF_HOLD_MS powers the phone off (the key must
+ * have been seen up first: the press that started the phone does not count); FB_IDLE_MS without a USB host power it
+ * off on battery, and on a charger (a wall charger, a sleeping computer) only darken the screen, black pixels being
+ * off pixels on the Mi 8's AMOLED: USB stays up, and a host or a key lights the screen again; and the wait itself
+ * naps in WFE (power.c).
+ */
+#define FB_KEY_MS	50
+#define FB_OFF_HOLD_MS	3000
+#define FB_IDLE_MS	(5 * 60 * 1000)
+
+static uint64_t pw_poll_ms, pw_down_ms, host_ms;
+static int pw_armed, pw_down;
+
+static void ui_wake(void)
+{
+	if (!ui_dark)
+		return;
+	ui_dark = 0;
+	fbui_init(entry_why);
+	ui_last_ms = 0;
+	ui_tick();
+}
+
+static void do_poweroff(const char *detail)
+{
+	ui_wake();
+	fbui_status("POWERING OFF", detail, FBUI_NOBAR, LABEL);
+	con_str("POWER", "off");
+	/* a key held through the shutdown would start the phone again */
+	for (uint64_t t0 = ms_now(); ms_now() - t0 < 8000;) {
+		unsigned k = pmic_keys();
+		if ((k & PMIC_KEY_ERR) || !(k & PMIC_KEY_POWER))
+			break;
+		power_wait_ms(20);
+	}
+	power_wait_ms(300);
+	usb_dwc3_stop();
+	(void)power_off();
+	/* still on, and USB is stopped: say why, then restart into a working fastboot */
+	fbui_error(power_off_why(), "could not power off: restarting in 8 s");
+	delay_ms(8000);
+	hw_reset(RESTART_REBOOT);
+}
+
+static void power_tick(void)
+{
+	uint64_t t = ms_now();
+	enum usb_state st = usb_dwc3_state();
+
+	if (st == USB_ST_RESET || st == USB_ST_ADDRESSED || st == USB_ST_CONFIGURED) {
+		host_ms = t;
+		ui_wake();
+	}
+	if (t - pw_poll_ms < FB_KEY_MS)
+		return;
+	pw_poll_ms = t;
+	unsigned k = pmic_keys();
+	if (!(k & PMIC_KEY_ERR)) {
+		if (ui_dark && (k & (PMIC_KEY_POWER | PMIC_KEY_VOLDN))) {
+			host_ms = t;		/* a key: light the screen, five more minutes */
+			ui_wake();
+			pw_armed = 0;		/* and this press is not the start of a power off */
+		}
+		if (!(k & PMIC_KEY_POWER)) {
+			pw_armed = 1;
+			pw_down = 0;
+		} else if (k & PMIC_KEY_VOLDN) {
+			pw_down = 0;		/* Power + Volume Down is the PMIC's own way to the bootloader: not ours */
+		} else if (pw_armed && !pw_down) {
+			pw_down = 1;
+			pw_down_ms = t;
+		} else if (pw_armed && t - pw_down_ms >= FB_OFF_HOLD_MS) {
+			do_poweroff("release the power key");
+		}
+	}
+	if (!ui_dark && t - host_ms >= FB_IDLE_MS) {
+		int usb = pmic_usb_present();
+
+		if (usb == 0) {
+			do_poweroff("no USB host for 5 minutes, on battery");
+		} else if (usb == 1) {
+			con_rect(0, 0, FB_W, FB_H, 0xff000000U);
+			ui_dark = 1;
+		} else {
+			host_ms = t;	/* PMIC unreadable: ask again in five minutes */
+		}
+	} else if (ui_dark && t - host_ms >= FB_IDLE_MS && pmic_usb_present() == 0) {
+		do_poweroff("unplugged");	/* dark on a charger, and the charger is gone */
+	}
+}
+
+static void p_poweroff(void *ctx)
+{
+	(void)ctx;
+	delay_ms(300);		/* the OKAY has completed on the wire */
+	do_poweroff("fastboot oem poweroff");
 }
 
 static int t_recv_cmd(void *ctx, char *buf, unsigned max)
@@ -427,6 +533,8 @@ static void p_idle(void *ctx, struct fb *fb)
 	(void)ctx;
 	(void)fb;
 	ui_tick();
+	power_tick();
+	power_nap();	/* under a millisecond in WFE between two polls of the USB controller */
 }
 
 /* [off, off + size) of the SWEETXNU payload inside the download, or a reason. */
@@ -828,6 +936,9 @@ const char *bergamota_fastboot(uintptr_t dtb)
 	int use_smmu = !(smmu_opt && *smmu_opt == '0');
 
 	ui_start_ms = ms_now();
+	pw_armed = pw_down = ui_dark = 0;
+	pw_poll_ms = host_ms = ui_start_ms;
+	(void)pmic_init();
 	con_str("USB", "starting controller...");
 	int rc = usb_dwc3_init(use_smmu);
 	if (rc) {
@@ -861,6 +972,7 @@ const char *bergamota_fastboot(uintptr_t dtb)
 	pl.display_info = p_display_info;
 	pl.usb_speed = p_usb_speed;
 	pl.charger = p_charger;
+	pl.poweroff = p_poweroff;
 	fb_init(&fb, &tr, &pl);
 	g_fb = &fb;
 	ui_last_ms = ms_now();

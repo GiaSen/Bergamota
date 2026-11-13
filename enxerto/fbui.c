@@ -93,7 +93,7 @@ void fbui_init(const char *entry)
 	art_image(num, (FB_W - art_image_w(num)) / 2, STAGE_NUM_Y, ID_WHITE);
 	art_stage_front(STAGE_PORTRAIT_W, 0, FB_H);
 	art_pill(FB_W / 2, STAGE_PILL_Y, ID_LEAF, ID_PAPER, "FASTBOOT");
-	art_text_centered(ART_MONO22, HINT_Y, ID_PAPER, "Hold Power + Volume Down for the bootloader");
+	art_text_centered(ART_MONO22, HINT_Y, ID_PAPER, "Hold Power 3 s to power off, Power + Volume Down for the bootloader");
 	entry_txt[0] = 0;
 	if (entry) {
 		int i = 0;

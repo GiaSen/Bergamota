@@ -14,12 +14,15 @@
 #include "fbui.h"
 #include "fdt.h"
 #include "pmic.h"
+#include "power.h"
 #include "usb_power.h"
 
 #define POLL_MS		40
 #define BATT_MS		5000
 #define IDLE_MS		20000
 #define HOLD_MS		2000
+#define USB_MS		1000	/* how often the cable is looked at */
+#define UNPLUG_MS	3000	/* the cable gone this long: power off (2026-11; the screen used to run on, on battery) */
 #define BLACK		0xff000000U
 
 static uint64_t ms_now(void)
@@ -30,11 +33,10 @@ static uint64_t ms_now(void)
 	return t / (f / 1000);
 }
 
+/* WFE between timer events once power_idle_init has checked them (power.c); the old spin otherwise */
 static void delay_ms(unsigned ms)
 {
-	uint64_t end = ms_now() + ms;
-	while (ms_now() < end)
-		;
+	power_wait_ms(ms);
 }
 
 static int starts(const char *s, const char *p)
@@ -217,14 +219,44 @@ static void enter_fastboot(uintptr_t dtb)
 	draw_diag();
 }
 
+/*
+ * The cable is out: off, for real (power.c). Before 2026-11 this loop ran on, screen dark, one core spinning, until the
+ * battery was empty. Returns only if the phone could not be powered off; the screen then says so and the loop goes on.
+ */
+static void unplugged_off(void)
+{
+	static char why_buf[96];
+	struct sb nb = { why_buf, 0, sizeof why_buf };
+
+	if (!screen_on)
+		wake();
+	charge_ui_notice("Unplugged: powering off", TEXT);
+	delay_ms(1500);
+	for (uint64_t t0 = ms_now(); ms_now() - t0 < 8000;) {	/* a key held through the shutdown starts the phone */
+		unsigned k = pmic_keys();
+		if ((k & PMIC_KEY_ERR) || !(k & PMIC_KEY_POWER))
+			break;
+		delay_ms(20);
+	}
+	if (pmic_usb_present() == 1) {		/* plugged back in while we waited */
+		charge_ui_notice("", TEXT);
+		return;
+	}
+	(void)power_off();
+	why_buf[0] = 0;
+	sb_str(&nb, "could not power off: ");
+	sb_str(&nb, power_off_why());
+	charge_ui_notice(why_buf, FBUI_ERR_COLOR);
+}
+
 
 /* ---- main loop ---- */
 
 void charge_run(uintptr_t dtb)
 {
-	uint64_t t = ms_now(), last_batt = t - BATT_MS, last_input = t, pw_t0 = 0;
+	uint64_t t = ms_now(), last_batt = t - BATT_MS, last_input = t, pw_t0 = 0, last_usb = t, gone_ms = 0;
 	unsigned raw_prev = 0, stable = 0, pw = 0, vd = 0;
-	int pw_woke = 0, keys_ok = 0, key_errs = 0, no_keys_told = 0;
+	int pw_woke = 0, keys_ok = 0, key_errs = 0, no_keys_told = 0, gone = 0, off_failed = 0;
 
 	con_str("ENXERTO", "off-mode charging");
 	pmic_rc = pmic_init();
@@ -286,6 +318,24 @@ void charge_run(uintptr_t dtb)
 			last_batt = t;
 			enxerto_charger_tick(0);
 			refresh();
+		}
+		/* the cable: only a successful read that says "out" counts, and only after UNPLUG_MS of it */
+		if (t - last_usb >= USB_MS) {
+			last_usb = t;
+			int usb = pmic_rc ? -1 : pmic_usb_present();
+			if (usb != 0) {
+				gone = 0;
+				if (usb == 1)
+					off_failed = 0;
+			} else if (!gone) {
+				gone = 1;
+				gone_ms = t;
+			} else if (t - gone_ms >= UNPLUG_MS && !off_failed) {
+				unplugged_off();
+				off_failed = 1;		/* still here: do not try again until a cable has been in */
+				gone = 0;
+				last_input = ms_now();
+			}
 		}
 		if (screen_on && keys_ok && t - last_input >= IDLE_MS)
 			blank();

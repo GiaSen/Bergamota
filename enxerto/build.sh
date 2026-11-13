@@ -58,7 +58,7 @@ case ${BERGAMOTA:-} in
 1) CMDLINE="$CMDLINE bergamota.fastboot=1" ;;
 0) CMDLINE="$CMDLINE bergamota.fastboot=0" ;;
 esac
-SRCS="start.S enxerto.c console.c artdraw.c bootui.c fbui.c mmu.c fdt.c loader.c ufs.c inflate.c usb_dwc3.c usb_power.c fastboot.c sparse.c storage.c blake2b.c bergamota.c pmic.c charge.c charge_mode.c charger.c display.c"
+SRCS="start.S enxerto.c console.c artdraw.c bootui.c fbui.c mmu.c fdt.c loader.c ufs.c inflate.c usb_dwc3.c usb_power.c fastboot.c sparse.c storage.c blake2b.c bergamota.c pmic.c power.c charge.c charge_mode.c charger.c display.c"
 OBJS=""
 for f in $SRCS; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o

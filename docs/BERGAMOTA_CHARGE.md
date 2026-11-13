@@ -17,6 +17,7 @@ power-on reason, so a warm reboot from iOS would be misdetected. Normal boots: o
 - Keys (PM8998 PON INT_RT_STS 0x810, SID 0, polled every 40 ms, two equal samples): bit0 KPDPWR (Power), bit1 RESIN (Volume Down), as in the kernel's SWEET KEYS.
   Power short = blank/wake toggle; Power hold 2 s = leave charging mode, the normal flow in `enxerto_main` continues (iOS payload, or Bergamota fastboot if none).
   Volume Down = `usb_power_up()` + `bergamota_fastboot()` (USB is only started now; if fastboot cannot start/ends, the charging screen returns with a red notice). While the screen is dark, any key only wakes it.
+- Since 2026-11-13 (docs/BERGAMOTA_POWER.md, not yet run on a phone): the cable out for 3 s powers the phone off (before, the screen ran on, on battery, until it was empty), and the loop waits in WFE instead of spinning.
 - Idle 20 s: WLED brightness ramps to 0 (quadratic, 5 steps) and the value found is restored on wake. If WLED cannot be read/written/read back (APID not EE0-owned, MOD_EN off) the panel is blanked with black pixels and the UI is redrawn on wake. If WLED is enabled but at 0 when we start, it is lit at 0x7ff.
 - If the arbiter lookup fails: screen shows `--%` / "Battery info unavailable", keys are then unreadable too: the screen stays on with the notice "hold Power 10 s to restart".
 
