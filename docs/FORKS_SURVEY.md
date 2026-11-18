@@ -142,3 +142,57 @@ oosexgang/hakios-xnu-kernel (pushed 2026-11-04) `userland/src/audio_plugin.c` (M
  - Their answer to "no speaker protection without the vendor's DSP algorithm" is `hakios.guard.c`: a 200 Hz second-order Butterworth high-pass, the speaker power averaged over 0.2 s / 3 s / 60 s with limits 3 / 6 / 9 dB under a full-scale sine at the vendor's loudest level, a peak limiter at -3 dB (43 ms release), a monitor reduction (cold amplifier, low battery), and up to +12 dB of gain in front to make up for Darwin's chain. A better replacement for our flat -12 dB ceiling; being APSL kernel code, re-implement the idea (SweetSpeaker can do it in floating point) and credit them.
  - Their own review's lessons that apply to us: stop paths must not leave the amp up on a failed I2C step (ours pulls the reset line, fine); a NaN volume must not mean loudest (ours clamps NaN to full scale, still under the ceiling); a failed DSP submission must be retried (ours is).
  - Earlier sections still worth a look for the Mi 8: B (Lrdsnow's "raise CPU frequency only up to 85%" thermal guard), B (ibragruslan 0081: HFS hotfile recording off; our 0026-sweet-builtin-hfs builds hfs_hotfiles.c and nothing turns it off: check whether it is active on the non-journaled iOSRoot before blaming it for anything).
+
+## H. Third survey for the Mi 8 (dipper), 2026-11-18 (read-only)
+
+Activity since section G (2026-11-04), checked through the GitHub API and two shallow clones in `research/` (gitignored):
+`research/hakios-xnu-kernel` (oosexgang main, 63fc2b4, 2026-11-06) and `research/hakios-fajita-kernel`
+(kiwiiiii-eth/hakios-xnu-kernel branch `fajita`, b47c5df, 2026-11-16).
+
+### H0. Nothing new for us
+- **Upstream ry-diffusion/Bergamota:** no push since 2026-10-26. `develop` is fully contained in `dipper` (every
+  difference is ours); `git cherry` finds only content-equivalent or unrelated commits on the other branches (iOS 18-era
+  history on `main`, the app's identity redesign, CI caching); its touch boost (11215 0217) is our 12377
+  `0218-beryllium-input-boost.patch`. ry-diffusion/Chlorophyll: no push since 2026-10-26.
+- No new commits since 11-04: HeliumStudio-Dev/hackios-xnu-kernel, yfl520/hackios-raphael, MakrSas/ios-topaz,
+  dipa-studio/ios-sweet, anonbeat1/ios-sweet. Gone (404): dipa-studio/ios-extra, Lrdsnow/ios-froggerpro, ibragruslan/ios-sweet.
+- **edi194/ios-fajita** (OnePlus 6T, SDM845), branch `brg-port`: imports Bergamota develop 37a7a7a and is where we were in
+  late October (QSEED3, Chlorophyll on the a630, RMI4 touch, the red rdar status bar it calls a MobileGestalt problem).
+  `main`: a630 SMMU-fault debugging, APSS watchdog readout, reboot-to-fastboot through ABL.
+- **JaneAwA/polaris-ios14** (Mi MIX 2S, SDM845): early pmap/TLB bring-up on iOS 14's kernel.
+- **oosexgang/hakios-xnu-kernel** main: hakios-metal moved into the kernel tree (`hakios-metal/`), CoreAnimation
+  pipeline variants, touch read every poll with a finger down; branch `mtk` (MediaTek). Their own SDM845 port (below)
+  reports 55-60 fps scrolling on the a630, like ours: no GPU lead for this SoC.
+
+### H1. kiwiiiii-eth/hakios-fajita: OnePlus 6T (SDM845) on HakiOS, iOS 16.5, Beta 0.6.1 (2026-11-16)
+https://github.com/kiwiiiii-eth/hakios-fajita (configs, kit, docs; repo licence NOASSERTION) + kernel and drivers in
+https://github.com/kiwiiiii-eth/hakios-xnu-kernel/tree/fajita. HakiOS's LICENSE: `drivers/` and `xnu/files/` are APSL 2.0
+(as our XNU patches), `userland/src/`, `tools/`, docs are MIT: usable with their notices / credit. Their status table vs
+ours: ahead on **location (GPS)**, a **temperature guard**, the main camera's **OIS**; behind on USB to a computer, the
+sensors, Bluetooth audio, the telephoto; no calls either.
+- **GPS (gnss=1, 11-14), the most useful:** kernel `drivers/modem/hakios.mpss845.c` (APSL) "GNSS" section: a QMI LOC
+  (service 16) client over QRTR: LOC_INFORM_CLIENT_REVISION 0x20 (rev 2), LOC_REGISTER_EVENTS 0x21 (0x185: position
+  report, NMEA, engine and session state), LOC_SET_OPERATION_MODE 0x4a (standalone), LOC_SET_NMEA_TYPES 0x3e, LOC_START
+  0x22 (one fix a second), reports 0x24 / NMEA 0x26 (ids from libqmi's qmi-service-loc.json); the fix in sysctls.
+  `userland/src/gnssfeed.m` (MIT, 111 lines) hands it to locationd through CoreLocation's `CLSimulationManager` (Xcode's
+  simulated location; entitlement `com.apple.locationd.simulation`) and turns Location Services on. Reported: 23
+  satellites in view indoors, Safari's geolocation gets a position; Apple Maps needs activation. For us the QMI half could
+  live in user space next to `sweetcelld` (the kernel already passes QMI through).
+- **Temperature guard:** `drivers/power/hakios.thermal.c` (APSL, 323 lines, boot-arg thermal=1): reads only, the two
+  TSENS blocks' status words (dt tsens@c222000 / c223000, qcom,tsens26xx: 15 + 12 sensors, bits 11:0 tenths of a degree
+  signed, bit 21 valid; already calibrated by the secure side); limits from the phone's DT thermal-zones
+  (`tools/dt-thermal.py`, MIT); log, sysctls, slow CPU/GPU, stop when too hot.
+- **Camera colour:** `tools/camtuning.py` (MIT, 152 lines) reads the phone's `com.qti.tuned.<maker>_<sensor>.bin`
+  ("ParameterParser V1.1.0", our files' layout too): colour matrices per lux and CCT range, lens shading (17x13 per
+  channel and CCT), AWB's ten reference lights (10000 K ... candle); consumed by `userland/src/camera_isp.c` (MIT).
+  Our vendor partition has semco/liteon_imx363, semco/liteon_s5k3m3, qtech/sunny_s5k3t1.
+- **Camera notes** (`docs/camera-port-notes.md`): main OIS = BU24218GWL at 0x3E (CCI 0, VAF L21 2.85 V, GPIO 40; init
+  a 2580-byte program + EEPROM calibration), lens motors SA3103 / LC898217XC, CamX resolutionData word layout.
+- **Their "hard parts"** (`docs/hard-parts.md`) worth knowing: ABL leaves the charge current at 0 (ours sets 1.7 A);
+  wifid's auto-join RSSI floor from APPLE80211_IOC_RSSI_BOUNDS (ours rejoins); a PMIC RTC restarted from zero after a
+  forced restart sent the clock hours back (offset kept with its count); mobileactivationd stalls behind Safari.
+
+### H2. Other new ports (not SDM845, little to take)
+hakios-thyme-mi10s, xm6661885/hakios-xnu-kernel-umi-fixes, suryastark6/ios-alioth (SM8250), qdizax-w/hakios-sm7125,
+oosexgang/hakios-sm7325 and hakios-mt6768, limonetexd/ios-sweet-gpu (A618 Metal), karthiknathan98-tech/A50s_IOS
+(Bergamota's layout on an Exynos), wuxianlin/hackios-os_devices_oneplus-dodge.
