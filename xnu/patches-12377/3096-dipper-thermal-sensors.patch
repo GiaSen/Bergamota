@@ -1,0 +1,483 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index fb626d9..b41d1e2 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -120,6 +120,7 @@ bsd/dev/sweet_a630_pas.c			standard
+ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/dipper_audio.c		standard
+ bsd/dev/dipper_haptics.c	standard
++bsd/dev/sweet_thermal.c	standard
+ bsd/dev/dipper_sensors.c	standard
+ bsd/dev/dipper_camera.c	standard
+ bsd/dev/sweet_80211.c			standard
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+new file mode 100644
+index 0000000..d94d65a
+--- /dev/null
++++ b/bsd/dev/sweet_thermal.c
+@@ -0,0 +1,445 @@
++/*
++ * Mi 8 (dipper, SDM845): the chip's temperature sensors and the battery's, READ ONLY (3096).
++ *
++ * Until now nothing in this kernel knew a temperature. This file only looks: sysctl kern.sweet_thermal, a line in the
++ * log when the chip gets warm. It slows nothing down and stops nothing; a guard that does comes on top of these numbers.
++ *
++ * The sensors (the phone's own device tree, dtb/dipper/live.dtb, /soc/thermal-zones and the two qcom,sdm845-tsens
++ * nodes): two blocks that measure by themselves all the time and keep each sensor's last reading in a status word:
++ *   tsens@c222000, readings at 0x0c263000: 0 aoss0, 1-4 the four Cortex-A55 ("silver"), 5-6 the L3 cache, 7-10 the four
++ *                                          Cortex-A75 ("gold"), 11-12 the GPU
++ *   tsens@c223000, readings at 0x0c265000: 0 aoss1, 1 modem DSP, 2 memory (stacked on the chip), 3 Wi-Fi, 4 HVX, 5 camera,
++ *                                          6 multimedia, 7 modem core
++ * Status word of sensor n at +0xa0 + 4 * n (Linux drivers/thermal/qcom/tsens-v2.c, register facts only): bits 11:0 the
++ * temperature in tenths of a degree, signed; bit 21 "valid". The blocks are calibrated and started by the boot loaders;
++ * nothing is written here, no interrupt is taken, no threshold is set. Two other ports read the same words on this
++ * chip: HakiOS's drivers/power/hakios.thermal.c (OnePlus 6T) and youzjuzi/dipper-xnu's thermgov (this phone).
++ * The vendor's own limits, from the same thermal-zones, for whoever reads the numbers: the chip's CPU limiter 95 C,
++ * GPU 95, memory 95, cores taken offline at 110.
++ *
++ * The battery: the PMI8998 fuel gauge's temperature word (SPMI slave 2, 0x4150/0x4151, 11 bits in quarter kelvins, as
++ * Linux's qpnp-fg-gen3 reads BATT_INFO_BATT_TEMP), the thermistor in the battery pack: the nearest thing to "how warm is
++ * the phone in the hand" that needs no ADC. Read every TS_BATT_EVERY passes; a value outside -30..100 C counts as none.
++ *
++ * A reading of the chip is believed with its valid bit and between -40 and 150 C; anything else is left out.
++ * Every second with the display on, every 5 s with it off (sweetthermal_ms= changes the first).
++ *
++ * sysctl kern.sweet_thermal (read-only string, format "v1"; lines separated by '\n', words key=value):
++ *   line 1:  sweet_thermal v1 state=<on|off|unmapped> period_ms=<now> reads=<passes> good=<sensors with a reading in the
++ *            last pass> invalid=<readings left out since boot> max_mc=<hottest sensor of the chip, millidegrees>
++ *            hottest=<its name> cpu_mc=<hottest core> gpu_mc=<hotter GPU sensor> batt_mc=<battery, -273000: none>
++ *            peak_mc=<highest max_mc since boot or the last reset> peak=<that sensor> peak_batt_mc=<same for the battery>
++ *   line 2:  now <name>=<degrees with one decimal> ... (every sensor that has a reading)
++ *   line 3:  peak <name>=<degrees> ... (each sensor's highest)
++ *   line 4:  boot int_en0= crit_mask0= thr0_s0= crit0_s0= thr0_s7= crit0_s7= int_en1= ... : each block's interrupt enable,
++ *            critical interrupt mask and the threshold words of its sensors 0 and 7 as the boot loaders left them (raw)
++ * sysctl kern.sweet_thermal_max_mc (int): the hottest sensor of the chip in millidegrees, -273000 before the first pass.
++ * sysctl kern.sweet_thermal_reset (write anything): forget the peaks, to measure one activity.
++ * sysctl kern.sweet_thermal_ms: the period with the display on, 100..60000; 0 pauses the reading (the values then read
++ *   "none", the thread looks every 5 s whether it may go on): for measuring what the reading itself costs.
++ * For other drivers: sweet_thermal_max_mc, sweet_thermal_cpu_mc, sweet_thermal_gpu_mc, sweet_thermal_batt_mc.
++ *
++ * Boot-args:
++ *   sweetthermal=0           off (default on, Mi 8 only)
++ *   sweetthermal_ms=<n>      period with the display on, 100..60000 (default 1000)
++ *   sweetthermal_log=<s>     a summary line this often (default 600; 0: only the warm lines)
++ * Log lines start with "SWEET THERMAL:": at the start every sensor and the blocks' interrupt and threshold words as the
++ * boot loaders left them (raw, for later); from 60 C up one each time the hottest sensor passes another 5 C (once per
++ * warm spell, which ends under 55 C) and one a minute while it stays warm. A report is three lines (the console cuts
++ * a line at 255 characters): the summary, then the sensors of each block.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_board.h"
++#include "sweet_spmi.h"
++
++extern void thread_set_thread_name(thread_t th, const char *name);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_fb_display_off;
++void sweet_thermal_init(void);
++
++#define TS_TM0_PA               0x0c263000u
++#define TS_TM1_PA               0x0c265000u
++#define TS_TM_SIZE              0x1000u         /* the DT gives 0x1ff; one page */
++#define TS_INT_EN               0x004u          /* raw words, logged once */
++#define TS_CRIT_INT_MASK        0x01cu
++#define TS_UPLOW_THRESHOLD(n)   (0x020u + 4u * (n))
++#define TS_CRIT_THRESHOLD(n)    (0x060u + 4u * (n))
++#define TS_STATUS(n)            (0x0a0u + 4u * (n))
++#define TS_VALID                (1u << 21)
++#define TS_MIN_TENTHS           (-400)
++#define TS_MAX_TENTHS           1500
++#define TS_NONE_MC              (-273000)
++#define TS_OFF_PERIOD_MS        5000u
++#define TS_WARM_TENTHS          600             /* log from here up: each 5 C once per warm spell, and every TS_WARM_LOG_S */
++#define TS_WARM_LOG_S           60u
++#define TS_BATT_SID             2u              /* PMI8998 */
++#define TS_BATT_TEMP            0x4150u
++#define TS_BATT_EVERY           5u
++
++enum { TS_G_OTHER, TS_G_LITTLE, TS_G_BIG, TS_G_GPU };
++
++static const struct ts_sensor {
++	const char *name;
++	uint8_t block, number, group;
++} ts_sensors[] = {
++	{ "aoss0", 0, 0, TS_G_OTHER },
++	{ "cpu0-silver", 0, 1, TS_G_LITTLE },
++	{ "cpu1-silver", 0, 2, TS_G_LITTLE },
++	{ "cpu2-silver", 0, 3, TS_G_LITTLE },
++	{ "cpu3-silver", 0, 4, TS_G_LITTLE },
++	{ "kryo-l3-0", 0, 5, TS_G_OTHER },
++	{ "kryo-l3-1", 0, 6, TS_G_OTHER },
++	{ "cpu0-gold", 0, 7, TS_G_BIG },
++	{ "cpu1-gold", 0, 8, TS_G_BIG },
++	{ "cpu2-gold", 0, 9, TS_G_BIG },
++	{ "cpu3-gold", 0, 10, TS_G_BIG },
++	{ "gpu0", 0, 11, TS_G_GPU },
++	{ "gpu1", 0, 12, TS_G_GPU },
++	{ "aoss1", 1, 0, TS_G_OTHER },
++	{ "mdm-dsp", 1, 1, TS_G_OTHER },
++	{ "ddr", 1, 2, TS_G_OTHER },
++	{ "wlan", 1, 3, TS_G_OTHER },
++	{ "compute-hvx", 1, 4, TS_G_OTHER },
++	{ "camera", 1, 5, TS_G_OTHER },
++	{ "mmss", 1, 6, TS_G_OTHER },
++	{ "mdm-core", 1, 7, TS_G_OTHER },
++};
++#define TS_N    (sizeof(ts_sensors) / sizeof(ts_sensors[0]))
++
++enum { TS_OFF, TS_ON, TS_UNMAPPED };
++
++static vm_offset_t ts_tm[2];
++static int ts_state = TS_OFF;
++static unsigned ts_period_ms = 1000, ts_log_secs = 600, ts_period_now;
++static int32_t ts_now[TS_N], ts_peak[TS_N];     /* tenths; INT32_MIN: none */
++static uint32_t ts_reads, ts_invalid, ts_good;
++static unsigned ts_hot, ts_peak_hot;
++static int ts_peak_mc = TS_NONE_MC, ts_peak_batt_mc = TS_NONE_MC;
++static volatile int ts_reset;
++static uint32_t ts_boot_words[2][6];            /* as the boot loaders left each block: see ts_thread */
++
++int sweet_thermal_max_mc = TS_NONE_MC;
++int sweet_thermal_cpu_mc = TS_NONE_MC;
++int sweet_thermal_gpu_mc = TS_NONE_MC;
++int sweet_thermal_batt_mc = TS_NONE_MC;
++
++static size_t
++ts_cat(char *buf, size_t size, size_t n, const char *fmt, ...) __printflike(4, 5);
++static size_t
++ts_cat(char *buf, size_t size, size_t n, const char *fmt, ...)
++{
++	va_list ap;
++	if (n >= size) {
++		return n;
++	}
++	va_start(ap, fmt);
++	int r = vsnprintf(buf + n, size - n, fmt, ap);
++	va_end(ap);
++	return r < 0 ? n : (n + (size_t)r >= size ? size - 1 : n + (size_t)r);
++}
++
++static inline uint32_t
++ts_rd(unsigned block, uint32_t off)
++{
++	return *(volatile uint32_t *)(ts_tm[block] + off);
++}
++
++/* " name=41.2" for every sensor of the table that has a value (block 0 or 1, or -1 for both) */
++static size_t
++ts_cat_all(char *buf, size_t size, size_t n, const int32_t *tenths, int block)
++{
++	for (unsigned i = 0; i < TS_N; i++) {
++		int32_t t = tenths[i];
++		if (t == INT32_MIN || (block >= 0 && ts_sensors[i].block != block)) {
++			continue;
++		}
++		n = ts_cat(buf, size, n, " %s=%s%d.%d", ts_sensors[i].name, t < 0 ? "-" : "", (t < 0 ? -t : t) / 10, (t < 0 ? -t : t) % 10);
++	}
++	return n;
++}
++
++static void
++ts_sleep_ms(unsigned ms)
++{
++	static int chan;
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* The fuel gauge's battery temperature; two readings that agree within 1 K. raw: the 11 bits, for the first log line. */
++static bool
++ts_batt(int *mc, unsigned *raw)
++{
++	unsigned previous = 0;
++	for (unsigned attempt = 0; attempt < 4; attempt++) {
++		uint8_t lo, hi;
++		if (sweet_spmi_read(TS_BATT_SID, TS_BATT_TEMP, &lo) || sweet_spmi_read(TS_BATT_SID, TS_BATT_TEMP + 1, &hi)) {
++			return false;
++		}
++		unsigned next = (((unsigned)hi & 7u) << 8) | lo;
++		int diff = (int)next - (int)previous;
++		if (attempt && diff >= -4 && diff <= 4) {
++			int value = (int)next * 250 - 273150;   /* quarter kelvins */
++			*raw = next;
++			if (value < -30000 || value > 100000) {
++				return false;
++			}
++			*mc = value;
++			return true;
++		}
++		previous = next;
++	}
++	return false;
++}
++
++static void
++ts_pass(void)
++{
++	int32_t hottest = INT32_MIN, cpu = INT32_MIN, gpu = INT32_MIN;
++	unsigned hot = 0, good = 0;
++
++	if (__atomic_exchange_n(&ts_reset, 0, __ATOMIC_RELAXED)) {
++		for (unsigned i = 0; i < TS_N; i++) {
++			ts_peak[i] = INT32_MIN;
++		}
++		ts_peak_mc = ts_peak_batt_mc = TS_NONE_MC;
++	}
++	for (unsigned i = 0; i < TS_N; i++) {
++		uint32_t status = ts_rd(ts_sensors[i].block, TS_STATUS(ts_sensors[i].number));
++		int32_t t = (int32_t)(status << 20) >> 20;
++		if (!(status & TS_VALID) || t < TS_MIN_TENTHS || t > TS_MAX_TENTHS) {
++			ts_invalid++;
++			ts_now[i] = INT32_MIN;
++			continue;
++		}
++		ts_now[i] = t;
++		good++;
++		if (t > ts_peak[i]) {
++			ts_peak[i] = t;
++		}
++		if (t > hottest) {
++			hottest = t;
++			hot = i;
++		}
++		if ((ts_sensors[i].group == TS_G_LITTLE || ts_sensors[i].group == TS_G_BIG) && t > cpu) {
++			cpu = t;
++		}
++		if (ts_sensors[i].group == TS_G_GPU && t > gpu) {
++			gpu = t;
++		}
++	}
++	ts_reads++;
++	ts_good = good;
++	ts_hot = hot;
++	sweet_thermal_cpu_mc = cpu == INT32_MIN ? TS_NONE_MC : cpu * 100;
++	sweet_thermal_gpu_mc = gpu == INT32_MIN ? TS_NONE_MC : gpu * 100;
++	sweet_thermal_max_mc = hottest == INT32_MIN ? TS_NONE_MC : hottest * 100;
++	if (hottest != INT32_MIN && hottest * 100 > ts_peak_mc) {
++		ts_peak_mc = hottest * 100;
++		ts_peak_hot = hot;
++	}
++}
++
++/* Three lines, each under the console's 255 characters: the summary, then the sensors of each block. */
++static void
++ts_log(const char *why)
++{
++	char line[250];
++	size_t n = 0;
++	int mc = sweet_thermal_max_mc, b = sweet_thermal_batt_mc;
++	n = ts_cat(line, sizeof(line), n, "SWEET THERMAL: %s: hottest %s %d.%d C, battery ", why, ts_sensors[ts_hot].name, mc / 1000, (mc % 1000) / 100);
++	if (b == TS_NONE_MC) {
++		n = ts_cat(line, sizeof(line), n, "n/a");
++	} else {
++		n = ts_cat(line, sizeof(line), n, "%d.%d C", b / 1000, (b < 0 ? -b : b) % 1000 / 100);
++	}
++	printf("%s\n", line);
++	for (int block = 0; block < 2; block++) {
++		n = ts_cat(line, sizeof(line), 0, "SWEET THERMAL:");
++		(void)ts_cat_all(line, sizeof(line), n, ts_now, block);
++		printf("%s\n", line);
++	}
++}
++
++static void
++ts_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	ts_tm[0] = ml_io_map(TS_TM0_PA, TS_TM_SIZE);
++	ts_tm[1] = ml_io_map(TS_TM1_PA, TS_TM_SIZE);
++	if (ts_tm[0] == 0 || ts_tm[1] == 0) {
++		printf("SWEET THERMAL: no mapping of the sensor blocks (%#x, %#x): off\n", TS_TM0_PA, TS_TM1_PA);
++		ts_state = TS_UNMAPPED;
++		goto out;
++	}
++	for (unsigned i = 0; i < TS_N; i++) {
++		ts_now[i] = ts_peak[i] = INT32_MIN;
++	}
++	/* as the boot loaders left the blocks: whether anything of the chip's own would act on a temperature (raw words) */
++	for (unsigned b = 0; b < 2; b++) {
++		uint32_t *w = ts_boot_words[b];
++		w[0] = ts_rd(b, TS_INT_EN);
++		w[1] = ts_rd(b, TS_CRIT_INT_MASK);
++		w[2] = ts_rd(b, TS_UPLOW_THRESHOLD(0));
++		w[3] = ts_rd(b, TS_CRIT_THRESHOLD(0));
++		w[4] = ts_rd(b, TS_UPLOW_THRESHOLD(7));
++		w[5] = ts_rd(b, TS_CRIT_THRESHOLD(7));
++		printf("SWEET THERMAL: block %u at %#x: INT_EN %#x, CRITICAL_INT_MASK %#x, thresholds of sensor 0: upper/lower %#x critical %#x, "
++		    "of sensor 7: %#x %#x\n", b, b ? TS_TM1_PA : TS_TM0_PA, w[0], w[1], w[2], w[3], w[4], w[5]);
++	}
++	ts_state = TS_ON;
++
++	uint64_t last_log = mach_absolute_time();
++	int said_step = 0;      /* the highest 5 C step already logged in this warm spell */
++	bool spmi = false, batt_said = false;
++	for (unsigned pass = 0;; pass++) {
++		if (ts_period_ms == 0) {
++			/* paused by kern.sweet_thermal_ms=0: no reading is better than an old one */
++			sweet_thermal_max_mc = sweet_thermal_cpu_mc = sweet_thermal_gpu_mc = sweet_thermal_batt_mc = TS_NONE_MC;
++			ts_good = 0;
++			ts_period_now = 0;
++			ts_sleep_ms(TS_OFF_PERIOD_MS);
++			continue;
++		}
++		ts_pass();
++		/* the battery: the SPMI bus comes up with the battery driver, some seconds into the boot */
++		if (pass % TS_BATT_EVERY == 0 && (spmi || (spmi = sweet_spmi_init() == 0))) {
++			int mc = TS_NONE_MC;
++			unsigned raw = 0;
++			bool ok = ts_batt(&mc, &raw);
++			sweet_thermal_batt_mc = ok ? mc : TS_NONE_MC;
++			if (ok && mc > ts_peak_batt_mc) {
++				ts_peak_batt_mc = mc;
++			}
++			if (!batt_said) {
++				batt_said = true;
++				printf("SWEET THERMAL: battery temperature word %#x (quarter kelvins) -> %d mC: %s\n", raw, (int)raw * 250 - 273150,
++				    ok ? "used" : "not plausible or not read, left out");
++			}
++		}
++		if (pass == 0) {
++			printf("SWEET THERMAL: %u of %u sensors have a reading; every %u ms (display off: %u ms); reads only\n", ts_good, (unsigned)TS_N,
++			    ts_period_ms, TS_OFF_PERIOD_MS);
++			if (ts_good) {
++				ts_log("start");
++			}
++		}
++		if (ts_good) {
++			int tenths = sweet_thermal_max_mc / 100;
++			int step = tenths >= TS_WARM_TENTHS ? tenths / 50 : 0;  /* one step each 5 C from 60 */
++			uint64_t now = mach_absolute_time(), ns;
++			absolutetime_to_nanoseconds(now - last_log, &ns);
++			if (step > said_step) {
++				ts_log("warmer");
++				said_step = step;
++				last_log = now;
++			} else if (ns >= (uint64_t)(step ? TS_WARM_LOG_S : ts_log_secs) * NSEC_PER_SEC && (step || ts_log_secs)) {
++				ts_log(step ? "warm" : "now");
++				last_log = now;
++			}
++			if (tenths < TS_WARM_TENTHS - 50) {
++				said_step = 0;  /* the spell is over under 55 C */
++			}
++		}
++		unsigned period = ts_period_ms ? ts_period_ms : TS_OFF_PERIOD_MS;
++		ts_period_now = __atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED) && period < TS_OFF_PERIOD_MS ? TS_OFF_PERIOD_MS : period;
++		ts_sleep_ms(ts_period_now);
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static int
++ts_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[1400];
++	size_t n = 0;
++	n = ts_cat(buf, sizeof(buf), n, "sweet_thermal v1 state=%s period_ms=%u reads=%u good=%u invalid=%u max_mc=%d hottest=%s cpu_mc=%d gpu_mc=%d "
++	    "batt_mc=%d peak_mc=%d peak=%s peak_batt_mc=%d\nnow", ts_state == TS_ON ? "on" : ts_state == TS_OFF ? "off" : "unmapped", ts_period_now,
++	    ts_reads, ts_good, ts_invalid, sweet_thermal_max_mc, ts_good ? ts_sensors[ts_hot].name : "none", sweet_thermal_cpu_mc, sweet_thermal_gpu_mc,
++	    sweet_thermal_batt_mc, ts_peak_mc, ts_peak_mc != TS_NONE_MC ? ts_sensors[ts_peak_hot].name : "none", ts_peak_batt_mc);
++	if (ts_state == TS_ON) {
++		n = ts_cat_all(buf, sizeof(buf), n, ts_now, -1);
++		n = ts_cat(buf, sizeof(buf), n, "\npeak");
++		n = ts_cat_all(buf, sizeof(buf), n, ts_peak, -1);
++		for (unsigned b = 0; b < 2; b++) {
++			const uint32_t *w = ts_boot_words[b];
++			n = ts_cat(buf, sizeof(buf), n, "%sint_en%u=%#x crit_mask%u=%#x thr%u_s0=%#x crit%u_s0=%#x thr%u_s7=%#x crit%u_s7=%#x", b ? " " : "\nboot ",
++			    b, w[0], b, w[1], b, w[2], b, w[3], b, w[4], b, w[5]);
++		}
++	}
++	(void)ts_cat(buf, sizeof(buf), n, "\n");
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_thermal, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, ts_sysctl, "A",
++    "Mi 8: the chip's temperature sensors and the battery's (see bsd/dev/sweet_thermal.c)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_thermal_max_mc, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_thermal_max_mc, 0,
++    "the hottest sensor of the chip, millidegrees (-273000: none read)");
++
++static int
++ts_ms_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = (int)ts_period_ms, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (v != 0 && (v < 100 || v > 60000)) {
++		return EINVAL;
++	}
++	ts_period_ms = (unsigned)v;
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_thermal_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, ts_ms_sysctl, "I",
++    "period with the display on, ms (100..60000); 0 pauses the reading");
++
++static int
++ts_reset_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = 0, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	__atomic_store_n(&ts_reset, 1, __ATOMIC_RELAXED);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_thermal_reset, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, ts_reset_sysctl, "I",
++    "write: forget the peak temperatures");
++
++/* Called from sweet_ufs_init() with the other board drivers. */
++void
++sweet_thermal_init(void)
++{
++	int on = 1, v;
++	thread_t th;
++
++	(void)PE_parse_boot_argn("sweetthermal", &on, sizeof(on));
++	if (!on || !sweet_board_is("xiaomi,dipper")) {
++		return;         /* the sensor table is the Mi 8's own device tree's */
++	}
++	if (PE_parse_boot_argn("sweetthermal_ms", &v, sizeof(v)) && v >= 100 && v <= 60000) {
++		ts_period_ms = (unsigned)v;
++	}
++	if (PE_parse_boot_argn("sweetthermal_log", &v, sizeof(v)) && v >= 0 && v <= 86400) {
++		ts_log_secs = (unsigned)v;
++	}
++	ts_period_now = ts_period_ms;
++	if (kernel_thread_start(ts_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_set_thread_name(th, "sweet thermal");
++		thread_deallocate(th);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 0e854aa..7308cf2 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -75,6 +75,7 @@ extern void beryllium_wlan_init(void);
+ extern void dipper_audio_init(void);
+ extern void dipper_haptics_init(void);
+ extern void dipper_sensors_init(void);
++extern void sweet_thermal_init(void);
+ extern void sweet80211_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_cpufreq_max(void);
+@@ -1186,6 +1187,7 @@ sweet_ufs_init(void)
+ 	dipper_audio_init();        /* boot-arg sweetaudio=N (Mi 8 audio DSP, 3040), off by default */
+ 	dipper_haptics_init();      /* boot-arg sweethap=1 (Mi 8 vibration motor, 3049), off by default */
+ 	dipper_sensors_init();      /* Mi 8 sensor DSP (3072): by itself when its files are on the root, see dipper_sensors.c */
++	sweet_thermal_init();       /* Mi 8 temperature sensors, reads only (3096); sweetthermal=0 turns it off */
+ 	return 0;
+ }
+ 
