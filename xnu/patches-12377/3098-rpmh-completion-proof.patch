@@ -1,0 +1,519 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 73052d8..b8cf280 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -1,13 +1,15 @@
+ /*
+  * SWEET PM6150L L11C bring-up; see report.md for DT and source evidence.
+  * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
+- * No sleep/wake programming, SPMI writes, GIC handler, or timeout recovery.
++ * No sleep/wake programming, SPMI writes or GIC handler. What proves a request and what a timeout costs: see 3098 below.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <sys/sysctl.h>
+ #include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
+ #include "sweet_board.h"
+ 
+@@ -62,7 +64,8 @@ int sweet_rpmh_rfclk_enable(const char *res);
+ #define RH_VRM          4u
+ #define RH_BCM          5u
+ #define RH_ARC_LEVELS   16u      /* RPMH_ARC_MAX_LEVELS */
+-#define RH_TIMEOUT_US   100000u
++#define RH_TIMEOUT_MS   1000u    /* 3098: a second by the clock (the slowest request seen took 1.8 ms); it was 100000 polls */
++#define RH_SETTLE       2000u    /* polls of "idle, complete, unproven" before such a request is released and sent again */
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+ static bool rh_be;
+@@ -76,6 +79,7 @@ static uint32_t rh_db_size;
+ static unsigned rh_ncpt;
+ static unsigned rh_lock;
+ static bool rh_poisoned;
++static bool rh_quiet;           /* 3009: the bus vote repeats every few seconds; 3098: rh_map's two lines follow it too */
+ 
+ static uint32_t
+ rh_read(vm_offset_t base, uint32_t off)
+@@ -146,9 +150,11 @@ rh_map(void)
+ 	unsigned major = (id >> 16) & 0xffu;
+ 	unsigned count = (config >> (6u * RH_DRV)) & 0x3fu;
+ 	rh_ncpt = (config >> 27) & 0x1fu;
+-	printf("SWEET RPMH: rsc=%#x tcs=%#x DRV=%u id=%#x solver=%#x config=%#x TCS=%u ncpt=%u\n",
+-	    rh_be ? RH_BE_RSC_PA : RH_RSC_PA, rh_be ? RH_BE_TCS_PA : RH_TCS_PA, RH_DRV, id, solver,
+-	    config, count, rh_ncpt);
++	if (!rh_quiet) {
++		printf("SWEET RPMH: rsc=%#x tcs=%#x DRV=%u id=%#x solver=%#x config=%#x TCS=%u ncpt=%u\n",
++		    rh_be ? RH_BE_RSC_PA : RH_RSC_PA, rh_be ? RH_BE_TCS_PA : RH_TCS_PA, RH_DRV, id, solver,
++		    config, count, rh_ncpt);
++	}
+ 	/* This client implements the pre-v3 layout only; do not guess v3 offsets. */
+ 	if ((major != 1 && major != 2) || config == 0xffffffffu ||
+ 	    solver == 0xffffffffu || count < RH_NORMAL_N ||
+@@ -176,8 +182,10 @@ rh_map(void)
+ 	uint32_t db_version = rh_read(rh_db, 0);
+ 	uint32_t magic = rh_read(rh_db, 4);
+ 	uint32_t flags = rh_read(rh_db, 140);
+-	printf("SWEET RPMH: cmd-db version=%#x magic=%#x checksum=%#x flags=%#x\n",
+-	    db_version, magic, rh_read(rh_db, 136), flags);
++	if (!rh_quiet) {
++		printf("SWEET RPMH: cmd-db version=%#x magic=%#x checksum=%#x flags=%#x\n",
++		    db_version, magic, rh_read(rh_db, 136), flags);
++	}
+ 	/* Linux only checks magic; version 1 is an intentionally stricter policy. */
+ 	if (magic != RH_DB_MAGIC || db_version != 1 || (flags & 1u)) {
+ 		printf("SWEET RPMH: unsupported/standalone cmd-db\n");
+@@ -259,24 +267,138 @@ rh_free(unsigned t)
+ 	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+ }
+ 
+-static bool rh_quiet;           /* 3009: the bus vote repeats every few seconds */
++/*
++ * 3098: WHAT PROVES THAT A REQUEST RAN, AND WHAT A TIMEOUT COSTS.
++ *
++ * Until now a request counted as done only if the TCS's interrupt status bit was set or a poll had caught the request in
++ * flight (TCS busy, or a command not yet completed). On the Mi 8 about one boot in eleven lost the whole driver to a
++ * "timeout" on a request that had completed (TCS idle, every command issued and completed); from then on every vote of
++ * that boot was refused: no modem, no Wi-Fi, no audio DSP, no camera rail, the memory votes stuck, and the governor
++ * logging the refusal 40 times a second. Measured on the phone (2026-11-20, two boots of an instrumented build, about
++ * 3400 requests; the build is kept outside the series as research/helpers/sweet_rpmh-3098-instrumented.c):
++ *   - The interrupt status bit never sets while this driver masks the TCS's enable bit, which it does for every request:
++ *     0 of 2032 requests in the saved logs, 0 of 50 when the bit was unmasked for a look after completion, 50 of 50 with
++ *     the enable bit left set. That half of the test has never fired; every request was accepted because a poll saw it run.
++ *   - The first poll had read the status 5 to 8 us after the trigger (one RSC register access takes 1.3 to 1.4 us, and
++ *     the interrupt status was read first), and about 640 times a second an RSC register access stalls for 17 to 20 us
++ *     (1462 of 1.6 million reads, interrupts off, while the CPU's clock shows no step over 2 us: the register
++ *     interface, not the CPU).
++ *   - A request that changes nothing is quick: a single ARC command is over in about 5 us, a three-command bus or
++ *     rail request in 15 to 21 us. So the first poll found some requests already finished: 21 of 300 repeated cx.lvl
++ *     votes without any stall, 7 and 12 of 1000 repeated bus votes and 1 of 300 rail votes when a stall hit the
++ *     trigger or the first reads. Each of those was a "timeout" for the old test.
++ *   - The command status reads 0 before every trigger (all 3340 looked at): releasing the TCS resets it. "Issued and
++ *     completed" after the trigger can therefore only be this request's.
++ * So: the command status is read before the trigger; if no command reads issued-and-completed there (fresh), then "TCS
++ * idle, every command issued and completed" after the trigger is the proof, whether or not a poll saw it run. Only with a
++ * status that was not fresh is a poll that saw it run still required; if that is missing too, the idle TCS is released
++ * and the request sent once more (every request here sets a state, sending it twice changes nothing), fresh then.
++ * A request still unfinished after RH_TIMEOUT_MS is a real timeout: its TCS is left as it is (never reset) and the other
++ * ACTIVE TCS serves from then on; the first one is used again once its request is seen finished. Only a register write
++ * that does not read back still stops the driver for the boot, and a refusal is logged three times and then every 4096th
++ * (rh_map's two lines per call stop with the first bus vote, like the other lines of a request that goes well).
++ * The interrupt stays masked as before: nothing in this kernel takes the RSC's line. The poll no longer reads the
++ * interrupt status, so its first look at the TCS comes one register access earlier. Tried on the phone with test knobs
++ * (research/helpers/rpmh-3098-testknobs.py, not in the series): 11 of 2500 requests flagged not fresh were sent again
++ * and none failed; a forced timeout was given up and its TCS used again three times; 800 requests went through the
++ * second ACTIVE TCS alone. kern.sweet_rpmh counts: "early" is a request found finished at the first look.
++ */
++static uint32_t rh_dead;        /* TCSs given up at a timeout (bit per TCS) */
++static uint32_t rh_dead_irq;    /* their interrupt enable bits as found */
++static uint32_t rh_n_refused, rh_n_nofree, rh_n_conflict, rh_n_busfail, rh_n_reclaimed;
++/* per kind (ARC, VRM, BCM): requests triggered; done before the first look (the old "timeout"); status not fresh; sent again; timeouts */
++static struct { uint32_t sent, early, stale, resent, timeouts; } rh_st[3];
++static bool rh_hush;            /* under rh_lock: this refusal is one of those not logged */
++
++/* A refusal is said three times and then every 4096th: the governor asks 40 times a second. */
++static bool
++rh_say(uint32_t *n)
++{
++	uint32_t k = (*n)++;
++	return k < 3 || (k & 4095u) == 0;
++}
++
++/* Under rh_lock: true when the driver has stopped for this boot (a register write did not read back). */
++static bool
++rh_refuse(void)
++{
++	rh_hush = false;
++	if (!rh_poisoned) {
++		return false;
++	}
++	rh_hush = !rh_say(&rh_n_refused);
++	if (!rh_hush) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access (%u refused)\n", rh_n_refused);
++	}
++	return true;
++}
+ 
+-/* Up to 3 commands (addresses absolute) in one ACTIVE AMC request, each with a write-ack. */
++/* Trigger off before the mode, then only our commands; the interrupt source cleared and its enable bit put back. */
++static bool
++rh_release(unsigned t, uint32_t irq_bit_was)
++{
++	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t;
++	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
++	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
++		return false;
++	}
++	rh_write(rh_tcs, RH_IRQ_CLEAR, bit); /* W1C: never clear other TCS bits */
++	return !(rh_read(rh_tcs, RH_IRQ_STATUS) & bit) &&
++	       rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_bit_was & bit));
++}
++
++/* A TCS given up at a timeout (its request was seen unfinished then: no stale status) whose request has finished since. */
++static void
++rh_reclaim(unsigned t)
++{
++	uint32_t b = t * RH_TCS_STRIDE;
++	uint32_t idle = rh_read(rh_tcs, b + RH_STATUS), enabled = rh_read(rh_tcs, b + RH_ENABLE);
++	if (idle == 0 || idle == 0xffffffffu || enabled == 0 || (enabled & ~7u) ||
++	    rh_read(rh_tcs, b + RH_CONTROL) != (RH_AMC_EN | RH_TRIGGER)) {
++		return;
++	}
++	for (unsigned c = 0; c < 3; ++c) {
++		uint32_t st = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
++		if ((enabled & (1u << c)) && (st == 0xffffffffu || (st & (RH_ISSUED | RH_COMPLETE)) != (RH_ISSUED | RH_COMPLETE))) {
++			return;
++		}
++	}
++	if (!rh_release(t, rh_dead_irq)) {
++		rh_poisoned = true;
++		return;
++	}
++	rh_dead &= ~(1u << t);
++	rh_n_reclaimed++;
++	printf("SWEET RPMH: TCS%u finished after its timeout; in use again\n", t);
++}
++
++/*
++ * Up to 3 commands (addresses absolute) in one ACTIVE AMC request, each with a write-ack. EAGAIN: the TCS ended idle and
++ * complete but nothing proves the request ran (status not fresh, no poll saw it); it is released, the caller sends it again.
++ */
+ static int
+-rh_cmds(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
++rh_cmds_once(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ {
+ 	if (ncmd == 0 || ncmd > 3) {
+ 		return EINVAL;
+ 	}
+ 	uint32_t address = addrs[0] & ~15u;
++	unsigned kind = (address >> 16) - RH_ARC;
++	kind = kind < 3 ? kind : 0;
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+ 		uint32_t b = t * RH_TCS_STRIDE;
++		if (rh_dead & (1u << t)) {
++			rh_reclaim(t);
++			if (rh_poisoned) {
++				return EIO;
++			}
++		}
+ 		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
+ 		if (!rh_quiet) {
+-			printf("SWEET RPMH: ACTIVE TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
++			printf("SWEET RPMH: ACTIVE TCS%u idle=%#x control=%#x enable=%#x wait=%#x%s\n",
+ 			    t, rh_read(rh_tcs, b + RH_STATUS), rh_read(rh_tcs, b + RH_CONTROL),
+-			    enabled, rh_read(rh_tcs, b + RH_WAIT));
++			    enabled, rh_read(rh_tcs, b + RH_WAIT), (rh_dead & (1u << t)) ? " (given up)" : "");
+ 		}
+ 		if (enabled & ~((1u << rh_ncpt) - 1u)) {
+ 			return EIO;
+@@ -284,16 +406,20 @@ rh_cmds(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+ 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++				if (rh_say(&rh_n_conflict)) {
++					printf("SWEET RPMH: a request for %#x is still in TCS%u (%u refused for that)\n", address, t, rh_n_conflict);
++				}
+ 				return EBUSY;
+ 			}
+ 		}
+-		if (chosen < 0 && rh_free(t)) {
++		if (chosen < 0 && !(rh_dead & (1u << t)) && rh_free(t)) {
+ 			chosen = (int)t;
+ 		}
+ 	}
+ 	if (chosen < 0) {
+-		printf("SWEET RPMH: no empty idle ACTIVE TCS; leaving inherited state intact\n");
++		if (rh_say(&rh_n_nofree)) {
++			printf("SWEET RPMH: no empty idle ACTIVE TCS; leaving inherited state intact (%u times)\n", rh_n_nofree);
++		}
+ 		return EBUSY;
+ 	}
+ 	unsigned t = (unsigned)chosen;
+@@ -314,7 +440,7 @@ rh_cmds(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ 		}
+ 		return EBUSY;
+ 	}
+-	/* From here an uncertain write/timeout quarantines our slot for this boot. */
++	/* From here a register write that does not read back stops the driver for this boot. */
+ 	rh_poisoned = true;
+ 	const uint32_t cmdmask = (1u << ncmd) - 1u;
+ 	if (!rh_quiet) {
+@@ -332,11 +458,21 @@ rh_cmds(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
++	/* Fresh: before the trigger no command of ours reads issued and completed, so such a reading afterwards is this request's. */
++	bool fresh = true;
++	for (unsigned c = 0; c < ncmd; ++c) {
++		uint32_t st = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
++		fresh &= st != 0xffffffffu && (st & (RH_ISSUED | RH_COMPLETE)) != (RH_ISSUED | RH_COMPLETE);
++	}
++	rh_st[kind].sent++;
++	rh_st[kind].stale += !fresh;
++	uint32_t idle = 0, status[3] = {0, 0, 0};
++	bool done = false, progress = false, unproven = false;
++	unsigned settle = 0;
++	uint64_t deadline;
++	clock_interval_to_deadline(RH_TIMEOUT_MS, NSEC_PER_MSEC, &deadline);
+ 	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+-	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
+-	bool done = false, progress = false;
+-	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
+-		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
++	for (;;) {
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+ 		for (unsigned c = 0; c < ncmd; ++c) {
+@@ -344,31 +480,50 @@ rh_cmds(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+ 		}
+-		/* A fresh IRQ or observed execution transition excludes stale CMD_STATUS. */
++		/* A poll that sees the request in flight proves it too (the only proof when the status was not fresh). */
+ 		progress |= idle == 0 || !complete;
+-		if (idle && idle != 0xffffffffu && irq != 0xffffffffu &&
+-		    ((irq & bit) || progress) && complete) {
+-			done = true;
+-			break;
++		if (idle && idle != 0xffffffffu && complete) {
++			if (fresh || progress) {
++				done = true;
++				break;
++			}
++			if (++settle >= RH_SETTLE) {
++				unproven = true;
++				break;
++			}
++		} else {
++			settle = 0;
++			if (mach_absolute_time() >= deadline) {
++				break;          /* this poll saw it unfinished */
++			}
+ 		}
+ 		delay(1);
+ 	}
+-	if (!rh_quiet || !done) {
++	if (!rh_quiet || !(done || unproven)) {
+ 		printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
+-		    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
++		    t, done, rh_read(rh_tcs, RH_IRQ_STATUS), idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
++	}
++	if (unproven) {
++		printf("SWEET RPMH: TCS%u idle and complete, but its status was not fresh and no poll saw the request run; sent again\n", t);
++		if (!rh_release(t, irq_en)) {
++			return EIO;
++		}
++		rh_poisoned = false;
++		rh_st[kind].resent++;
++		return EAGAIN;
+ 	}
+ 	if (!done) {
+-		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
++		/* Seen unfinished to the end. The TCS stays as it is, its interrupt masked; the other one serves from now on. */
++		printf("SWEET RPMH: timeout after %u ms; TCS%u given up until its request finishes, no reset/retry\n", RH_TIMEOUT_MS, t);
++		rh_dead |= bit;
++		rh_dead_irq = (rh_dead_irq & ~bit) | (irq_en & bit);
++		rh_st[kind].timeouts++;
++		rh_poisoned = false;
+ 		return ETIMEDOUT;
+ 	}
++	rh_st[kind].early += !progress;
+ 	/* Proven completion: clear trigger before mode, then free only our commands. */
+-	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
+-	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
+-		return EIO;
+-	}
+-	rh_write(rh_tcs, RH_IRQ_CLEAR, bit); /* W1C: never clear other TCS bits */
+-	if ((rh_read(rh_tcs, RH_IRQ_STATUS) & bit) ||
+-	    !rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++	if (!rh_release(t, irq_en)) {
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+@@ -378,6 +533,45 @@ rh_cmds(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ 	return 0;
+ }
+ 
++static int
++rh_cmds(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
++{
++	int error = rh_cmds_once(addrs, vals, ncmd);
++	if (error == EAGAIN) {
++		error = rh_cmds_once(addrs, vals, ncmd);
++		error = error == EAGAIN ? EIO : error;
++	}
++	return error;
++}
++
++/* Counters, read only: sent, early (done before the first look: a "timeout" before 3098), stale, resent, timeouts per kind. */
++static int
++rh_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	static const char *const kinds[3] = { "arc", "vrm", "bcm" };
++	char buf[400];
++	/* rh_poisoned is also set while a request is being written: read it between requests (stopped=-1: none found in 20 ms) */
++	int stopped = -1;
++	for (unsigned tries = 0; tries < 200 && stopped < 0; tries++) {
++		if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE) == 0) {
++			stopped = rh_poisoned;
++			__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++		} else {
++			delay(100);
++		}
++	}
++	int n = snprintf(buf, sizeof(buf), "sweet_rpmh v1 given_up=%#x stopped=%d reclaimed=%u refused=%u no_tcs=%u conflicts=%u bus_failed=%u\n", rh_dead,
++	    stopped, rh_n_reclaimed, rh_n_refused, rh_n_nofree, rh_n_conflict, rh_n_busfail);
++	for (unsigned k = 0; k < 3 && n > 0 && (size_t)n < sizeof(buf); k++) {
++		n += snprintf(buf + n, sizeof(buf) - (size_t)n, "%s sent=%u early=%u stale=%u resent=%u timeouts=%u\n", kinds[k], rh_st[k].sent,
++		    rh_st[k].early, rh_st[k].stale, rh_st[k].resent, rh_st[k].timeouts);
++	}
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmh, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, rh_sysctl, "A",
++    "RPMh requests per kind: sent, early (done before the first look), stale, resent, timeouts (see bsd/dev/sweet_rpmh.c, 3098)");
++
+ /* VRM: enable=false sends a single ENABLE=0 command (voltage and mode stay as they were). */
+ static int
+ rh_send(uint32_t address, unsigned mv, bool enable)
+@@ -429,8 +623,7 @@ sweet_rpmh_rfclk_enable(const char *res)
+ 	}
+ 	int error = EIO;
+ 	uint32_t address = 0;
+-	if (rh_poisoned) {
+-		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++	if (rh_refuse()) {
+ 		goto out;
+ 	}
+ 	error = rh_map();
+@@ -443,7 +636,7 @@ sweet_rpmh_rfclk_enable(const char *res)
+ 		error = rh_cmds(a, v, 1);
+ 	}
+ out:
+-	if (error) {
++	if (error && !rh_hush) {
+ 		printf("SWEET RPMH: RF clock %s enable failed errno=%d\n", res, error);
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+@@ -467,8 +660,7 @@ sweet_rpmh_lnbclk2_enable(void)
+ 	}
+ 	int error = EIO;
+ 	uint32_t address = 0;
+-	if (rh_poisoned) {
+-		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++	if (rh_refuse()) {
+ 		goto out;
+ 	}
+ 	error = rh_map();
+@@ -481,7 +673,7 @@ sweet_rpmh_lnbclk2_enable(void)
+ 		error = rh_cmds(a, v, 1);
+ 	}
+ out:
+-	if (error) {
++	if (error && !rh_hush) {
+ 		printf("SWEET RPMH: clock lnbclka2 enable failed errno=%d\n", error);
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+@@ -537,8 +729,7 @@ sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable)
+ 	}
+ 	int error = EIO;
+ 	uint32_t address = 0;
+-	if (rh_poisoned) {
+-		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++	if (rh_refuse()) {
+ 		goto out;
+ 	}
+ 	error = rh_map();
+@@ -549,7 +740,7 @@ sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable)
+ 		error = rh_send(address, mv, enable);
+ 	}
+ out:
+-	if (error) {
++	if (error && !rh_hush) {
+ 		printf("SWEET RPMH: %s %s failed errno=%d\n", res, enable ? "enable" : "disable", error);
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+@@ -569,8 +760,7 @@ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ 	}
+ 	int error = EIO;
+ 	uint32_t address = 0;
+-	if (rh_poisoned) {
+-		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++	if (rh_refuse()) {
+ 		goto out;
+ 	}
+ 	error = rh_map();
+@@ -581,7 +771,7 @@ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ 		error = rh_send(address, mv, true);
+ 	}
+ out:
+-	if (error) {
++	if (error && !rh_hush) {
+ 		printf("SWEET RPMH: enable failed errno=%d\n", error);
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+@@ -619,8 +809,7 @@ sweet_rpmh_bus_vote(unsigned mbps)
+ 	int error = EIO;
+ 	uint32_t addrs[3], vals[3];
+ 	unsigned n = 0;
+-	if (rh_poisoned) {
+-		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++	if (rh_refuse()) {
+ 		goto out;
+ 	}
+ 	error = rh_map();
+@@ -651,10 +840,10 @@ sweet_rpmh_bus_vote(unsigned mbps)
+ 	if (!error) {
+ 		error = n ? rh_cmds(addrs, vals, n) : ENODEV;
+ 		looked = true;
+-		rh_quiet = !error;
++		rh_quiet = true;        /* 3098: also after a failure, which says its own line; the governor asks again every period */
+ 	}
+ out:
+-	if (error) {
++	if (error && !rh_hush && (error == ETIMEDOUT || rh_say(&rh_n_busfail))) {
+ 		printf("SWEET RPMH: bus vote %u MB/s failed errno=%d\n", mbps, error);
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+@@ -688,8 +877,7 @@ sweet_rpmh_bcm_vote(const char *res, uint32_t vote)
+ 	}
+ 	int error = EIO;
+ 	uint32_t address = 0, aux = 0, aux_len = 0;
+-	if (rh_poisoned) {
+-		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++	if (rh_refuse()) {
+ 		goto out;
+ 	}
+ 	error = rh_map();
+@@ -704,7 +892,7 @@ sweet_rpmh_bcm_vote(const char *res, uint32_t vote)
+ 		error = rh_cmds(&address, &value, 1);
+ 	}
+ out:
+-	if (error) {
++	if (error && !rh_hush) {
+ 		printf("SWEET RPMH: %s BCM vote failed errno=%d\n", res, error);
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+@@ -733,8 +921,7 @@ sweet_rpmh_arc_vote(const char *res, bool max)
+ 	}
+ 	int error = EIO;
+ 	uint32_t address = 0, aux = 0, aux_len = 0;
+-	if (rh_poisoned) {
+-		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++	if (rh_refuse()) {
+ 		goto out;
+ 	}
+ 	error = rh_map();
+@@ -773,7 +960,7 @@ sweet_rpmh_arc_vote(const char *res, bool max)
+ 		error = rh_cmds(&address, &hlvl, 1);
+ 	}
+ out:
+-	if (error) {
++	if (error && !rh_hush) {
+ 		printf("SWEET RPMH: %s ARC vote failed errno=%d\n", res, error);
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
