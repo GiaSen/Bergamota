@@ -1,0 +1,437 @@
+diff --git a/bsd/dev/beryllium_bt_hci.c b/bsd/dev/beryllium_bt_hci.c
+index 92a4deb..a4ae760 100644
+--- a/bsd/dev/beryllium_bt_hci.c
++++ b/bsd/dev/beryllium_bt_hci.c
+@@ -93,6 +93,23 @@ static struct {
+ static uint8_t bt_ring[BT_RING_SIZE];
+ static uint8_t bt_stage[BT_STAGE_SIZE];         /* only the single consumer (RX thread) uses it */
+ 
++/*
++ * 3101: ACL data in either direction within the last second: audio to a speaker, or any other transfer, is running.
++ * The UART's reader keeps its fast poll then, display off or not.
++ */
++static uint64_t bt_last_acl_abs;
++bool bt_hci_streaming(void);
++bool
++bt_hci_streaming(void)
++{
++	uint64_t last = bt_last_acl_abs, second;
++	if (last == 0) {
++		return false;
++	}
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
++	return mach_absolute_time() - last < second;
++}
++
+ /* ------------------------------------------------------------ logging */
+ 
+ static const char *
+@@ -111,6 +128,9 @@ bt_h4_name(uint8_t t)
+ static void
+ bt_log_pkt(const char *dir, const uint8_t *p, unsigned n)
+ {
++	if (n != 0 && p[0] == 2) {
++		bt_last_acl_abs = mach_absolute_time();  /* 3101: see bt_hci_streaming */
++	}
+ 	char hex[3 * 16 + 1];
+ 	unsigned o = 0, i;
+ 
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 7b282b3..f93a68a 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -82,6 +82,7 @@ extern void bt_hci_rx_packet(const uint8_t *pkt, unsigned len);
+ extern void bt_hci_rx_service(void);
+ extern void bt_hci_stats_periodic(bool force);
+ extern bool bt_hci_connected(void);
++extern bool bt_hci_streaming(void);
+ #define WL_PART_READ(p, o, d, l)  sweet_ufs_read_part((p), (o), (d), (l))
+ #endif
+ 
+@@ -7518,8 +7519,11 @@ static struct {
+ 	bool summary_done;
+ } svc;
+ 
+-/* 3099: the service loop's periods (kern.sweet_wlan_idle_ms, _busy_ms, _busy_hold_ms): joined and quiet, busy, and how long "busy" lasts */
+-static unsigned svc_conn_ms = 5, svc_busy_ms = 1, svc_busy_hold_ms = 200;
++/*
++ * 3099/3101: the service loop's periods with the display off (kern.sweet_wlan_idle_ms 20 on the common grid, _busy_ms 4,
++ * _busy_hold_ms 50): joined and quiet, busy, and how long "busy" lasts after a message; with it on 5, 1 and 200 as before
++ */
++static unsigned svc_conn_ms = 20, svc_busy_ms = 4, svc_busy_hold_ms = 50;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_idle_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &svc_conn_ms, 0, "Wi-Fi/modem service loop period when joined and quiet, ms");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_busy_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &svc_busy_ms, 0, "Wi-Fi/modem service loop period when busy, ms");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_busy_hold_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &svc_busy_hold_ms, 0, "how long the loop stays busy after a message, ms");
+@@ -7542,7 +7546,7 @@ svc_busy(void)
+ 	    sta.wq_n) {
+ 		svc.last_busy_ms = ms_now_ms();
+ 	}
+-	return ms_now_ms() < svc.last_busy_ms + (svc_busy_hold_ms >= 10 && svc_busy_hold_ms <= 2000 ? svc_busy_hold_ms : 200);
++	return ms_now_ms() < svc.last_busy_ms + (svc_busy_hold_ms >= 10 && svc_busy_hold_ms <= 2000 && sweet_paced() ? svc_busy_hold_ms : 200);
+ }
+ 
+ static void
+@@ -7652,11 +7656,14 @@ ms_ipc_run(unsigned hold_s)
+ 		}
+ 		if (svc_busy()) {
+ 			svc.busy_loops++;
+-			wl_sleep(svc_busy_ms >= 1 && svc_busy_ms <= 50 ? svc_busy_ms : 1);
++			wl_sleep(svc_busy_ms >= 1 && svc_busy_ms <= 50 && sweet_paced() ? svc_busy_ms : 1);
++		} else if (svc_conn_ms >= 5 && svc_conn_ms <= 500 && sweet_paced()) {
++			/* 3099/3101: quiet and the display off: on the common grid; en0 output wakes the thread at once */
++			unsigned idle_ms = sta.state == ST_CONNECTED || svc_conn_ms > SVC_IDLE_MS ? svc_conn_ms : SVC_IDLE_MS;
++			(void)assert_wait_deadline(wl_sleep_event(), THREAD_UNINT, sweet_poll_deadline_us((uint64_t)idle_ms * 1000, true));
++			thread_block(THREAD_CONTINUE_NULL);
+ 		} else {
+-			/* 3099: kern.sweet_wlan_idle_ms (5..500): 200 wake-ups a second at 5 */
+-			unsigned conn_ms = svc_conn_ms >= 5 && svc_conn_ms <= 500 ? svc_conn_ms : 5;
+-			wl_sleep(sta.state == ST_CONNECTED ? conn_ms : conn_ms > SVC_IDLE_MS ? conn_ms : SVC_IDLE_MS);   /* en0 output wakes the thread at once */
++			wl_sleep(sta.state == ST_CONNECTED ? 5 : SVC_IDLE_MS);   /* en0 output wakes the thread at once */
+ 		}
+ 	}
+ 	printf("SWEET IPC: %u s: glink %s, IPCRTR %s, qrtr hello %s; %u packets in, %u out; rmtfs %u reads (%llu bytes), "
+@@ -9731,7 +9738,7 @@ wl_xport_start(void)
+  * userland. A line "SWEET BT: UART RX ..." every 10 s shows the measured maximum FIFO fill
+  * (max words vs depth) and FIFO error count; a FIFO error would mean the margin was exceeded.
+  */
+-static unsigned wl_bt_idle_us = 2000;
++static unsigned wl_bt_idle_us = 20000;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_bt_idle_us, CTLFLAG_RW | CTLFLAG_LOCKED, &wl_bt_idle_us, 0,
+     "Bluetooth UART poll period while the controller sleeps or nobody is connected, us");
+ 
+@@ -9763,9 +9770,20 @@ wl_xport_run(void)
+ 			 * 3014: 300 us is about 2560 wakes/s, 6% of a core with nothing to do. A controller asleep (IBS) has to
+ 			 * send a wake byte before any data and waits for the ack, so 2 ms is only 2 ms of latency there.
+ 			 */
+-			/* 3099: kern.sweet_bt_idle_us (2000..200000): the asleep / no-client period, 500 wake-ups a second at 2000 */
+-			unsigned idle_us = wl_bt_idle_us >= 2000 && wl_bt_idle_us <= 200000 ? wl_bt_idle_us : 2000;
+-			wl_sleep_us(bt_hci_connected() && !wl.ibs_asleep ? 300 : idle_us);
++			/*
++			 * 3099/3101: asleep or no client it was 2 ms, 500 wake-ups a second. With the display off it is
++			 * kern.sweet_bt_idle_us (2000..200000, default 20000) on the common grid: the controller's wake byte and
++			 * whatever follows wait in its own buffers (hardware flow control) until the next look.
++			 */
++			if (bt_hci_connected() && !wl.ibs_asleep) {
++				/* awake: 300 us with the display on; 2 ms paced (the FIFO and flow control hold what arrives meanwhile) */
++				wl_sleep_us(sweet_paced() && !bt_hci_streaming() ? 2000 : 300);
++			} else if (wl_bt_idle_us > 2000 && wl_bt_idle_us <= 200000 && sweet_paced()) {
++				(void)assert_wait_deadline(wl_sleep_event(), THREAD_UNINT, sweet_poll_deadline_us(wl_bt_idle_us, true));
++				thread_block(THREAD_CONTINUE_NULL);
++			} else {
++				wl_sleep_us(2000);
++			}
+ 		}
+ 		if (wl_ms() - last_ms >= 10000) {
+ 			last_ms = wl_ms();
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index 459994d..8710794 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -319,7 +319,7 @@ static int a630_off_idle_ms = 30000;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_off_idle_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &a630_off_idle_ms, 0, "GPU slumber after this idle with the display off");
+ /* 3099: the PM thread's period while the GPU is in slumber (kern.sweet_gpu_pm_slumber_ms, 4..1000): 250 wake-ups a second at 4, and the
+  * touch hook wakes the thread at the first event of a burst anyway */
+-static int a630_pm_slumber_ms = 4;
++static int a630_pm_slumber_ms = 250;     /* 3101: was 4 */
+ SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_pm_slumber_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &a630_pm_slumber_ms, 0, "GPU PM thread period in slumber, ms");
+ static int a630_resume_us, a630_resume_max_us;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_resume_us, CTLFLAG_RD | CTLFLAG_LOCKED, &a630_resume_us, 0, "the last wake from slumber took this long");
+@@ -3888,7 +3888,13 @@ a630_pm_thread(void *arg, wait_result_t wr)
+ 	(void)wr;
+ 	for (;;) {
+ 		int slumber_ms = a630_pm_slumber_ms;
+-		pm_sleep_ms(a630_dev.ready && !a630_awake && slumber_ms >= 4 && slumber_ms <= 1000 ? (unsigned)slumber_ms : a630_gov ? 4 : 20);
++		if (a630_dev.ready && !a630_awake && slumber_ms >= 4 && slumber_ms <= 1000 && sweet_pace) {
++			/* asleep: nothing to govern; the touch hook wakes this thread at the first event of a burst */
++			(void)assert_wait_deadline(&a630_pm_chan, THREAD_UNINT, sweet_poll_deadline_us((uint64_t)slumber_ms * 1000, sweet_paced()));
++			thread_block(THREAD_CONTINUE_NULL);
++		} else {
++			pm_sleep_ms(a630_gov ? 4 : 20);
++		}
+ 		sweet_gpu_lock();
+ 		uint64_t now = mach_absolute_time(), dt;
+ 		absolutetime_to_nanoseconds(now - last, &dt);
+diff --git a/bsd/dev/sweet_board.h b/bsd/dev/sweet_board.h
+index 3d9c06a..76c8c28 100644
+--- a/bsd/dev/sweet_board.h
++++ b/bsd/dev/sweet_board.h
+@@ -76,4 +76,42 @@ sweet_board_beryllium(void)
+ 	return cached == 1;
+ }
+ 
++/*
++ * 3101: screen-off pacing. Nothing in this kernel has a device interrupt (but the wake timer of 3100): every driver
++ * looks at its hardware on a timer, and with the display off those timers were all the phone did: 2700 idle exits a
++ * second, never all eight cores idle for more than 2 ms (kern.sweet_wake, 2026-11-20). With the display off each
++ * driver now uses a longer period of its own, and its deadline is moved up to the next tick of one common grid
++ * (kern.sweet_poll_grid_ms), so that the polls of all drivers fall on the same instants and the time between them is
++ * one long stretch in which the cores, and with 3100 the cluster, can stay powered down. kern.sweet_pace=0 switches
++ * all of it off (every period as with the display on).
++ */
++#ifdef __cplusplus
++extern "C" {
++#endif
++extern int sweet_fb_display_off;        /* bsd/dev/sweet_fb.c */
++extern unsigned sweet_pace;             /* bsd/dev/sweet_cpufreq.c */
++extern uint64_t sweet_poll_grid_abs;    /* the grid in timebase ticks; 0: none */
++extern void clock_interval_to_deadline(uint32_t interval, uint32_t scale_factor, uint64_t *result);
++#ifdef __cplusplus
++}
++#endif
++
++static inline bool
++sweet_paced(void)
++{
++	return sweet_pace != 0 && __atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED) != 0;
++}
++
++/* The deadline of a poll `us` from now; `grid`: on the common grid's next tick at or after it */
++static inline uint64_t
++sweet_poll_deadline_us(uint64_t us, bool grid)
++{
++	uint64_t deadline, g = sweet_poll_grid_abs;
++	clock_interval_to_deadline((uint32_t)us, 1000 /* NSEC_PER_USEC */, &deadline);
++	if (grid && g != 0) {
++		deadline = (deadline + g - 1) / g * g;
++	}
++	return deadline;
++}
++
+ #endif /* _SWEET_BOARD_H_ */
+diff --git a/bsd/dev/sweet_charger.c b/bsd/dev/sweet_charger.c
+index cb764fd..74bb6fb 100644
+--- a/bsd/dev/sweet_charger.c
++++ b/bsd/dev/sweet_charger.c
+@@ -196,8 +196,7 @@ static void
+ sc_sleep_ms(unsigned ms)
+ {
+ 	static int chan;
+-	uint64_t deadline;
+-	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	uint64_t deadline = sweet_poll_deadline_us((uint64_t)ms * 1000, ms >= 100 && sweet_paced());   /* 3101: on the common grid */
+ 	(void)assert_wait_deadline(&chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index c37f15d..438dcb5 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -173,9 +173,13 @@ static struct cf_domain {
+ 
+ static bool cf_started;
+ static int cf_mode = MODE_OFF;
+-/* 3099: the sample period with the display off (kern.sweet_cpufreq_off_ms; 0 = the usual period): 40 wake-ups a second for nothing to see */
+-static unsigned cf_off_ms;
+-extern int sweet_fb_display_off;
++/* 3099: the sample period with the display off (kern.sweet_cpufreq_off_ms; 0 = the usual period): 40 wake-ups a second for nothing to see.
++ * 3101: 250 by default, on the common grid */
++static unsigned cf_off_ms = 250;
++/* 3101: screen-off pacing, see sweet_board.h */
++unsigned sweet_pace = 1;
++static unsigned sweet_poll_grid_ms = 30;
++uint64_t sweet_poll_grid_abs = 30ull * 19200;   /* the 19.2 MHz timebase; set again by the sysctl */
+ static unsigned cf_ncpus;
+ static unsigned cf_log_secs = 10;
+ static int cf_force;
+@@ -621,7 +625,13 @@ cf_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ 	for (;;) {
+ 		unsigned off_ms = cf_off_ms;
+-		cf_sleep_ms(off_ms >= period && off_ms <= 2000 && __atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED) ? off_ms : period);
++		if (off_ms >= period && off_ms <= 2000 && sweet_paced()) {
++			static int off_chan;
++			(void)assert_wait_deadline(&off_chan, THREAD_UNINT, sweet_poll_deadline_us((uint64_t)off_ms * 1000, true));
++			thread_block(THREAD_CONTINUE_NULL);
++		} else {
++			cf_sleep_ms(period);
++		}
+ 		uint64_t now = mach_absolute_time();
+ 		uint64_t wall = now - last, wall_ns;
+ 		last = now;
+@@ -1153,6 +1163,30 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_psci, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_L
+     sysctl_sweet_psci, "A", "the firmware's PSCI version and features (3099)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_cpufreq_off_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &cf_off_ms, 0,
+     "the governor's sample period with the display off, ms (0: as with it on)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_pace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pace, 0,
++    "screen-off pacing of the drivers' polls: 1 on, 0 every period as with the display on (3101)");
++
++static int
++sysctl_sweet_poll_grid SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = (int)sweet_poll_grid_ms, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (v < 0 || v > 1000) {
++		return EINVAL;
++	}
++	uint64_t a = 0;
++	if (v != 0) {
++		nanoseconds_to_absolutetime((uint64_t)v * NSEC_PER_MSEC, &a);
++	}
++	sweet_poll_grid_ms = (unsigned)v;
++	sweet_poll_grid_abs = a;
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_poll_grid_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_poll_grid, "I",
++    "with the display off the drivers' polls fall on multiples of this, ms (0: no grid) (3101)");
+ 
+ /* 3100: CPU 0 and the cluster power down (osfmk/arm64/cpu.c) */
+ extern uint32_t sweet_cluster, sweet_cluster_min_us, sweet_cluster_lead_us;
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+index 1235515..8053e61 100644
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -62,7 +62,7 @@ static int sweet_fb_sysctl SYSCTL_HANDLER_ARGS
+ int sweet_fb_hud;
+ /* 3006: copy mode shows a frame when the GPU has finished it (1) or only at a vsync tick (0, boot-arg sweetfb_gatepoll=0) */
+ /* 3099: the vsync timer's period once the display is off and dark (kern.sweet_fb_off_vsync_us; 0: as with it on, 60 a second) */
+-int sweet_fb_off_vsync_us = 0;
++int sweet_fb_off_vsync_us = 1000000;    /* 3101: once a second */
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_off_vsync_us, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_off_vsync_us, 0, "vsync timer period with the display off, us (0: unchanged)");
+ int sweet_fb_gatepoll = 1;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_gatepoll, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_gatepoll, 0, "show a frame when the GPU finishes it");
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index a9b11b6..b6e67b6 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -49,9 +49,9 @@ static int keys_use_lock = 1;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_keys_glitches, CTLFLAG_RD | CTLFLAG_LOCKED, &keys_glitches, 0, "key reads that did not last, ignored");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_keys_read_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &keys_read_errors, 0, "failed key reads");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_keys_lock, CTLFLAG_RW | CTLFLAG_LOCKED, &keys_use_lock, 0, "key polling takes the SPMI lock");
+-/* 3099: the poll period (kern.sweet_keys_ms, 5..500): 50 wake-ups a second at 20 */
+-static int keys_poll_ms = 20;
+-SYSCTL_INT(_kern, OID_AUTO, sweet_keys_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &keys_poll_ms, 0, "key poll period, ms");
++/* 3099/3101: the poll period with the display off (kern.sweet_keys_ms, 5..500, default 30, on the common grid); 20 ms with it on */
++static int keys_poll_ms = 30;
++SYSCTL_INT(_kern, OID_AUTO, sweet_keys_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &keys_poll_ms, 0, "key poll period with the display off, ms");
+ 
+ static uint32_t
+ keys_rd(vm_offset_t base, uint32_t off)
+@@ -109,7 +109,11 @@ keys_wait(void)
+ {
+ 	uint64_t deadline;
+ 	int ms = keys_poll_ms;
+-	clock_interval_to_deadline(ms >= 5 && ms <= 500 ? (uint32_t)ms : 20, NSEC_PER_MSEC, &deadline);
++	if (ms >= 5 && ms <= 500 && sweet_paced()) {
++		deadline = sweet_poll_deadline_us((uint64_t)ms * 1000, true);
++	} else {
++		clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
++	}
+ 	(void)assert_wait_deadline(&keys_sleep_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+index d94d65a..12c1d8b 100644
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -171,8 +171,7 @@ static void
+ ts_sleep_ms(unsigned ms)
+ {
+ 	static int chan;
+-	uint64_t deadline;
+-	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	uint64_t deadline = sweet_poll_deadline_us((uint64_t)ms * 1000, ms >= 100 && sweet_paced());   /* 3101: on the common grid */
+ 	(void)assert_wait_deadline(&chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index d93a474..dfaf11c 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -190,7 +190,11 @@ static void
+ touch_wait(unsigned ms)
+ {
+ 	uint64_t deadline;
+-	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	if (ms >= 20 && sweet_paced()) {
++		deadline = sweet_poll_deadline_us((uint64_t)ms * 1000, true);   /* 3101: the display-off look, on the common grid */
++	} else {
++		clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	}
+ 	(void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index fd15e19..0dbaf9e 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1002,16 +1002,22 @@ ud_event(uint32_t ev)
+ 	}
+ }
+ 
+-/* 3099: how often the controller's event buffer is looked at (kern.sweet_usb_poll_ms, 1..1000): 1000 wake-ups a second at 1 */
+-static int ud_poll_ms = 1;
+-SYSCTL_INT(_kern, OID_AUTO, sweet_usb_poll_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &ud_poll_ms, 0, "USB event poll period, ms");
++/*
++ * 3099/3101: how often the controller's event buffer is looked at. 1 ms always was 1000 wake-ups a second. With the
++ * display off (kern.sweet_pace) and more than UD_QUIET_POLLS empty looks in a row it is kern.sweet_usb_poll_ms (1..1000, default
++ * 10) on the common grid; any event brings 1 ms back, so a transfer keeps its speed and only the first packet waits.
++ */
++#define UD_QUIET_POLLS  5
++static int ud_poll_ms = 10;
++SYSCTL_INT(_kern, OID_AUTO, sweet_usb_poll_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &ud_poll_ms, 0, "USB event poll period with the display off and no traffic, ms");
+ 
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+-	uint32_t ticks = 0;
++	uint32_t ticks = 0, quiet = 0;
+ 	for (;;) {
+ 		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
++		quiet = count ? 0 : quiet + 1;
+ 		if (count) {
+ 			ud_sync(UD_EVT, UD_EVT_SIZE);
+ 			for (uint32_t done = 0; done < count; done += 4) {
+@@ -1036,7 +1042,13 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			    rx[2], rx[3], ud.xfer_active[EP_RX], tx[2], tx[3], ud.xfer_active[EP_TX], dwc_rd(DSTS));
+ 		}
+ 		int poll_ms = ud_poll_ms;
+-		ud_sleep_ms(poll_ms >= 1 && poll_ms <= 1000 ? (unsigned)poll_ms : 1);
++		if (quiet > UD_QUIET_POLLS && poll_ms > 1 && poll_ms <= 1000 && sweet_paced()) {
++			(void)assert_wait_deadline(&ud.sleep_chan, THREAD_UNINT, sweet_poll_deadline_us((uint64_t)poll_ms * 1000, true));
++			thread_block(THREAD_CONTINUE_NULL);
++			ticks += (uint32_t)poll_ms - 1;         /* the 30 s line below counts milliseconds */
++		} else {
++			ud_sleep_ms(1);
++		}
+ 	}
+ }
+ 
+@@ -1065,7 +1077,13 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	to.sin_port = htons(5140);
+ 	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
+ 	for (;;) {
+-		ud_sleep_ms(100);
++		if (sweet_paced()) {
++			/* 3101: on the common grid, and not more often than every 500 ms with the display off */
++			(void)assert_wait_deadline(&ud.sleep_chan, THREAD_UNINT, sweet_poll_deadline_us(500000, true));
++			thread_block(THREAD_CONTINUE_NULL);
++		} else {
++			ud_sleep_ms(100);
++		}
+ 		if (!ud.configured) {
+ 			continue;
+ 		}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index dc09b03..6b0b292 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -67,6 +67,7 @@ extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet
+ extern "C" int sweet_fb_hud;
+ extern "C" int sweet_fb_gatepoll;               /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_gatepoll (3006) */
+ extern "C" int sweet_fb_off_vsync_us;           /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_off_vsync_us (3099) */
++extern "C" unsigned sweet_pace;                 /* bsd/dev/sweet_cpufreq.c: sysctl kern.sweet_pace (3101) */
+ extern "C" int sweet_fb_display_off;            /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_display_off (3023) */
+ /*
+  * 3087: the hardware scaler's panel rectangle (x, y, w, h; w 0 = not scaling in hardware), for SweetHID's touch mapping:
+@@ -1152,7 +1153,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		IOLockLock(fb->fLock);
+ 		int offUS = sweet_fb_off_vsync_us;
+ 		bool dark = fb->fPowerOff && ((fb->fBlOK && fb->fBlPos == 0 && !fb->fBlOffFailed) || fb->fBlackDone);
+-		sender->setTimeoutUS(dark && offUS >= 20000 && offUS <= 5000000 ? (uint32_t)offUS : nextUS);
++		sender->setTimeoutUS(dark && sweet_pace && offUS >= 20000 && offUS <= 5000000 ? (uint32_t)offUS : nextUS);
+ 		IOLockUnlock(fb->fLock);
+ 		return;
+ 	}

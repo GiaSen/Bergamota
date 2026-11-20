@@ -1,0 +1,633 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 9fca46a..7b282b3 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -7518,6 +7518,12 @@ static struct {
+ 	bool summary_done;
+ } svc;
+ 
++/* 3099: the service loop's periods (kern.sweet_wlan_idle_ms, _busy_ms, _busy_hold_ms): joined and quiet, busy, and how long "busy" lasts */
++static unsigned svc_conn_ms = 5, svc_busy_ms = 1, svc_busy_hold_ms = 200;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_idle_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &svc_conn_ms, 0, "Wi-Fi/modem service loop period when joined and quiet, ms");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_busy_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &svc_busy_ms, 0, "Wi-Fi/modem service loop period when busy, ms");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_busy_hold_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &svc_busy_hold_ms, 0, "how long the loop stays busy after a message, ms");
++
+ static bool
+ svc_busy(void)
+ {
+@@ -7536,7 +7542,7 @@ svc_busy(void)
+ 	    sta.wq_n) {
+ 		svc.last_busy_ms = ms_now_ms();
+ 	}
+-	return ms_now_ms() < svc.last_busy_ms + 200;
++	return ms_now_ms() < svc.last_busy_ms + (svc_busy_hold_ms >= 10 && svc_busy_hold_ms <= 2000 ? svc_busy_hold_ms : 200);
+ }
+ 
+ static void
+@@ -7646,9 +7652,11 @@ ms_ipc_run(unsigned hold_s)
+ 		}
+ 		if (svc_busy()) {
+ 			svc.busy_loops++;
+-			wl_sleep(1);
++			wl_sleep(svc_busy_ms >= 1 && svc_busy_ms <= 50 ? svc_busy_ms : 1);
+ 		} else {
+-			wl_sleep(sta.state == ST_CONNECTED ? 5 : SVC_IDLE_MS);   /* en0 output wakes the thread at once */
++			/* 3099: kern.sweet_wlan_idle_ms (5..500): 200 wake-ups a second at 5 */
++			unsigned conn_ms = svc_conn_ms >= 5 && svc_conn_ms <= 500 ? svc_conn_ms : 5;
++			wl_sleep(sta.state == ST_CONNECTED ? conn_ms : conn_ms > SVC_IDLE_MS ? conn_ms : SVC_IDLE_MS);   /* en0 output wakes the thread at once */
+ 		}
+ 	}
+ 	printf("SWEET IPC: %u s: glink %s, IPCRTR %s, qrtr hello %s; %u packets in, %u out; rmtfs %u reads (%llu bytes), "
+@@ -9723,6 +9731,10 @@ wl_xport_start(void)
+  * userland. A line "SWEET BT: UART RX ..." every 10 s shows the measured maximum FIFO fill
+  * (max words vs depth) and FIFO error count; a FIFO error would mean the margin was exceeded.
+  */
++static unsigned wl_bt_idle_us = 2000;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_bt_idle_us, CTLFLAG_RW | CTLFLAG_LOCKED, &wl_bt_idle_us, 0,
++    "Bluetooth UART poll period while the controller sleeps or nobody is connected, us");
++
+ static void
+ wl_xport_run(void)
+ {
+@@ -9751,7 +9763,9 @@ wl_xport_run(void)
+ 			 * 3014: 300 us is about 2560 wakes/s, 6% of a core with nothing to do. A controller asleep (IBS) has to
+ 			 * send a wake byte before any data and waits for the ack, so 2 ms is only 2 ms of latency there.
+ 			 */
+-			wl_sleep_us(bt_hci_connected() && !wl.ibs_asleep ? 300 : 2000);
++			/* 3099: kern.sweet_bt_idle_us (2000..200000): the asleep / no-client period, 500 wake-ups a second at 2000 */
++			unsigned idle_us = wl_bt_idle_us >= 2000 && wl_bt_idle_us <= 200000 ? wl_bt_idle_us : 2000;
++			wl_sleep_us(bt_hci_connected() && !wl.ibs_asleep ? 300 : idle_us);
+ 		}
+ 		if (wl_ms() - last_ms >= 10000) {
+ 			last_ms = wl_ms();
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index bb60b41..459994d 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -317,6 +317,10 @@ static uint32_t a630_hwcg;              /* sweetgpuhwcg=1: hardware clock gating
+  */
+ static int a630_off_idle_ms = 30000;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_off_idle_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &a630_off_idle_ms, 0, "GPU slumber after this idle with the display off");
++/* 3099: the PM thread's period while the GPU is in slumber (kern.sweet_gpu_pm_slumber_ms, 4..1000): 250 wake-ups a second at 4, and the
++ * touch hook wakes the thread at the first event of a burst anyway */
++static int a630_pm_slumber_ms = 4;
++SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_pm_slumber_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &a630_pm_slumber_ms, 0, "GPU PM thread period in slumber, ms");
+ static int a630_resume_us, a630_resume_max_us;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_resume_us, CTLFLAG_RD | CTLFLAG_LOCKED, &a630_resume_us, 0, "the last wake from slumber took this long");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_gpu_resume_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &a630_resume_max_us, 0, "the longest wake from slumber");
+@@ -3883,7 +3887,8 @@ a630_pm_thread(void *arg, wait_result_t wr)
+ 	(void)arg;
+ 	(void)wr;
+ 	for (;;) {
+-		pm_sleep_ms(a630_gov ? 4 : 20);
++		int slumber_ms = a630_pm_slumber_ms;
++		pm_sleep_ms(a630_dev.ready && !a630_awake && slumber_ms >= 4 && slumber_ms <= 1000 ? (unsigned)slumber_ms : a630_gov ? 4 : 20);
+ 		sweet_gpu_lock();
+ 		uint64_t now = mach_absolute_time(), dt;
+ 		absolutetime_to_nanoseconds(now - last, &dt);
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 5dc3e4d..f0a598c 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -173,6 +173,9 @@ static struct cf_domain {
+ 
+ static bool cf_started;
+ static int cf_mode = MODE_OFF;
++/* 3099: the sample period with the display off (kern.sweet_cpufreq_off_ms; 0 = the usual period): 40 wake-ups a second for nothing to see */
++static unsigned cf_off_ms;
++extern int sweet_fb_display_off;
+ static unsigned cf_ncpus;
+ static unsigned cf_log_secs = 10;
+ static int cf_force;
+@@ -617,7 +620,8 @@ cf_thread(void *arg __unused, wait_result_t wr __unused)
+ 		(void)cf_cluster_load(&cf_dom[i], 1);   /* prime prev_idle */
+ 	}
+ 	for (;;) {
+-		cf_sleep_ms(period);
++		unsigned off_ms = cf_off_ms;
++		cf_sleep_ms(off_ms >= period && off_ms <= 2000 && __atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED) ? off_ms : period);
+ 		uint64_t now = mach_absolute_time();
+ 		uint64_t wall = now - last, wall_ns;
+ 		last = now;
+@@ -1112,4 +1116,41 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_deep_idle_screen, CTLFLAG_RW | CTLFLAG_LOCKED
+     "1: power cores down only while the display is off");
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_deep_idle_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
+     sysctl_sweet_deep_idle_stats, "A", "per-CPU deep idle counters (3055)");
++
++/* 3099: who wakes the phone (osfmk/arm64/cpu.c). A read reports, a write of anything clears the counters. */
++extern int sweet_wake_stats(char *buf, size_t len, bool clear);
++extern int sweet_psci_info(char *buf, size_t len);
++static char sweet_wake_buf[6144];
++static int sweet_wake_busy;
++
++static int
++sysctl_sweet_wake SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	if (__atomic_exchange_n(&sweet_wake_busy, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	sweet_wake_stats(sweet_wake_buf, sizeof(sweet_wake_buf), false);
++	int error = sysctl_handle_string(oidp, sweet_wake_buf, sizeof(sweet_wake_buf), req);
++	if (!error && req->newptr) {
++		sweet_wake_stats(sweet_wake_buf, sizeof(sweet_wake_buf), true);
++	}
++	__atomic_store_n(&sweet_wake_busy, 0, __ATOMIC_RELEASE);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wake, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_wake, "A", "idle exits, all-CPUs-idle windows and the timers behind them (3099); a write clears");
++
++static int
++sysctl_sweet_psci SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[256];
++	sweet_psci_info(buf, sizeof(buf));
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_psci, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_psci, "A", "the firmware's PSCI version and features (3099)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_cpufreq_off_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &cf_off_ms, 0,
++    "the governor's sample period with the display off, ms (0: as with it on)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+index 4d9676a..1235515 100644
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -61,6 +61,9 @@ static int sweet_fb_sysctl SYSCTL_HANDLER_ARGS
+  */
+ int sweet_fb_hud;
+ /* 3006: copy mode shows a frame when the GPU has finished it (1) or only at a vsync tick (0, boot-arg sweetfb_gatepoll=0) */
++/* 3099: the vsync timer's period once the display is off and dark (kern.sweet_fb_off_vsync_us; 0: as with it on, 60 a second) */
++int sweet_fb_off_vsync_us = 0;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_off_vsync_us, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_off_vsync_us, 0, "vsync timer period with the display off, us (0: unchanged)");
+ int sweet_fb_gatepoll = 1;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_gatepoll, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_gatepoll, 0, "show a frame when the GPU finishes it");
+ /* sysctl kern.sweet_fb_bl (3016): Mi 8 panel brightness by hand, 2..1023; 0 = the level iOS asks for */
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 73d95f3..a9b11b6 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -49,6 +49,9 @@ static int keys_use_lock = 1;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_keys_glitches, CTLFLAG_RD | CTLFLAG_LOCKED, &keys_glitches, 0, "key reads that did not last, ignored");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_keys_read_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &keys_read_errors, 0, "failed key reads");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_keys_lock, CTLFLAG_RW | CTLFLAG_LOCKED, &keys_use_lock, 0, "key polling takes the SPMI lock");
++/* 3099: the poll period (kern.sweet_keys_ms, 5..500): 50 wake-ups a second at 20 */
++static int keys_poll_ms = 20;
++SYSCTL_INT(_kern, OID_AUTO, sweet_keys_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &keys_poll_ms, 0, "key poll period, ms");
+ 
+ static uint32_t
+ keys_rd(vm_offset_t base, uint32_t off)
+@@ -105,7 +108,8 @@ static void
+ keys_wait(void)
+ {
+ 	uint64_t deadline;
+-	clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
++	int ms = keys_poll_ms;
++	clock_interval_to_deadline(ms >= 5 && ms <= 500 ? (uint32_t)ms : 20, NSEC_PER_MSEC, &deadline);
+ 	(void)assert_wait_deadline(&keys_sleep_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 9ab2626..fd15e19 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -13,6 +13,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/sysctl.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -1001,6 +1002,10 @@ ud_event(uint32_t ev)
+ 	}
+ }
+ 
++/* 3099: how often the controller's event buffer is looked at (kern.sweet_usb_poll_ms, 1..1000): 1000 wake-ups a second at 1 */
++static int ud_poll_ms = 1;
++SYSCTL_INT(_kern, OID_AUTO, sweet_usb_poll_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &ud_poll_ms, 0, "USB event poll period, ms");
++
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -1030,7 +1035,8 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			    ud.rx_frames, ud.tx_frames, ud.configured, ud.data_alt, ud.tx_busy, ud.txq_count,
+ 			    rx[2], rx[3], ud.xfer_active[EP_RX], tx[2], tx[3], ud.xfer_active[EP_TX], dwc_rd(DSTS));
+ 		}
+-		ud_sleep_ms(1);
++		int poll_ms = ud_poll_ms;
++		ud_sleep_ms(poll_ms >= 1 && poll_ms <= 1000 ? (unsigned)poll_ms : 1);
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ce17afa..dc09b03 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -66,6 +66,7 @@ extern "C" int sweet_smmu_probe_sid(unsigned sid, unsigned level); /* bsd/dev/sw
+ extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb */
+ extern "C" int sweet_fb_hud;
+ extern "C" int sweet_fb_gatepoll;               /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_gatepoll (3006) */
++extern "C" int sweet_fb_off_vsync_us;           /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_off_vsync_us (3099) */
+ extern "C" int sweet_fb_display_off;            /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_display_off (3023) */
+ /*
+  * 3087: the hardware scaler's panel rectangle (x, y, w, h; w 0 = not scaling in hardware), for SweetHID's touch mapping:
+@@ -335,6 +336,14 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	static void gateFired(OSObject *owner, IOTimerEventSource *sender);
+ 
+ public:
++	/* 3099: the next vsync tick in 1 ms, whatever the timer was armed for (called with fLock held) */
++	void
++	kickVsync(void)
++	{
++		if (fVsync != NULL) {
++			fVsync->setTimeoutUS(1000);
++		}
++	}
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+@@ -1136,7 +1145,15 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fBlackDone = true;
+ 			fb->blackout();
+ 		}
+-		sender->setTimeoutUS(nextUS);
++		/*
++		 * 3099: off and dark, nothing left to do here: tick slowly. Under the lock, as the power request's kick is, so
++		 * an "on" that arrives meanwhile always ends with the short timeout.
++		 */
++		IOLockLock(fb->fLock);
++		int offUS = sweet_fb_off_vsync_us;
++		bool dark = fb->fPowerOff && ((fb->fBlOK && fb->fBlPos == 0 && !fb->fBlOffFailed) || fb->fBlackDone);
++		sender->setTimeoutUS(dark && offUS >= 20000 && offUS <= 5000000 ? (uint32_t)offUS : nextUS);
++		IOLockUnlock(fb->fLock);
+ 		return;
+ 	}
+ 	/* 3006: with the previous frame not latched yet the gate timer takes this one, so this thread does not spin in waitLatch */
+@@ -4049,6 +4066,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				fFB->fBlackDone = false;
+ 				fFB->fBlOffFailed = false;      /* 0242: every request tries the backlight again */
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
++				if (!off) {
++					fFB->kickVsync();       /* 3099: the timer may be on its slow display-off period */
++				}
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index dd05f13..ec4e0b6 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -475,6 +475,8 @@ wfe_to_deadline_or_interrupt(uint32_t cid, uint64_t wfe_deadline, cpu_data_t *cd
+ 
+ #if defined(SWEET)
+ static bool sweet_deep_idle_enter(cpu_data_t *cdp);
++void sweet_idle_enter_note(cpu_data_t *cdp);
++void sweet_idle_exit_note(cpu_data_t *cdp);
+ #endif
+ 
+ /*
+@@ -616,10 +618,14 @@ cpu_idle(void)
+ 		arm64_retention_wfi();
+ #else
+ #if defined(SWEET)
+-		/* 3055: power the core down instead when its next timer is far enough */
++		/* 3055: power the core down instead when its next timer is far enough; 3099: count the idle periods */
++		sweet_idle_enter_note(cpu_data_ptr);
+ 		if (!sweet_deep_idle_enter(cpu_data_ptr))
+ #endif
+ 		__builtin_arm_wfi();
++#if defined(SWEET)
++		sweet_idle_exit_note(cpu_data_ptr);
++#endif
+ #endif
+ 
+ #if defined(APPLETYPHOON)
+@@ -1188,6 +1194,7 @@ sweet_deep_idle_resume(cpu_data_t *cdp)
+ 	unsigned int cpu = (unsigned int)cdp->cpu_number;
+ 
+ 	PE_init_cpu();          /* GIC CPU interface: SRE, PMR, BPR, EOI mode, group 1 enable */
++	sweet_idle_exit_note(cdp);
+ 	if (cpu < MAX_CPUS) {
+ 		struct sweet_di_cpu *s = &sweet_di[cpu];
+ 		uint64_t now = mach_absolute_time();
+@@ -1280,6 +1287,281 @@ sweet_deep_idle_stats(char *buf, size_t len)
+ 	}
+ 	return 0;
+ }
++
++/*
++ * 3099: who wakes the phone. Counters only, read with kern.sweet_wake (a write clears them).
++ *  - per CPU, how often it left idle;
++ *  - the windows in which every CPU was in idle at once, by length: the cluster and its cache can only power down in
++ *    such a window, and the DT's llcc-off wants about 10 ms of it (latency 6562 us, time overhead 5000 us);
++ *  - every timer that expired, by its function (a thread's wait timer also by the thread, or by the process for a user
++ *    thread; a delayed thread call by the call's function), and how often it ran within SWEET_WAKE_CREDIT_US of its
++ *    CPU leaving idle: that timer woke the CPU.
++ * The notes run with interrupts masked (cpu_idle, the reset path, the timer interrupt). The table is lock-free: a slot
++ * is claimed by its key with one compare-and-swap, its counters are only ever added to.
++ */
++#define SWEET_WAKE_SLOTS        192
++#define SWEET_WAKE_CREDIT_US    500
++#define SWEET_WAKE_PID          (1ULL << 40)
++#define SWEET_ALLIDLE_BUCKETS   9
++
++struct sweet_wake_slot {
++	uint64_t        key;            /* 0: free */
++	uintptr_t       func;
++	uint64_t        who;            /* thread id, or pid | SWEET_WAKE_PID, or 0 */
++	uint64_t        fired;
++	uint64_t        woke;
++	uint32_t        kind;           /* 0 timer call, 1 delayed thread call */
++	char            name[28];       /* a kernel thread's name, taken when the slot was claimed */
++};
++struct sweet_idle_cpu {
++	uint64_t        exit_abs;       /* the last time this CPU left idle; 0 once a timer took the credit */
++	uint64_t        exits;
++	uint64_t        by_timer;       /* exits a timer took the credit for */
++	uint32_t        in;
++} __attribute__((aligned(128)));
++
++static struct sweet_wake_slot sweet_wake_tab[SWEET_WAKE_SLOTS];
++static struct sweet_idle_cpu sweet_idle_cpu[MAX_CPUS];
++static uint64_t sweet_wake_lost, sweet_wake_since, sweet_wake_credit_abs;
++static uint32_t sweet_idle_n, sweet_idle_ncpus;
++static uint64_t sweet_allidle_start;
++static const uint32_t sweet_allidle_us[SWEET_ALLIDLE_BUCKETS - 1] = { 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000 };
++static struct { uint64_t count, abs; } sweet_allidle[SWEET_ALLIDLE_BUCKETS];
++
++void sweet_idle_enter_note(cpu_data_t *cdp);
++void
++sweet_idle_enter_note(cpu_data_t *cdp)
++{
++	unsigned int cpu = (unsigned int)cdp->cpu_number;
++	if (cpu >= MAX_CPUS || sweet_idle_cpu[cpu].in) {
++		return;
++	}
++	if (__improbable(sweet_idle_ncpus == 0)) {
++		uint64_t a;
++		nanoseconds_to_absolutetime((uint64_t)SWEET_WAKE_CREDIT_US * NSEC_PER_USEC, &a);
++		sweet_wake_credit_abs = a;
++		sweet_wake_since = mach_absolute_time();
++		sweet_idle_ncpus = ml_get_topology_info()->num_cpus;
++	}
++	sweet_idle_cpu[cpu].in = 1;
++	if (os_atomic_inc(&sweet_idle_n, relaxed) == sweet_idle_ncpus) {
++		os_atomic_store(&sweet_allidle_start, mach_absolute_time(), relaxed);
++	}
++}
++
++void sweet_idle_exit_note(cpu_data_t *cdp);
++void
++sweet_idle_exit_note(cpu_data_t *cdp)
++{
++	unsigned int cpu = (unsigned int)cdp->cpu_number;
++	if (cpu >= MAX_CPUS || !sweet_idle_cpu[cpu].in) {
++		return;
++	}
++	uint64_t now = mach_absolute_time();
++	sweet_idle_cpu[cpu].in = 0;
++	sweet_idle_cpu[cpu].exits++;
++	sweet_idle_cpu[cpu].exit_abs = now;
++	/* only the CPU that ends a window sees the full count, so it is the window's one writer */
++	if (os_atomic_dec_orig(&sweet_idle_n, relaxed) == sweet_idle_ncpus) {
++		uint64_t start = os_atomic_xchg(&sweet_allidle_start, 0, relaxed), ns;
++		if (start != 0 && now > start) {
++			unsigned b = 0;
++			absolutetime_to_nanoseconds(now - start, &ns);
++			while (b < SWEET_ALLIDLE_BUCKETS - 1 && ns / NSEC_PER_USEC >= sweet_allidle_us[b]) {
++				b++;
++			}
++			sweet_allidle[b].count++;
++			sweet_allidle[b].abs += now - start;
++		}
++	}
++}
++
++/* A timer is about to run (timer_queue_expire, thread_call_delayed_timer): interrupts masked */
++void sweet_wake_note(void *func, void *param0, int kind);
++void
++sweet_wake_note(void *func, void *param0, int kind)
++{
++	uint64_t who = 0;
++	thread_t named = THREAD_NULL;
++
++	if (__improbable(sweet_idle_ncpus == 0)) {
++		return;
++	}
++	if (kind == 0 && func == (void *)thread_timer_expire && param0 != NULL) {
++		thread_t th = (thread_t)param0;
++		named = th;
++		task_t task = get_threadtask(th);
++		int pid = task != TASK_NULL ? task_pid(task) : 0;
++		who = pid > 0 ? ((uint64_t)pid | SWEET_WAKE_PID) : th->thread_id;
++	}
++	uint64_t key = ((uint64_t)(uintptr_t)func * 0x9E3779B97F4A7C15ULL) ^ (who * 0xC2B2AE3D27D4EB4FULL) ^ (uint64_t)kind;
++	if (key == 0) {
++		key = 1;
++	}
++	struct sweet_wake_slot *s = NULL;
++	for (unsigned i = 0, at = (unsigned)(key >> 40); i < SWEET_WAKE_SLOTS; i++, at++) {
++		struct sweet_wake_slot *t = &sweet_wake_tab[at % SWEET_WAKE_SLOTS];
++		uint64_t k = os_atomic_load(&t->key, relaxed);
++		if (k == 0 && os_atomic_cmpxchgv(&t->key, 0, key, &k, relaxed)) {
++			t->func = (uintptr_t)func;
++			t->who = who;
++			t->kind = (uint32_t)kind;
++			if (named != THREAD_NULL && !(who & SWEET_WAKE_PID)) {
++				extern void bsd_getthreadname(void *uth, char *buffer);
++				char full[64];          /* MAXTHREADNAMESIZE */
++				full[0] = 0;
++				bsd_getthreadname(get_bsdthread_info(named), full);
++				strlcpy(t->name, full, sizeof(t->name));
++			}
++			k = key;
++		}
++		if (k == key) {
++			s = t;
++			break;
++		}
++	}
++	if (s == NULL) {
++		os_atomic_inc(&sweet_wake_lost, relaxed);
++		return;
++	}
++	os_atomic_inc(&s->fired, relaxed);
++	unsigned int cpu = (unsigned int)cpu_number();
++	if (cpu < MAX_CPUS) {
++		uint64_t out = sweet_idle_cpu[cpu].exit_abs;
++		if (out != 0) {
++			sweet_idle_cpu[cpu].exit_abs = 0;
++			if (mach_absolute_time() - out < sweet_wake_credit_abs) {
++				sweet_idle_cpu[cpu].by_timer++;
++				os_atomic_inc(&s->woke, relaxed);
++			}
++		}
++	}
++}
++
++/* the report; clear: forget everything counted so far */
++int sweet_wake_stats(char *buf, size_t len, bool clear);
++int
++sweet_wake_stats(char *buf, size_t len, bool clear)
++{
++	size_t off = 0;
++	uint64_t ns, total = 0, total_n = 0;
++	static const char *const edge[SWEET_ALLIDLE_BUCKETS] = { "<0.5", "<1", "<2", "<5", "<10", "<20", "<50", "<100", ">=100" };
++#define SW_CAT(...) do { int n_ = snprintf(buf + off, off < len ? len - off : 0, __VA_ARGS__); if (n_ > 0) { off += (size_t)n_; } if (off >= len) { off = len - 1; } } while (0)
++
++	if (clear) {
++		for (unsigned i = 0; i < SWEET_WAKE_SLOTS; i++) {
++			sweet_wake_tab[i].fired = sweet_wake_tab[i].woke = 0;
++		}
++		for (unsigned c = 0; c < MAX_CPUS; c++) {
++			sweet_idle_cpu[c].exits = sweet_idle_cpu[c].by_timer = 0;
++		}
++		bzero(sweet_allidle, sizeof(sweet_allidle));
++		sweet_wake_lost = 0;
++		sweet_wake_since = mach_absolute_time();
++		buf[0] = 0;
++		return 0;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - sweet_wake_since, &ns);
++	SW_CAT("sweet_wake v1 ms=%llu cpus=%u lost=%llu slide=0x%lx\nexits", ns / NSEC_PER_MSEC, sweet_idle_ncpus, sweet_wake_lost,
++	    (unsigned long)vm_kernel_slide);
++	for (unsigned c = 0; c < MAX_CPUS; c++) {
++		if (CpuDataEntries[c].cpu_data_vaddr != NULL) {
++			SW_CAT(" cpu%u=%llu/%llu", c, sweet_idle_cpu[c].exits, sweet_idle_cpu[c].by_timer);
++		}
++	}
++	SW_CAT("\nallidle_ms(count:ms)");
++	for (unsigned b = 0; b < SWEET_ALLIDLE_BUCKETS; b++) {
++		absolutetime_to_nanoseconds(sweet_allidle[b].abs, &ns);
++		SW_CAT(" %s=%llu:%llu", edge[b], sweet_allidle[b].count, ns / NSEC_PER_MSEC);
++		total += ns / NSEC_PER_MSEC;
++		total_n += sweet_allidle[b].count;
++	}
++	SW_CAT(" all=%llu:%llu\n", total_n, total);
++	/* the timers, busiest first (by wake-ups, then by expiries): a selection over a copy of the counts */
++	static uint8_t shown[SWEET_WAKE_SLOTS];
++	bzero(shown, sizeof(shown));
++	for (unsigned line = 0; line < 40; line++) {
++		int best = -1;
++		for (unsigned i = 0; i < SWEET_WAKE_SLOTS; i++) {
++			const struct sweet_wake_slot *t = &sweet_wake_tab[i];
++			if (t->key == 0 || shown[i] || t->fired == 0) {
++				continue;
++			}
++			if (best < 0 || t->woke > sweet_wake_tab[best].woke ||
++			    (t->woke == sweet_wake_tab[best].woke && t->fired > sweet_wake_tab[best].fired)) {
++				best = (int)i;
++			}
++		}
++		if (best < 0) {
++			break;
++		}
++		shown[best] = 1;
++		const struct sweet_wake_slot *t = &sweet_wake_tab[best];
++		SW_CAT("%s 0x%lx", t->kind ? "call" : "timer", (unsigned long)VM_KERNEL_UNSLIDE(t->func));
++		if (t->who & SWEET_WAKE_PID) {
++			SW_CAT(" pid=%llu", t->who & ~SWEET_WAKE_PID);
++		} else if (t->who) {
++			SW_CAT(" tid=0x%llx", t->who);
++			if (t->name[0]) {
++				char n2[sizeof(t->name)];
++				strlcpy(n2, t->name, sizeof(n2));
++				for (char *c = n2; *c; c++) {
++					if (*c == ' ') {
++						*c = '_';
++					}
++				}
++				SW_CAT(" name=%s", n2);
++			}
++		}
++		SW_CAT(" fired=%llu woke=%llu\n", t->fired, t->woke);
++	}
++#undef SW_CAT
++	return 0;
++}
++
++/*
++ * 3099: what the firmware's PSCI says of itself, for the cluster work: the version, and PSCI_FEATURES of the calls a
++ * deeper sleep would use. Reads only; called from a sysctl. A negative number is PSCI's "not supported" (-1).
++ */
++static int64_t
++sweet_smc4(uint64_t fid, uint64_t a1, uint64_t a2, uint64_t a3)
++{
++	register uint64_t x0 __asm__("x0") = fid;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	boolean_t intr = ml_set_interrupts_enabled(FALSE);
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	         "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	         "x14", "x15", "x16", "x17", "cc", "memory");
++	ml_set_interrupts_enabled(intr);
++	return (int64_t)x0;
++}
++
++int sweet_psci_info(char *buf, size_t len);
++int
++sweet_psci_info(char *buf, size_t len)
++{
++	static const struct { const char *name; uint32_t fid; } calls[] = {
++		{ "cpu_suspend", 0xC4000001u }, { "set_suspend_mode", 0x8400000Fu }, { "system_suspend", 0xC400000Eu },
++		{ "stat_residency", 0xC4000010u }, { "stat_count", 0xC4000011u }, { "cpu_default_suspend", 0xC400000Cu },
++		{ "node_hw_state", 0xC400000Du },
++	};
++	int32_t version = (int32_t)sweet_smc4(0x84000000u, 0, 0, 0);
++	size_t off = 0;
++	int n = snprintf(buf, len, "sweet_psci v1 version=%d.%d", (version >> 16) & 0x7fff, version & 0xffff);
++	off = n > 0 ? (size_t)n : 0;
++	if (version >= 0x10000) {       /* PSCI_FEATURES is from 1.0 on */
++		for (unsigned i = 0; i < sizeof(calls) / sizeof(calls[0]) && off < len; i++) {
++			n = snprintf(buf + off, len - off, " %s=%d", calls[i].name, (int32_t)sweet_smc4(0x8400000Au, calls[i].fid, 0, 0));
++			off += n > 0 ? (size_t)n : 0;
++		}
++	}
++	if (off < len) {
++		(void)snprintf(buf + off, len - off, "\n");
++	}
++	return 0;
++}
+ #endif /* SWEET */
+ 
+ 
+diff --git a/osfmk/kern/thread_call.c b/osfmk/kern/thread_call.c
+index c65772c..40e38b6 100644
+--- a/osfmk/kern/thread_call.c
++++ b/osfmk/kern/thread_call.c
+@@ -2046,6 +2046,13 @@ thread_call_delayed_timer(timer_call_param_t p0, timer_call_param_t p1)
+ 			break;
+ 		}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		{
++			/* 3099: who wakes the phone: the delayed call that is due (osfmk/arm64/cpu.c) */
++			extern void sweet_wake_note(void *func, void *param0, int kind);
++			sweet_wake_note((void *)call->tc_func, NULL, 1);
++		}
++#endif
+ 		if (THREAD_CALL_SIGNAL & call->tc_flags) {
+ 			__assert_only queue_head_t *old_queue;
+ 			old_queue = thread_call_dequeue(call);
+diff --git a/osfmk/kern/timer_call.c b/osfmk/kern/timer_call.c
+index ef29922..0b2d69a 100644
+--- a/osfmk/kern/timer_call.c
++++ b/osfmk/kern/timer_call.c
+@@ -1028,6 +1028,13 @@ timer_queue_expire_with_options(
+ 			 */
+ 			uint64_t *ttdp = &current_processor()->timer_call_ttd;
+ 			*ttdp = call->tc_ttd;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			{
++				/* 3099: who wakes the phone (osfmk/arm64/cpu.c) */
++				extern void sweet_wake_note(void *func, void *param0, int kind);
++				sweet_wake_note((void *)func, (void *)param0, 0);
++			}
++#endif
+ 			(*func)(param0, param1);
+ 			*ttdp = 0;
+ #if CONFIG_DTRACE

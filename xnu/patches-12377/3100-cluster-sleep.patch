@@ -1,0 +1,723 @@
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index f0a598c..c37f15d 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -1153,4 +1153,61 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_psci, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_L
+     sysctl_sweet_psci, "A", "the firmware's PSCI version and features (3099)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_cpufreq_off_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &cf_off_ms, 0,
+     "the governor's sample period with the display off, ms (0: as with it on)");
++
++/* 3100: CPU 0 and the cluster power down (osfmk/arm64/cpu.c) */
++extern uint32_t sweet_cluster, sweet_cluster_min_us, sweet_cluster_lead_us;
++extern int sweet_cluster_configure(uint32_t mode);
++extern int sweet_cluster_stats(char *buf, size_t len);
++
++static int
++sysctl_sweet_cluster SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = (int)sweet_cluster, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	int rc = v < 0 ? -1 : sweet_cluster_configure((uint32_t)v);
++	return rc == 0 ? 0 : rc == -3 ? ENXIO : EINVAL;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cluster, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_cluster, "I",
++    "CPU 0 powers down too: 0 off, 1 as a core with CPU 1 on guard, 2 as a core, 3 with the cluster (3100)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_cluster_min_us, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_cluster_min_us, 0,
++    "CPU 0 powers down only if nothing is due for this long (us); takes effect at the next kern.sweet_cluster write");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_cluster_lead_us, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_cluster_lead_us, 0,
++    "CPU 0's wake timer fires this long before the earliest deadline (us); takes effect at the next kern.sweet_cluster write");
++
++extern uint32_t sweet_cluster_state, sweet_cluster_all, sweet_cluster3_min_us, sweet_cluster3_lead_us;
++extern int sweet_psci_set_mode(uint32_t osi);
++SYSCTL_UINT(_kern, OID_AUTO, sweet_cluster3_min_us, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_cluster3_min_us, 0, "mode 3: nothing due for this long (us)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_cluster3_lead_us, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_cluster3_lead_us, 0, "mode 3: the wake timer's lead (us)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_cluster_state, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_cluster_state, 0, "mode 3's PSCI power_state (a test knob)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_cluster_all, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_cluster_all, 0, "mode 3: every core asks for the cluster state (a test knob)");
++static int sweet_psci_osi_rc = -100;
++
++static int
++sysctl_sweet_psci_osi SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = sweet_psci_osi_rc, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	sweet_psci_osi_rc = sweet_psci_set_mode(v != 0);
++	printf("SWEET CLUSTER: PSCI_SET_SUSPEND_MODE(%d) -> %d\n", v != 0, sweet_psci_osi_rc);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_psci_osi, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_psci_osi, "I",
++    "write 1/0: PSCI_SET_SUSPEND_MODE OS-initiated / platform-coordinated; reads the firmware's last answer (-100: never asked)");
++
++static int
++sysctl_sweet_cluster_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[1024];
++	sweet_cluster_stats(buf, sizeof(buf));
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cluster_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_cluster_stats, "A", "CPU 0 / cluster power-down counters (3100)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index b8cf280..9fcc8c7 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -966,4 +966,81 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/*
++ * 3100: for the cluster's power-down (osfmk/arm64/cpu.c, kern.sweet_cluster=3). The DT calls the cluster's deepest level
++ * "notify-rpm": before the last core goes, Linux (drivers/soc/qcom/system_pm.c) makes sure no request is in flight and
++ * writes the time of the next wake-up, the memory-mapped timer's compare value, into the RSC's two hidden control
++ * slots: +0x38 the upper 24 bits with bit 31 "valid", +0x40 the lower 32. In that state the power controller brings
++ * the cluster back, not the GIC. No sleep or wake votes are written: what is voted stays voted.
++ * sweet_rpmh_sleep_enter: CPU 0, interrupts masked, every other core down; takes the driver's lock and keeps it until
++ * sweet_rpmh_sleep_exit. false: a request is in flight or the driver is not up, do not sleep that deep now.
++ */
++#define RH_HIDDEN_CMD0  0x38u
++#define RH_HIDDEN_CMD1  0x40u
++bool sweet_rpmh_sleep_enter(uint32_t cval_lo, uint32_t cval_hi);
++void sweet_rpmh_sleep_exit(void);
++
++bool
++sweet_rpmh_sleep_enter(uint32_t cval_lo, uint32_t cval_hi)
++{
++	if (!rh_rsc || !rh_tcs || !rh_be) {
++		return false;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return false;
++	}
++	for (unsigned t = 0; t < RH_ACTIVE_N; t++) {
++		if (!rh_free(t)) {
++			__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++			return false;
++		}
++	}
++	rh_write(rh_rsc, RH_HIDDEN_CMD0, (1u << 31) | (cval_hi & 0xffffffu));
++	rh_write(rh_rsc, RH_HIDDEN_CMD1, cval_lo);
++	return true;
++}
++
++void
++sweet_rpmh_sleep_exit(void)
++{
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++}
++
++/* kern.sweet_rpmh_sets: what the sleep (TCS 2-4) and wake (TCS 5-7) sets and the hidden slots hold; reads only */
++static int
++sysctl_sweet_rpmh_sets SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[1536];
++	size_t n = 0;
++	if (!rh_rsc || !rh_tcs) {
++		return ENXIO;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	n += (size_t)snprintf(buf + n, sizeof(buf) - n, "sweet_rpmh_sets v1 hidden0=%#x hidden1=%#x solver=%#x irq_en=%#x irq_status=%#x\n",
++	    rh_read(rh_rsc, RH_HIDDEN_CMD0), rh_read(rh_rsc, RH_HIDDEN_CMD1), rh_read(rh_rsc, 4), rh_read(rh_tcs, RH_IRQ_EN), rh_read(rh_tcs, RH_IRQ_STATUS));
++	for (unsigned t = 0; t < RH_NORMAL_N && n < sizeof(buf); t++) {
++		uint32_t b = t * RH_TCS_STRIDE, en = rh_read(rh_tcs, b + RH_ENABLE);
++		n += (size_t)snprintf(buf + n, sizeof(buf) - n, "tcs%u %s enable=%#x control=%#x status=%#x wait=%#x", t,
++		    t < RH_ACTIVE_N ? "active" : t < RH_ACTIVE_N + 3 ? "sleep" : "wake", en, rh_read(rh_tcs, b + RH_CONTROL), rh_read(rh_tcs, b + RH_STATUS),
++		    rh_read(rh_tcs, b + RH_WAIT));
++		for (unsigned c = 0; c < 16 && n < sizeof(buf); c++) {
++			if (en & (1u << c)) {
++				n += (size_t)snprintf(buf + n, sizeof(buf) - n, " [%u %#x=%#x]", c, rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE),
++				    rh_read(rh_tcs, b + RH_DATA + c * RH_CMD_STRIDE));
++			}
++		}
++		if (n < sizeof(buf)) {
++			n += (size_t)snprintf(buf + n, sizeof(buf) - n, "\n");
++		}
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	buf[sizeof(buf) - 1] = 0;
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmh_sets, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_rpmh_sets, "A",
++    "the RSC's sleep and wake sets and hidden slots (3100)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/osfmk/arm/arm_timer.c b/osfmk/arm/arm_timer.c
+index 2858201..bd6983d 100644
+--- a/osfmk/arm/arm_timer.c
++++ b/osfmk/arm/arm_timer.c
+@@ -58,6 +58,7 @@
+ #if defined(SWEET)
+ extern void sweet_deep_idle_kick(uint64_t now);
+ extern void sweet_deep_idle_resync(cpu_data_t *cdp);
++extern void sweet_cluster_guard(cpu_data_t *cdp, uint64_t now, bool resync);
+ #endif
+ 
+ /*
+@@ -84,6 +85,8 @@ timer_intr(__unused int inuser, __unused uint64_t iaddr)
+ 	/* 3055: CPU 0 is the timer of the cores powered down in idle */
+ 	if (cpu_data_ptr->cpu_number == 0) {
+ 		sweet_deep_idle_kick(abstime);
++	} else {
++		sweet_cluster_guard(cpu_data_ptr, abstime, false);      /* 3100 */
+ 	}
+ #endif
+ 
+@@ -196,6 +199,8 @@ timer_resync_deadlines(void)
+ #if defined(SWEET)
+ 	if (cpu_data_ptr->cpu_number == 0) {
+ 		sweet_deep_idle_resync(cpu_data_ptr);
++	} else {
++		sweet_cluster_guard(cpu_data_ptr, 0, true);     /* 3100 */
+ 	}
+ #endif
+ 	splx(s);
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index ec4e0b6..fce3d3d 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -1055,9 +1055,13 @@ struct sweet_di_cpu {
+ 	uint64_t        late_abs;       /* worst resume after the core's own pop */
+ 	int32_t         last_rc;
+ 	uint32_t        prepared;
++	uint32_t        down;           /* 3100: in CPU_SUSPEND (or on its way in or out) */
+ } __attribute__((aligned(128)));
+ 
+ static struct sweet_di_cpu sweet_di[MAX_CPUS];
++static bool sweet_cluster_enter(cpu_data_t *cdp, uint32_t mode);
++static void sweet_cluster_resume(cpu_data_t *cdp);
++extern uint32_t sweet_cluster;
+ #define SWEET_DI_DEFAULT        1       /* boot default: rail-pc (3056, after the 3055 soak) */
+ uint32_t sweet_deep_idle = SWEET_DI_DEFAULT; /* 0 off, 1 rail-pc, 2 pc */
+ uint32_t sweet_deep_idle_mask = 0xFE;   /* CPUs allowed to power down; CPU 0 never does */
+@@ -1122,9 +1126,15 @@ sweet_deep_idle_enter(cpu_data_t *cdp)
+ 	uint32_t mode = os_atomic_load(&sweet_deep_idle, acquire);
+ 	unsigned int cpu = (unsigned int)cdp->cpu_number;
+ 
+-	if (mode == 0 || cpu == 0 || cpu >= MAX_CPUS || !(sweet_deep_idle_mask & (1U << cpu))) {
++	if (cpu == 0) {
++		return sweet_cluster_enter(cdp, mode);  /* 3100: the last core, with a wake timer of its own */
++	}
++	if (mode == 0 || cpu >= MAX_CPUS || !(sweet_deep_idle_mask & (1U << cpu))) {
+ 		return false;
+ 	}
++	if (cpu == 1 && os_atomic_load(&sweet_cluster, relaxed) == 1) {
++		return false;                           /* 3100: CPU 0's guard stays in WFI */
++	}
+ 	if (sweet_deep_idle_screen && !sweet_fb_display_off) {
+ 		return false;
+ 	}
+@@ -1170,11 +1180,18 @@ sweet_deep_idle_enter(cpu_data_t *cdp)
+ 	}
+ 	s->entries++;
+ 	s->enter_abs = now;
++	os_atomic_store(&s->down, 1, relaxed);
+ 	__builtin_arm_dsb(DSB_SY);
+ 
+-	int32_t rc = sweet_psci_cpu_suspend(mode == 2 ? SWEET_DI_PC : SWEET_DI_RAIL_PC, sweet_di_entry_pa, cpu);
++	extern uint32_t sweet_cluster_state, sweet_cluster_all;
++	uint64_t state = mode == 2 ? SWEET_DI_PC : SWEET_DI_RAIL_PC;
++	if (sweet_cluster_all && os_atomic_load(&sweet_cluster, relaxed) == 3) {
++		state = sweet_cluster_state;    /* 3100, a test: platform-coordinated, every core votes for the cluster's state */
++	}
++	int32_t rc = sweet_psci_cpu_suspend(state, sweet_di_entry_pa, cpu);
+ 
+ 	/* Only if the core did not power down: a wake-up was pending, or PSCI refused */
++	os_atomic_store(&s->down, 0, relaxed);
+ 	os_atomic_store(&s->deadline, 0, relaxed);
+ 	s->last_rc = rc;
+ 	if (rc < 0) {
+@@ -1188,6 +1205,7 @@ sweet_deep_idle_enter(cpu_data_t *cdp)
+ 
+ /* arm_init_idle_cpu, before cpu_idle_exit(TRUE): the core was powered down */
+ void sweet_deep_idle_resume(cpu_data_t *cdp);
++void sweet_deep_idle_resync(cpu_data_t *cdp);
+ void
+ sweet_deep_idle_resume(cpu_data_t *cdp)
+ {
+@@ -1195,10 +1213,13 @@ sweet_deep_idle_resume(cpu_data_t *cdp)
+ 
+ 	PE_init_cpu();          /* GIC CPU interface: SRE, PMR, BPR, EOI mode, group 1 enable */
+ 	sweet_idle_exit_note(cdp);
+-	if (cpu < MAX_CPUS) {
++	if (cpu == 0) {
++		sweet_cluster_resume(cdp);
++	} else if (cpu < MAX_CPUS) {
+ 		struct sweet_di_cpu *s = &sweet_di[cpu];
+ 		uint64_t now = mach_absolute_time();
+ 
++		os_atomic_store(&s->down, 0, relaxed);
+ 		os_atomic_store(&s->deadline, 0, relaxed);
+ 		s->resumes++;
+ 		s->deep_abs += now - s->enter_abs;
+@@ -1208,6 +1229,9 @@ sweet_deep_idle_resume(cpu_data_t *cdp)
+ 	}
+ 	cdp->cpu_idle_pop = 0x0ULL;
+ 	setPop(cdp->rtcPop);    /* the timer lost its compare value; a past pop fires at once */
++	if (cpu == 0) {
++		sweet_deep_idle_resync(cdp);    /* 3100: and no later than the earliest sleeper */
++	}
+ }
+ 
+ /* CPU 0, timer_intr: wake the sleepers whose time has come */
+@@ -1519,6 +1543,368 @@ sweet_wake_stats(char *buf, size_t len, bool clear)
+ 	return 0;
+ }
+ 
++
++/*
++ * 3100: CPU 0 powers down too, and then the cluster with its cache.
++ *
++ * Until now CPU 0 stayed in WFI as the sleepers' timer, so the cluster (one L3 for all eight cores) could never go.
++ * A powered-down core loses its own timer, so CPU 0 needs another one to come back: frame 0 of the memory-mapped
++ * timer (DT arm,armv7-timer-mem at 0x17c90000, frame@17ca0000; Linux's broadcast timer on this chip), which keeps
++ * counting the same 19.2 MHz and raises SPI 6 (INTID 38), routed to CPU 0 here: the first device interrupt this
++ * kernel takes. CPU 0 goes down only when every other core is down, as the last one, for at least min_us, with the
++ * frame timer set lead_us before the earliest thing anyone waits for (its own pop or a sleeper's deadline); back up, it
++ * serves the sleepers as before.
++ *
++ * kern.sweet_cluster: 0 off (boot default);
++ *   1  CPU 0 powers down as a core (the same PSCI state as the others) while CPU 1 stays in WFI as its guard: if CPU 0
++ *      is not back 20 ms after its time, CPU 1 sends it an IPI and counts it (guard_kicks): a wake timer that does
++ *      not work shows as a number, not as a dead phone;
++ *   2  the same without a guard: all eight cores down, the cluster still on;
++ *   3  the last core asks for the cluster too: power_state 0x4100C244 = rail-pc + the DT's llcc-off (0xC24 << 4,
++ *      affinity level 1), as Linux's lpm-levels builds it for the last core in (platform-coordinated PSCI, the
++ *      default: PSCI_FEATURES says the firmware could do OS-initiated too). llcc-off is "notify-rpm": the wake time
++ *      also goes to the RSC (sweet_rpmh_sleep_enter), because in that state the power controller, not the GIC, is
++ *      what brings the cluster back. min_us / lead_us are raised to 15000 / 8000 for it (DT: latency 6562 us, time
++ *      overhead 5000 us).
++ * All of it only where the cores' deep idle runs (kern.sweet_deep_idle on, display off unless _screen is 0).
++ * kern.sweet_cluster_stats: one line of counters and the wake timer's self-test.
++ */
++#define SWEET_QT_CTRL_PA        0x17c90000ULL
++#define SWEET_QT_FRAME_PA       0x17ca0000ULL
++#define SWEET_QT_INTID          38u             /* SPI 6: frame 0's virtual timer */
++#define QT_CNTTIDR              0x08u           /* control frame */
++#define QT_CNTACR0              0x40u
++#define QT_CNTFRQ               0x10u           /* frame 0 */
++#define QT_CNTV_CVAL_LO         0x30u
++#define QT_CNTV_CVAL_HI         0x34u
++#define QT_CNTV_TVAL            0x38u
++#define QT_CNTV_CTL             0x3cu
++#define QT_CTL_ENABLE           1u
++#define QT_CTL_IMASK            2u
++#define QT_CTL_ISTATUS          4u
++#define SWEET_CL_STATE          0x4100C244ULL
++#define SWEET_CL_GUARD_MS       20
++#define SWEET_CL3_MIN_US        15000
++#define SWEET_CL3_LEAD_US       8000
++
++uint32_t sweet_cluster;
++uint32_t sweet_cluster_min_us = 6000, sweet_cluster_lead_us = 2000;
++/* for finding out how this firmware wants to be asked (kern.sweet_cluster_state, _all, kern.sweet_psci_osi) */
++uint32_t sweet_cluster_state = (uint32_t)0x4100C244u;   /* mode 3's power_state for the last core */
++uint32_t sweet_cluster_all;                             /* 1: in mode 3 every core asks for it, not only the last */
++uint32_t sweet_cluster3_min_us = SWEET_CL3_MIN_US, sweet_cluster3_lead_us = SWEET_CL3_LEAD_US;  /* mode 3's own limits */
++static vm_offset_t sweet_qt_ctrl, sweet_qt_frame;
++static bool sweet_qt_ready;
++static uint64_t sweet_cl_min_abs, sweet_cl_lead_abs, sweet_cl_guard_abs;
++static struct {
++	uint64_t        entries, returns, resumes, errors, too_short, not_all, busy, no_reset, guard_kicks, irqs;
++	uint64_t        deep_abs, late_abs, enter_abs, target_abs;
++	uint64_t        ret_abs, ret_last_abs, ret_planned_abs; /* calls that returned: time inside them, the last one's, and what it was meant to sleep */
++	uint64_t        denied;                                 /* PSCI DENIED: another core was not off yet; tried again later */
++	uint64_t        ent3, res3, deep3_abs, late3_abs;       /* mode 3 alone: asked for the cluster, came back through the reset vector */
++	uint64_t        guard_deadline;         /* CPU 1 kicks CPU 0 when this passes; 0: nothing to guard */
++	int32_t         last_rc;
++	uint32_t        prepared, in, in_mode;
++	char            selftest[176];
++} sweet_cl;
++
++extern uint32_t sweet_gic_spi_setup(uint32_t intid, uint64_t affinity, bool enable);    /* pexpert/arm/pe_fiq.c */
++extern bool sweet_rpmh_sleep_enter(uint32_t cval_lo, uint32_t cval_hi);                 /* bsd/dev/sweet_rpmh.c */
++extern void sweet_rpmh_sleep_exit(void);
++
++static inline uint32_t
++qt_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(sweet_qt_frame + off);
++}
++
++static inline void
++qt_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(sweet_qt_frame + off) = v;
++	__builtin_arm_dsb(DSB_SY);
++}
++
++/* sleh_irq: the frame timer's interrupt. Asleep, CPU 0 switches the timer off before it unmasks, so this is the awake case. */
++bool sweet_qtimer_intr(uint32_t intid);
++bool
++sweet_qtimer_intr(uint32_t intid)
++{
++	if (intid != SWEET_QT_INTID) {
++		return false;
++	}
++	if (sweet_qt_frame) {
++		qt_wr(QT_CNTV_CTL, 0);
++	}
++	sweet_cl.irqs++;
++	return true;
++}
++
++/* CPU 1 in mode 1, from its timer interrupt (resync false) and at the end of timer_resync_deadlines (true) */
++void sweet_cluster_guard(cpu_data_t *cdp, uint64_t now, bool resync);
++void
++sweet_cluster_guard(cpu_data_t *cdp, uint64_t now, bool resync)
++{
++	if (cdp->cpu_number != 1 || os_atomic_load(&sweet_cluster, relaxed) != 1) {
++		return;
++	}
++	uint64_t d = os_atomic_load(&sweet_cl.guard_deadline, relaxed);
++	if (d == 0) {
++		return;
++	}
++	if (resync) {
++		if (d < cdp->rtcPop) {
++			setPop(d);
++		}
++	} else if (d <= now && os_atomic_cmpxchg(&sweet_cl.guard_deadline, d, 0, relaxed)) {
++		cpu_data_t *c0 = CpuDataEntries[0].cpu_data_vaddr;
++		sweet_cl.guard_kicks++;
++		if (c0 != NULL) {
++			cpu_signal(c0, SIGPnop, NULL, NULL);
++		}
++	}
++}
++
++/* CPU 0 is back, powered down or not: the wake timer off, the guard and the RSC released */
++static void
++sweet_cluster_leave(void)
++{
++	qt_wr(QT_CNTV_CTL, 0);
++	os_atomic_store(&sweet_cl.guard_deadline, 0, relaxed);
++	if (sweet_cl.in_mode == 3) {
++		sweet_rpmh_sleep_exit();
++	}
++	os_atomic_store(&sweet_cl.in, 0, relaxed);
++}
++
++/* cpu_idle on CPU 0, interrupts masked: true if the WFI is done */
++static bool
++sweet_cluster_enter(cpu_data_t *cdp, uint32_t mode)
++{
++	uint32_t cl = os_atomic_load(&sweet_cluster, acquire);
++
++	if (cl == 0 || mode == 0 || !sweet_qt_ready) {
++		return false;
++	}
++	if (sweet_deep_idle_screen && !sweet_fb_display_off) {
++		return false;
++	}
++	uint64_t first = cdp->cpu_idle_pop ? cdp->cpu_idle_pop : cdp->rtcPop;
++	for (unsigned int cpu = 1; cpu < MAX_CPUS; cpu++) {
++		if (CpuDataEntries[cpu].cpu_data_vaddr == NULL || (cl == 1 && cpu == 1)) {
++			continue;
++		}
++		/*
++		 * Down, and staying down: a core CPU 0 has just kicked (its deadline is cleared by the kick) or one with any
++		 * other IPI pending is on its way up, which takes it half a millisecond; the firmware gives up a cluster
++		 * power-down that a core walks into (observed: the call back after 0.5-0.7 ms, nothing powered down).
++		 */
++		cpu_data_t *other = CpuDataEntries[cpu].cpu_data_vaddr;
++		uint64_t d = os_atomic_load(&sweet_di[cpu].deadline, relaxed);
++		if (!os_atomic_load(&sweet_di[cpu].down, relaxed) || d == 0 ||
++		    (os_atomic_load(&other->cpu_signal, relaxed) & ~SIGPdisabled) != 0) {
++			sweet_cl.not_all++;
++			return false;
++		}
++		if (d < first) {
++			first = d;
++		}
++	}
++	uint64_t now = mach_absolute_time(), min_abs = sweet_cl_min_abs, lead_abs = sweet_cl_lead_abs, a;
++	if (cl == 3) {
++		nanoseconds_to_absolutetime((uint64_t)sweet_cluster3_min_us * NSEC_PER_USEC, &a);
++		min_abs = MAX(min_abs, a);
++		nanoseconds_to_absolutetime((uint64_t)sweet_cluster3_lead_us * NSEC_PER_USEC, &a);
++		lead_abs = MAX(lead_abs, a);
++	}
++	if (first <= now || first - now < min_abs) {
++		sweet_cl.too_short++;
++		return false;
++	}
++	if (cdp->cpu_reset_handler != sweet_di_resume_pa) {
++		sweet_cl.no_reset++;
++		return false;
++	}
++	if (!sweet_cl.prepared) {
++		extern uint8_t bootstrap_pagetables[BOOTSTRAP_TABLE_SIZE];
++		CleanPoC_DcacheRegion_Force((vm_offset_t)CpuDataEntries, sizeof(CpuDataEntries));
++		CleanPoC_DcacheRegion_Force((vm_offset_t)cdp, sizeof(cpu_data_t));
++		CleanPoC_DcacheRegion_Force((vm_offset_t)&ResetHandlerData, sizeof(ResetHandlerData));
++		CleanPoC_DcacheRegion_Force((vm_offset_t)BootArgs, sizeof(*BootArgs));
++		CleanPoC_DcacheRegion_Force((vm_offset_t)&cpu_ttep, sizeof(cpu_ttep));
++		CleanPoC_DcacheRegion_Force((vm_offset_t)bootstrap_pagetables, BOOTSTRAP_TABLE_SIZE);
++		__builtin_arm_dsb(DSB_SY);
++		sweet_cl.prepared = 1;
++	}
++	uint64_t wake = first - lead_abs, delta = wake - now;
++	if (delta > 0x7fffffffULL) {
++		delta = 0x7fffffffULL;
++		wake = now + delta;
++	}
++	qt_wr(QT_CNTV_CTL, 0);
++	qt_wr(QT_CNTV_TVAL, (uint32_t)delta);
++	qt_wr(QT_CNTV_CTL, QT_CTL_ENABLE);
++	sweet_cl.in_mode = cl;
++	if (cl == 3 && !sweet_rpmh_sleep_enter(qt_rd(QT_CNTV_CVAL_LO), qt_rd(QT_CNTV_CVAL_HI))) {
++		qt_wr(QT_CNTV_CTL, 0);
++		sweet_cl.busy++;
++		return false;
++	}
++	if (cl == 1) {
++		cpu_data_t *guard = CpuDataEntries[1].cpu_data_vaddr;
++		os_atomic_store(&sweet_cl.guard_deadline, wake + sweet_cl_guard_abs, relaxed);
++		os_atomic_thread_fence(seq_cst);
++		if (guard != NULL) {
++			cpu_signal(guard, SIGPTimerLocal, NULL, NULL);
++		}
++	}
++	sweet_cl.entries++;
++	if (cl == 3) {
++		sweet_cl.ent3++;
++	}
++	sweet_cl.enter_abs = now;
++	sweet_cl.target_abs = wake;
++	os_atomic_store(&sweet_cl.in, 1, relaxed);
++	__builtin_arm_dsb(DSB_SY);
++
++	int32_t rc = sweet_psci_cpu_suspend(cl == 3 ? (uint64_t)sweet_cluster_state : (mode == 2 ? SWEET_DI_PC : SWEET_DI_RAIL_PC), sweet_di_entry_pa, 0);
++
++	/* Only if CPU 0 did not power down: a wake-up was pending, PSCI refused, or the state kept the core's context */
++	uint64_t back = mach_absolute_time();
++	sweet_cluster_leave();
++	sweet_cl.last_rc = rc;
++	sweet_cl.ret_last_abs = back - now;
++	sweet_cl.ret_abs += back - now;
++	sweet_cl.ret_planned_abs = delta;
++	if (rc == -3) {
++		sweet_cl.denied++;      /* PSCI DENIED: a core the firmware does not yet count as off (it was still going down) */
++	} else if (rc < 0) {
++		sweet_cl.errors++;
++		os_atomic_store(&sweet_cluster, 0, relaxed);
++	} else {
++		sweet_cl.returns++;
++	}
++	return true;
++}
++
++/* sweet_deep_idle_resume on CPU 0: it was powered down */
++static void
++sweet_cluster_resume(cpu_data_t *cdp)
++{
++	if (!os_atomic_load(&sweet_cl.in, relaxed)) {
++		return;
++	}
++	uint64_t now = mach_absolute_time();
++	bool cluster = sweet_cl.in_mode == 3;
++	sweet_cluster_leave();
++	if (cluster) {
++		(void)sweet_gic_spi_setup(SWEET_QT_INTID, 0, true);     /* the distributor may have been off with the cluster */
++	}
++	sweet_cl.resumes++;
++	sweet_cl.deep_abs += now - sweet_cl.enter_abs;
++	if (now > sweet_cl.target_abs && now - sweet_cl.target_abs > sweet_cl.late_abs) {
++		sweet_cl.late_abs = now - sweet_cl.target_abs;
++	}
++	if (cluster) {
++		sweet_cl.res3++;
++		sweet_cl.deep3_abs += now - sweet_cl.enter_abs;
++		if (now > sweet_cl.target_abs && now - sweet_cl.target_abs > sweet_cl.late3_abs) {
++			sweet_cl.late3_abs = now - sweet_cl.target_abs;
++		}
++	}
++	(void)cdp;
++}
++
++/* Thread context (the sysctl): map and try the wake timer once, then set the mode. <0: not possible */
++int sweet_cluster_configure(uint32_t mode);
++int
++sweet_cluster_configure(uint32_t mode)
++{
++	uint64_t a;
++
++	if (mode > 3) {
++		return -1;
++	}
++	if (mode != 0 && sweet_qt_frame == 0) {
++		vm_offset_t ctrl = ml_io_map(SWEET_QT_CTRL_PA, 0x1000), frame = ml_io_map(SWEET_QT_FRAME_PA, 0x1000);
++		if (ctrl == 0 || frame == 0) {
++			return -2;
++		}
++		uint32_t tidr = *(volatile uint32_t *)(ctrl + QT_CNTTIDR);
++		*(volatile uint32_t *)(ctrl + QT_CNTACR0) = 0x3f;       /* every access to frame 0, as Linux asks */
++		__builtin_arm_dsb(DSB_SY);
++		uint32_t acr = *(volatile uint32_t *)(ctrl + QT_CNTACR0);
++		sweet_qt_ctrl = ctrl;
++		sweet_qt_frame = frame;
++		uint32_t frq = qt_rd(QT_CNTFRQ);
++		/* 1: the timer counts down and says so, masked */
++		unsigned us1 = 0, us2 = 0;
++		qt_wr(QT_CNTV_CTL, 0);
++		qt_wr(QT_CNTV_TVAL, 19200);     /* 1 ms */
++		qt_wr(QT_CNTV_CTL, QT_CTL_ENABLE | QT_CTL_IMASK);
++		while (us1 < 5000 && !(qt_rd(QT_CNTV_CTL) & QT_CTL_ISTATUS)) {
++			delay(50);
++			us1 += 50;
++		}
++		bool status = (qt_rd(QT_CNTV_CTL) & QT_CTL_ISTATUS) != 0;
++		qt_wr(QT_CNTV_CTL, 0);
++		/* 2: its interrupt arrives at CPU 0 */
++		uint32_t gic = sweet_gic_spi_setup(SWEET_QT_INTID, 0, true);
++		uint64_t irqs = sweet_cl.irqs;
++		qt_wr(QT_CNTV_TVAL, 19200);
++		qt_wr(QT_CNTV_CTL, QT_CTL_ENABLE);
++		while (us2 < 20000 && sweet_cl.irqs == irqs) {
++			delay(100);
++			us2 += 100;
++		}
++		bool irq = sweet_cl.irqs != irqs;
++		qt_wr(QT_CNTV_CTL, 0);
++		snprintf(sweet_cl.selftest, sizeof(sweet_cl.selftest), "tidr=%#x acr0=%#x frq=%u status=%s/%uus irq=%s/%uus gic=%#x", tidr, acr, frq,
++		    status ? "ok" : "no", us1, irq ? "ok" : "no", us2, gic);
++		printf("SWEET CLUSTER: wake timer (frame 0 at %#llx, INTID %u): %s\n", SWEET_QT_FRAME_PA, SWEET_QT_INTID, sweet_cl.selftest);
++		sweet_qt_ready = status && irq;
++	}
++	if (mode != 0 && !sweet_qt_ready) {
++		return -3;
++	}
++	if (sweet_cluster_min_us < sweet_cluster_lead_us + 1000) {
++		return -4;
++	}
++	sweet_di_setup();
++	nanoseconds_to_absolutetime((uint64_t)sweet_cluster_min_us * NSEC_PER_USEC, &a);
++	sweet_cl_min_abs = a;
++	nanoseconds_to_absolutetime((uint64_t)sweet_cluster_lead_us * NSEC_PER_USEC, &a);
++	sweet_cl_lead_abs = a;
++	nanoseconds_to_absolutetime((uint64_t)SWEET_CL_GUARD_MS * NSEC_PER_MSEC, &a);
++	sweet_cl_guard_abs = a;
++	os_atomic_thread_fence(seq_cst);
++	os_atomic_store(&sweet_cluster, mode, release);
++	return 0;
++}
++
++int sweet_cluster_stats(char *buf, size_t len);
++int
++sweet_cluster_stats(char *buf, size_t len)
++{
++	uint64_t deep_ns, late_ns, ret_ns, ret_last_ns, ret_planned_ns, deep3_ns, late3_ns;
++	absolutetime_to_nanoseconds(sweet_cl.deep3_abs, &deep3_ns);
++	absolutetime_to_nanoseconds(sweet_cl.late3_abs, &late3_ns);
++	absolutetime_to_nanoseconds(sweet_cl.deep_abs, &deep_ns);
++	absolutetime_to_nanoseconds(sweet_cl.late_abs, &late_ns);
++	absolutetime_to_nanoseconds(sweet_cl.ret_abs, &ret_ns);
++	absolutetime_to_nanoseconds(sweet_cl.ret_last_abs, &ret_last_ns);
++	absolutetime_to_nanoseconds(sweet_cl.ret_planned_abs, &ret_planned_ns);
++	snprintf(buf, len, "sweet_cluster v1 mode=%u ready=%d min_us=%u lead_us=%u state=%#x all=%u ent=%llu ret=%llu res=%llu err=%llu rc=%d short=%llu notall=%llu "
++	    "busy=%llu norst=%llu guard_kicks=%llu irqs=%llu deep_ms=%llu late_us=%llu ret_us=%llu ret_last_us=%llu ret_last_planned_us=%llu "
++	    "denied=%llu ent3=%llu res3=%llu deep3_ms=%llu late3_us=%llu\nselftest %s\n",
++	    sweet_cluster, sweet_qt_ready, sweet_cluster_min_us, sweet_cluster_lead_us, sweet_cluster_state, sweet_cluster_all,
++	    sweet_cl.entries, sweet_cl.returns, sweet_cl.resumes, sweet_cl.errors, sweet_cl.last_rc, sweet_cl.too_short,
++	    sweet_cl.not_all, sweet_cl.busy, sweet_cl.no_reset, sweet_cl.guard_kicks, sweet_cl.irqs, deep_ns / NSEC_PER_MSEC, late_ns / NSEC_PER_USEC,
++	    ret_ns / NSEC_PER_USEC, ret_last_ns / NSEC_PER_USEC, ret_planned_ns / NSEC_PER_USEC, sweet_cl.denied, sweet_cl.ent3, sweet_cl.res3,
++	    deep3_ns / NSEC_PER_MSEC, late3_ns / NSEC_PER_USEC, sweet_cl.selftest[0] ? sweet_cl.selftest : "not run");
++	return 0;
++}
++
+ /*
+  * 3099: what the firmware's PSCI says of itself, for the cluster work: the version, and PSCI_FEATURES of the calls a
+  * deeper sleep would use. Reads only; called from a sysctl. A negative number is PSCI's "not supported" (-1).
+@@ -1538,6 +1924,14 @@ sweet_smc4(uint64_t fid, uint64_t a1, uint64_t a2, uint64_t a3)
+ 	return (int64_t)x0;
+ }
+ 
++/* 3100: PSCI_SET_SUSPEND_MODE (0 platform-coordinated, 1 OS-initiated); the firmware's answer */
++int sweet_psci_set_mode(uint32_t osi);
++int
++sweet_psci_set_mode(uint32_t osi)
++{
++	return (int)(int32_t)sweet_smc4(0x8400000Fu, osi ? 1 : 0, 0, 0);
++}
++
+ int sweet_psci_info(char *buf, size_t len);
+ int
+ sweet_psci_info(char *buf, size_t len)
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index d87e7f5..d8697a2 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3194,7 +3194,8 @@ sleh_irq(arm_saved_state_t *state)
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+-		if (cdp->interrupt_handler) {
++		extern bool sweet_qtimer_intr(uint32_t intid);  /* 3100, osfmk/arm64/cpu.c: the wake timer of a sleeping CPU 0 */
++		if (!sweet_qtimer_intr(intid) && cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
+ 			    cdp->interrupt_refCon,
+ 			    cdp->interrupt_nub,
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..de0ba9e 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -222,6 +222,50 @@ pe_init_fiq()
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* SWEET */
+ }
++
++#if defined(SWEET)
++/*
++ * 3100: one shared interrupt (an SPI), level-sensitive, Group 1, priority as the others, sent to the CPU with the given
++ * affinity (MPIDR Aff3..Aff0); or switched off. The first device interrupt of this kernel: everything else is polled.
++ * Returns what the distributor kept: bit 0 enabled, bit 1 group 1, bits 15:8 the priority, bits 31:16 the route's low
++ * half. Thread context or interrupts masked; the distributor is always-on and needs no lock for one interrupt's bits
++ * as long as nothing else writes the same words (nothing does).
++ */
++#define GICD_IGROUPR(n)         (0x0080 + 4 * ((n) / 32))
++#define GICD_ISENABLER(n)       (0x0100 + 4 * ((n) / 32))
++#define GICD_ICENABLER(n)       (0x0180 + 4 * ((n) / 32))
++#define GICD_IPRIORITYR(n)      (0x0400 + 4 * ((n) / 4))
++#define GICD_ICFGR(n)           (0x0c00 + 4 * ((n) / 16))
++#define GICD_IROUTER(n)         (0x6000 + 8 * (n))
++
++uint32_t sweet_gic_spi_setup(uint32_t intid, uint64_t affinity, bool enable);
++uint32_t
++sweet_gic_spi_setup(uint32_t intid, uint64_t affinity, bool enable)
++{
++	if (!gicd_base || intid < 32 || intid >= 1020) {
++		return 0;
++	}
++	uint32_t bit = 1u << (intid % 32);
++	if (!enable) {
++		gicd_write32(GICD_ICENABLER(intid), bit);
++	} else {
++		gicd_write32(GICD_ICENABLER(intid), bit);
++		gicd_write32(GICD_IGROUPR(intid), gicd_read32(GICD_IGROUPR(intid)) | bit);
++		uint32_t pri = gicd_read32(GICD_IPRIORITYR(intid));
++		pri = (pri & ~(0xffu << (8 * (intid % 4)))) | (0xa0u << (8 * (intid % 4)));
++		gicd_write32(GICD_IPRIORITYR(intid), pri);
++		gicd_write32(GICD_ICFGR(intid), gicd_read32(GICD_ICFGR(intid)) & ~(3u << (2 * (intid % 16))));
++		*((volatile uint64_t *)(gicd_base + GICD_IROUTER(intid))) = affinity & 0xff00ffffffULL;
++		gicd_write32(GICD_ISENABLER(intid), bit);
++	}
++	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++		;
++	}
++	return ((gicd_read32(GICD_ISENABLER(intid)) & bit) ? 1u : 0u) | ((gicd_read32(GICD_IGROUPR(intid)) & bit) ? 2u : 0u) |
++	       (((gicd_read32(GICD_IPRIORITYR(intid)) >> (8 * (intid % 4))) & 0xffu) << 8) |
++	       ((uint32_t)_gic_read64(gicd_base + GICD_IROUTER(intid)) << 16);
++}
++#endif /* SWEET */
+ #else
+ void
+ pe_init_fiq()
