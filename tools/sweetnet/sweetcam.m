@@ -415,7 +415,21 @@ struct isp {
 	const struct cam_live_hdr *hdr;
 	const struct output *still_out; /* the still output (developed from raw, not from rgb) */
 	bool ready;
+	/* 2026-11-18: the camera's own colour tuning (see "colour tuning" below); without it the fixed matrix, no shading */
+	float ccm[9];                   /* the colour matrix in use */
+	float cct, lux;                 /* the light's colour temperature (from the white balance) and the scene's lux index */
+	float level;                    /* the frame's mean green level, of the range above black (the exposure aims at 0.156) */
+	int sensor;                     /* whose tuning is loaded (-1 none yet) */
+	bool lsc_on;
+	float lsc[4 * 17 * 13];         /* the lens shading in use: gains of R, Gr, Gb, B on the 17 x 13 grid over the sensor */
+	float lsc_cct, lsc_lux;         /* what it was picked for */
+	uint16_t *lsc_map;              /* the shading at the preview's half size: R, G, B gains x 4096 a cell */
+	unsigned lsc_map_w, lsc_map_h;
+	bool lsc_map_ok;
 };
+
+/* the fixed colour matrix (before 2026-11-18 the only one; still, for a camera without its tuning file) */
+static const float isp_ccm0[9] = { 1.55f, -0.40f, -0.15f, -0.25f, 1.45f, -0.20f, -0.05f, -0.45f, 1.50f };
 
 static void
 isp_init(struct isp *p)
@@ -436,6 +450,14 @@ isp_init(struct isp *p)
 	p->ty = p->tc = NULL;
 	p->tcap = 0;
 	p->ready = p->rgb != NULL;
+	memcpy(p->ccm, isp_ccm0, sizeof(p->ccm));
+	p->cct = 5000;
+	p->lux = 300;
+	p->sensor = -1;
+	p->lsc_on = false;
+	p->lsc_map = NULL;
+	p->lsc_map_w = p->lsc_map_h = 0;
+	p->lsc_map_ok = false;
 }
 
 static inline unsigned
@@ -451,20 +473,349 @@ raw10_at(const uint8_t *row, unsigned x)
  * that, and the matrix's negative terms then took them off the green: every lamp in the picture came out pink (the user,
  * in an office: "the lights ... are pink"). Clamped, a clipped pixel is white.
  */
-static const float isp_ccm[9] = { 1.55f, -0.40f, -0.15f, -0.25f, 1.45f, -0.20f, -0.05f, -0.45f, 1.50f };
-
 static inline void
-isp_colour(const float *k, float R, float G, float B, int out[3])
+isp_colour(const float *k, const float *m, float R, float G, float B, int out[3])
 {
 	float r = R * k[0], g = G * k[1], b = B * k[2];
 	r = r > 4095.f ? 4095.f : r;
 	g = g > 4095.f ? 4095.f : g;
 	b = b > 4095.f ? 4095.f : b;
-	int ir = (int)(isp_ccm[0] * r + isp_ccm[1] * g + isp_ccm[2] * b), ig = (int)(isp_ccm[3] * r + isp_ccm[4] * g + isp_ccm[5] * b),
-	    ib = (int)(isp_ccm[6] * r + isp_ccm[7] * g + isp_ccm[8] * b);
+	int ir = (int)(m[0] * r + m[1] * g + m[2] * b), ig = (int)(m[3] * r + m[4] * g + m[5] * b), ib = (int)(m[6] * r + m[7] * g + m[8] * b);
 	out[0] = ir < 0 ? 0 : ir > 4095 ? 4095 : ir;
 	out[1] = ig < 0 ? 0 : ig > 4095 ? 4095 : ig;
 	out[2] = ib < 0 ? 0 : ib > 4095 ? 4095 : ib;
+}
+
+/*
+ * ---- colour tuning (2026-11-18): each camera's own, from its Qualcomm tuning file -----------------------------------------
+ * /usr/local/share/sweetcam/<sensor>.ctun, made on the Mac by tools/camera/chromatix.py from the phone's
+ * com.qti.tuned.<maker>_<sensor>.bin (vendor data, never in git): colour matrices and lens shading per scene brightness (a
+ * lux index, Qualcomm's: higher is darker) and colour temperature, and the white balance's ten reference lights. The layout
+ * of those modules as HakiOS's tools/camtuning.py documents it (MIT; the OnePlus 6T port, docs/FORKS_SURVEY.md H1). Used:
+ *   lens shading  each raw colour by its gain at the pixel's place on the sensor (17 x 13 grid, bilinear), before the white
+ *                 balance: the corners came out dark and tinted (the main's corners want x4 in red, x3.2 in blue)
+ *   white balance the grey-world estimate put on the line through the reference lights (in log R/G, log B/G): no green or
+ *                 magenta casts from a scene's colours; the place on it gives the colour temperature
+ *   colour matrix by that temperature and the brightness, blended across the gaps between the tuned ranges
+ * Without a file: the fixed matrix, no shading, grey world as before.
+ */
+#define LSC_W 17
+#define LSC_H 13
+#define LSC_N (LSC_W * LSC_H)
+struct ctun_region { float lux_from, lux_to; unsigned n; const float *r; };    /* n ranges of (cct from, to, values) */
+struct ctun_tree { unsigned n; struct ctun_region g[16]; unsigned nv; };
+struct ctun {
+	bool tried, ok;
+	struct ctun_tree ccm, lsc;
+	unsigned nref;
+	float ref[10][3];               /* R/G, B/G, CCT */
+	float zero_us;                  /* the exposure (microseconds x gain) of lux index 0; 0: not in the file */
+	void *blob;
+};
+static struct ctun ctuns[3];
+static const char *const ctun_name[3] = { "imx363", "s5k3m3", "s5k3t1" };
+
+static bool
+ctun_tree_read(const uint8_t **at, const uint8_t *end, struct ctun_tree *t, unsigned nv)
+{
+	uint32_t n;
+	if (*at + 4 > end) {
+		return false;
+	}
+	memcpy(&n, *at, 4);
+	*at += 4;
+	if (n == 0 || n > 16) {
+		return false;
+	}
+	t->n = n;
+	t->nv = nv;
+	for (unsigned i = 0; i < n; i++) {
+		uint32_t k;
+		if (*at + 12 > end) {
+			return false;
+		}
+		memcpy(&t->g[i].lux_from, *at, 4);
+		memcpy(&t->g[i].lux_to, *at + 4, 4);
+		memcpy(&k, *at + 8, 4);
+		*at += 12;
+		size_t bytes = (size_t)k * (2 + nv) * 4;
+		if (k == 0 || k > 16 || *at + bytes > end || ((uintptr_t)*at & 3)) {
+			return false;
+		}
+		t->g[i].n = k;
+		t->g[i].r = (const float *)(const void *)*at;
+		*at += bytes;
+	}
+	return true;
+}
+
+static struct ctun *
+ctun_get(int sensor)
+{
+	if (sensor < 0 || sensor > 2) {
+		return NULL;
+	}
+	struct ctun *c = &ctuns[sensor];
+	if (c->tried) {
+		return c->ok ? c : NULL;
+	}
+	c->tried = true;
+	char path[96];
+	snprintf(path, sizeof(path), "/usr/local/share/sweetcam/%s.ctun", ctun_name[sensor]);
+	if (access("/private/var/tmp/sweetcam.notuning", F_OK) == 0) {
+		say("colour tuning: off (/private/var/tmp/sweetcam.notuning)");
+		return NULL;
+	}
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		say("colour tuning: %{public}s: %{public}s: the fixed matrix, no lens shading", path, strerror(errno));
+		return NULL;
+	}
+	fseek(f, 0, SEEK_END);
+	long len = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	uint8_t *b = len > 16 && len < (8 << 20) ? malloc((size_t)len) : NULL;
+	if (!b || fread(b, 1, (size_t)len, f) != (size_t)len || memcmp(b, "SWCTUN01", 8) != 0) {
+		fclose(f);
+		free(b);
+		say("colour tuning: %{public}s is not a sweetcam tuning file", path);
+		return NULL;
+	}
+	fclose(f);
+	const uint8_t *at = b + 8, *end = b + len;
+	uint32_t nref = 0;
+	if (!ctun_tree_read(&at, end, &c->ccm, 9) || !ctun_tree_read(&at, end, &c->lsc, 4 * LSC_N) || at + 4 > end) {
+		free(b);
+		say("colour tuning: %{public}s: cut short or malformed", path);
+		return NULL;
+	}
+	memcpy(&nref, at, 4);
+	at += 4;
+	c->nref = nref <= 10 && at + nref * 12 <= end ? nref : 0;
+	for (unsigned i = 0; i < c->nref; i++) {
+		memcpy(c->ref[i], at + 12 * i, 12);
+	}
+	at += 12 * c->nref;
+	c->zero_us = 0;
+	if (c->nref == nref && at + 4 <= end) {
+		memcpy(&c->zero_us, at, 4);
+		if (!(c->zero_us > 0.5f && c->zero_us < 1000)) {
+			c->zero_us = 0;
+		}
+	}
+	c->blob = b;
+	c->ok = true;
+	say("colour tuning: %{public}s: %u matrix and %u shading brightness ranges, %u reference lights, lux index 0 at %.1f us",
+	    path, c->ccm.n, c->lsc.n, c->nref, c->zero_us);
+	return c;
+}
+
+/* a region's values at a colour temperature: its range's, or blended across a gap; out has t->nv floats */
+static void
+ctun_region_at(const struct ctun_tree *t, const struct ctun_region *g, float cct, float *out)
+{
+	const unsigned stride = 2 + t->nv;
+	const float *r = g->r;
+	unsigned i = 0;
+	while (i + 1 < g->n && cct > r[stride * i + 1]) {
+		i++;
+	}
+	const float *a = r + stride * i;
+	if (cct < a[0] && i > 0) {
+		const float *p = r + stride * (i - 1);
+		float w = (cct - p[1]) / (a[0] - p[1] > 1 ? a[0] - p[1] : 1);
+		w = w < 0 ? 0 : w > 1 ? 1 : w;
+		for (unsigned k = 0; k < t->nv; k++) {
+			out[k] = (1 - w) * p[2 + k] + w * a[2 + k];
+		}
+	} else {
+		memcpy(out, a + 2, t->nv * sizeof(float));
+	}
+}
+
+/* the tree's values at (lux index, colour temperature): the region's, or blended across the gap between two */
+static void
+ctun_pick(const struct ctun_tree *t, float lux, float cct, float *out, float *tmp)
+{
+	unsigned i = 0;
+	while (i + 1 < t->n && lux > t->g[i].lux_to) {
+		i++;
+	}
+	ctun_region_at(t, &t->g[i], cct, out);
+	if (lux < t->g[i].lux_from && i > 0) {
+		float w = (lux - t->g[i - 1].lux_to) / (t->g[i].lux_from - t->g[i - 1].lux_to > 1 ? t->g[i].lux_from - t->g[i - 1].lux_to : 1);
+		w = w < 0 ? 0 : w > 1 ? 1 : w;
+		ctun_region_at(t, &t->g[i - 1], cct, tmp);
+		for (unsigned k = 0; k < t->nv; k++) {
+			out[k] = (1 - w) * tmp[k] + w * out[k];
+		}
+	}
+}
+
+/* the frame on the sensor, as a part of the shading grid's field (u0, v0, u1, v1, 0-1) */
+static void
+isp_fov(unsigned sensor, unsigned w, unsigned h, float f[4])
+{
+	f[0] = f[1] = 0;
+	f[2] = f[3] = 1;
+	if (sensor == 0 && w == 1920 && h == 1080) {
+		/* the main's mode 2: rows 376-2647 binned 2x2 to 2016x1136, cropped from (48, 28): sensor 96-3936 x 432-2592 */
+		f[0] = 96.f / 4032;
+		f[1] = 432.f / 3024;
+		f[2] = 3936.f / 4032;
+		f[3] = 2592.f / 3024;
+	}
+}
+
+/*
+ * The scene's lux index from the exposure, as Qualcomm counts it: a step per 3 % more exposure (23.4 an exposure value),
+ * higher darker. Index 0 is the first knee of the tuning's own exposure table (zero_us: gain 1 at 42.1 us for the main
+ * sensor, 9.8 us the telephoto, 16.3 us the front one; its other knees confirm the 3 %: 10 ms = 185). Without one:
+ * 26 us, between the three. The gains counted are the sensor's, the kernel's digital one and the one applied here
+ * (extra_gain): with all at their end (16 x 4 x 4 at 1/30 s) the main sensor reads 413, seen with the lens covered. The
+ * tunings' dimmest ranges (shading from 410 on the main) are therefore reached only in near darkness; a dim room at
+ * gain 30 reads about 340 and is corrected at full strength, as the tuning says (Qualcomm's noise filters, which we
+ * do not have, deal with the corners there).
+ */
+static float
+isp_lux(const struct cam_live_hdr *h, float extra_gain, float zero_us)
+{
+	double e_us = (double)h->exposure_lines * h->line_ns / 1000.0 * (h->again_x256 / 256.0) * (h->dgain_x256 / 256.0) *
+	    (extra_gain > 1 ? extra_gain : 1);
+	double zero = zero_us > 0 ? zero_us : 26.0;
+	float l = e_us > zero ? (float)(log(e_us / zero) / log(1.03)) : 1.f;
+	return l < 1 ? 1 : l > 999 ? 999 : l;
+}
+
+/*
+ * The white balance on the reference lights' line: the grey-world estimate (R/G, B/G) to the nearest point of the polyline
+ * through them in (log R/G, log B/G); its colour temperature by the same place. False without the ten.
+ */
+#define AWB_DARK0 0.030f
+#define AWB_DARK1 0.060f
+
+static bool
+awb_on_locus(const struct ctun *c, float *rg, float *bg, float *cct)
+{
+	if (!c || c->nref < 2) {
+		return false;
+	}
+	float x = logf(*rg), y = logf(*bg), best = 1e30f, bx = x, by = y, bc = 5000;
+	for (unsigned i = 0; i + 1 < c->nref; i++) {
+		float ax = logf(c->ref[i][0]), ay = logf(c->ref[i][1]), cx = logf(c->ref[i + 1][0]), cy = logf(c->ref[i + 1][1]);
+		float dx = cx - ax, dy = cy - ay, l2 = dx * dx + dy * dy, t = l2 > 0 ? ((x - ax) * dx + (y - ay) * dy) / l2 : 0;
+		t = t < 0 ? 0 : t > 1 ? 1 : t;
+		float px = ax + t * dx, py = ay + t * dy, d = (x - px) * (x - px) + (y - py) * (y - py);
+		if (d < best) {
+			best = d;
+			bx = px;
+			by = py;
+			bc = c->ref[i][2] + t * (c->ref[i + 1][2] - c->ref[i][2]);
+		}
+	}
+	/* up to 0.05 (5 %) of the estimate's distance from the line kept: lights a little off it (tubes, LEDs) still grey */
+	float ox = x - bx, oy = y - by, od = sqrtf(ox * ox + oy * oy), keep = od > 0.05f ? 0.05f / od : 1;
+	*rg = expf(bx + keep * ox);
+	*bg = expf(by + keep * oy);
+	*cct = bc;
+	return true;
+}
+
+/*
+ * The shading of one row of the frame (y of h, its centre) at the grid's 17 columns, R G B, and a pixel's from
+ * it (x of w): the grid's rows blended once a row, its columns a pixel
+ */
+static void
+lsc_row(const float *lsc, const float *f, float y, unsigned h, float row[LSC_W][3])
+{
+	float v = f[1] + (y + 0.5f) / h * (f[3] - f[1]), gy = v * (LSC_H - 1);
+	gy = gy < 0 ? 0 : gy > LSC_H - 1 ? LSC_H - 1 : gy;
+	int y0 = (int)gy;
+	y0 = y0 > LSC_H - 2 ? LSC_H - 2 : y0;
+	float fy = gy - y0;
+	for (int x = 0; x < LSC_W; x++) {
+		float c[4];
+		for (int k = 0; k < 4; k++) {
+			const float *q = lsc + k * LSC_N + y0 * LSC_W + x;
+			c[k] = (1 - fy) * q[0] + fy * q[LSC_W];
+		}
+		row[x][0] = c[0];
+		row[x][1] = 0.5f * (c[1] + c[2]);
+		row[x][2] = c[3];
+	}
+}
+
+static inline void
+lsc_px(const float row[LSC_W][3], const float *f, float x, unsigned w, float g[3])
+{
+	float u = f[0] + (x + 0.5f) / w * (f[2] - f[0]), gx = u * (LSC_W - 1);
+	gx = gx < 0 ? 0 : gx > LSC_W - 1 ? LSC_W - 1 : gx;
+	int x0 = (int)gx;
+	x0 = x0 > LSC_W - 2 ? LSC_W - 2 : x0;
+	float fx = gx - x0;
+	for (int k = 0; k < 3; k++) {
+		g[k] = (1 - fx) * row[x0][k] + fx * row[x0 + 1][k];
+	}
+}
+
+/* the shading at the preview's half size (one gain triple a 2x2 cell), x 4096 */
+static void
+lsc_map_make(struct isp *p, const struct cam_live_hdr *h)
+{
+	unsigned w = h->width / 2, hh = h->height / 2;
+	if (p->lsc_map_w != w || p->lsc_map_h != hh || !p->lsc_map) {
+		free(p->lsc_map);
+		p->lsc_map = malloc((size_t)w * hh * 3 * sizeof(uint16_t));
+		p->lsc_map_w = w;
+		p->lsc_map_h = hh;
+	}
+	p->lsc_map_ok = false;
+	if (!p->lsc_map) {
+		return;
+	}
+	float f[4], row[LSC_W][3];
+	isp_fov((h->flags >> 8) & 3, h->width, h->height, f);
+	for (unsigned y = 0; y < hh; y++) {
+		lsc_row(p->lsc, f, 2.f * y + 0.5f, h->height, row);
+		uint16_t *o = p->lsc_map + (size_t)y * w * 3;
+		for (unsigned x = 0; x < w; x++, o += 3) {
+			float g[3];
+			lsc_px(row, f, 2.f * x + 0.5f, h->width, g);
+			for (int k = 0; k < 3; k++) {
+				float q = g[k] * 4096.f;
+				o[k] = (uint16_t)(q < 4096.f ? 4096.f : q > 65535.f ? 65535.f : q);
+			}
+		}
+	}
+	p->lsc_map_ok = true;
+}
+
+/* per frame: the tuning of the frame's sensor, the matrix for the light, the shading when the light moved */
+static void
+isp_tune(struct isp *p, const struct cam_live_hdr *h)
+{
+	int sensor = (int)((h->flags >> 8) & 3);
+	struct ctun *c = ctun_get(sensor);
+	if (sensor != p->sensor) {
+		p->sensor = sensor;
+		p->lsc_on = false;
+		p->lsc_map_ok = false;
+		memcpy(p->ccm, isp_ccm0, sizeof(p->ccm));
+	}
+	p->lux = 0.8f * p->lux + 0.2f * isp_lux(h, p->gain, c ? c->zero_us : 0);
+	if (!c) {
+		return;
+	}
+	float tmp[4 * LSC_N];
+	ctun_pick(&c->ccm, p->lux, p->cct, p->ccm, tmp);
+	if (!p->lsc_on || fabsf(p->lux - p->lsc_lux) > 15 || fabsf(p->cct - p->lsc_cct) > 150 || p->lsc_map_w != h->width / 2 ||
+	    p->lsc_map_h != h->height / 2) {
+		ctun_pick(&c->lsc, p->lux, p->cct, p->lsc, tmp);
+		p->lsc_on = true;
+		p->lsc_lux = p->lux;
+		p->lsc_cct = p->cct;
+		lsc_map_make(p, h);
+	}
 }
 
 struct half_job {
@@ -486,6 +837,7 @@ half_piece(void *ctx, size_t piece)
 	unsigned rows = (HH + 15) / 16, y0 = (unsigned)piece * rows, y1 = MIN(HH, y0 + rows);
 	uint64_t sr = 0, sg = 0, sb = 0, wr = 0, wg = 0, wb = 0;
 	const int lim = (int)j->lim;
+	const uint16_t *lm = j->p->lsc_on && j->p->lsc_map_ok && j->p->lsc_map_w == HW && j->p->lsc_map_h == HH ? j->p->lsc_map : NULL;
 	for (unsigned y = y0; y < y1; y++) {
 		const uint8_t *r0 = j->raw + (size_t)(2 * y) * j->stride, *r1 = r0 + j->stride;
 		uint8_t *o = j->rot ? j->p->rgb + ((size_t)(HH - 1 - y) * HW + (HW - 1)) * 3 : j->p->rgb + (size_t)y * HW * 3;
@@ -505,18 +857,26 @@ half_piece(void *ctx, size_t piece)
 			R = R < 0 ? 0 : R;
 			G = G < 0 ? 0 : G;
 			B = B < 0 ? 0 : B;
+			/* near clipping as the sensor gave it, before the shading lifts the corners */
+			bool clip = R >= lim || G >= lim || B >= lim;
+			if (lm) {
+				const uint16_t *m = lm + ((size_t)y * HW + x) * 3;
+				R = (R * m[0]) >> 12;
+				G = (G * m[1]) >> 12;
+				B = (B * m[2]) >> 12;
+			}
 			if ((x & 7) == 0) {
 				sr += (unsigned)R;
 				sg += (unsigned)G;
 				sb += (unsigned)B;
-				if (R < lim && G < lim && B < lim) {
+				if (!clip) {
 					wr += (unsigned)R;
 					wg += (unsigned)G;
 					wb += (unsigned)B;
 				}
 			}
 			int c[3];
-			isp_colour(j->k, (float)R, (float)G, (float)B, c);
+			isp_colour(j->k, j->p->ccm, (float)R, (float)G, (float)B, c);
 			o[0] = j->p->gamma[c[0]];
 			o[1] = j->p->gamma[c[1]];
 			o[2] = j->p->gamma[c[2]];
@@ -552,6 +912,7 @@ isp_half(struct isp *p, const struct cam_live_hdr *h, const uint8_t *raw)
 		say("frames of %ux%u (sensor %u, colour order %u): the preview picture is %ux%u", h->width, h->height,
 		    (h->flags >> 8) & 3, h->flags & 3, HW, HH);
 	}
+	isp_tune(p, h);
 	for (int c = 0; c < 3; c++) {
 		j.k[c] = p->wb[c] * scale;
 	}
@@ -578,6 +939,7 @@ isp_half(struct isp *p, const struct cam_live_hdr *h, const uint8_t *raw)
 			want = want > 4.f ? 4.f : want;
 		}
 		p->gain = 0.9f * p->gain + 0.1f * want;
+		p->level = tm;
 	}
 	/*
 	 * grey world over the cells that are not near clipping: a clipped cell is R = G = B whatever the light's colour, and a
@@ -586,6 +948,21 @@ isp_half(struct isp *p, const struct cam_live_hdr *h, const uint8_t *raw)
 	 */
 	if (ws[0] > 1000 && ws[1] > 1000 && ws[2] > 1000) {
 		float gr = (float)ws[1] / (float)ws[0], gb = (float)ws[1] / (float)ws[2];
+		/* with the camera's tuning: the estimate on its reference lights' line, and the light's colour temperature from it */
+		float rg = 1 / gr, bg = 1 / gb, cct;
+		if (access("/private/var/tmp/sweetcam.greyworld", F_OK) != 0 && awb_on_locus(ctun_get(p->sensor), &rg, &bg, &cct)) {
+			/*
+			 * A frame of nothing but noise (the lens covered, a night with the exposure at its end) has R = G = B before
+			 * the gains; no light on the line looks like that, and the line's gains tint the noise magenta (2026-11-20, the
+			 * lens covered: the viewfinder's mean 41 26 39 against 28 28 28 with plain grey world). Under a mean level of
+			 * AWB_DARK0 the plain estimate stays, from AWB_DARK1 on the line's is taken, a blend between them.
+			 */
+			float k = (p->level - AWB_DARK0) / (AWB_DARK1 - AWB_DARK0);
+			k = k < 0 ? 0 : k > 1 ? 1 : k;
+			gr = expf((1 - k) * logf(gr) - k * logf(rg));
+			gb = expf((1 - k) * logf(gb) - k * logf(bg));
+			p->cct = (1 - 0.15f * k) * p->cct + 0.15f * k * cct;
+		}
 		gr = gr < 0.5f ? 0.5f : gr > 4.f ? 4.f : gr;
 		gb = gb < 0.5f ? 0.5f : gb > 4.f ? 4.f : gb;
 		p->wb[0] = 0.85f * p->wb[0] + 0.15f * gr;
@@ -692,6 +1069,7 @@ struct full_job {
 	unsigned W, H, cx, cy, cw, ch;
 	bool cells;                     /* cw x ch are 2x2 cells of the frame from (cx, cy), not pixels */
 	unsigned xo;                    /* 1: GRBG, the mosaic taken one column over is RGGB's */
+	float fov[4];                   /* the frame on the sensor (the lens shading's grid), isp_fov */
 	CVPixelBufferRef pb;
 	unsigned w, h, pieces;
 };
@@ -771,6 +1149,10 @@ full_demosaic(void *ctx, size_t piece)
 		int y = (int)(yy + j->cy);
 		uint16_t *o = j->d + (size_t)yy * j->cw * 3;
 		bool inner_y = y >= 2 && y + 2 < (int)j->H;
+		float lrow[LSC_W][3];
+		if (p->lsc_on) {
+			lsc_row(p->lsc, j->fov, (float)y, j->H, lrow);
+		}
 		for (unsigned xx = 0; xx < j->cw; xx++) {
 			int x = (int)(xx + j->cx), c, n, s, e, w, nn, ss, ee, ww, ne, nw, se, sw;
 			if (inner_y && x >= 2 && x + 2 < (int)j->W) {
@@ -803,8 +1185,15 @@ full_demosaic(void *ctx, size_t piece)
 			fr = fr < 0 ? 0 : fr;
 			fg = fg < 0 ? 0 : fg;
 			fb = fb < 0 ? 0 : fb;
+			if (p->lsc_on) {
+				float g[3];
+				lsc_px(lrow, j->fov, (float)x, j->W, g);
+				fr *= g[0];
+				fg *= g[1];
+				fb *= g[2];
+			}
 			int l[3];
-			isp_colour(p->k, fr, fg, fb, l);
+			isp_colour(p->k, p->ccm, fr, fg, fb, l);
 			o[0] = p->gamma10[l[0]];
 			o[1] = p->gamma10[l[1]];
 			o[2] = p->gamma10[l[2]];
@@ -824,6 +1213,10 @@ full_cells(void *ctx, size_t piece)
 	for (unsigned yy = y0; yy < y1; yy++) {
 		const uint8_t *r0 = p->raw + (size_t)(2 * (yy + j->cy)) * j->hd->stride, *r1 = r0 + j->hd->stride;
 		uint16_t *o = j->d + (size_t)yy * j->cw * 3;
+		float lrow[LSC_W][3];
+		if (p->lsc_on) {
+			lsc_row(p->lsc, j->fov, 2.f * (yy + j->cy) + 0.5f, j->hd->height, lrow);
+		}
 		for (unsigned xx = 0; xx < j->cw; xx++, o += 3) {
 			unsigned x = 2 * (xx + j->cx);
 			float R, G, B;
@@ -839,8 +1232,15 @@ full_cells(void *ctx, size_t piece)
 			R = R < 0 ? 0 : R;
 			G = G < 0 ? 0 : G;
 			B = B < 0 ? 0 : B;
+			if (p->lsc_on) {
+				float g[3];
+				lsc_px(lrow, j->fov, 2.f * (xx + j->cx) + 0.5f, j->hd->width, g);
+				R *= g[0];
+				G *= g[1];
+				B *= g[2];
+			}
 			int l[3];
-			isp_colour(p->k, R, G, B, l);
+			isp_colour(p->k, p->ccm, R, G, B, l);
 			o[0] = p->gamma10[l[0]];
 			o[1] = p->gamma10[l[1]];
 			o[2] = p->gamma10[l[2]];
@@ -1081,6 +1481,7 @@ render_still_full(const struct isp *p, CVPixelBufferRef pb, unsigned w, unsigned
 	}
 	struct full_job j = { .p = p, .hd = hd, .W = hd->width & ~3u, .H = hd->height & ~1u, .pb = pb, .w = w, .h = h, .pieces = 16,
 		              .xo = (hd->flags & 3) == 1 };
+	isp_fov((hd->flags >> 8) & 3, hd->width, hd->height, j.fov);
 	float crop = p->crop > 0.02f && p->crop < 1.f ? p->crop : 1.f;         /* the zoom: the centre part */
 	/* the part shown at least twice the still's size (mode 0's 4032x3024 for a 2016x1512 still): one RGB pixel a 2x2 Bayer cell */
 	j.cells = j.W * crop >= 2 * w && j.H * crop >= 2 * h && access("/private/var/tmp/sweetcam.nocells", F_OK) != 0;
@@ -2258,8 +2659,9 @@ worker(void *ctx)
 			}
 		}
 		if (s->frames <= 2 || s->frames % 300 == 0) {
-			say("frame %u: %u lines x %.1f x %.2f, lens %u; white balance R %.2f B %.2f; outputs %d%d%d%d enabled %d%d%d%d, delivering %d",
-			    h->seq, h->exposure_lines, h->again_x256 / 256.0, h->dgain_x256 / 256.0, h->lens, isp.wb[0], isp.wb[2],
+			say("frame %u: %u lines x %.1f x %.2f, lens %u; white balance R %.2f B %.2f (%.0f K, lux index %.0f, level %.3f%{public}s); outputs %d%d%d%d enabled %d%d%d%d, delivering %d",
+			    h->seq, h->exposure_lines, h->again_x256 / 256.0, h->dgain_x256 / 256.0, h->lens, isp.wb[0], isp.wb[2], isp.cct, isp.lux,
+			    isp.level, isp.lsc_on ? ", tuned" : ", untuned",
 			    s->out[0].handler != NULL, s->out[1].handler != NULL, s->out[2].handler != NULL, s->out[3].handler != NULL,
 			    s->out[0].enabled, s->out[1].enabled, s->out[2].enabled, s->out[3].enabled, s->delivering);
 		}

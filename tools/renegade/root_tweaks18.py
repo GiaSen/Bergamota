@@ -773,6 +773,10 @@ def torch(root):
 # RENEGADE_CAM_SEQ=DIRECTORY (2026-11-09, three cameras): every *.seq in it goes to /usr/local/share/sweetcam/ under its own
 # name: imx363-mode2.seq (the rear main's preview), imx363-mode0.seq (its 12 MP stills), s5k3m3-mode1.seq (the rear tele),
 # s5k3t1-mode1.seq (the front); a camera without its file does not stream.
+# Every *.ctun in that directory goes there too (2026-11-20): a camera's colour tuning (colour matrices, lens shading, the
+# white balance's reference lights) as tools/camera/chromatix.py takes it from the phone's own com.qti.tuned.*.bin:
+# imx363.ctun, s5k3m3.ctun, s5k3t1.ctun. Vendor-derived, never in git; a camera without one keeps sweetcam's fixed matrix and
+# gets no lens shading correction.
 # Camera's settings for this phone: Live Photo off (it records a movie and there is no video encoder) and "Most Compatible"
 # (JPEG: HEIC needs the HEVC encoder); both stay changeable in Camera and Settings. Photos also need the Chlorophyll of
 # gpu/metal 4f37778 or later (RENEGADE_CHL=1 from research/chl-work/out-metal).
@@ -818,6 +822,14 @@ def camera(root):
         print('camera: %s and %d sensor sequence(s) from %s: %s' % (CAMERA_DYLIB, len(names), seq, ' '.join(names)))
         if os.path.basename(CAM_SEQ) not in names:
             note_skip('camera', 'no %s in RENEGADE_CAM_SEQ: the rear main camera will not stream' % os.path.basename(CAM_SEQ))
+        tuned = sorted(n for n in os.listdir(seq) if n.endswith('.ctun'))
+        for n in tuned:
+            install_file(os.path.join(seq, n), os.path.join(root, os.path.dirname(CAM_SEQ).lstrip('/'), n), 0o644)
+        if tuned:
+            print('camera: colour tuning for %d camera(s): %s' % (len(tuned), ' '.join(tuned)))
+        else:
+            print('camera: no *.ctun in %s (tools/camera/chromatix.py): the fixed colour matrix, no lens shading' % seq)
+            note_skip('camera colour', 'no *.ctun in RENEGADE_CAM_SEQ')
     elif seq and os.path.isfile(seq):
         install_file(seq, os.path.join(root, CAM_SEQ.lstrip('/')), 0o644)
         os.chmod(os.path.dirname(os.path.join(root, CAM_SEQ.lstrip('/'))), 0o755)
