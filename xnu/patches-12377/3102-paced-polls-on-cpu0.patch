@@ -1,0 +1,153 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index f93a68a..0a29732 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -7654,6 +7654,8 @@ ms_ipc_run(unsigned hold_s)
+ 		} else {
+ 			sta_abort(wf_state_name[wf.state]);
+ 		}
++		static bool svc_bound;
++		sweet_poll_bind(&svc_bound);
+ 		if (svc_busy()) {
+ 			svc.busy_loops++;
+ 			wl_sleep(svc_busy_ms >= 1 && svc_busy_ms <= 50 && sweet_paced() ? svc_busy_ms : 1);
+@@ -9775,6 +9777,8 @@ wl_xport_run(void)
+ 			 * kern.sweet_bt_idle_us (2000..200000, default 20000) on the common grid: the controller's wake byte and
+ 			 * whatever follows wait in its own buffers (hardware flow control) until the next look.
+ 			 */
++			static bool bt_bound;
++			sweet_poll_bind(&bt_bound);
+ 			if (bt_hci_connected() && !wl.ibs_asleep) {
+ 				/* awake: 300 us with the display on; 2 ms paced (the FIFO and flow control hold what arrives meanwhile) */
+ 				wl_sleep_us(sweet_paced() && !bt_hci_streaming() ? 2000 : 300);
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index 8710794..cb6de47 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -3888,6 +3888,8 @@ a630_pm_thread(void *arg, wait_result_t wr)
+ 	(void)wr;
+ 	for (;;) {
+ 		int slumber_ms = a630_pm_slumber_ms;
++		static bool pm_bound;
++		sweet_poll_bind(&pm_bound);
+ 		if (a630_dev.ready && !a630_awake && slumber_ms >= 4 && slumber_ms <= 1000 && sweet_pace) {
+ 			/* asleep: nothing to govern; the touch hook wakes this thread at the first event of a burst */
+ 			(void)assert_wait_deadline(&a630_pm_chan, THREAD_UNINT, sweet_poll_deadline_us((uint64_t)slumber_ms * 1000, sweet_paced()));
+diff --git a/bsd/dev/sweet_board.h b/bsd/dev/sweet_board.h
+index 76c8c28..c29b17b 100644
+--- a/bsd/dev/sweet_board.h
++++ b/bsd/dev/sweet_board.h
+@@ -92,6 +92,14 @@ extern int sweet_fb_display_off;        /* bsd/dev/sweet_fb.c */
+ extern unsigned sweet_pace;             /* bsd/dev/sweet_cpufreq.c */
+ extern uint64_t sweet_poll_grid_abs;    /* the grid in timebase ticks; 0: none */
+ extern void clock_interval_to_deadline(uint32_t interval, uint32_t scale_factor, uint64_t *result);
++/*
++ * 3102: a polling thread stays on CPU 0 while the display is off and paced (bsd/dev/sweet_cpufreq.c). A poll whose
++ * timer fires on one core and whose thread then runs on another wakes two cores, and a third when the core it ran on
++ * tells CPU 0 its next deadline; on CPU 0 it is one wake-up, on the core that is the others' timer anyway, and the
++ * other seven stay down. Call it in the thread's loop before its wait with a flag of the thread's own; the move
++ * happens at that wait. kern.sweet_poll_cpu0=0 leaves the threads where the scheduler puts them.
++ */
++extern void sweet_poll_bind(bool *bound);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/dev/sweet_charger.c b/bsd/dev/sweet_charger.c
+index 74bb6fb..5dd0c76 100644
+--- a/bsd/dev/sweet_charger.c
++++ b/bsd/dev/sweet_charger.c
+@@ -196,6 +196,8 @@ static void
+ sc_sleep_ms(unsigned ms)
+ {
+ 	static int chan;
++	static bool sc_bound;
++	sweet_poll_bind(&sc_bound);
+ 	uint64_t deadline = sweet_poll_deadline_us((uint64_t)ms * 1000, ms >= 100 && sweet_paced());   /* 3101: on the common grid */
+ 	(void)assert_wait_deadline(&chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 438dcb5..2cb90e8 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -624,7 +624,9 @@ cf_thread(void *arg __unused, wait_result_t wr __unused)
+ 		(void)cf_cluster_load(&cf_dom[i], 1);   /* prime prev_idle */
+ 	}
+ 	for (;;) {
++		static bool cf_bound;
+ 		unsigned off_ms = cf_off_ms;
++		sweet_poll_bind(&cf_bound);
+ 		if (off_ms >= period && off_ms <= 2000 && sweet_paced()) {
+ 			static int off_chan;
+ 			(void)assert_wait_deadline(&off_chan, THREAD_UNINT, sweet_poll_deadline_us((uint64_t)off_ms * 1000, true));
+@@ -1166,6 +1168,23 @@ SYSCTL_UINT(_kern, OID_AUTO, sweet_cpufreq_off_ms, CTLFLAG_RW | CTLFLAG_LOCKED,
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_pace, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_pace, 0,
+     "screen-off pacing of the drivers' polls: 1 on, 0 every period as with the display on (3101)");
+ 
++/* 3102: see sweet_board.h */
++static unsigned sweet_poll_cpu0 = 1;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_poll_cpu0, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_poll_cpu0, 0,
++    "paced polling threads stay on CPU 0 (3102)");
++extern processor_t cpu_to_processor(int cpu);
++extern processor_t thread_bind(processor_t processor);
++
++void
++sweet_poll_bind(bool *bound)
++{
++	bool want = sweet_poll_cpu0 != 0 && sweet_paced();
++	if (want != *bound) {
++		*bound = want;
++		(void)thread_bind(want ? cpu_to_processor(0) : PROCESSOR_NULL);         /* takes effect at the next block */
++	}
++}
++
+ static int
+ sysctl_sweet_poll_grid SYSCTL_HANDLER_ARGS
+ {
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index b6e67b6..b421ad7 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -109,6 +109,8 @@ keys_wait(void)
+ {
+ 	uint64_t deadline;
+ 	int ms = keys_poll_ms;
++	static bool keys_bound;
++	sweet_poll_bind(&keys_bound);
+ 	if (ms >= 5 && ms <= 500 && sweet_paced()) {
+ 		deadline = sweet_poll_deadline_us((uint64_t)ms * 1000, true);
+ 	} else {
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+index 12c1d8b..a686731 100644
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -171,6 +171,8 @@ static void
+ ts_sleep_ms(unsigned ms)
+ {
+ 	static int chan;
++	static bool ts_bound;
++	sweet_poll_bind(&ts_bound);
+ 	uint64_t deadline = sweet_poll_deadline_us((uint64_t)ms * 1000, ms >= 100 && sweet_paced());   /* 3101: on the common grid */
+ 	(void)assert_wait_deadline(&chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 0dbaf9e..6500633 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1042,6 +1042,8 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			    rx[2], rx[3], ud.xfer_active[EP_RX], tx[2], tx[3], ud.xfer_active[EP_TX], dwc_rd(DSTS));
+ 		}
+ 		int poll_ms = ud_poll_ms;
++		static bool ud_bound;
++		sweet_poll_bind(&ud_bound);
+ 		if (quiet > UD_QUIET_POLLS && poll_ms > 1 && poll_ms <= 1000 && sweet_paced()) {
+ 			(void)assert_wait_deadline(&ud.sleep_chan, THREAD_UNINT, sweet_poll_deadline_us((uint64_t)poll_ms * 1000, true));
+ 			thread_block(THREAD_CONTINUE_NULL);
+@@ -1077,6 +1079,8 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	to.sin_port = htons(5140);
+ 	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
+ 	for (;;) {
++		static bool ud_log_bound;
++		sweet_poll_bind(&ud_log_bound);
+ 		if (sweet_paced()) {
+ 			/* 3101: on the common grid, and not more often than every 500 ms with the display off */
+ 			(void)assert_wait_deadline(&ud.sleep_chan, THREAD_UNINT, sweet_poll_deadline_us(500000, true));
