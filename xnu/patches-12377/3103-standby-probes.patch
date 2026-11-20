@@ -1,0 +1,130 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 9fcc8c7..f057eae 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -1043,4 +1043,86 @@ sysctl_sweet_rpmh_sets SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmh_sets, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_rpmh_sets, "A",
+     "the RSC's sleep and wake sets and hidden slots (3100)");
++/*
++ * 3103: one ARC rail at a chosen level, for finding out what the rails cost and where they may sit with the display
++ * off. Until now every vote was "the top level" and stayed (cx, mx, mss for the modem's start, cx for audio and the
++ * camera, lcx/lmx for the sensor hub): Linux drops such proxy votes once the subsystem is up. kern.sweet_arc_set:
++ * write "cx.lvl=5" (the level's index in the rail's own table), read: the tables and what was last voted here.
++ * Never below the level whose value is RH_ARC_FLOOR (128, "SVS") for cx and mx: they feed everything.
++ */
++#define RH_ARC_FLOOR    128u
++static char rh_arc_text[512];
++
++static int
++rh_arc_set(const char *res, unsigned hlvl)
++{
++	static const char *const allowed[] = { "cx.lvl", "mx.lvl", "lcx.lvl", "lmx.lvl" };
++	unsigned i;
++	for (i = 0; i < sizeof(allowed) / sizeof(allowed[0]) && strcmp(res, allowed[i]); ++i) {
++	}
++	if (i == sizeof(allowed) / sizeof(allowed[0]) || !sweet_board_beryllium()) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0, aux = 0, aux_len = 0;
++	if (!rh_refuse() && !(error = rh_map()) && !(error = rh_lookup_slave(res, RH_ARC, &address, &aux, &aux_len))) {
++		unsigned count = aux_len / 2;
++		uint16_t vl[RH_ARC_LEVELS];
++		size_t n = strlen(rh_arc_text);
++		if (n > sizeof(rh_arc_text) - 120) {
++			n = 0;
++		}
++		if (count == 0 || count > RH_ARC_LEVELS) {
++			error = EINVAL;
++		} else {
++			n += (size_t)snprintf(rh_arc_text + n, sizeof(rh_arc_text) - n, "%s levels", res);
++			for (unsigned k = 0; k < count; ++k) {
++				vl[k] = (uint16_t)rh_db16(aux + 2 * k);
++				if (k > 0 && vl[k] == 0) {
++					count = k;
++					break;
++				}
++				n += (size_t)snprintf(rh_arc_text + n, sizeof(rh_arc_text) - n, " %u", vl[k]);
++			}
++			if (hlvl >= count || ((i < 2) && vl[hlvl] < RH_ARC_FLOOR)) {
++				error = ERANGE;
++				(void)snprintf(rh_arc_text + n, sizeof(rh_arc_text) - n, " refused=%u\n", hlvl);
++			} else {
++				uint32_t v = hlvl;
++				printf("SWEET RPMH: %s ARC %#x: vote hlvl %u (vlvl %u) by kern.sweet_arc_set\n", res, address, hlvl, vl[hlvl]);
++				error = rh_cmds(&address, &v, 1);
++				(void)snprintf(rh_arc_text + n, sizeof(rh_arc_text) - n, " voted=%u (%u) err=%d\n", hlvl, vl[hlvl], error);
++			}
++		}
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++static int
++sysctl_sweet_arc_set SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[sizeof(rh_arc_text)];
++	strlcpy(buf, rh_arc_text, sizeof(buf));
++	int error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	char *eq = strchr(buf, '=');
++	if (eq == NULL || eq[1] < '0' || eq[1] > '9') {
++		return EINVAL;
++	}
++	*eq = 0;
++	unsigned lvl = (unsigned)(eq[1] - '0');
++	if (eq[2] >= '0' && eq[2] <= '9') {
++		lvl = lvl * 10 + (unsigned)(eq[2] - '0');
++	}
++	return rh_arc_set(buf, lvl);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_arc_set, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_arc_set, "A",
++    "write RAIL=INDEX (cx.lvl, mx.lvl, lcx.lvl, lmx.lvl): vote that level; read: the tables and the votes made here (3103)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 6500633..2b51146 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1011,6 +1011,34 @@ ud_event(uint32_t ev)
+ static int ud_poll_ms = 10;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_usb_poll_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &ud_poll_ms, 0, "USB event poll period with the display off and no traffic, ms");
+ 
++/*
++ * 3103: kern.sweet_usb_off=SECONDS (1..300): the controller leaves the bus (DCTL.RUN_STOP off: the host sees an unplug),
++ * waits, and comes back; the host enumerates again. For measuring what the link costs with the cable in: nothing can
++ * talk to the phone meanwhile, so whatever measures must run on the phone and write to a file.
++ */
++extern void IOSleep(unsigned int milliseconds);
++static int
++sysctl_sweet_usb_off SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = 0, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (v < 1 || v > 300) {
++		return EINVAL;
++	}
++	uint32_t dctl = dwc_rd(DCTL);
++	printf("SWEET USB: off the bus for %d s (DCTL %#x)\n", v, dctl);
++	dwc_wr(DCTL, dctl & ~DCTL_RUN_STOP);
++	IOSleep((unsigned)v * 1000u);
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	printf("SWEET USB: back on the bus (DCTL %#x)\n", dwc_rd(DCTL));
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_usb_off, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_usb_off, "I",
++    "leave the USB bus for this many seconds, then come back (3103)");
++
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {

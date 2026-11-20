@@ -1,0 +1,81 @@
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 2cb90e8..4abcdea 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -823,6 +823,11 @@ static int sweet_llcc_on, sweet_bus_mbps;
+ static int sweet_mem_lock;
+ /* sweet_bus_mbps != 0 or a kern.sweet_l3 write: set by hand, the policy leaves that one alone */
+ static bool cf_mem_auto, cf_l3_manual;
++static unsigned cf_cx_off_vlvl = 256, cf_cx_changes;    /* 3104 */
++static bool cf_cx_is_low;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_cx_off_vlvl, CTLFLAG_RW | CTLFLAG_LOCKED, &cf_cx_off_vlvl, 0,
++    "the cx rail's level with the display off (256 nominal; 0: stays at the top) (3104)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_cx_changes, CTLFLAG_RD | CTLFLAG_LOCKED, &cf_cx_changes, 0, "cx level changes made by the display-off policy");
+ static int cf_mem_state;        /* 3026: 0 idle, 1 high, 2 display off */
+ static uint64_t cf_mem_until;
+ #define MEM_DDR_HIGH            7216    /* top */
+@@ -1000,6 +1005,22 @@ cf_mem_step(uint64_t now)
+ 	}
+ 	bool high = now < cf_mem_until;
+ 	int state = high ? 1 : __atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED) ? 2 : 0;
++	/*
++	 * 3104: the display off and nothing moving: cx down from the top level to nominal (kern.sweet_cx_off_vlvl, 256; 0
++	 * leaves it): 16 mA at the battery. Back at the top before anything else when the display comes on or something
++	 * moves. A vote that finds the driver busy is tried again at the next period.
++	 */
++	bool cx_low = state == 2 && cf_cx_off_vlvl >= 128;
++	if (cx_low != cf_cx_is_low) {
++		extern int sweet_rpmh_arc_vlvl(const char *res, unsigned vlvl);
++		extern int sweet_rpmh_arc_vote(const char *res, bool max);
++		if ((cx_low ? sweet_rpmh_arc_vlvl("cx.lvl", cf_cx_off_vlvl) : sweet_rpmh_arc_vote("cx.lvl", true)) == 0) {
++			cf_cx_is_low = cx_low;
++			cf_cx_changes++;
++		} else if (!cx_low) {
++			return;         /* not yet at the top again: nothing else changes before it is */
++		}
++	}
+ 	if (state == cf_mem_state) {
+ 		return;
+ 	}
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index f057eae..2a6def2 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -1102,6 +1102,37 @@ rh_arc_set(const char *res, unsigned hlvl)
+ 	return error;
+ }
+ 
++/*
++ * 3104: a rail at the lowest of its levels that is at least `vlvl` (256 = nominal). For cx with the display off:
++ * the top level ("turbo", 384), which every start-up vote here leaves behind, cost 16 mA against nominal with the
++ * display off (2026-11-20, paired A/B); 128 gained nothing more. EBUSY while another request holds the driver.
++ */
++int sweet_rpmh_arc_vlvl(const char *res, unsigned vlvl);
++int
++sweet_rpmh_arc_vlvl(const char *res, unsigned vlvl)
++{
++	uint32_t address = 0, aux = 0, aux_len = 0;
++	unsigned hlvl = RH_ARC_LEVELS;
++	if (vlvl < RH_ARC_FLOOR || !sweet_board_beryllium()) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = rh_refuse() ? EIO : rh_map();
++	if (!error && !(error = rh_lookup_slave(res, RH_ARC, &address, &aux, &aux_len))) {
++		unsigned count = aux_len / 2 > RH_ARC_LEVELS ? RH_ARC_LEVELS : aux_len / 2;
++		for (unsigned k = 0; k < count; ++k) {
++			if (rh_db16(aux + 2 * k) >= vlvl) {
++				hlvl = k;
++				break;
++			}
++		}
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error ? error : hlvl == RH_ARC_LEVELS ? ERANGE : rh_arc_set(res, hlvl);
++}
++
+ static int
+ sysctl_sweet_arc_set SYSCTL_HANDLER_ARGS
+ {
