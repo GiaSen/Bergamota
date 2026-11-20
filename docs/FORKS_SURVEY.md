@@ -196,3 +196,43 @@ sensors, Bluetooth audio, the telephoto; no calls either.
 hakios-thyme-mi10s, xm6661885/hakios-xnu-kernel-umi-fixes, suryastark6/ios-alioth (SM8250), qdizax-w/hakios-sm7125,
 oosexgang/hakios-sm7325 and hakios-mt6768, limonetexd/ios-sweet-gpu (A618 Metal), karthiknathan98-tech/A50s_IOS
 (Bergamota's layout on an Exynos), wuxianlin/hackios-os_devices_oneplus-dodge.
+
+## I. Fourth survey for the Mi 8 (dipper), 2026-11-20 (read-only)
+
+Clones in `research/` (gitignored) fetched again, no new commits: `hakios-xnu-kernel` (oosexgang main, 63fc2b4),
+`hakios-fajita-kernel` (kiwiiiii-eth branch `fajita`, b47c5df), `hexagonrpc` (da7a374). New shallow clone
+`research/youzjuzi-dipper-xnu` (5fcd752, 2026-11-19). Every repo named in sections G and H checked for pushes through the
+GitHub API, plus repository searches ("sdm845 ios", "sdm845 xnu", hakios / hackios / ios-sweet created since 11-10, UniXNU).
+
+### I0. Nothing new for us
+- No push since section H (2026-11-18): ry-diffusion/Bergamota and Chlorophyll (10-26), kiwiiiii-eth/hakios-fajita and
+  hakios-xnu-kernel (11-16), oosexgang/hakios-xnu-kernel (11-10, not on `main`), hakios-metal (11-05), edi194/ios-fajita
+  (11-14), JaneAwA/polaris-ios14 (11-13), HeliumStudio-Dev/hackios-xnu-kernel, yfl520/hackios-raphael, MakrSas/ios-topaz,
+  dipa-studio/ios-sweet, anonbeat1/ios-sweet, linux-msm/hexagonrpc.
+
+### I1. youzjuzi/dipper-xnu: the Mi 8 on HackiOS, iOS 16.5 (created 2026-10-29, last push 2026-11-19, 103 stars)
+https://github.com/youzjuzi/dipper-xnu: our phone, another route: xnu-8796 + iOS 16.5 on oosexgang's HackiOS, booted
+stock bootloaders -> edk2-sdm845 UEFI -> xnuloader, root in a new `darwin` UFS partition (wipes userdata). Source patches
+only (`patches/xnu-mi8.patch` 1.3 MB, `hackios-kernel.patch`, `hackios-userland.patch`), no binaries. Licences: MIT for
+their own scripts, docs and listed original modules; APSL 2.0 for XNU/HackiOS-derived code; GPL-2.0-only for the
+Linux-derived `mi8_a630_hw_init.inc` (keep that one out). Their status: home screen, GPU (Mesa freedreno), touch, Wi-Fi,
+Bluetooth pairing (no audio), speaker; no cellular, microphone, calls, cameras or sensors. We are ahead nearly everywhere
+(iOS 26.6.2, cellular data, mic, earpiece, three cameras, sensors, Bluetooth audio). Worth taking from:
+- **Temperature governor `thermgov`** (in `xnu-mi8.patch`, boot-arg `thermgov=`, 66 °C by default on dipper): caps the
+  CPU frequency row when hot. **Touch- and GPU-driven CPU/DDR scaling** (`mi8_perf_kick()`): idles at 825 MHz and DDR
+  level 2 of 16, raised on touch and GPU work. Ours: DDR vote lowered only with the screen off (3026), little-core caps
+  (0190, 0192), no temperature guard at all. With H1's TSENS guard this is a second reference, now for this exact phone.
+- **Not new for us:** A630 GMEM (their fix was `MSM_PARAM_GMEM_BASE` = 0x100000; ours has always returned that, and
+  Chlorophyll renders to system memory on purpose: measured faster, NOTES "DIRECT RENDERING EVERYWHERE").
+- **Not compared yet:** their zero-copy scanout (`fb_native=2`, 59 fps), Wi-Fi signal bars from kernel LQM events, and
+  a muted volume HUD fixed by reporting the HID Telephony ring switch. Whether ours has either UI problem is not checked.
+
+### I2. Other new SDM845 ports (behind us, nothing to take)
+keyfan/UniXNU-enchilada-bringup (OnePlus 6, GMU start-up debugging), dragon120820/UniXNU-sdm845-common (a skeleton),
+RisanYu/r1-hakios-port (Smartisan Nut R1, home screen 11-18), WeiXiaoye/perseus-xnu (Mi MIX 3, GPU draws, tearing).
+
+### I3. Elsewhere (not SDM845)
+suryastark6/ios-alioth (SM8250, Adreno 650 first frames 11-20), limonetexd/ios-sweet-gpu (A618 Metal, quiet since
+11-11), ampekk/ios-guacamole-hotdog (xnu-12377 SWEET on the OnePlus 7T Pro, CI builds only), azjhf-dev/ios26-on-xiaomi15
+(iOS 26 arm64e on Snapdragon 8 Elite, instructions only), UniXNU/UniXNU (UEFI framework, 3032 stars, its SDM845 layer is
+the skeleton above), and many new HakiOS ports on MediaTek and other SoCs.
