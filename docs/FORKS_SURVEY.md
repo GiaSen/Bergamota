@@ -220,8 +220,10 @@ Bluetooth pairing (no audio), speaker; no cellular, microphone, calls, cameras o
 (iOS 26.6.2, cellular data, mic, earpiece, three cameras, sensors, Bluetooth audio). Worth taking from:
 - **Temperature governor `thermgov`** (in `xnu-mi8.patch`, boot-arg `thermgov=`, 66 °C by default on dipper): caps the
   CPU frequency row when hot. **Touch- and GPU-driven CPU/DDR scaling** (`mi8_perf_kick()`): idles at 825 MHz and DDR
-  level 2 of 16, raised on touch and GPU work. Ours: DDR vote lowered only with the screen off (3026), little-core caps
-  (0190, 0192), no temperature guard at all. With H1's TSENS guard this is a second reference, now for this exact phone.
+  level 2 of 16, raised on touch and GPU work. Ours (corrected the same day, the first wording missed 3009): a load
+  governor on both clusters with touch boost and an animation floor, and DDR / L3 votes that already follow frames and
+  fingers with the screen on (7216 MB/s moving, 4000 idle, 1000 with the display off since 3026); what we lack is any
+  temperature reading. With H1's TSENS guard this is a second reference, now for this exact phone.
 - **Not new for us:** A630 GMEM (their fix was `MSM_PARAM_GMEM_BASE` = 0x100000; ours has always returned that, and
   Chlorophyll renders to system memory on purpose: measured faster, NOTES "DIRECT RENDERING EVERYWHERE").
 - **Not compared yet:** their zero-copy scanout (`fb_native=2`, 59 fps), Wi-Fi signal bars from kernel LQM events, and
