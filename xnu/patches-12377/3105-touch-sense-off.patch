@@ -1,0 +1,55 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index dfaf11c..432d39b 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -979,6 +979,29 @@ stfts_event(uint8_t *ev)
+ static const char *touch_suspect;       /* 3027: why the IC should be restarted, set by touch_stfts */
+ static const uint8_t stfts_ier[] = { 0xfa, 0x20, 0x00, 0x00, 0x29, 0x41 }; /* FTS_CMD_HW_REG_W ADDR_IER IER_ENABLE */
+ static const uint8_t stfts_scan[] = { 0xa0, 0x00, 0x01 };                  /* FTS_CMD_SCAN_MODE ACTIVE, MULTI_TOUCH */
++/*
++ * 3105: the same command with no scan enabled ("sense off", what Linux's fts driver sends at suspend): the IC stops
++ * scanning the glass. With the display off nobody reads touches; at display on the IC is reset and set up again anyway
++ * (3029). kern.sweet_touch_sense_off=1 sends it when the display goes off (the policy); kern.sweet_touch_sense=0/1
++ * sends it or the scan command by hand, for measuring.
++ */
++static const uint8_t stfts_scan_off[] = { 0xa0, 0x00, 0x00 };
++static int touch_sense_off = 0, touch_sense_req, touch_sense_sent;
++SYSCTL_INT(_kern, OID_AUTO, sweet_touch_sense_off, CTLFLAG_RW | CTLFLAG_LOCKED, &touch_sense_off, 0, "touch IC stops scanning while the display is off (3105)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_touch_sense_sent, CTLFLAG_RD | CTLFLAG_LOCKED, &touch_sense_sent, 0, "sense on/off commands sent");
++static int
++touch_sense_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = -1, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	__atomic_store_n(&touch_sense_req, v ? 2 : 1, __ATOMIC_RELAXED);        /* the touch thread sends it at its next look */
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_touch_sense, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, touch_sense_sysctl, "I",
++    "write 0: the touch IC stops scanning, 1: it scans again (3105)");
+ 
+ /*
+  * ST FTS events (fts_521 fts_*_pointer_event_handler): [0] event id, [1] touch id (7:4) | touch type (3:0),
+@@ -1639,6 +1662,20 @@ selected:
+ 			if (st.active == 0) {
+ 				was_plugged = plugged;
+ 			}
++			{
++				/* 3105 */
++				int sense = __atomic_exchange_n(&touch_sense_req, 0, __ATOMIC_RELAXED);
++				if (sense == 0 && touch_sense_off && off && !was_off) {
++					sense = 1;
++				}
++				if (sense == 1 || sense == 2) {
++					int e = stfts_write(sense == 1 ? stfts_scan_off : stfts_scan, sizeof(stfts_scan));
++					touch_sense_sent++;
++					if (touch_sense_sent <= 6 || e) {
++						printf("SWEET TOUCH: scan %s (err=%d)\n", sense == 1 ? "off" : "on", e);
++					}
++				}
++			}
+ 			was_off = off;
+ 		}
+ 		touch_wait(touch_pace());
