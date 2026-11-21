@@ -1,0 +1,50 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index b421ad7..0f5abf3 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -52,6 +52,17 @@ SYSCTL_INT(_kern, OID_AUTO, sweet_keys_lock, CTLFLAG_RW | CTLFLAG_LOCKED, &keys_
+ /* 3099/3101: the poll period with the display off (kern.sweet_keys_ms, 5..500, default 30, on the common grid); 20 ms with it on */
+ static int keys_poll_ms = 30;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_keys_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &keys_poll_ms, 0, "key poll period with the display off, ms");
++/*
++ * 3109: once a read differs from a key's state the reads that confirm it come this many ms apart (kern.sweet_keys_confirm_ms,
++ * 1..50, default 8; 0: at the poll period, as before). At the poll period a press had to last three reads: 40 to 60 ms with
++ * the display on and, since the display-off pacing of 3101, 60 to 90 ms with it off. The user's short presses of the power
++ * key were then read once or twice, counted as glitches and dropped: "to unlock I need to press the power button for
++ * longer" (2026-11-21, and the log shows it: "read differently and came back, ignored" before every wake). Now a press
++ * counts once it has lasted two confirming reads after the first: 16 ms, plus up to one poll period until that first read.
++ * The wrong reads the three-in-a-row rule was made for (3024) were single reads.
++ */
++static int keys_confirm_ms = 8;
++SYSCTL_INT(_kern, OID_AUTO, sweet_keys_confirm_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &keys_confirm_ms, 0, "ms between the reads that confirm a key change (3109)");
+ 
+ static uint32_t
+ keys_rd(vm_offset_t base, uint32_t off)
+@@ -105,13 +116,15 @@ keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
+ }
+ 
+ static void
+-keys_wait(void)
++keys_wait(bool pending)
+ {
+ 	uint64_t deadline;
+-	int ms = keys_poll_ms;
++	int ms = keys_poll_ms, confirm = keys_confirm_ms;
+ 	static bool keys_bound;
+ 	sweet_poll_bind(&keys_bound);
+-	if (ms >= 5 && ms <= 500 && sweet_paced()) {
++	if (pending && confirm >= 1 && confirm <= 50) {
++		clock_interval_to_deadline((uint32_t)confirm, NSEC_PER_MSEC, &deadline);        /* 3109 */
++	} else if (ms >= 5 && ms <= 500 && sweet_paced()) {
+ 		deadline = sweet_poll_deadline_us((uint64_t)ms * 1000, true);
+ 	} else {
+ 		clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
+@@ -168,7 +181,7 @@ keys_thread(void *arg, wait_result_t result)
+ 			    k, state[k], pon, gpio);
+ 			sweet_hid_key(k, state[k]);
+ 		}
+-		keys_wait();
++		keys_wait(same[0] != 0 || same[1] != 0 || same[2] != 0);
+ 	}
+ }
+ 
