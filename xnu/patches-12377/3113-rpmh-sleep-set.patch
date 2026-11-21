@@ -1,0 +1,150 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index dbd30ef..a36f564 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -533,6 +533,46 @@ rh_cmds_once(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ 	return 0;
+ }
+ 
++/*
++ * 3113: a sleep vote and a wake vote (kern.sweet_rpmh_sleepset, at the end of this file). The RSC keeps three kinds of
++ * requests: the active ones sent at once (TCS 0-1, everything this driver did until now), and two sets it sends by
++ * itself, the sleep set (TCS 2-4) when the last core powers the cluster down in the "AOSS sleep" state (3100, mode 3)
++ * and the wake set (TCS 5-7) before the cores come back. With both empty what is voted stays voted through every such
++ * sleep, and the power controller can never lower a rail for this processor. rh_set[] is what the two sets hold, one
++ * command slot each in TCS 2 and TCS 5.
++ */
++#define RH_SLEEP_TCS    RH_ACTIVE_N
++#define RH_WAKE_TCS     (RH_ACTIVE_N + 3u)
++#define RH_SET_MAX      4u
++#define RH_WRITE_NOACK  (8u | (1u << 16))
++static struct {
++	uint32_t address, sleep, wake;
++	char name[12];
++} rh_set[RH_SET_MAX];
++static unsigned rh_set_n;
++static uint32_t rh_set_programmed, rh_set_followed;
++
++/* with rh_lock held: both sets written anew from rh_set[] (as Linux __tcs_buffer_write without a trigger; wake requests
++ * ask for their completion, sleep requests do not: rpmh.c send_single) */
++static void
++rh_set_program(void)
++{
++	static const unsigned tcs[2] = { RH_SLEEP_TCS, RH_WAKE_TCS };
++	for (unsigned s = 0; s < 2; s++) {
++		uint32_t b = tcs[s] * RH_TCS_STRIDE, en = 0;
++		rh_write(rh_tcs, b + RH_ENABLE, 0);
++		rh_write(rh_tcs, b + RH_WAIT, 0);
++		for (unsigned c = 0; c < rh_set_n; c++) {
++			rh_write(rh_tcs, b + RH_MSGID + c * RH_CMD_STRIDE, s ? RH_WRITE_ACK : RH_WRITE_NOACK);
++			rh_write(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE, rh_set[c].address);
++			rh_write(rh_tcs, b + RH_DATA + c * RH_CMD_STRIDE, s ? rh_set[c].wake : rh_set[c].sleep);
++			en |= 1u << c;
++		}
++		rh_write(rh_tcs, b + RH_ENABLE, en);
++	}
++	rh_set_programmed++;
++}
++
+ static int
+ rh_cmds(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ {
+@@ -541,6 +581,22 @@ rh_cmds(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ 		error = rh_cmds_once(addrs, vals, ncmd);
+ 		error = error == EAGAIN ? EIO : error;
+ 	}
++	if (error == 0 && rh_set_n != 0) {
++		/* the wake vote is the active vote: a rail must come back at the level in force now */
++		bool changed = false;
++		for (unsigned c = 0; c < ncmd; c++) {
++			for (unsigned k = 0; k < rh_set_n; k++) {
++				if (rh_set[k].address == addrs[c] && rh_set[k].wake != vals[c]) {
++					rh_set[k].wake = vals[c];
++					changed = true;
++				}
++			}
++		}
++		if (changed) {
++			rh_set_program();
++			rh_set_followed++;
++		}
++	}
+ 	return error;
+ }
+ 
+@@ -1226,4 +1282,75 @@ sysctl_sweet_sleep_stats SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_sleep_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_sleep_stats, "A",
+     "the power controller's sleep records (aosd, cxsd) and each subsystem's (3112)");
++
++/*
++ * 3113: kern.sweet_rpmh_sleepset: write "cx.lvl=S:W" (or mx.lvl): the rail's level, an index into its table
++ * (kern.sweet_arc_set shows the tables: for cx 0 off, 1 retention, 2 min SVS, 3 low SVS, 4 SVS ... 6 nominal, 7 turbo),
++ * for the sleep set and for the wake set; "clear" empties both. W must be the level voted now: write it as it is, later
++ * active votes for that rail move it by themselves. Nothing happens until the cluster powers down in mode 3
++ * (kern.sweet_cluster=3); whether the rail then really drops is the power controller's to decide, with every other
++ * subsystem's vote: kern.sweet_sleep_stats counts it (cxsd). A probe: nothing sets this by itself.
++ */
++static int
++sysctl_sweet_rpmh_sleepset SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[320];
++	size_t n = (size_t)snprintf(buf, sizeof(buf), "sweet_rpmh_sleepset v1 programmed=%u followed=%u", rh_set_programmed, rh_set_followed);
++	for (unsigned k = 0; k < rh_set_n && n < sizeof(buf); k++) {
++		n += (size_t)snprintf(buf + n, sizeof(buf) - n, " %s(%#x) sleep=%u wake=%u", rh_set[k].name, rh_set[k].address, rh_set[k].sleep, rh_set[k].wake);
++	}
++	if (!req->newptr) {
++		return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++	}
++	char in[32] = "";
++	int error = sysctl_handle_string(oidp, in, sizeof(in), req);
++	if (error) {
++		return error;
++	}
++	if (!rh_rsc || !rh_tcs || !rh_be) {
++		return ENXIO;
++	}
++	bool clear = strcmp(in, "clear") == 0;
++	char *eq = strchr(in, '='), *colon = eq ? strchr(eq, ':') : NULL;
++	uint32_t sl = 0, wk = 0, address = 0, aux = 0, aux_len = 0;
++	if (!clear) {
++		if (eq == NULL || colon == NULL || eq[1] < '0' || eq[1] > '9' || colon != eq + 2 || colon[1] < '0' || colon[1] > '9' || colon[2] != 0) {
++			return EINVAL;
++		}
++		*eq = 0;
++		sl = (uint32_t)(eq[1] - '0');
++		wk = (uint32_t)(colon[1] - '0');
++		if ((strcmp(in, "cx.lvl") && strcmp(in, "mx.lvl")) || wk < 4 || wk > 7 || sl > wk) {
++			return EINVAL;
++		}
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	if (clear) {
++		rh_set_n = 0;
++		rh_set_program();
++		printf("SWEET RPMH: sleep and wake sets emptied\n");
++	} else if (!(error = rh_map()) && !(error = rh_lookup_slave(in, RH_ARC, &address, &aux, &aux_len))) {
++		unsigned k;
++		for (k = 0; k < rh_set_n && rh_set[k].address != address; k++) {
++		}
++		if (k == RH_SET_MAX) {
++			error = ENOSPC;
++		} else {
++			rh_set[k].address = address;
++			rh_set[k].sleep = sl;
++			rh_set[k].wake = wk;
++			strlcpy(rh_set[k].name, in, sizeof(rh_set[k].name));
++			rh_set_n = k == rh_set_n ? k + 1 : rh_set_n;
++			rh_set_program();
++			printf("SWEET RPMH: %s (%#x) in the sleep set at level %u, in the wake set at %u\n", in, address, sl, wk);
++		}
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmh_sleepset, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_rpmh_sleepset, "A",
++    "write cx.lvl=S:W (levels for the sleep and the wake set) or clear; read: what the sets hold (3113)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

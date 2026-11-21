@@ -1,0 +1,282 @@
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+index 2471acd..7e01848 100644
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -137,6 +137,18 @@ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_te_limit, CTLFLAG_RW | CTLFLAG_LOCKED, &swe
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_te_lost, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_te_lost, 0, "wakes after which the tearing signal was missing");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_panel_redo, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_panel_redo, 0, "send the wake sequence again when the tearing signal is missing (3108)");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_panel_redone, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_panel_redone, 0, "wake sequences sent again");
++/*
++ * 3111: the display engine's clocks stopped behind a sleeping panel (iokit/Kernel/arm/SweetFramebuffer.cpp clkGate).
++ * kern.sweet_fb_clk_gate: what to stop, a mask: 1 the DSI link's branches, 2 its PLL (with 1), 4 the engine's core, LUT,
++ * rotator and vsync clocks, 8 its bus clock; 0 nothing. A change takes effect at the next slow tick or two.
++ */
++int sweet_fb_clk_gate, sweet_fb_clk_gated, sweet_fb_clk_gates, sweet_fb_clk_fails, sweet_fb_clk_lock_us, sweet_fb_clk_was;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_clk_gate, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_clk_gate, 0, "display clocks to stop while the panel sleeps: 1 link, 2 link PLL, 4 engine, 8 bus (3111)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_clk_gated, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_clk_gated, 0, "the mask stopped now");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_clk_gates, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_clk_gates, 0, "times the display clocks were stopped");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_clk_fails, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_clk_fails, 0, "branches that did not switch, PLL locks that did not come");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_clk_lock_us, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_clk_lock_us, 0, "the DSI PLL's latest lock time, us");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_clk_was, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_clk_was, 0, "what was on and stopped at the latest stop: bits 0-3 link, 4-7 engine, 8 bus, 0x1000 the PLL");
+ int sweet_fb_panel_skip = 0;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_panel_skip, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_panel_skip, 0, "commands of the panel's wake sequence to leave out, a mask (3108)");
+ int sweet_fb_panel_hold = 3;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7516631..b014cb6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -74,6 +74,7 @@ extern "C" int sweet_fb_panel_sleep, sweet_fb_panel_sleeps, sweet_fb_panel_wakes
+ extern "C" int sweet_fb_panel_hold, sweet_fb_panel_skip, sweet_fb_dcs_long_n;     /* 3108 */
+ extern "C" uint8_t sweet_fb_dcs_long[8];
+ extern "C" int sweet_fb_te_line, sweet_fb_te_max, sweet_fb_te_limit, sweet_fb_te_lost, sweet_fb_panel_redo, sweet_fb_panel_redone;
++extern "C" int sweet_fb_clk_gate, sweet_fb_clk_gated, sweet_fb_clk_gates, sweet_fb_clk_fails, sweet_fb_clk_lock_us, sweet_fb_clk_was;    /* 3111 */
+ extern "C" int sweet_fb_display_off;            /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_display_off (3023) */
+ /*
+  * 3087: the hardware scaler's panel rectangle (x, y, w, h; w 0 = not scaling in hardware), for SweetHID's touch mapping:
+@@ -637,6 +638,14 @@ public:
+ 	}
+ 	void          dsiInit(void);
+ 	void          dsiTick(bool off = false, bool dark = false);
++	/* 3111: the display engine's clocks stopped behind a sleeping panel; see clkGate */
++	vm_offset_t   fDispcc, fDsiPhy;
++	bool          fClkGated, fClkPllWasOn;
++	uint32_t      fClkMask, fClkWasOn, fClkIdleTicks, fClkLogged;
++	uint32_t      fClkRbuf, fClkMuxes;
++	bool          clkBranch(uint32_t off, bool on);
++	void          clkGate(bool gate);
++	void          clkPolicy(bool dark);
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -1188,6 +1197,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		IOLockLock(fb->fLock);
+ 		int offUS = sweet_fb_off_vsync_us;
+ 		bool dark = fb->fPowerOff && ((fb->fBlOK && fb->fBlPos == 0 && !fb->fBlOffFailed) || fb->fBlackDone);
++		fb->clkPolicy(dark);    /* 3111 */
+ 		sender->setTimeoutUS(dark && sweet_pace && offUS >= 20000 && offUS <= 5000000 ? (uint32_t)offUS : nextUS);
+ 		IOLockUnlock(fb->fLock);
+ 		return;
+@@ -1727,6 +1737,9 @@ sweet_mdp_restore_apply(void)
+ static void
+ sweet_fb_restore_boot_scanout(void)
+ {
++	if (sweet_fb_clk_gated != 0) {
++		return;         /* 3111: the display engine has no clocks (and the panel sleeps): its registers would not answer */
++	}
+ 	if (sweet_mdp_restore.base == 0) {
+ 		return;
+ 	}
+@@ -2975,6 +2988,17 @@ AppleCLCD::blInit(void)
+ #define SWEET_DSI_BL_MIN        2u      /* qcom,mdss-dsi-bl-min-level */
+ #define SWEET_DSI_BL_MAX        1023u
+ #define SWEET_DSI_WAIT_TICKS    12u
++/* 3111: the display clock controller, and the DSI PHY with its PLL (PLL registers 0x600 above the PHY's) */
++#define SWEET_DISPCC_PA         0x0af00000u
++#define SWEET_DISPCC_SIZE       0x6000u
++#define SWEET_DSIPHY_PA         0x0ae94400u
++#define SWEET_DSIPHY_SIZE       0x800u
++#define DSIPHY_CMN_CLK_CFG1     0x014u
++#define DSIPHY_CMN_RBUF_CTRL    0x01cu
++#define DSIPHY_CMN_CTRL_0       0x024u
++#define DSIPHY_CMN_PLL_CNTRL    0x038u
++#define DSIPLL_SYSTEM_MUXES     0x624u
++#define DSIPLL_COMMON_STATUS_ONE 0x7a0u
+ 
+ void
+ AppleCLCD::dsiInit(void)
+@@ -2985,6 +3009,174 @@ AppleCLCD::dsiInit(void)
+ 	IOLog("SWEET DSI: ctrl 0x%08x status 0x%08x fifo 0x%08x dma_ctrl 0x%08x trig 0x%08x int 0x%08x tpg 0x%08x\n",
+ 	    mdp_rd(fDsi, DSI_R_CTRL), mdp_rd(fDsi, DSI_R_STATUS), mdp_rd(fDsi, DSI_R_FIFO_STATUS), mdp_rd(fDsi, DSI_R_DMA_CTRL),
+ 	    mdp_rd(fDsi, DSI_R_TRIG_CTRL), mdp_rd(fDsi, DSI_R_INT_CTRL), mdp_rd(fDsi, DSI_R_TPG_CTRL));
++	fDispcc = ml_io_map(SWEET_DISPCC_PA, SWEET_DISPCC_SIZE);
++	fDsiPhy = ml_io_map(SWEET_DSIPHY_PA, SWEET_DSIPHY_SIZE);
++	if (fDispcc != 0 && fDsiPhy != 0) {
++		IOLog("SWEET FB: clocks: byte0 0x%08x intf 0x%08x pclk0 0x%08x esc0 0x%08x mdp 0x%08x lut 0x%08x rot 0x%08x vsync 0x%08x "
++		    "axi 0x%08x ahb 0x%08x gdsc 0x%08x; DSI PLL cntrl 0x%x status 0x%x cfg1 0x%x rbuf 0x%x ctrl0 0x%x muxes 0x%x\n",
++		    mdp_rd(fDispcc, 0x2028), mdp_rd(fDispcc, 0x202c), mdp_rd(fDispcc, 0x2004), mdp_rd(fDispcc, 0x2038),
++		    mdp_rd(fDispcc, 0x200c), mdp_rd(fDispcc, 0x201c), mdp_rd(fDispcc, 0x2014), mdp_rd(fDispcc, 0x2024),
++		    mdp_rd(fDispcc, 0x4008), mdp_rd(fDispcc, 0x4004), mdp_rd(fDispcc, 0x3000),
++		    mdp_rd(fDsiPhy, DSIPHY_CMN_PLL_CNTRL), mdp_rd(fDsiPhy, DSIPLL_COMMON_STATUS_ONE), mdp_rd(fDsiPhy, DSIPHY_CMN_CLK_CFG1),
++		    mdp_rd(fDsiPhy, DSIPHY_CMN_RBUF_CTRL), mdp_rd(fDsiPhy, DSIPHY_CMN_CTRL_0), mdp_rd(fDsiPhy, DSIPLL_SYSTEM_MUXES));
++	}
++}
++
++/*
++ * 3111: the display engine's clocks behind a sleeping panel. Nothing here ever switched off what the bootloader
++ * switched on: with the panel asleep (3107) the DSI link's PLL and its byte, pixel and escape clocks, the display
++ * engine's core, LUT, rotator and vsync clocks and its memory bus clock all kept running. kern.sweet_fb_clk_gate is a
++ * mask of what to stop once the display is off, dark and the panel asleep for two slow ticks: 1 the link's branches,
++ * 2 the link's PLL (only with 1), 4 the engine's clocks, 8 its bus clock. Only branches that were on are stopped, and
++ * exactly those come back, in the opposite order, before the display is "on" again for anybody: in the power request
++ * itself, under the lock. The register clock (AHB) and the power domain stay, so every setting keeps its value. While
++ * the clocks are away nothing touches the engine or the link: with the display off the swap paths do not (they test
++ * fPowerOff), dsiTick returns at once, and the panic hook leaves the scan-out alone. Order and registers as the vendor
++ * kernel's (clk/qcom/dispcc-sdm845.c; mdss-dsi-pll-10nm.c dsi_pll_disable / dsi_pll_enable: the PLL's output gated
++ * first, then the PLL, its buffer and bias; back: bias, start, wait for the lock, output, buffer). The link's lanes rest
++ * in LP-11 throughout (the panel's device tree does not force the clock lane to high speed).
++ */
++static const uint16_t kClkLink[] = { 0x2028, 0x202c, 0x2004, 0x2038 };  /* byte0, byte0_intf, pclk0, esc0 */
++static const uint16_t kClkMdp[] = { 0x200c, 0x201c, 0x2014, 0x2024 };   /* mdp, mdp_lut, rot, vsync */
++static const uint16_t kClkAxi[] = { 0x4008 };
++#define SWEET_CLK_GROUPS 3
++static const struct {
++	const uint16_t *off;
++	unsigned n, bit;
++} kClkGroup[SWEET_CLK_GROUPS] = {
++	{ kClkLink, 4, 1 }, { kClkMdp, 4, 4 }, { kClkAxi, 1, 8 },
++};
++
++/* A branch on or off, then its status (bit 31: the clock is off) for up to a millisecond */
++bool
++AppleCLCD::clkBranch(uint32_t off, bool on)
++{
++	uint32_t v = mdp_rd(fDispcc, off);
++	mdp_wr(fDispcc, off, on ? (v | 1u) : (v & ~1u));
++	__asm__ volatile ("dsb osh" ::: "memory");
++	for (int i = 0; i < 100; i++) {
++		if (((mdp_rd(fDispcc, off) >> 31) != 0) != on) {
++			return true;
++		}
++		IODelay(10);
++	}
++	sweet_fb_clk_fails++;
++	if (fClkLogged++ < 16) {
++		IOLog("SWEET FB: clock branch 0x%x did not go %s: 0x%08x\n", off, on ? "on" : "off", mdp_rd(fDispcc, off));
++	}
++	return false;
++}
++
++/* with fLock held; the panel asleep and no command in flight (gate), or about to wake (ungate) */
++void
++AppleCLCD::clkGate(bool gate)
++{
++	if (fDispcc == 0 || fDsiPhy == 0 || gate == fClkGated) {
++		return;
++	}
++	if (gate) {
++		uint32_t mask = (uint32_t)sweet_fb_clk_gate & 0xfu, was = 0;
++		for (unsigned g = 0, b = 0; g < SWEET_CLK_GROUPS; g++) {
++			for (unsigned i = 0; i < kClkGroup[g].n; i++, b++) {
++				if ((mask & kClkGroup[g].bit) && (mdp_rd(fDispcc, kClkGroup[g].off[i]) & 1u)) {
++					was |= 1u << b;
++				}
++			}
++		}
++		fClkMask = mask;
++		fClkWasOn = was;
++		fClkGated = true;
++		__atomic_store_n(&sweet_fb_clk_gated, (int)mask, __ATOMIC_RELEASE);
++		for (unsigned i = 0; i < 4; i++) {
++			if (was & (1u << i)) {
++				(void)clkBranch(kClkLink[i], false);
++			}
++		}
++		fClkPllWasOn = (mask & 3u) == 3u && (mdp_rd(fDsiPhy, DSIPHY_CMN_PLL_CNTRL) & 1u) != 0;
++		if (fClkPllWasOn) {
++			fClkRbuf = mdp_rd(fDsiPhy, DSIPHY_CMN_RBUF_CTRL);
++			fClkMuxes = mdp_rd(fDsiPhy, DSIPLL_SYSTEM_MUXES);
++			mdp_wr(fDsiPhy, DSIPHY_CMN_CLK_CFG1, mdp_rd(fDsiPhy, DSIPHY_CMN_CLK_CFG1) & ~(1u << 5));
++			mdp_wr(fDsiPhy, DSIPHY_CMN_PLL_CNTRL, 0);
++			mdp_wr(fDsiPhy, DSIPHY_CMN_RBUF_CTRL, 0);
++			mdp_wr(fDsiPhy, DSIPLL_SYSTEM_MUXES, 0);
++			mdp_wr(fDsiPhy, DSIPHY_CMN_CTRL_0, mdp_rd(fDsiPhy, DSIPHY_CMN_CTRL_0) & ~(1u << 5));
++			__asm__ volatile ("dsb osh" ::: "memory");
++		}
++		for (unsigned i = 0; i < 5; i++) {
++			if (was & (1u << (4 + i))) {
++				(void)clkBranch(i < 4 ? kClkMdp[i] : kClkAxi[0], false);
++			}
++		}
++		sweet_fb_clk_gates++;
++		sweet_fb_clk_was = (int)(was | (fClkPllWasOn ? 0x1000u : 0));
++		if (fClkLogged++ < 16) {
++			IOLog("SWEET FB: display clocks stopped: mask 0x%x, branches that were on 0x%x, DSI PLL %s\n", mask, was,
++			    fClkPllWasOn ? "stopped" : "left");
++		}
++		return;
++	}
++	uint32_t was = fClkWasOn;
++	for (int i = 4; i >= 0; i--) {
++		if (was & (1u << (4 + i))) {
++			(void)clkBranch(i < 4 ? kClkMdp[i] : kClkAxi[0], true);
++		}
++	}
++	if (fClkPllWasOn) {
++		mdp_wr(fDsiPhy, DSIPHY_CMN_CTRL_0, mdp_rd(fDsiPhy, DSIPHY_CMN_CTRL_0) | (1u << 5));
++		mdp_wr(fDsiPhy, DSIPLL_SYSTEM_MUXES, fClkMuxes);
++		__asm__ volatile ("dsb osh" ::: "memory");
++		IODelay(1);
++		mdp_wr(fDsiPhy, DSIPHY_CMN_PLL_CNTRL, 1);
++		__asm__ volatile ("dsb osh" ::: "memory");
++		int us = 0;
++		while (!(mdp_rd(fDsiPhy, DSIPLL_COMMON_STATUS_ONE) & 1u) && us < 10000) {
++			IODelay(50);
++			us += 50;
++		}
++		sweet_fb_clk_lock_us = us;
++		if (us >= 10000) {
++			sweet_fb_clk_fails++;
++			IOLog("SWEET FB: the DSI PLL did not lock in 10 ms: status 0x%x\n", mdp_rd(fDsiPhy, DSIPLL_COMMON_STATUS_ONE));
++		}
++		mdp_wr(fDsiPhy, DSIPHY_CMN_CLK_CFG1, mdp_rd(fDsiPhy, DSIPHY_CMN_CLK_CFG1) | (1u << 5));
++		mdp_wr(fDsiPhy, DSIPHY_CMN_RBUF_CTRL, fClkRbuf);
++		__asm__ volatile ("dsb osh" ::: "memory");
++	}
++	for (int i = 3; i >= 0; i--) {
++		if (was & (1u << i)) {
++			(void)clkBranch(kClkLink[i], true);
++		}
++	}
++	fClkGated = false;
++	fClkIdleTicks = 0;
++	__atomic_store_n(&sweet_fb_clk_gated, 0, __ATOMIC_RELEASE);
++	if (fClkLogged++ < 16) {
++		IOLog("SWEET FB: display clocks back (PLL lock after %d us)\n", sweet_fb_clk_lock_us);
++	}
++}
++
++/* from the vsync timer's slow tick with the display off, fLock held */
++void
++AppleCLCD::clkPolicy(bool dark)
++{
++	if (fDispcc == 0 || fDsiPhy == 0) {
++		return;
++	}
++	uint32_t want = (uint32_t)sweet_fb_clk_gate & 0xfu;
++	bool hand = __atomic_load_n(&sweet_fb_dcs, __ATOMIC_RELAXED) != 0 || __atomic_load_n(&sweet_fb_dcs_long_n, __ATOMIC_RELAXED) != 0;
++	bool can = fPowerOff && dark && fPanelState == 2 && !fDsiBusy && !hand;
++	if (fClkGated) {
++		if (want != fClkMask || hand) {
++			clkGate(false);         /* the switch changed, or a command by hand waits */
++		}
++		return;
++	}
++	if (!can || want == 0) {
++		fClkIdleTicks = 0;
++	} else if (++fClkIdleTicks >= 2) {
++		clkGate(true);
++	}
+ }
+ 
+ /*
+@@ -3156,8 +3348,8 @@ AppleCLCD::teWatch(void)
+ void
+ AppleCLCD::dsiTick(bool off, bool dark)
+ {
+-	if (fDsi == 0) {
+-		return;
++	if (fDsi == 0 || fClkGated) {
++		return;         /* 3111: no clocks, no commands: clkPolicy brings them back for one sent by hand */
+ 	}
+ 	if (fDsiBusy) {
+ 		uint32_t in = mdp_rd(fDsi, DSI_R_INT_CTRL);
+@@ -4317,6 +4509,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			bool off = args->scalarInput[0] == 0;
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
++				if (!off && fFB->fClkGated) {
++					fFB->clkGate(false);    /* 3111: before anybody sees "on" */
++				}
+ 				fFB->fPowerOff = off;
+ 				__atomic_store_n(&sweet_fb_display_off, off ? 1 : 0, __ATOMIC_RELAXED);
+ 				fFB->fEmptyBlackArmed = !off;   /* 0233: the first swap after the display comes on may be layerless: black */

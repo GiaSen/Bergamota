@@ -1,0 +1,188 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index b41d1e2..012cfad 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -121,6 +121,7 @@ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/dipper_audio.c		standard
+ bsd/dev/dipper_haptics.c	standard
+ bsd/dev/sweet_thermal.c	standard
++bsd/dev/sweet_mmio.c	standard
+ bsd/dev/dipper_sensors.c	standard
+ bsd/dev/dipper_camera.c	standard
+ bsd/dev/sweet_80211.c			standard
+diff --git a/bsd/dev/sweet_mmio.c b/bsd/dev/sweet_mmio.c
+new file mode 100644
+index 0000000..1e5b1a2
+--- /dev/null
++++ b/bsd/dev/sweet_mmio.c
+@@ -0,0 +1,170 @@
++/*
++ * SWEET register probe (3110): kern.sweet_mmio reads and writes 32-bit device registers by physical address.
++ *
++ * For finding out what is left running with the screen off (clock branches, PLLs, power domains: nothing here switches
++ * off what the bootloader switched on) and for trying a change by hand before it becomes code. Root only.
++ *
++ *   write "ADDR"        choose where to read (hex, with or without 0x), one word
++ *   write "ADDR N"      ... N words (decimal, up to 32)
++ *   write "ADDR=VALUE"  write one word (hex)
++ *   read                "0xADDR: v v v ..." of the latest choice; nothing is read from the hardware by a write
++ *
++ * Only below 0x20000000, the SoC's device space (the memory starts at 0x80000000), and only whole words. A register
++ * of a block that has no clock or no power does not answer: the access is an external abort and the kernel panics.
++ * Know what is on before asking. Each 4 KiB window touched stays mapped (up to MMIO_WINDOWS of them).
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/locks.h>
++#include <string.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define MMIO_WINDOWS    128
++#define MMIO_LIMIT      0x20000000u
++#define MMIO_WORDS      32u
++
++static struct {
++	uint32_t pa;
++	vm_offset_t va;
++} mmio_win[MMIO_WINDOWS];
++static unsigned mmio_wins;
++static uint32_t mmio_addr, mmio_count;
++static uint64_t mmio_reads, mmio_writes;
++static LCK_GRP_DECLARE(mmio_grp, "sweet_mmio");
++static LCK_MTX_DECLARE(mmio_lock, &mmio_grp);
++
++/* with mmio_lock held */
++static volatile uint32_t *
++mmio_ptr(uint32_t pa)
++{
++	uint32_t base = pa & ~0xfffu;
++	if (pa >= MMIO_LIMIT || (pa & 3u) != 0) {
++		return NULL;
++	}
++	for (unsigned i = 0; i < mmio_wins; i++) {
++		if (mmio_win[i].pa == base) {
++			return (volatile uint32_t *)(mmio_win[i].va + (pa & 0xfffu));
++		}
++	}
++	if (mmio_wins >= MMIO_WINDOWS) {
++		return NULL;
++	}
++	vm_offset_t va = ml_io_map(base, 0x1000);
++	if (va == 0) {
++		return NULL;
++	}
++	mmio_win[mmio_wins].pa = base;
++	mmio_win[mmio_wins].va = va;
++	mmio_wins++;
++	return (volatile uint32_t *)(va + (pa & 0xfffu));
++}
++
++static const char *
++mmio_hex(const char *c, uint32_t *out)
++{
++	uint32_t v = 0;
++	unsigned digits = 0;
++	if (c[0] == '0' && (c[1] == 'x' || c[1] == 'X')) {
++		c += 2;
++	}
++	for (;; c++, digits++) {
++		char h = *c;
++		int d = (h >= '0' && h <= '9') ? h - '0' : ((h >= 'a' && h <= 'f') ? h - 'a' + 10 : ((h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1));
++		if (d < 0) {
++			break;
++		}
++		if (digits >= 8) {
++			return NULL;
++		}
++		v = (v << 4) | (uint32_t)d;
++	}
++	if (digits == 0) {
++		return NULL;
++	}
++	*out = v;
++	return c;
++}
++
++static int
++sweet_mmio_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[16 + 9 * MMIO_WORDS] = "";
++	if (!req->newptr) {
++		size_t n = 0;
++		lck_mtx_lock(&mmio_lock);
++		if (mmio_count != 0) {
++			n = (size_t)snprintf(buf, sizeof(buf), "0x%08x:", mmio_addr);
++			for (uint32_t i = 0; i < mmio_count && n + 10 < sizeof(buf); i++) {
++				volatile uint32_t *p = mmio_ptr(mmio_addr + 4 * i);
++				if (p == NULL) {
++					n += (size_t)snprintf(buf + n, sizeof(buf) - n, " ?");
++					break;
++				}
++				uint32_t v = *p;
++				__asm__ volatile ("dmb oshld" ::: "memory");
++				mmio_reads++;
++				n += (size_t)snprintf(buf + n, sizeof(buf) - n, " %08x", v);
++			}
++		}
++		lck_mtx_unlock(&mmio_lock);
++		return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++	}
++	char in[40] = "";
++	int error = sysctl_handle_string(oidp, in, sizeof(in), req);
++	if (error) {
++		return error;
++	}
++	uint32_t addr = 0, val = 0, count = 1;
++	const char *c = mmio_hex(in, &addr);
++	if (c == NULL || addr >= MMIO_LIMIT || (addr & 3u) != 0) {
++		return EINVAL;
++	}
++	if (*c == '=') {
++		c = mmio_hex(c + 1, &val);
++		if (c == NULL || *c != 0) {
++			return EINVAL;
++		}
++		lck_mtx_lock(&mmio_lock);
++		volatile uint32_t *p = mmio_ptr(addr);
++		if (p != NULL) {
++			*p = val;
++			__asm__ volatile ("dsb osh" ::: "memory");
++			mmio_writes++;
++			mmio_addr = addr;
++			mmio_count = 1;
++		}
++		lck_mtx_unlock(&mmio_lock);
++		if (p == NULL) {
++			return ENOMEM;
++		}
++		printf("SWEET MMIO: 0x%08x = 0x%08x\n", addr, val);
++		return 0;
++	}
++	if (*c == ' ') {
++		count = 0;
++		for (c++; *c >= '0' && *c <= '9'; c++) {
++			count = count * 10 + (uint32_t)(*c - '0');
++			if (count > MMIO_WORDS) {
++				return EINVAL;
++			}
++		}
++	}
++	if (*c != 0 || count == 0 || addr + 4 * count > MMIO_LIMIT) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&mmio_lock);
++	mmio_addr = addr;
++	mmio_count = count;
++	lck_mtx_unlock(&mmio_lock);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mmio, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sweet_mmio_sysctl, "A",
++    "device registers by physical address: write ADDR [N] to choose, ADDR=VALUE to write; read (3110)");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_mmio_reads, CTLFLAG_RD | CTLFLAG_LOCKED, &mmio_reads, "words read through kern.sweet_mmio");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_mmio_writes, CTLFLAG_RD | CTLFLAG_LOCKED, &mmio_writes, "words written through kern.sweet_mmio");
++#endif /* ARM64_BOARD_CONFIG_SWEET */

@@ -1,0 +1,79 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 2a6def2..dbd30ef 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -1156,4 +1156,74 @@ sysctl_sweet_arc_set SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_arc_set, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_arc_set, "A",
+     "write RAIL=INDEX (cx.lvl, mx.lvl, lcx.lvl, lmx.lvl): vote that level; read: the tables and the votes made here (3103)");
++
++/*
++ * 3112: kern.sweet_sleep_stats: has the chip ever slept, and which of its subsystems do?
++ *
++ * The power controller (AOP) keeps two records in its message RAM (0x0c300000 + the offset at 0x0c3f0004, as the vendor
++ * kernel's soc/qcom/rpm_stats.c reads them): "aosd", the whole chip asleep (clock source off, memory in self-refresh),
++ * and "cxsd", the main logic rail collapsed. Each subsystem with a power controller client of its own (modem, audio DSP,
++ * sensor hub, compute DSP) keeps one in shared memory (items 605 to 608 in its partition with the application processor,
++ * soc/qcom/rpmh_master_stat.c): how often it let go of its votes. A subsystem that never does keeps the rails up for
++ * everybody. Times in ticks of the 19.2 MHz counter, and in ms.
++ */
++extern uint32_t sweet_smem_rd(uint32_t off);
++extern uint32_t sweet_smem_item(uint32_t host, uint32_t item, uint32_t *size);
++#define RH_STATS_PA     0x0c3f0000u
++#define RH_STATS_BASE   0x000f0000u     /* the page above, as an offset from 0x0c300000 */
++
++static int
++sysctl_sweet_sleep_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	static vm_offset_t page;
++	static const struct {
++		const char *name;
++		uint32_t host, item;
++	} masters[] = { { "mpss", 1, 605 }, { "adsp", 2, 606 }, { "cdsp", 5, 607 }, { "slpi", 3, 608 } };
++	char buf[1100];
++	size_t n = 0;
++	if (page == 0) {
++		page = ml_io_map(RH_STATS_PA, 0x1000);
++	}
++	n += (size_t)snprintf(buf + n, sizeof(buf) - n, "sweet_sleep v1 now=%llu\n", mach_absolute_time());
++	uint32_t off = page ? rh_read(page, 4) : 0;
++	if (off >= RH_STATS_BASE && off <= RH_STATS_BASE + 0x1000 - 64) {
++		for (unsigned i = 0; i < 2; i++) {
++			uint32_t r = off - RH_STATS_BASE + 32 * i, t = rh_read(page, r);
++			uint64_t in = rh_read(page, r + 8) | ((uint64_t)rh_read(page, r + 12) << 32);
++			uint64_t out = rh_read(page, r + 16) | ((uint64_t)rh_read(page, r + 20) << 32);
++			uint64_t total = rh_read(page, r + 24) | ((uint64_t)rh_read(page, r + 28) << 32);
++			n += (size_t)snprintf(buf + n, sizeof(buf) - n, "%c%c%c%c count=%u last_in=%llu last_out=%llu total=%llu (%llu ms)\n",
++			    (char)t, (char)(t >> 8), (char)(t >> 16), (char)(t >> 24), rh_read(page, r + 4), in, out, total, total / 19200);
++		}
++	} else {
++		n += (size_t)snprintf(buf + n, sizeof(buf) - n, "no records (offset %#x)\n", off);
++	}
++	for (unsigned m = 0; m < sizeof(masters) / sizeof(masters[0]) && n + 160 < sizeof(buf); m++) {
++		uint32_t sz = 0, it = sweet_smem_item(masters[m].host, masters[m].item, &sz);
++		if (it == 0 || sz < 32) {
++			/* not where the vendor kernel looks: is it in another partition (0xfffe: the global one)? */
++			static const uint32_t hosts[] = { 0xfffe, 1, 2, 3, 5 };
++			uint32_t where = 0;
++			for (unsigned h = 0; h < sizeof(hosts) / sizeof(hosts[0]) && (it == 0 || sz < 32); h++) {
++				it = sweet_smem_item(hosts[h], masters[m].item, &sz);
++				where = hosts[h];
++			}
++			if (it == 0 || sz < 32) {
++				n += (size_t)snprintf(buf + n, sizeof(buf) - n, "%s no record\n", masters[m].name);
++				continue;
++			}
++			n += (size_t)snprintf(buf + n, sizeof(buf) - n, "(found elsewhere: partition %#x, %u bytes) ", where, sz);
++		}
++		uint64_t in = sweet_smem_rd(it + 8) | ((uint64_t)sweet_smem_rd(it + 12) << 32);
++		uint64_t out = sweet_smem_rd(it + 16) | ((uint64_t)sweet_smem_rd(it + 20) << 32);
++		uint64_t total = sweet_smem_rd(it + 24) | ((uint64_t)sweet_smem_rd(it + 28) << 32);
++		n += (size_t)snprintf(buf + n, sizeof(buf) - n, "%s version=%u count=%u last_in=%llu last_out=%llu total=%llu (%llu ms)%s\n",
++		    masters[m].name, sweet_smem_rd(it), sweet_smem_rd(it + 4), in, out, total, total / 19200, in > out ? " asleep now" : "");
++	}
++	return SYSCTL_OUT(req, buf, n + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_sleep_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_sleep_stats, "A",
++    "the power controller's sleep records (aosd, cxsd) and each subsystem's (3112)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
