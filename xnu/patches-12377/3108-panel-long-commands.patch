@@ -1,0 +1,271 @@
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+index f5ab1f7..2471acd 100644
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -84,6 +84,63 @@ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_panel_sleeps, CTLFLAG_RD | CTLFLAG_LOCKED,
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_panel_wakes, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_panel_wakes, 0, "times the panel was woken");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_panel_resent, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_panel_resent, 0, "panel commands sent again after a send that did not finish");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_panel_state, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_panel_state, 0, "0 awake, 1 going to sleep, 2 asleep, 3 waking");
++/* 3108: vsync ticks between the panel's "display on" and the first brightness command: the picture goes to the panel first */
++/*
++ * 3108, probes: kern.sweet_fb_dcs_hex sends one panel command with its parameters by hand, up to 8 bytes as hex
++ * ("2b000008c7"); kern.sweet_fb_panel_skip is a mask of commands of the wake sequence to leave out (bit n = command n).
++ */
++uint8_t sweet_fb_dcs_long[8];
++int sweet_fb_dcs_long_n = 0;
++static int
++sweet_fb_dcs_hex_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[20] = "";
++	int error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (__atomic_load_n(&sweet_fb_dcs_long_n, __ATOMIC_ACQUIRE) != 0) {
++		return EBUSY;
++	}
++	unsigned n = 0;
++	for (const char *c = buf; c[0] != 0 && c[1] != 0 && n < 8; c += 2) {
++		int v = 0;
++		for (int k = 0; k < 2; k++) {
++			char h = c[k];
++			int d = (h >= '0' && h <= '9') ? h - '0' : ((h >= 'a' && h <= 'f') ? h - 'a' + 10 : -1);
++			if (d < 0) {
++				return EINVAL;
++			}
++			v = (v << 4) | d;
++		}
++		sweet_fb_dcs_long[n++] = (uint8_t)v;
++	}
++	if (n == 0) {
++		return EINVAL;
++	}
++	__atomic_store_n(&sweet_fb_dcs_long_n, (int)n, __ATOMIC_RELEASE);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_dcs_hex, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sweet_fb_dcs_hex_sysctl, "A", "one panel command with parameters, hex (3108)");
++/*
++ * 3108: the wake checks itself. The display engine's line counter (PP0 INT_COUNT_VAL) is set back by the panel's
++ * tearing signal every frame; with the signal missing it runs on to 0xfff0. kern.sweet_fb_te_line is the last value
++ * read (one a vsync tick, display on), _te_max the highest since it was last written, _te_limit the value above which
++ * the signal counts as missing in the ticks after a wake (0: no check), _te_lost how often that was seen, and with
++ * kern.sweet_fb_panel_redo the wake sequence is then sent again (twice at most a wake; _panel_redone counts).
++ */
++int sweet_fb_te_line, sweet_fb_te_max, sweet_fb_te_limit = 6000, sweet_fb_te_lost, sweet_fb_panel_redo = 1, sweet_fb_panel_redone;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_te_line, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_te_line, 0, "the display engine's line counter, last read (3108)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_te_max, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_te_max, 0, "its highest value since last written");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_te_limit, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_te_limit, 0, "above this after a wake the panel's tearing signal is missing (0: no check)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_te_lost, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_te_lost, 0, "wakes after which the tearing signal was missing");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_panel_redo, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_panel_redo, 0, "send the wake sequence again when the tearing signal is missing (3108)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_panel_redone, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_panel_redone, 0, "wake sequences sent again");
++int sweet_fb_panel_skip = 0;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_panel_skip, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_panel_skip, 0, "commands of the panel's wake sequence to leave out, a mask (3108)");
++int sweet_fb_panel_hold = 3;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_panel_hold, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_panel_hold, 0, "vsync ticks the panel stays at brightness 0 after a wake (3108)");
+ int sweet_fb_gatepoll = 1;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_gatepoll, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_gatepoll, 0, "show a frame when the GPU finishes it");
+ /* sysctl kern.sweet_fb_bl (3016): Mi 8 panel brightness by hand, 2..1023; 0 = the level iOS asks for */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5b069e2..7516631 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -71,6 +71,9 @@ extern "C" unsigned sweet_pace;                 /* bsd/dev/sweet_cpufreq.c: sysc
+ extern "C" int sweet_fb_dcs;                    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_dcs (3106) */
+ #define SWEET_PANEL_TICK_US     2000u   /* 3107: the vsync timer's period while a panel sequence runs */
+ extern "C" int sweet_fb_panel_sleep, sweet_fb_panel_sleeps, sweet_fb_panel_wakes, sweet_fb_panel_resent, sweet_fb_panel_state;  /* 3107 */
++extern "C" int sweet_fb_panel_hold, sweet_fb_panel_skip, sweet_fb_dcs_long_n;     /* 3108 */
++extern "C" uint8_t sweet_fb_dcs_long[8];
++extern "C" int sweet_fb_te_line, sweet_fb_te_max, sweet_fb_te_limit, sweet_fb_te_lost, sweet_fb_panel_redo, sweet_fb_panel_redone;
+ extern "C" int sweet_fb_display_off;            /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_display_off (3023) */
+ /*
+  * 3087: the hardware scaler's panel rectangle (x, y, w, h; w 0 = not scaling in hardware), for SweetHID's touch mapping:
+@@ -613,6 +616,9 @@ public:
+ 	uint32_t      fDsiWait, fDsiLevel, fDsiSent, fDsiFailed;
+ 	/* 3107: the panel asleep with the display off; see panelTick */
+ 	uint32_t      fPanelState, fPanelIdx, fPanelWait, fDcsTries;
++	uint32_t      fPanelHold;       /* 3108: vsync ticks left before the first brightness command after a wake */
++	uint32_t      fPanelCheck, fPanelRedo;  /* 3108: vsync ticks of the wake's own check left; sequences sent again this wake */
++	void          teWatch(void);
+ 	bool          fPanelFlight;
+ 	void          panelTick(bool off, bool dark);
+ 	void          dsiSend(const uint8_t *b, unsigned n);
+@@ -621,9 +627,11 @@ public:
+ 	{
+ 		/*
+ 		 * A frame may go to the panel only once it is fully awake. Sent between "sleep out" and "display on" a frame
+-		 * waited for the panel's tearing signal, which only returns with "display on": each vsync tick then sat half a
+-		 * second in that wait and the eight ticks of the 120 ms took 4.5 s (observed, 2026-11-21). The panel lights with
+-		 * the black frame it kept and gets the picture a tick later.
++		 * waited for the panel's tearing signal: each vsync tick then sat half a second in that wait and the eight ticks
++		 * of the 120 ms took 4.5 s (observed 2026-11-21, with a wake sequence that did not yet switch that signal on
++		 * again: whether it runs before "display on" once it is switched on was not tried). The panel lights at
++		 * brightness 0 with what its memory holds, noise after a sleep, and gets the picture a tick later; the
++		 * brightness waits for that (3108, fPanelHold).
+ 		 */
+ 		return fPanelState == 0;
+ 	}
+@@ -1211,6 +1219,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		(void)fb->blSet(true);     /* 0242: back on: the latest frame is up, light the panel in one step */
+ 	}
+ 	fb->dsiTick();
++	fb->teWatch();          /* 3108 */
+ 	uint32_t req = __atomic_load_n(&fb->fBlReq, __ATOMIC_ACQUIRE);
+ 	if (fb->fBlOK && req != fb->fBlReqApplied && fb->fBlPos == SWEET_FB_BL_STEPS) {
+ 		/* 0243: iOS's brightness, on both WLED strings (the floor keeps the panel readable: 0 is iOS's "off", which is
+@@ -1648,6 +1657,7 @@ static const struct {
+ #define SWEET_MDP_CTL_BIT       (1u << 17)
+ #define SWEET_MDP_LM0           0x45000u
+ #define SWEET_MDP_INTF1         0x6b800u
++#define SWEET_MDP_PP0           0x71000u        /* 3108: pingpong 0; +0x14 INT_COUNT_VAL, the line counter in its low half */
+ #define SSPP_SRC_SIZE           0x00u
+ #define SSPP_SRC_IMG_SIZE       0x04u
+ #define SSPP_SRC_XY             0x08u
+@@ -2983,7 +2993,8 @@ AppleCLCD::dsiInit(void)
+  *   0 awake -> (off and dark) the off sequence -> 1 -> done -> 2 asleep -> (on) the on sequence -> 3 -> done -> 0.
+  * The sequences are the panel's own, from the phone's device tree (dtb/dipper/live.dtb, the 1080x2248 EA8074's
+  * qcom,mdss-dsi-off-command and -on-command, both sent in low power mode): off = display off, sleep in, 120 ms;
+- * on = sleep out, 10 ms, the page address, the vendor's registers between its unlock and lock, tearing effect on,
++ * on = sleep out, 10 ms, the page address, the vendor's registers between its unlock and lock (but for d5, see the
++ * list), tearing effect on,
+  * brightness 0, the brightness control, 110 ms, display on. Sleep out alone is not enough: without "tearing effect on"
+  * the panel gives no sync signal and the display engine showed 2 frames a second of the 58 rendered (2026-11-21).
+  * A frame goes to the panel only when it is fully awake (panelReady): sent earlier it waited for that sync signal and
+@@ -3006,8 +3017,14 @@ static const struct sweet_panel_cmd kPanelOn[] = {
+ 	{ 8, 0, { 0xef, 0xf0, 0x31, 0x00, 0x33, 0x31, 0x14, 0x35 } },
+ 	{ 2, 0, { 0xb0, 0x01 } }, { 2, 0, { 0xbb, 0x03 } }, { 2, 0, { 0xb0, 0x4f } }, { 2, 0, { 0xcb, 0x00 } },
+ 	{ 2, 0, { 0xb0, 0x6b } }, { 2, 0, { 0xcb, 0x00 } }, { 2, 0, { 0xf7, 0x03 } }, { 2, 0, { 0xb0, 0x05 } },
+-	{ 2, 0, { 0xb1, 0x10 } }, { 2, 0, { 0xb0, 0x02 } },
+-	{ 5, 0, { 0xd5, 0x02, 0x17, 0x54, 0x14 } },
++	{ 2, 0, { 0xb1, 0x10 } },
++	/*
++	 * 3108: the vendor's next two, "b0 02" and "d5 02 17 54 14", are left out. Sent whole (they went out cut short
++	 * until the FIFO's pairing word, see dsiSend) the panel gave no tearing signal after nearly every wake: 2 frames a
++	 * second shown, in 14 wakes of 17 on 2026-11-21, most often the wake after the one that wrote them; without them
++	 * 7 of 7 kept 50-57. Why is not known: the vendor's kernel sends this list to a panel it has just reset, this one
++	 * only slept. kern.sweet_fb_dcs_hex sends them by hand.
++	 */
+ 	{ 3, 0, { 0xf0, 0xa5, 0xa5 } },
+ 	{ 2, 0, { 0x35, 0x00 } },
+ 	{ 3, 0, { 0x51, 0x00, 0x00 } },
+@@ -3036,6 +3053,16 @@ AppleCLCD::dsiSend(const uint8_t *b, unsigned n)
+ 		}
+ 		mdp_wr(fDsi, DSI_R_TPG_DMA_INIT, w);
+ 	}
++	/*
++	 * The FIFO takes its words in pairs: a command of an odd number of words (header + 2 for 5 to 8 bytes) needs one
++	 * more word of zero, or its last word does not go out as written. Without it the wake sequence's "2b 00 00 08 c7"
++	 * (rows 0 to 2247) reached the panel with its fifth byte wrong: the picture stopped near row 2048 and the strip
++	 * below kept the noise the panel's memory woke with (the user's photo, 2026-11-21). Commands of up to 4 bytes
++	 * (brightness, sleep, display on) are two words and were never affected.
++	 */
++	if ((((n + 3) / 4) + 1) & 1u) {
++		mdp_wr(fDsi, DSI_R_TPG_DMA_INIT, 0);
++	}
+ 	mdp_wr(fDsi, DSI_R_DMA_CTRL, (mdp_rd(fDsi, DSI_R_DMA_CTRL) & ~((1u << 31) | (1u << 30))) | DSI_DMA_LPM | DSI_DMA_EMBEDDED);
+ 	mdp_wr(fDsi, DSI_R_DMA_LENGTH, 4 + ((n + 3) & ~3u));
+ 	__asm__ volatile ("dsb osh" ::: "memory");
+@@ -3055,11 +3082,15 @@ AppleCLCD::panelTick(bool off, bool dark)
+ 	} else if (fPanelState == 2 && !off) {
+ 		fPanelState = 3;
+ 		fPanelIdx = fPanelWait = 0;
++		fPanelRedo = 0;
+ 	}
+ 	if (fPanelState == 1 || fPanelState == 3) {
+ 		SWEET_PANEL_SEQ(fPanelState, seq, count);
+ 		if (fPanelWait != 0) {
+ 			fPanelWait--;
++		} else if (fPanelIdx < count && fPanelState == 3 && (((unsigned)sweet_fb_panel_skip >> fPanelIdx) & 1u)) {
++			fPanelWait = seq[fPanelIdx].wait;       /* 3108, a probe: this command is left out, its wait kept */
++			fPanelIdx++;
+ 		} else if (fPanelIdx < count) {
+ 			dsiSend(seq[fPanelIdx].b, seq[fPanelIdx].n);
+ 			fPanelFlight = true;
+@@ -3071,6 +3102,9 @@ AppleCLCD::panelTick(bool off, bool dark)
+ 		} else {
+ 			fPanelState = 0;
+ 			fDsiLevel = 0;          /* the brightness iOS wants is sent again */
++			int hold = sweet_fb_panel_hold;
++			fPanelHold = hold < 0 ? 0 : (hold > 60 ? 60 : (uint32_t)hold);
++			fPanelCheck = 6;        /* 3108: teWatch looks at the last four of these ticks */
+ 			if (sweet_fb_panel_wakes++ < 4) {
+ 				IOLog("SWEET FB: panel awake\n");
+ 			}
+@@ -3079,6 +3113,46 @@ AppleCLCD::panelTick(bool off, bool dark)
+ 	sweet_fb_panel_state = (int)fPanelState;
+ }
+ 
++/*
++ * 3108: did the panel really wake? From the vsync tick, display on. A panel that has woken gives its tearing signal,
++ * which sets the display engine's line counter back every frame; one that has not (seen after most wakes that followed
++ * a write of the vendor's d5 setting, the bootloader's at power on included: the panel dark, 2 frames a second "shown",
++ * and the same commands sent once more by hand brought it back) lets the counter run on to 0xfff0. Four ticks are
++ * looked at, from the third after "display on": about 2250 lines apart, so with the signal missing one of them is
++ * above any limit of 6000. Then the wake sequence goes out again.
++ */
++void
++AppleCLCD::teWatch(void)
++{
++	if (fMdp == 0 || fDsi == 0 || fHeight != 2248) {
++		return;
++	}
++	uint32_t line = mdp_rd(fMdp + SWEET_MDP_PP0, 0x14) & 0xffffu;
++	sweet_fb_te_line = (int)line;
++	if ((int)line > sweet_fb_te_max) {
++		sweet_fb_te_max = (int)line;
++	}
++	if (fPanelState != 0 || fPanelCheck == 0) {
++		return;
++	}
++	fPanelCheck--;
++	int limit = sweet_fb_te_limit;
++	if (fPanelCheck >= 4 || limit <= 0 || line <= (uint32_t)limit) {
++		return;
++	}
++	fPanelCheck = 0;
++	sweet_fb_te_lost++;
++	if (sweet_fb_panel_redo && fPanelRedo < 2) {
++		fPanelRedo++;
++		fPanelState = 3;
++		fPanelIdx = fPanelWait = 0;
++		sweet_fb_panel_state = 3;
++		if (sweet_fb_panel_redone++ < 8) {
++			IOLog("SWEET FB: no tearing signal after the wake (line counter %u): the wake sequence again\n", line);
++		}
++	}
++}
++
+ void
+ AppleCLCD::dsiTick(bool off, bool dark)
+ {
+@@ -3134,9 +3208,30 @@ AppleCLCD::dsiTick(bool off, bool dark)
+ 		}
+ 		return;
+ 	}
++	int ln = __atomic_load_n(&sweet_fb_dcs_long_n, __ATOMIC_ACQUIRE);
++	if (ln != 0 && (fPanelState == 0 || fPanelState == 2)) {
++		/* 3108: a command with parameters by hand (kern.sweet_fb_dcs_hex) */
++		dsiSend(sweet_fb_dcs_long, (unsigned)ln > 8 ? 8 : (unsigned)ln);
++		if (fDsiSent++ < 64) {
++			IOLog("SWEET DSI: %d bytes by hand: %02x %02x %02x %02x %02x ...\n", ln, sweet_fb_dcs_long[0], sweet_fb_dcs_long[1],
++			    sweet_fb_dcs_long[2], sweet_fb_dcs_long[3], sweet_fb_dcs_long[4]);
++		}
++		__atomic_store_n(&sweet_fb_dcs_long_n, 0, __ATOMIC_RELEASE);
++		return;
++	}
+ 	if (off || fPanelState != 0) {
+ 		return;         /* 3107: no brightness with the display off, nor to a panel that is not awake */
+ 	}
++	if (fPanelHold != 0) {
++		/*
++		 * 3108: the picture first, then the light, as the vendor's flow has it (its on sequence ends at brightness 0 and
++		 * the level follows the first frame). The panel's memory wakes holding noise (seen below the last row written,
++		 * 2026-11-21), and the brightness used to go out in the very tick "display on" completed, one refresh before
++		 * the first frame.
++		 */
++		fPanelHold--;
++		return;
++	}
+ 	uint32_t want = (uint32_t)__atomic_load_n(&sweet_fb_bl, __ATOMIC_RELAXED);
+ 	if (want == 0) {
+ 		uint32_t req = __atomic_load_n(&fBlReq, __ATOMIC_ACQUIRE);
