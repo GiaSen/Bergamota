@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+index 8053e61..ec76e4f 100644
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -64,6 +64,13 @@ int sweet_fb_hud;
+ /* 3099: the vsync timer's period once the display is off and dark (kern.sweet_fb_off_vsync_us; 0: as with it on, 60 a second) */
+ int sweet_fb_off_vsync_us = 1000000;    /* 3101: once a second */
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_off_vsync_us, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_off_vsync_us, 0, "vsync timer period with the display off, us (0: unchanged)");
++/*
++ * 3106: kern.sweet_fb_dcs: DCS commands without parameters for the Mi 8's panel, one byte each, the low byte first
++ * (0x1028 = display off 0x28, then sleep in 0x10; 0x2911 = sleep out, then display on). The vsync timer sends one per
++ * tick (iokit/Kernel/arm/SweetFramebuffer.cpp dsiTick). For measuring what the panel costs asleep and awake.
++ */
++int sweet_fb_dcs = 0;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_dcs, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_dcs, 0, "DCS commands to send to the panel, low byte first (3106)");
+ int sweet_fb_gatepoll = 1;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_gatepoll, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_gatepoll, 0, "show a frame when the GPU finishes it");
+ /* sysctl kern.sweet_fb_bl (3016): Mi 8 panel brightness by hand, 2..1023; 0 = the level iOS asks for */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6b0b292..7c876ba 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -68,6 +68,7 @@ extern "C" int sweet_fb_hud;
+ extern "C" int sweet_fb_gatepoll;               /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_gatepoll (3006) */
+ extern "C" int sweet_fb_off_vsync_us;           /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_off_vsync_us (3099) */
+ extern "C" unsigned sweet_pace;                 /* bsd/dev/sweet_cpufreq.c: sysctl kern.sweet_pace (3101) */
++extern "C" int sweet_fb_dcs;                    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_dcs (3106) */
+ extern "C" int sweet_fb_display_off;            /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_display_off (3023) */
+ /*
+  * 3087: the hardware scaler's panel rectangle (x, y, w, h; w 0 = not scaling in hardware), for SweetHID's touch mapping:
+@@ -1146,6 +1147,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fBlackDone = true;
+ 			fb->blackout();
+ 		}
++		if (__atomic_load_n(&sweet_fb_dcs, __ATOMIC_RELAXED) != 0 || fb->fDsiBusy) {
++			fb->dsiTick();  /* 3106: a DCS command by hand also goes out with the display off */
++		}
+ 		/*
+ 		 * 3099: off and dark, nothing left to do here: tick slowly. Under the lock, as the power request's kick is, so
+ 		 * an "on" that arrives meanwhile always ends with the short timeout.
+@@ -2975,6 +2979,25 @@ AppleCLCD::dsiTick(void)
+ 		mdp_wr(fDsi, DSI_R_TPG_FIFO_RESET, 0);
+ 		fDsiBusy = false;
+ 	}
++	/* 3106: a DCS command by hand (kern.sweet_fb_dcs): a long write of its one byte, as the brightness below */
++	int dcs = __atomic_load_n(&sweet_fb_dcs, __ATOMIC_RELAXED);
++	if (dcs != 0 && __atomic_compare_exchange_n(&sweet_fb_dcs, &dcs, (int)((unsigned)dcs >> 8), false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++		uint32_t t = mdp_rd(fDsi, DSI_R_TRIG_CTRL);
++		if ((t & 7u) != DSI_TRIG_SW) {
++			mdp_wr(fDsi, DSI_R_TRIG_CTRL, (t & ~7u) | DSI_TRIG_SW);
++		}
++		mdp_wr(fDsi, DSI_R_TPG_CTRL, DSI_TPG_CUSTOM_FIFO);
++		mdp_wr(fDsi, DSI_R_TPG_DMA_INIT, 0xc0390001u);
++		mdp_wr(fDsi, DSI_R_TPG_DMA_INIT, 0xffffff00u | ((uint32_t)dcs & 0xffu));
++		mdp_wr(fDsi, DSI_R_DMA_CTRL, (mdp_rd(fDsi, DSI_R_DMA_CTRL) & ~((1u << 31) | (1u << 30))) | DSI_DMA_LPM | DSI_DMA_EMBEDDED);
++		mdp_wr(fDsi, DSI_R_DMA_LENGTH, 8);
++		__asm__ volatile ("dsb osh" ::: "memory");
++		mdp_wr(fDsi, DSI_R_DMA_SW_TRIGGER, 1);
++		fDsiBusy = true;
++		fDsiWait = 0;
++		IOLog("SWEET DSI: DCS 0x%02x by hand\n", dcs & 0xff);
++		return;
++	}
+ 	uint32_t want = (uint32_t)__atomic_load_n(&sweet_fb_bl, __ATOMIC_RELAXED);
+ 	if (want == 0) {
+ 		uint32_t req = __atomic_load_n(&fBlReq, __ATOMIC_ACQUIRE);
