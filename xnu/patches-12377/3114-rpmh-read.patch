@@ -1,0 +1,88 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index a36f564..56133cb 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -376,6 +376,12 @@ rh_reclaim(unsigned t)
+  * Up to 3 commands (addresses absolute) in one ACTIVE AMC request, each with a write-ack. EAGAIN: the TCS ended idle and
+  * complete but nothing proves the request ran (status not fresh, no poll saw it); it is released, the caller sends it again.
+  */
++/* 3114: a request without the write bit is a read; its answer is in the command's response word (kern.sweet_rpmh_read) */
++#define RH_RESP_DATA    0x40u
++#define RH_READ_ACK     (8u | (1u << 8))
++static bool rh_reading;
++static uint32_t rh_resp;
++
+ static int
+ rh_cmds_once(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ {
+@@ -448,7 +454,7 @@ rh_cmds_once(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ 	}
+ 	for (unsigned c = 0; c < ncmd; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+-		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
++		if (!rh_sync(cmd + RH_MSGID, rh_reading ? RH_READ_ACK : RH_WRITE_ACK) ||
+ 		    !rh_sync(cmd + RH_ADDR, addrs[c]) ||
+ 		    !rh_sync(cmd + RH_DATA, vals[c])) {
+ 			return EIO;
+@@ -522,6 +528,9 @@ rh_cmds_once(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ 		return ETIMEDOUT;
+ 	}
+ 	rh_st[kind].early += !progress;
++	if (rh_reading) {
++		rh_resp = rh_read(rh_tcs, b + RH_RESP_DATA);       /* 3114: what a read request brought back, before the slot is freed */
++	}
+ 	/* Proven completion: clear trigger before mode, then free only our commands. */
+ 	if (!rh_release(t, irq_en)) {
+ 		return EIO;
+@@ -1283,6 +1292,51 @@ sysctl_sweet_sleep_stats SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_sleep_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_sleep_stats, "A",
+     "the power controller's sleep records (aosd, cxsd) and each subsystem's (3112)");
+ 
++/*
++ * 3114: kern.sweet_rpmh_read: write a rail's name (cx.lvl, mx.lvl, lcx.lvl, lmx.lvl) and the kernel sends a read
++ * request for it through an active TCS, as it sends its votes; read the sysctl for what came back. Meant to show this
++ * processor's own vote as the power controller holds it: the one thing that tells whether a sleep or wake set (3113)
++ * was really sent, since those change the vote without the kernel asking. Whether the rails answer reads at all was not
++ * known when this was written; a request that never finishes costs one of the two active TCSes until a reboot.
++ */
++static char rh_read_text[96] = "sweet_rpmh_read v1 nothing read";
++
++static int
++sysctl_sweet_rpmh_read SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	if (!req->newptr) {
++		return SYSCTL_OUT(req, rh_read_text, strlen(rh_read_text) + 1);
++	}
++	char in[16] = "";
++	int error = sysctl_handle_string(oidp, in, sizeof(in), req);
++	if (error) {
++		return error;
++	}
++	if (strcmp(in, "cx.lvl") && strcmp(in, "mx.lvl") && strcmp(in, "lcx.lvl") && strcmp(in, "lmx.lvl")) {
++		return EINVAL;
++	}
++	if (!rh_rsc || !rh_tcs || !rh_be) {
++		return ENXIO;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	uint32_t address = 0, aux = 0, aux_len = 0, zero = 0;
++	if (!rh_refuse() && !(error = rh_map()) && !(error = rh_lookup_slave(in, RH_ARC, &address, &aux, &aux_len))) {
++		rh_reading = true;
++		rh_resp = 0xdeadbeefu;
++		error = rh_cmds_once(&address, &zero, 1);
++		rh_reading = false;
++	}
++	(void)snprintf(rh_read_text, sizeof(rh_read_text), "sweet_rpmh_read v1 %s(%#x)=%#x err=%d", in, address, rh_resp, error);
++	printf("SWEET RPMH: %s\n", rh_read_text);
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmh_read, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_rpmh_read, "A",
++    "write a rail's name: a read request for it; read: what came back (3114)");
++
+ /*
+  * 3113: kern.sweet_rpmh_sleepset: write "cx.lvl=S:W" (or mx.lvl): the rail's level, an index into its table
+  * (kern.sweet_arc_set shows the tables: for cx 0 off, 1 retention, 2 min SVS, 3 low SVS, 4 SVS ... 6 nominal, 7 turbo),
