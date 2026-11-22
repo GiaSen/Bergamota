@@ -1,0 +1,127 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index c1edec7..637180b 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -6144,6 +6144,114 @@ sta_vdev_param(uint32_t param, uint32_t value, const char *what)
+ 	sta_wmi(c, scan_cmd(c, 0x5008, 95, v, 12), what);
+ }
+ 
++/*
++ * 3118: kern.sweet_wlan_wmi: one parameter command by hand, for finding what lets the firmware (and the modem it runs
++ * in) sleep: "pdev P V" (PDEV_SET_PARAM), "vdev P V" (VDEV_SET_PARAM), "psmode M" (STA_POWERSAVE_MODE), "psparam P V"
++ * (STA_POWERSAVE_PARAM), numbers decimal or 0x hex, pdev/vdev 0. Queued by the service loop like every other command;
++ * the firmware does not answer a parameter command. A probe: nothing uses it by itself.
++ */
++static struct {
++	uint32_t pending;
++	uint32_t kind, a, b, sent;
++} wdbg;
++
++static void
++wdbg_pump(void)
++{
++	if (!__atomic_load_n(&wdbg.pending, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	uint8_t c[32];
++	uint32_t v[3] = { 0, wdbg.a, wdbg.b };
++	bool ok = false;
++	switch (wdbg.kind) {
++	case 1:
++		ok = sta_wmi(c, scan_cmd(c, 0x4003, 82, v, 12), "debug pdev param");
++		break;
++	case 2:
++		ok = sta_wmi(c, scan_cmd(c, 0x5008, 95, v, 12), "debug vdev param");
++		break;
++	case 3:
++		ok = sta_wmi(c, scan_cmd(c, 0x9001, 108, v, 8), "debug power save mode");
++		break;
++	case 4:
++		ok = sta_wmi(c, scan_cmd(c, 0x9002, 109, v, 12), "debug power save param");
++		break;
++	default:
++		break;
++	}
++	wdbg.sent += ok ? 1 : 0;
++	printf("SWEET WLAN dbg: kind %u (1 pdev, 2 vdev, 3 psmode, 4 psparam) %u %u: %s\n", wdbg.kind, wdbg.a, wdbg.b, ok ? "queued" : "NOT queued");
++	__atomic_store_n(&wdbg.pending, 0, __ATOMIC_RELEASE);
++}
++
++static bool
++wdbg_number(const char **pp, uint32_t *out)
++{
++	const char *t = *pp;
++	uint32_t v = 0, base = 10;
++	while (*t == ' ') {
++		t++;
++	}
++	if (t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) {
++		base = 16;
++		t += 2;
++	}
++	const char *first = t;
++	for (;; t++) {
++		uint32_t d = (*t >= '0' && *t <= '9') ? (uint32_t)(*t - '0') : (*t >= 'a' && *t <= 'f') ? (uint32_t)(*t - 'a' + 10) :
++		    (*t >= 'A' && *t <= 'F') ? (uint32_t)(*t - 'A' + 10) : 99u;
++		if (d >= base) {
++			break;
++		}
++		v = v * base + d;
++	}
++	if (t == first) {
++		return false;
++	}
++	*out = v;
++	*pp = t;
++	return true;
++}
++
++static int
++sysctl_sweet_wlan_wmi SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char in[48] = "";
++	if (!req->newptr) {
++		(void)snprintf(in, sizeof(in), "sweet_wlan_wmi v1 sent=%u pending=%u", wdbg.sent, wdbg.pending);
++		return SYSCTL_OUT(req, in, strlen(in) + 1);
++	}
++	int error = sysctl_handle_string(oidp, in, sizeof(in), req);
++	if (error) {
++		return error;
++	}
++	static const char *const kinds[4] = { "pdev ", "vdev ", "psmode ", "psparam " };
++	uint32_t kind = 0, a = 0, b = 0;
++	const char *t = in;
++	for (uint32_t k = 0; k < 4; k++) {
++		if (!strncmp(in, kinds[k], strlen(kinds[k]))) {
++			kind = k + 1;
++			t = in + strlen(kinds[k]);
++		}
++	}
++	if (kind == 0 || !wdbg_number(&t, &a) || (kind != 3 && !wdbg_number(&t, &b)) || *t != 0) {
++		return EINVAL;
++	}
++	if (__atomic_load_n(&wdbg.pending, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	wdbg.kind = kind;
++	wdbg.a = a;
++	wdbg.b = b;
++	__atomic_store_n(&wdbg.pending, 1, __ATOMIC_RELEASE);
++	thread_wakeup(&wl.sleep_chan);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wlan_wmi, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_wlan_wmi, "A",
++    "write pdev P V, vdev P V, psmode M or psparam P V: one WMI parameter command to the Wi-Fi firmware (3118)");
++
+ static void
+ sta_peer_param(uint32_t param, uint32_t value, const char *what)
+ {
+@@ -7721,6 +7829,7 @@ ms_ipc_run(unsigned hold_s)
+ 		}
+ 		svc_tick(t0);
+ 		svc_scan();
++		wdbg_pump();
+ 		if (wf.state == WS_SCAN_DONE || wf.state == WS_SCANNING || wf.state == WS_SCAN_SETUP) {
+ 			sta_step();
+ 		} else {
