@@ -1,0 +1,179 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 0a29732..c1edec7 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -3900,6 +3900,8 @@ wf_msa_assign(unsigned k, bool to_wlan)
+ #define CE_DST_WR_IDX           0x40u
+ #define CE_CURRENT_SRRI         0x44u
+ #define CE_CURRENT_DRRI         0x48u
++#define CE_HOST_IS              0x30u           /* wcn3990_wm_reg: bit 0 copy complete, bits 1-4 watermarks */
++#define CE_HOST_IS_ALL          0x1fu
+ #define CE_SRC_WM               0x4cu
+ #define CE_DST_WM               0x50u
+ #define CE_CTRL1_DMAX           0xffffu
+@@ -3953,6 +3955,8 @@ static struct {
+ 	bool pool_ok, mode_on, mode_sent, rings;
+ 	int prev_state;                 /* the state to report again after mode off */
+ 	uint32_t sw[5], wr[5];
++	bool tx_pending[5];             /* 3117: a send whose "copy complete" has not been cleared yet */
++	int sleep_was;                  /* 3117: kern.sweet_wlan_ce_sleep as wce_poll last saw it */
+ 	unsigned msgs, logged, wmi_events, htt_msgs, wmi_credits, nchunks;
+ 	uint16_t credits, credit_size, conn_svc;
+ 	uint8_t max_ep, htc_version, htt_eid, wmi_eid, seq[8], mac[6];
+@@ -4032,6 +4036,36 @@ wce_desc(unsigned r, uint32_t i)
+ 	return (struct wce_desc *)(wce.pool + wce_ring[r].ring) + i;
+ }
+ 
++/*
++ * 3117: let the Wi-Fi hardware sleep. ath10k ce.c, ath10k_ce_per_engine_service(): "When the last copy engine interrupt
++ * is cleared the hardware will go to sleep. Once this happens any access to the CE registers can cause a hardware
++ * fault." This driver polls the rings in memory and never cleared an engine's interrupt status (CE_HOST_IS), so from
++ * the first message on the hardware never slept, and with it the modem the firmware runs in (the power controller's
++ * table, 0x0c3f008c: mpss awake on every boot with Wi-Fi in mission mode, asleep without; 2026-11-22). With
++ * kern.sweet_wlan_ce_sleep=1: (1) a destination ring's status is cleared before its completed descriptors are handled,
++ * as ath10k does, and again until a pass finds nothing (wce_poll); (2) a source ring's status is cleared once the
++ * target has taken everything sent; (3) the "ring full" check reads the target's read index from memory
++ * (ath10k_ce_src_ring_read_index_from_ddr: the pool's first words, CTRL1 UPD in wce_up) instead of the register.
++ * What is left touches the registers only while a completion is standing (the hardware is awake then) or through the
++ * shadow registers, which exist for that. 0 = as before 3117: nothing cleared, the register read.
++ */
++static int wce_sleep;
++static uint32_t wce_is_clears;
++SYSCTL_INT(_kern, OID_AUTO, sweet_wlan_ce_sleep, CTLFLAG_RW | CTLFLAG_LOCKED, &wce_sleep, 0,
++    "1: clear the Wi-Fi copy engines' interrupt status after handling, so the hardware and the modem can sleep (3117)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_ce_clears, CTLFLAG_RD | CTLFLAG_LOCKED, &wce_is_clears, 0, "copy engine status clears so far (3117)");
++
++/* a source ring's read index: where the target has got to */
++static uint32_t
++wce_src_rri(unsigned r)
++{
++	uint32_t mask = wce_ring[r].n - 1;
++	if (wce_sleep) {
++		return *(volatile uint32_t *)(wce.pool + 4u * wce_ring[r].ce) & 0xffffu & mask;
++	}
++	return wl_rd(wce.regs, WCE_BASE(wce_ring[r].ce) + CE_CURRENT_SRRI) & mask;
++}
++
+ /* ath10k_ce_alloc_rri() + ath10k_ce_init_src_ring() / ath10k_ce_init_dest_ring() + ath10k_snoc_rx_post() */
+ static bool
+ wce_up(void)
+@@ -4140,8 +4174,8 @@ wce_send(unsigned r, uint8_t eid, const void *payload, uint32_t plen)
+ 			return false;           /* one WMI command in flight: wait for the credit report */
+ 		}
+ 	}
+-	uint32_t b = WCE_BASE(wce_ring[r].ce), mask = wce_ring[r].n - 1, wr = wce.wr[r];
+-	uint32_t srri = wl_rd(wce.regs, b + CE_CURRENT_SRRI) & mask;
++	uint32_t mask = wce_ring[r].n - 1, wr = wce.wr[r];
++	uint32_t srri = wce_src_rri(r);
+ 	if (((srri - 1 - wr) & mask) == 0) {
+ 		printf("SWEET IPC: wmi: CE%u source ring full\n", wce_ring[r].ce);
+ 		return false;
+@@ -4166,6 +4200,7 @@ wce_send(unsigned r, uint8_t eid, const void *payload, uint32_t plen)
+ 	wce.wr[r] = wr;
+ 	/* shadow_sr_wr_ind_addr(): CE0 0x32000, CE3 0x3200c, CE4 0x32010 */
+ 	wl_wr(wce.regs, wce_ring[r].ce == 0 ? 0x32000u : (wce_ring[r].ce == 3 ? 0x3200cu : 0x32010u), wr);
++	wce.tx_pending[r] = true;
+ 	if (eid && eid == wce.wmi_eid) {
+ 		wce.wmi_credits--;
+ 	}
+@@ -5138,28 +5173,64 @@ wce_poll(void)
+ 	if (!wce.rings) {
+ 		return;
+ 	}
++	if (wce_sleep != wce.sleep_was) {
++		/* 3117: switched at run time. On: every engine's status goes once, whatever stood there from before (the
++		 * hardware is awake: nothing was ever cleared). The two views of the source read indices, to compare. */
++		wce.sleep_was = wce_sleep;
++		if (wce_sleep) {
++			for (unsigned ce = 0; ce < 12; ce++) {
++				wl_wr(wce.regs, WCE_BASE(ce) + CE_HOST_IS, CE_HOST_IS_ALL);
++			}
++			wce_is_clears += 12;
++			for (unsigned r = 0; r < WCE_NRINGS; r++) {
++				wce.tx_pending[r] = wce_ring[r].src;    /* looked at once below */
++			}
++		}
++		printf("SWEET IPC: wce: copy engine status clearing %s (kern.sweet_wlan_ce_sleep)\n", wce_sleep ? "on" : "off");
++	}
+ 	for (unsigned r = 0; r < WCE_NRINGS; r++) {
++		uint32_t mask = wce_ring[r].n - 1;
+ 		if (wce_ring[r].src) {
++			if (wce_sleep && wce.tx_pending[r] && wce_src_rri(r) == wce.wr[r]) {
++				/* everything sent has been taken: its "copy complete" is standing, the hardware awake */
++				wce.tx_pending[r] = false;
++				wl_wr(wce.regs, WCE_BASE(wce_ring[r].ce) + CE_HOST_IS, CE_HOST_IS_ALL);
++				wce_is_clears++;
++			}
+ 			continue;
+ 		}
+-		uint32_t mask = wce_ring[r].n - 1;
+-		for (unsigned guard = 0; guard < wce_ring[r].n; guard++) {
+-			struct wce_desc *d = wce_desc(r, wce.sw[r]);
+-			uint16_t nb = *(volatile uint16_t *)&d->nbytes;
+-			if (nb == 0) {
+-				break;
++		for (unsigned pass = 0; pass < 4; pass++) {
++			unsigned handled = 0;
++			if (wce_sleep) {
++				if (pass == 0 && *(volatile uint16_t *)&wce_desc(r, wce.sw[r])->nbytes == 0) {
++					break;                  /* nothing arrived: no register is touched */
++				}
++				/* "Clear before handling" (ath10k_ce_per_engine_service): a completion after this sets it again */
++				wl_wr(wce.regs, WCE_BASE(wce_ring[r].ce) + CE_HOST_IS, CE_HOST_IS_ALL);
++				wce_is_clears++;
++			}
++			for (unsigned guard = 0; guard < wce_ring[r].n; guard++) {
++				struct wce_desc *d = wce_desc(r, wce.sw[r]);
++				uint16_t nb = *(volatile uint16_t *)&d->nbytes;
++				if (nb == 0) {
++					break;
++				}
++				__asm__ volatile ("dmb ld" ::: "memory");      /* the data after the descriptor */
++				const uint8_t *buf = (const uint8_t *)(wce.pool + wce_ring[r].bufs + (uint64_t)wce.sw[r] * CE_RX_BUF);
++				wce_htc(wce_ring[r].ce, buf, MIN((uint32_t)nb, CE_RX_BUF));
++				d->nbytes = 0;
++				wce.sw[r] = (wce.sw[r] + 1) & mask;
++				struct wce_desc *w = wce_desc(r, wce.wr[r]);
++				w->addr = (WCE_POOL_PA + wce_ring[r].bufs + (uint64_t)wce.wr[r] * CE_RX_BUF) & 0x7ffffffffull;
++				w->nbytes = 0;
++				__asm__ volatile ("dsb sy" ::: "memory");
++				wce.wr[r] = (wce.wr[r] + 1) & mask;
++				wl_wr(wce.regs, WCE_BASE(wce_ring[r].ce) + CE_DST_WR_IDX, wce.wr[r]);
++				handled++;
++			}
++			if (!wce_sleep || handled == 0) {
++				break;                          /* with clearing on: the last pass cleared and found nothing */
+ 			}
+-			__asm__ volatile ("dmb ld" ::: "memory");      /* the data after the descriptor */
+-			const uint8_t *buf = (const uint8_t *)(wce.pool + wce_ring[r].bufs + (uint64_t)wce.sw[r] * CE_RX_BUF);
+-			wce_htc(wce_ring[r].ce, buf, MIN((uint32_t)nb, CE_RX_BUF));
+-			d->nbytes = 0;
+-			wce.sw[r] = (wce.sw[r] + 1) & mask;
+-			struct wce_desc *w = wce_desc(r, wce.wr[r]);
+-			w->addr = (WCE_POOL_PA + wce_ring[r].bufs + (uint64_t)wce.wr[r] * CE_RX_BUF) & 0x7ffffffffull;
+-			w->nbytes = 0;
+-			__asm__ volatile ("dsb sy" ::: "memory");
+-			wce.wr[r] = (wce.wr[r] + 1) & mask;
+-			wl_wr(wce.regs, WCE_BASE(wce_ring[r].ce) + CE_DST_WR_IDX, wce.wr[r]);
+ 		}
+ 	}
+ }
+@@ -6087,8 +6158,8 @@ static bool
+ sta_ce4_send2(uint64_t pa0, uint16_t len0, uint64_t pa1, uint16_t len1)
+ {
+ 	unsigned r = 4;                         /* wce_ring[4] = CE4 */
+-	uint32_t b = WCE_BASE(wce_ring[r].ce), mask = wce_ring[r].n - 1, wr = wce.wr[r];
+-	uint32_t srri = wl_rd(wce.regs, b + CE_CURRENT_SRRI) & mask;
++	uint32_t mask = wce_ring[r].n - 1, wr = wce.wr[r];
++	uint32_t srri = wce_src_rri(r);
+ 	if (((srri - 1 - wr) & mask) < 2) {
+ 		return false;
+ 	}
+@@ -6109,6 +6180,7 @@ sta_ce4_send2(uint64_t pa0, uint16_t len0, uint64_t pa1, uint16_t len1)
+ 	wr = (wr + 1) & mask;
+ 	wce.wr[r] = wr;
+ 	wl_wr(wce.regs, 0x32010u, wr);          /* CE4 shadow source write index */
++	wce.tx_pending[r] = true;
+ 	return true;
+ }
+ 
