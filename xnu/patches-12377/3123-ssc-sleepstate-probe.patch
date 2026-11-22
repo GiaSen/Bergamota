@@ -1,0 +1,53 @@
+diff --git a/bsd/dev/dipper_sensors.c b/bsd/dev/dipper_sensors.c
+index 955586c..006ad92 100644
+--- a/bsd/dev/dipper_sensors.c
++++ b/bsd/dev/dipper_sensors.c
+@@ -278,6 +278,48 @@ ss_smp2p_out(void)
+ 	return true;
+ }
+ 
++/*
++ * 3123: kern.sweet_ssc_sleepstate: the vendor's "sleepstate" entry towards the sensor DSP (smp2p_sleepstate.c,
++ * qcom,smp2pgpio-sleepstate-3-out): bit 0 = the application processor is awake. The vendor sets it at probe, clears
++ * it when the system prepares to suspend and sets it again after. This kernel never had the entry; in the power
++ * controller's table (0x0c3f008c) the sensor DSP reads "not asleep" although its own record counts thousands of naps.
++ * The first write adds the entry (nothing changes for a boot that never writes); 1 = awake, 0 = asleep. A probe.
++ */
++static int ss_sleepstate = -1;
++static uint32_t ss_slst_index;
++
++static int
++sysctl_sweet_ssc_sleepstate SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = ss_sleepstate;
++	int error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (v != 0 && v != 1) {
++		return EINVAL;
++	}
++	uint32_t d = ss.smp2p_out;
++	if (!d) {
++		return ENXIO;
++	}
++	if (ss_sleepstate < 0) {
++		ss_slst_index = sweet_smem_rd(d + 12) >> 16;
++		if (ss_slst_index >= SMP2P_MAX_ENTRY) {
++			return ENOSPC;
++		}
++		ss_smp2p_entry(d, "sleepstate");
++	}
++	sweet_smem_wr(d + 20 + ss_slst_index * 20 + 16, (uint32_t)v);
++	sweet_apcs_kick(SS_SMP2P_DOORBELL);
++	ss_sleepstate = v;
++	SS_LOG("smp2p sleepstate entry %u: application processor %s\n", ss_slst_index, v ? "awake" : "asleep");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_ssc_sleepstate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_ssc_sleepstate, "I",
++    "the sleepstate entry towards the sensor DSP: 1 = application processor awake, 0 = asleep, -1 = no entry yet (3123)");
++
+ /* the SLPI's "slave-kernel" bits, false while its item or entry does not exist */
+ static bool
+ ss_smp2p_in(uint32_t *bits)

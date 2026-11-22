@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 59a94d7..85ed4c0 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -4059,8 +4059,10 @@ wce_desc(unsigned r, uint32_t i)
+  *    the pool's first words, CTRL1 UPD in wce_up); write indices of sends go through the shadow registers.
+  * No register of the block is touched outside a window an interrupt opened. CE4 keeps its enable at 0 (no interrupt in
+  * the target's configuration; it does not count). 0 = as before: enables 0, polled, the hardware always awake.
++ * 3122: 1 by default (36 -> 26 mA of standby on image 167, 2026-11-22), taken up when the start-up scan is done;
++ * boot-arg sweetcesleep=0 keeps the old way for a boot.
+  */
+-static int wce_sleep;
++static int wce_sleep = 1;       /* 3122: on by default; boot-arg sweetcesleep=0 for the old way */
+ static uint32_t wce_is_clears, wce_irqs, wce_irq_pending, wce_irq_waits;
+ static uint32_t wce_irq_run[12], wce_irq_storms, wce_irq_errs, wce_irq_err_last, wce_irq_noerr;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_wlan_ce_sleep, CTLFLAG_RW | CTLFLAG_LOCKED, &wce_sleep, 0,
+@@ -5259,8 +5261,9 @@ wce_poll(void)
+ 		return;
+ 	}
+ 	vm_offset_t m = wce.regs;
+-	if (wce_sleep && !wce.sleep_was) {
+-		/* switched on: the hardware is awake (every enable is 0). Lines on, whatever status stood cleared, enables. */
++	if (wce_sleep && !wce.sleep_was && wf.state == WS_SCAN_DONE) {
++		/* 3122: once the start-up scan is over (the order every run so far had: on while idle, then the join).
++		 * The hardware is awake (every enable is 0). Lines on, whatever status stood cleared, enables. */
+ 		wce.sleep_was = 1;
+ 		os_atomic_store(&wce_irq_pending, 0, relaxed);
+ 		for (unsigned r = 0; r < WCE_NRINGS; r++) {
+@@ -10323,6 +10326,7 @@ beryllium_wlan_init(void)
+ 	}
+ 	(void)PE_parse_boot_argn("sweetwlandelay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("sweetwlanps", &sta_ps_ms, sizeof(sta_ps_ms));
++	(void)PE_parse_boot_argn("sweetcesleep", &wce_sleep, sizeof(wce_sleep));      /* 3122 */
+ 	/* Bluetooth firmware (stage 2): sweetbtfw=1 (default) downloads rampatch + NVM when the files exist */
+ 	wl.bt_fw = 1;
+ 	wl.bt_baud = 3000000;           /* 3200000 is the dtsi max-speed and also has an exact S6 rate */
