@@ -1,0 +1,123 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 0f0f25c..59a94d7 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -3901,6 +3901,9 @@ wf_msa_assign(unsigned k, bool to_wlan)
+ #define CE_CURRENT_SRRI         0x44u
+ #define CE_CURRENT_DRRI         0x48u
+ #define CE_HOST_IE              0x2cu           /* wcn3990_host_ie_cc: bit 0 copy complete */
++#define CE_MISC_IE              0x34u           /* wcn3990_misc_reg: error interrupt enables, 0x3e0 */
++#define CE_MISC_IS              0x38u
++#define CE_MISC_ERR             0x3e0u
+ #define CE_HOST_IS              0x30u           /* wcn3990_wm_reg: bit 0 copy complete, bits 1-4 watermarks */
+ #define CE_HOST_IS_ALL          0x1fu
+ #define CE_SRC_WM               0x4cu
+@@ -4059,16 +4062,29 @@ wce_desc(unsigned r, uint32_t i)
+  */
+ static int wce_sleep;
+ static uint32_t wce_is_clears, wce_irqs, wce_irq_pending, wce_irq_waits;
++static uint32_t wce_irq_run[12], wce_irq_storms, wce_irq_errs, wce_irq_err_last, wce_irq_noerr;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_wlan_ce_sleep, CTLFLAG_RW | CTLFLAG_LOCKED, &wce_sleep, 0,
+     "1: enable and service the Wi-Fi copy engines' interrupts, so the hardware and the modem can sleep; stays until a reboot (3117, 3120)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_ce_clears, CTLFLAG_RD | CTLFLAG_LOCKED, &wce_is_clears, 0, "copy engine status clears so far (3117)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_ce_irqs, CTLFLAG_RD | CTLFLAG_LOCKED, &wce_irqs, 0, "copy engine interrupts taken (3120)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_ce_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &wce_irq_waits, 0,
+     "polls that saw a filled descriptor whose engine had not interrupted yet (3120)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_ce_storms, CTLFLAG_RD | CTLFLAG_LOCKED, &wce_irq_storms, 0,
++    "copy engine lines switched off at the GIC after 64 interrupts in a row with no service in between (3121)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_ce_errs, CTLFLAG_RD | CTLFLAG_LOCKED, &wce_irq_errs, 0,
++    "copy engine interrupts that came with an error bit in the misc status (3121)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_ce_err_last, CTLFLAG_RD | CTLFLAG_LOCKED, &wce_irq_err_last, 0,
++    "the last such: engine << 16 | misc status (3121)");
+ #define WCE_INTID(ce)           (446u + (ce))   /* GIC SPI 414 + engine (sdm845.dtsi, the wifi node), level high */
+ extern uint32_t sweet_gic_spi_setup(uint32_t intid, uint64_t affinity, bool enable);    /* pexpert/arm/pe_fiq.c */
+ 
+-/* sleh_irq: one of the engines' lines. Standing interrupt = hardware awake: mask the engine at once, the line drops. */
++/*
++ * sleh_irq: one of the engines' lines. Standing interrupt = hardware awake: mask the engine at once, copy complete and
++ * the error enables both (ath10k_ce_disable_interrupt; the errors share the line, and an error left enabled would bring
++ * the interrupt straight back: a storm on CPU 0 is a frozen phone), note it, wake the service loop. 3121: an engine
++ * that interrupts 64 times in a row with no service in between loses its line at the GIC: slower Wi-Fi shows in a
++ * counter, a storm would not show at all. An error bit in the misc status is counted and its enable stays off.
++ */
+ bool sweet_wlan_ce_intr(uint32_t intid);
+ bool
+ sweet_wlan_ce_intr(uint32_t intid)
+@@ -4077,15 +4093,39 @@ sweet_wlan_ce_intr(uint32_t intid)
+ 		return false;
+ 	}
+ 	unsigned ce = intid - WCE_INTID(0);
++	wce_irqs++;
+ 	if (wce.regs) {
+-		*(volatile uint32_t *)(wce.regs + WCE_BASE(ce) + CE_HOST_IE) = 0;
++		vm_offset_t b = wce.regs + WCE_BASE(ce);
++		*(volatile uint32_t *)(b + CE_HOST_IE) = 0;
++		*(volatile uint32_t *)(b + CE_MISC_IE) = 0;
+ 		__asm__ volatile ("dsb sy" ::: "memory");
++		uint32_t mis = *(volatile uint32_t *)(b + CE_MISC_IS) & CE_MISC_ERR;
++		if (mis) {
++			wce_irq_errs++;
++			wce_irq_err_last = (ce << 16) | mis;
++			os_atomic_or(&wce_irq_noerr, 1u << ce, relaxed);
++		}
+ 		os_atomic_or(&wce_irq_pending, 1u << ce, relaxed);
+ 	}
+-	wce_irqs++;
++	if (!wce.regs || ++wce_irq_run[ce] > 64) {
++		(void)sweet_gic_spi_setup(intid, 0, false);
++		wce_irq_storms++;
++	}
++	thread_wakeup(&wl.sleep_chan);
+ 	return true;
+ }
+ 
++/* the end of an engine's service: its interrupts back on (ath10k_ce_enable_interrupt) */
++static inline void
++wce_unmask(unsigned ce)
++{
++	wce_irq_run[ce] = 0;
++	if (!(os_atomic_load(&wce_irq_noerr, relaxed) & (1u << ce))) {
++		wl_wr(wce.regs, WCE_BASE(ce) + CE_MISC_IE, CE_MISC_ERR);
++	}
++	wl_wr(wce.regs, WCE_BASE(ce) + CE_HOST_IE, 1);
++}
++
+ /* the lines off at the GIC (no register of the block: it may be asleep or gone) */
+ static void
+ wce_irq_off(void)
+@@ -5236,7 +5276,9 @@ wce_poll(void)
+ 		wce_is_clears += 12;
+ 		printf("SWEET IPC: wce: copy engine interrupts on (kern.sweet_wlan_ce_sleep; GIC INTID %u-%u, last setup %#x): the hardware may sleep\n",
+ 		    WCE_INTID(0), WCE_INTID(11), gic);
++		os_atomic_store(&wce_irq_noerr, 0, relaxed);
+ 		for (unsigned ce = 0; ce < 12; ce++) {
++			wce_irq_run[ce] = 0;
+ 			if (ce != 4) {
+ 				wl_wr(m, WCE_BASE(ce) + CE_HOST_IE, 1);
+ 			}
+@@ -5255,7 +5297,7 @@ wce_poll(void)
+ 				pend &= ~bit;
+ 				wce.tx_pending[r] = false;
+ 				wl_wr(m, b + CE_HOST_IS, CE_HOST_IS_ALL);
+-				wl_wr(m, b + CE_HOST_IE, 1);
++				wce_unmask(wce_ring[r].ce);
+ 				wce_is_clears++;
+ 			}
+ 			continue;
+@@ -5297,14 +5339,14 @@ wce_poll(void)
+ 			}
+ 		}
+ 		if (on) {
+-			wl_wr(m, b + CE_HOST_IE, 1);
++			wce_unmask(wce_ring[r].ce);
+ 		}
+ 	}
+ 	for (unsigned ce = 0; pend && ce < 12; ce++) {
+ 		if (pend & (1u << ce)) {                /* an engine the host has no ring on (CE6): nothing to handle */
+ 			pend &= ~(1u << ce);
+ 			wl_wr(m, WCE_BASE(ce) + CE_HOST_IS, CE_HOST_IS_ALL);
+-			wl_wr(m, WCE_BASE(ce) + CE_HOST_IE, 1);
++			wce_unmask(ce);
+ 			wce_is_clears++;
+ 		}
+ 	}
