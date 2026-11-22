@@ -1,0 +1,182 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 56133cb..21aa733 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -1298,8 +1298,51 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_sleep_stats, CTLTYPE_STRING | CTLFLAG_RD | CT
+  * processor's own vote as the power controller holds it: the one thing that tells whether a sleep or wake set (3113)
+  * was really sent, since those change the vote without the kernel asking. Whether the rails answer reads at all was not
+  * known when this was written; a request that never finishes costs one of the two active TCSes until a reboot.
++ *
++ * 3115: any resource of the command database by its name, and "NAME+4", "+8", "+c" for a regulator's other
++ * registers (+0 the voltage, +4 enable, +8 mode, +c headroom, as the vendor's rpmh-regulator.c). For the inventory a
++ * system sleep needs: every vote standing in this processor's name, the bootloader's included, keeps its resource up
++ * while the cores are down unless the sleep set says otherwise. The rails answered reads (3114); regulators and bus
++ * votes had not been asked when this was written, and the same warning holds: two requests that never finish and this
++ * kernel can vote nothing more until a reboot. kern.sweet_rpmh_db lists the names: write arc, vrm or bcm, then read.
+  */
+-static char rh_read_text[96] = "sweet_rpmh_read v1 nothing read";
++static char rh_read_text[112] = "sweet_rpmh_read v2 nothing read";
++
++/* any entry by name, whatever its kind; with rh_map done */
++static int
++rh_lookup_any(const char *res, uint32_t *address)
++{
++	uint32_t key[2] = {0, 0};
++	for (unsigned i = 0; i < 8 && res[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	unsigned matches = 0;
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		unsigned count = rh_db16(h + 6);
++		if (slave < 3 || slave > 5 || (entries & 3u) || !rh_range(entries, count * RH_DB_ENTRY)) {
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t addr = rh_read(rh_db, e + 16);
++			if ((addr >> 16) != slave) {
++				return EINVAL;
++			}
++			*address = addr;
++			++matches;
++		}
++	}
++	return matches == 1 ? 0 : ENODEV;
++}
+ 
+ static int
+ sysctl_sweet_rpmh_read SYSCTL_HANDLER_ARGS
+@@ -1313,29 +1356,115 @@ sysctl_sweet_rpmh_read SYSCTL_HANDLER_ARGS
+ 	if (error) {
+ 		return error;
+ 	}
+-	if (strcmp(in, "cx.lvl") && strcmp(in, "mx.lvl") && strcmp(in, "lcx.lvl") && strcmp(in, "lmx.lvl")) {
++	char name[9] = "";
++	uint32_t off = 0;
++	unsigned k = 0;
++	for (; k < 8 && in[k] && in[k] != '+'; k++) {
++		name[k] = in[k];
++	}
++	if (k == 0 || (in[k] != 0 && in[k] != '+')) {
+ 		return EINVAL;
+ 	}
++	if (in[k] == '+') {
++		char d = in[k + 1];
++		off = d == '0' ? 0 : d == '4' ? 4 : d == '8' ? 8 : (d == 'c' || d == 'C') ? 12 : 0xffu;
++		if (off == 0xffu || in[k + 2] != 0) {
++			return EINVAL;
++		}
++	}
+ 	if (!rh_rsc || !rh_tcs || !rh_be) {
+ 		return ENXIO;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+ 		return EBUSY;
+ 	}
+-	uint32_t address = 0, aux = 0, aux_len = 0, zero = 0;
+-	if (!rh_refuse() && !(error = rh_map()) && !(error = rh_lookup_slave(in, RH_ARC, &address, &aux, &aux_len))) {
+-		rh_reading = true;
+-		rh_resp = 0xdeadbeefu;
+-		error = rh_cmds_once(&address, &zero, 1);
+-		rh_reading = false;
++	uint32_t address = 0, zero = 0;
++	if (!rh_refuse() && !(error = rh_map()) && !(error = rh_lookup_any(name, &address))) {
++		if (off != 0 && (address >> 16) != RH_VRM) {
++			error = EINVAL;
++		} else {
++			address += off;
++			rh_reading = true;
++			rh_resp = 0xdeadbeefu;
++			error = rh_cmds_once(&address, &zero, 1);
++			rh_reading = false;
++		}
+ 	}
+-	(void)snprintf(rh_read_text, sizeof(rh_read_text), "sweet_rpmh_read v1 %s(%#x)=%#x err=%d", in, address, rh_resp, error);
++	(void)snprintf(rh_read_text, sizeof(rh_read_text), "sweet_rpmh_read v2 %s(%#x)=%#x err=%d", in, address, rh_resp, error);
+ 	printf("SWEET RPMH: %s\n", rh_read_text);
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmh_read, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_rpmh_read, "A",
+-    "write a rail's name: a read request for it; read: what came back (3114)");
++    "write a resource's name, or NAME+4/+8/+c for a regulator's other registers: a read request for it; read: what came back (3114, 3115)");
++
++/* 3115: kern.sweet_rpmh_db: the command database's names and addresses, one kind at a time; reads memory only */
++static unsigned rh_db_kind = RH_ARC;
++
++static int
++sysctl_sweet_rpmh_db SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	if (req->newptr) {
++		char in[8] = "";
++		int error = sysctl_handle_string(oidp, in, sizeof(in), req);
++		if (error) {
++			return error;
++		}
++		unsigned kind = !strcmp(in, "arc") ? RH_ARC : !strcmp(in, "vrm") ? RH_VRM : !strcmp(in, "bcm") ? RH_BCM : 0;
++		if (kind == 0) {
++			return EINVAL;
++		}
++		rh_db_kind = kind;
++		return 0;
++	}
++	static char buf[3072];
++	size_t n = 0;
++	if (!rh_rsc || !rh_tcs || !rh_be) {
++		return ENXIO;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = rh_map();
++	unsigned kind = rh_db_kind;
++	n += (size_t)snprintf(buf + n, sizeof(buf) - n, "sweet_rpmh_db v1 %s:", kind == RH_ARC ? "arc" : kind == RH_VRM ? "vrm" : "bcm");
++	for (unsigned i = 0; !error && i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		unsigned count = rh_db16(h + 6);
++		if (slave < 3 || slave > 5 || (entries & 3u) || !rh_range(entries, count * RH_DB_ENTRY)) {
++			error = EINVAL;
++			break;
++		}
++		if (slave != kind) {
++			continue;
++		}
++		for (unsigned j = 0; j < count && n + 24 < sizeof(buf); ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			uint32_t w[2] = { rh_read(rh_db, e), rh_read(rh_db, e + 4) };
++			char nm[9];
++			for (unsigned c = 0; c < 8; c++) {
++				char ch = (char)(w[c / 4] >> (8u * (c % 4)));
++				nm[c] = (ch == 0 || (ch > 32 && ch < 127)) ? ch : '?';
++			}
++			nm[8] = 0;
++			n += (size_t)snprintf(buf + n, sizeof(buf) - n, " %s=%#x", nm, rh_read(rh_db, e + 16));
++		}
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	if (error) {
++		return error;
++	}
++	buf[sizeof(buf) - 1] = 0;
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmh_db, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_rpmh_db, "A",
++    "write arc, vrm or bcm; read: that kind's resource names and addresses from the command database (3115)");
+ 
+ /*
+  * 3113: kern.sweet_rpmh_sleepset: write "cx.lvl=S:W" (or mx.lvl): the rail's level, an index into its table
