@@ -1,0 +1,250 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index d9336c3..0f0f25c 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -3958,7 +3958,6 @@ static struct {
+ 	uint32_t sw[5], wr[5];
+ 	bool tx_pending[5];             /* 3117: a send whose "copy complete" has not been cleared yet */
+ 	int sleep_was;                  /* 3117: kern.sweet_wlan_ce_sleep as wce_poll last saw it */
+-	uint32_t ce6_last, ce6_win;     /* 3119: CE6's read indices in memory as last seen; polls left of its service */
+ 	unsigned msgs, logged, wmi_events, htt_msgs, wmi_credits, nchunks;
+ 	uint16_t credits, credit_size, conn_svc;
+ 	uint8_t max_ep, htc_version, htt_eid, wmi_eid, seq[8], mac[6];
+@@ -4039,32 +4038,66 @@ wce_desc(unsigned r, uint32_t i)
+ }
+ 
+ /*
+- * 3117, 3119: let the Wi-Fi hardware sleep, and with it the modem its firmware runs in. Found on the phone, 2026-11-22
+- * (the power controller's table at 0x0c3f008c says whether the modem sleeps): with every engine's copy-complete
+- * interrupt enable (CE_HOST_IE) at 0, as this polled driver left it, the hardware never sleeps; with the enables at 1
+- * and no status (CE_HOST_IS) standing it sleeps within a second. So the enable is the host's "I am not servicing this
+- * engine" and a standing status its "I still have to": ath10k keeps an engine's interrupt masked exactly while its
+- * NAPI poll runs, clears the status before handling, and unmasks at the end. ath10k ce.c: "When the last copy engine
+- * interrupt is cleared the hardware will go to sleep. Once this happens any access to the CE registers can cause a
+- * hardware fault." With kern.sweet_wlan_ce_sleep=1 (one way: a reboot ends it) this driver does the same without
+- * interrupts, from what it sees in memory:
+- *  - a destination ring whose next descriptor is filled has a completion standing, so the hardware is awake: enable to
+- *    0, then status cleared and descriptors handled until a pass finds none, then enable to 1;
+- *  - a source ring whose read index in memory (ath10k_ce_src_ring_read_index_from_ddr: the pool's first words, CTRL1
+- *    UPD in wce_up) has caught up with what was sent has its completion standing: enable 0, status cleared, enable 1.
+- *    The "ring full" check reads the same word instead of the register. CE4 is left alone: no interrupt in the target's
+- *    configuration, its enable stays 0 and it does not count;
+- *  - CE6 is the target's own pipe; its status stands after every use and nothing here handles it. Its read indices in
+- *    memory moving is the sign: enable to 0 at once (the target is at work, so awake), the status cleared and the
+- *    enable back to 1 two polls later, when the copy is over.
+- * Outside those windows no register of the block is touched; write indices of sends go through the shadow registers,
+- * which exist for that. 0 = as before: enables 0, nothing cleared, the hardware always awake.
++ * 3117, 3119, 3120: let the Wi-Fi hardware sleep, and with it the modem its firmware runs in. Found on the phone,
++ * 2026-11-22 (the power controller's table at 0x0c3f008c says whether the modem sleeps): with every engine's
++ * copy-complete interrupt enable (CE_HOST_IE) at 0, as this polled driver left it, the hardware never sleeps; with the
++ * enables at 1 and no status (CE_HOST_IS) standing it sleeps within a second. The enable is the host's "I am not
++ * servicing this engine", a standing status its "I still have to". ath10k ce.c: "When the last copy engine interrupt
++ * is cleared the hardware will go to sleep. Once this happens any access to the CE registers can cause a hardware
++ * fault." Here that fault is a frozen SoC (3119, which opened its service windows from what it saw in memory, hung the
++ * phone at once), so with kern.sweet_wlan_ce_sleep=1 (one way: a reboot ends it) 3120 does exactly what ath10k does:
++ *  - the engines' GIC lines (SPI 414 + engine, level) are enabled; sweet_wlan_ce_intr(), from sleh_irq, masks the
++ *    engine that interrupted (enable to 0: an interrupt standing means the hardware is awake, and a masked engine keeps
++ *    it awake) and notes it, as ath10k_snoc_per_engine_handler does;
++ *  - the service loop, for each engine noted: status cleared before handling, the ring handled until a pass finds
++ *    nothing (destination rings), then the enable back to 1, as ath10k's NAPI poll does. Engines the host has no ring
++ *    on (CE6, the target's own pipe, interrupts after every use) get the clear and the enable only;
++ *  - the "ring full" check of a send reads the target's read index from memory (ath10k_ce_src_ring_read_index_from_ddr:
++ *    the pool's first words, CTRL1 UPD in wce_up); write indices of sends go through the shadow registers.
++ * No register of the block is touched outside a window an interrupt opened. CE4 keeps its enable at 0 (no interrupt in
++ * the target's configuration; it does not count). 0 = as before: enables 0, polled, the hardware always awake.
+  */
+ static int wce_sleep;
+-static uint32_t wce_is_clears;
++static uint32_t wce_is_clears, wce_irqs, wce_irq_pending, wce_irq_waits;
+ SYSCTL_INT(_kern, OID_AUTO, sweet_wlan_ce_sleep, CTLFLAG_RW | CTLFLAG_LOCKED, &wce_sleep, 0,
+-    "1: enable and service the Wi-Fi copy engines' interrupts, so the hardware and the modem can sleep; stays until a reboot (3117, 3119)");
++    "1: enable and service the Wi-Fi copy engines' interrupts, so the hardware and the modem can sleep; stays until a reboot (3117, 3120)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_ce_clears, CTLFLAG_RD | CTLFLAG_LOCKED, &wce_is_clears, 0, "copy engine status clears so far (3117)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_ce_irqs, CTLFLAG_RD | CTLFLAG_LOCKED, &wce_irqs, 0, "copy engine interrupts taken (3120)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_ce_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &wce_irq_waits, 0,
++    "polls that saw a filled descriptor whose engine had not interrupted yet (3120)");
++#define WCE_INTID(ce)           (446u + (ce))   /* GIC SPI 414 + engine (sdm845.dtsi, the wifi node), level high */
++extern uint32_t sweet_gic_spi_setup(uint32_t intid, uint64_t affinity, bool enable);    /* pexpert/arm/pe_fiq.c */
++
++/* sleh_irq: one of the engines' lines. Standing interrupt = hardware awake: mask the engine at once, the line drops. */
++bool sweet_wlan_ce_intr(uint32_t intid);
++bool
++sweet_wlan_ce_intr(uint32_t intid)
++{
++	if (intid < WCE_INTID(0) || intid > WCE_INTID(11)) {
++		return false;
++	}
++	unsigned ce = intid - WCE_INTID(0);
++	if (wce.regs) {
++		*(volatile uint32_t *)(wce.regs + WCE_BASE(ce) + CE_HOST_IE) = 0;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		os_atomic_or(&wce_irq_pending, 1u << ce, relaxed);
++	}
++	wce_irqs++;
++	return true;
++}
++
++/* the lines off at the GIC (no register of the block: it may be asleep or gone) */
++static void
++wce_irq_off(void)
++{
++	if (wce.sleep_was) {
++		for (unsigned ce = 0; ce < 12; ce++) {
++			(void)sweet_gic_spi_setup(WCE_INTID(ce), 0, false);
++		}
++	}
++	wce.sleep_was = 0;
++	os_atomic_store(&wce_irq_pending, 0, relaxed);
++}
+ 
+ /* a source ring's read index: where the target has got to */
+ static uint32_t
+@@ -4133,8 +4166,7 @@ wce_up(void)
+ 		    wce_ring[r].src ? "source" : "destination", n, pa, wce.sw[r], wce.wr[r], wl_rd(m, b + CE_CTRL1));
+ 	}
+ 	wce.rings = true;
+-	wce.sleep_was = 0;              /* 3119: a block just switched on has every enable at 0 again */
+-	wce.ce6_win = 0;
++	wce_irq_off();                  /* 3120: a block just switched on has every enable at 0 again */
+ 	return true;
+ }
+ 
+@@ -5188,46 +5220,53 @@ wce_poll(void)
+ 	}
+ 	vm_offset_t m = wce.regs;
+ 	if (wce_sleep && !wce.sleep_was) {
+-		/* switched on: the hardware is awake (every enable is 0). Whatever status stood goes, then the enables. */
++		/* switched on: the hardware is awake (every enable is 0). Lines on, whatever status stood cleared, enables. */
+ 		wce.sleep_was = 1;
++		os_atomic_store(&wce_irq_pending, 0, relaxed);
++		for (unsigned r = 0; r < WCE_NRINGS; r++) {
++			wce.tx_pending[r] = false;
++		}
++		uint32_t gic = 0;
+ 		for (unsigned ce = 0; ce < 12; ce++) {
+ 			wl_wr(m, WCE_BASE(ce) + CE_HOST_IS, CE_HOST_IS_ALL);
++			if (ce != 4) {
++				gic = sweet_gic_spi_setup(WCE_INTID(ce), 0, true);
++			}
+ 		}
+ 		wce_is_clears += 12;
+-		for (unsigned r = 0; r < WCE_NRINGS; r++) {
+-			wce.tx_pending[r] = false;
+-		}
+-		wce.ce6_last = *(volatile uint32_t *)(wce.pool + 4u * 6u);
+-		wce.ce6_win = 0;
++		printf("SWEET IPC: wce: copy engine interrupts on (kern.sweet_wlan_ce_sleep; GIC INTID %u-%u, last setup %#x): the hardware may sleep\n",
++		    WCE_INTID(0), WCE_INTID(11), gic);
+ 		for (unsigned ce = 0; ce < 12; ce++) {
+ 			if (ce != 4) {
+ 				wl_wr(m, WCE_BASE(ce) + CE_HOST_IE, 1);
+ 			}
+ 		}
+-		printf("SWEET IPC: wce: copy engine interrupts enabled and serviced from now on (kern.sweet_wlan_ce_sleep): the hardware may sleep\n");
++		return;                         /* nothing more this round: every later access waits for an interrupt */
+ 	} else if (!wce_sleep && wce.sleep_was == 1) {
+ 		wce.sleep_was = 2;
+-		printf("SWEET IPC: wce: kern.sweet_wlan_ce_sleep=0 ignored: the hardware may be asleep, the enables stay until a reboot\n");
++		printf("SWEET IPC: wce: kern.sweet_wlan_ce_sleep=0 ignored: the hardware may be asleep, it stays on until a reboot\n");
+ 	}
+ 	bool on = wce.sleep_was != 0;
++	uint32_t pend = on ? os_atomic_xchg(&wce_irq_pending, 0, relaxed) : 0;
+ 	for (unsigned r = 0; r < WCE_NRINGS; r++) {
+-		uint32_t mask = wce_ring[r].n - 1, b = WCE_BASE(wce_ring[r].ce);
++		uint32_t mask = wce_ring[r].n - 1, b = WCE_BASE(wce_ring[r].ce), bit = 1u << wce_ring[r].ce;
+ 		if (wce_ring[r].src) {
+-			if (on && wce_ring[r].ce != 4 && wce.tx_pending[r] && wce_src_rri(r) == wce.wr[r]) {
++			if (pend & bit) {               /* what was sent has been taken */
++				pend &= ~bit;
+ 				wce.tx_pending[r] = false;
+-				wl_wr(m, b + CE_HOST_IE, 0);
+ 				wl_wr(m, b + CE_HOST_IS, CE_HOST_IS_ALL);
+ 				wl_wr(m, b + CE_HOST_IE, 1);
+ 				wce_is_clears++;
+ 			}
+ 			continue;
+ 		}
+-		if (on) {
+-			if (*(volatile uint16_t *)&wce_desc(r, wce.sw[r])->nbytes == 0) {
+-				continue;                       /* nothing arrived: no register is touched */
++		if (on && !(pend & bit)) {
++			if (*(volatile uint16_t *)&wce_desc(r, wce.sw[r])->nbytes != 0) {
++				wce_irq_waits++;                /* its interrupt is on its way: no register is touched before it */
+ 			}
+-			wl_wr(m, b + CE_HOST_IE, 0);            /* being serviced: the hardware stays awake */
++			continue;
+ 		}
++		pend &= ~bit;
+ 		for (unsigned pass = 0; pass < 8; pass++) {
+ 			unsigned handled = 0;
+ 			if (on) {
+@@ -5261,17 +5300,11 @@ wce_poll(void)
+ 			wl_wr(m, b + CE_HOST_IE, 1);
+ 		}
+ 	}
+-	if (on) {
+-		uint32_t now6 = *(volatile uint32_t *)(wce.pool + 4u * 6u);
+-		if (now6 != wce.ce6_last) {
+-			wce.ce6_last = now6;
+-			if (!wce.ce6_win) {
+-				wl_wr(m, WCE_BASE(6) + CE_HOST_IE, 0);
+-			}
+-			wce.ce6_win = 2;
+-		} else if (wce.ce6_win && --wce.ce6_win == 0) {
+-			wl_wr(m, WCE_BASE(6) + CE_HOST_IS, CE_HOST_IS_ALL);
+-			wl_wr(m, WCE_BASE(6) + CE_HOST_IE, 1);
++	for (unsigned ce = 0; pend && ce < 12; ce++) {
++		if (pend & (1u << ce)) {                /* an engine the host has no ring on (CE6): nothing to handle */
++			pend &= ~(1u << ce);
++			wl_wr(m, WCE_BASE(ce) + CE_HOST_IS, CE_HOST_IS_ALL);
++			wl_wr(m, WCE_BASE(ce) + CE_HOST_IE, 1);
+ 			wce_is_clears++;
+ 		}
+ 	}
+@@ -5295,6 +5328,7 @@ wf_data_path(void)
+ static void
+ wf_shutdown(void)
+ {
++	wce_irq_off();                  /* 3120 */
+ 	wce.rings = false;
+ 	/* also when mission mode was requested but never confirmed (timeout, hold over): the chip may be in it */
+ 	if (!(wce.mode_on || wce.mode_sent) || wf.state == WS_OFF) {
+@@ -5557,6 +5591,7 @@ wf_reset(bool free_buf)
+ 	}
+ 	memset(&wf, 0, sizeof(wf));
+ 	wf.buf = buf;
++	wce_irq_off();                  /* 3120 */
+ 	wce.rings = false;
+ 	wce.mode_on = false;
+ 	wce.mode_sent = false;
+@@ -7761,7 +7796,7 @@ svc_busy(void)
+ 	for (unsigned k = 0; k < TFTP_CLIENTS; k++) {
+ 		tftp_active = tftp_active || tftp_cl[k].used;
+ 	}
+-	moved = moved || wce.ce6_win != 0;      /* 3119: CE6's service window closes two polls on */
++	moved = moved || os_atomic_load(&wce_irq_pending, relaxed) != 0;        /* 3120: an engine is masked and waits */
+ 	bool settled = wf.state == WS_SCAN_DONE || wf.state == WS_FAILED || wf.state == WS_OFF ||
+ 	    (wf.state == WS_WMI_READY && !ipc.scan) || (wf.state == WS_READY && !ipc.ce);
+ 	bool joining = sta.state != ST_IDLE && sta.state != ST_CONNECTED;
+@@ -7912,6 +7947,7 @@ ms_ipc_run(unsigned hold_s)
+ 	if (alive) {
+ 		wf_shutdown();
+ 	} else {
++		wce_irq_off();                  /* 3120 */
+ 		wce.rings = false;
+ 	}
+ 	if (ipc.wlfw) {
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index d8697a2..23ac83a 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3195,7 +3195,8 @@ sleh_irq(arm_saved_state_t *state)
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 		extern bool sweet_qtimer_intr(uint32_t intid);  /* 3100, osfmk/arm64/cpu.c: the wake timer of a sleeping CPU 0 */
+-		if (!sweet_qtimer_intr(intid) && cdp->interrupt_handler) {
++		extern bool sweet_wlan_ce_intr(uint32_t intid); /* 3120, bsd/dev/beryllium_wlan.c: a Wi-Fi copy engine's line */
++		if (!sweet_qtimer_intr(intid) && !sweet_wlan_ce_intr(intid) && cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
+ 			    cdp->interrupt_refCon,
+ 			    cdp->interrupt_nub,
