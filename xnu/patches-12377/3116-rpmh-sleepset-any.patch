@@ -1,0 +1,165 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 21aa733..8fb4103 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -552,7 +552,7 @@ rh_cmds_once(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+  */
+ #define RH_SLEEP_TCS    RH_ACTIVE_N
+ #define RH_WAKE_TCS     (RH_ACTIVE_N + 3u)
+-#define RH_SET_MAX      4u
++#define RH_SET_MAX      16u     /* 3116: one slot holds 16 commands */
+ #define RH_WRITE_NOACK  (8u | (1u << 16))
+ static struct {
+ 	uint32_t address, sleep, wake;
+@@ -1473,20 +1473,56 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmh_db, CTLTYPE_STRING | CTLFLAG_RW | CTLFLA
+  * active votes for that rail move it by themselves. Nothing happens until the cluster powers down in mode 3
+  * (kern.sweet_cluster=3); whether the rail then really drops is the power controller's to decide, with every other
+  * subsystem's vote: kern.sweet_sleep_stats counts it (cxsd). A probe: nothing sets this by itself.
++ * 3116: any resource of the command database, NAME=S:W or NAME+4=S:W (a regulator's or clock buffer's enable register),
++ * S and W the raw request values, decimal or 0x hex; up to 16 entries, all in one sleep and one wake slot. For a bus
++ * vote write the whole word: 0x40000000 (commit) for "nothing", 0x60000000 | y for a vote, as the active requests do.
++ * W is what kern.sweet_rpmh_read gives for the resource now (plus the commit bit for a bus vote). cx.lvl and mx.lvl
++ * keep their check (W 4-7, S <= W); nothing else is checked: a wrong S for the memory's rail or the crystal hangs the
++ * phone at the next cluster power-down.
+  */
++static bool
++rh_number(const char *t, uint32_t *out)
++{
++	uint32_t v = 0, base = 10;
++	if (t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) {
++		base = 16;
++		t += 2;
++	}
++	if (*t == 0) {
++		return false;
++	}
++	for (; *t; t++) {
++		uint32_t d = (*t >= '0' && *t <= '9') ? (uint32_t)(*t - '0') : (*t >= 'a' && *t <= 'f') ? (uint32_t)(*t - 'a' + 10) :
++		    (*t >= 'A' && *t <= 'F') ? (uint32_t)(*t - 'A' + 10) : 99u;
++		if (d >= base || v > (0xffffffffu - d) / base) {
++			return false;
++		}
++		v = v * base + d;
++	}
++	*out = v;
++	return true;
++}
++
+ static int
+ sysctl_sweet_rpmh_sleepset SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(arg1, arg2)
+-	char buf[320];
+-	size_t n = (size_t)snprintf(buf, sizeof(buf), "sweet_rpmh_sleepset v1 programmed=%u followed=%u", rh_set_programmed, rh_set_followed);
+-	for (unsigned k = 0; k < rh_set_n && n < sizeof(buf); k++) {
+-		n += (size_t)snprintf(buf + n, sizeof(buf) - n, " %s(%#x) sleep=%u wake=%u", rh_set[k].name, rh_set[k].address, rh_set[k].sleep, rh_set[k].wake);
+-	}
++	static char buf[1024];
++	char in[48] = "";
+ 	if (!req->newptr) {
+-		return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++		if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++			return EBUSY;
++		}
++		size_t n = (size_t)snprintf(buf, sizeof(buf), "sweet_rpmh_sleepset v2 programmed=%u followed=%u", rh_set_programmed, rh_set_followed);
++		for (unsigned k = 0; k < rh_set_n && n < sizeof(buf); k++) {
++			n += (size_t)snprintf(buf + n, sizeof(buf) - n, " %s(%#x) sleep=%#x wake=%#x", rh_set[k].name, rh_set[k].address, rh_set[k].sleep,
++			    rh_set[k].wake);
++		}
++		buf[sizeof(buf) - 1] = 0;
++		int out = SYSCTL_OUT(req, buf, strlen(buf) + 1);
++		__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++		return out;
+ 	}
+-	char in[32] = "";
+ 	int error = sysctl_handle_string(oidp, in, sizeof(in), req);
+ 	if (error) {
+ 		return error;
+@@ -1495,16 +1531,28 @@ sysctl_sweet_rpmh_sleepset SYSCTL_HANDLER_ARGS
+ 		return ENXIO;
+ 	}
+ 	bool clear = strcmp(in, "clear") == 0;
+-	char *eq = strchr(in, '='), *colon = eq ? strchr(eq, ':') : NULL;
+-	uint32_t sl = 0, wk = 0, address = 0, aux = 0, aux_len = 0;
++	char *eq = strchr(in, '='), *colon = eq ? strchr(eq, ':') : NULL, *plus = NULL;
++	uint32_t sl = 0, wk = 0, address = 0, off = 0;
+ 	if (!clear) {
+-		if (eq == NULL || colon == NULL || eq[1] < '0' || eq[1] > '9' || colon != eq + 2 || colon[1] < '0' || colon[1] > '9' || colon[2] != 0) {
++		if (eq == NULL || colon == NULL) {
+ 			return EINVAL;
+ 		}
+ 		*eq = 0;
+-		sl = (uint32_t)(eq[1] - '0');
+-		wk = (uint32_t)(colon[1] - '0');
+-		if ((strcmp(in, "cx.lvl") && strcmp(in, "mx.lvl")) || wk < 4 || wk > 7 || sl > wk) {
++		*colon = 0;
++		if (!rh_number(eq + 1, &sl) || !rh_number(colon + 1, &wk)) {
++			return EINVAL;
++		}
++		if ((plus = strchr(in, '+')) != NULL) {
++			char d = plus[1];
++			off = d == '4' ? 4 : d == '8' ? 8 : (d == 'c' || d == 'C') ? 12 : 0xffu;
++			if (off == 0xffu || plus[2] != 0) {
++				return EINVAL;
++			}
++		}
++		if (in[0] == 0 || strlen(in) >= sizeof(rh_set[0].name)) {
++			return EINVAL;
++		}
++		if ((!strcmp(in, "cx.lvl") || !strcmp(in, "mx.lvl")) && (wk < 4 || wk > 7 || sl > wk)) {
+ 			return EINVAL;
+ 		}
+ 	}
+@@ -1515,25 +1563,38 @@ sysctl_sweet_rpmh_sleepset SYSCTL_HANDLER_ARGS
+ 		rh_set_n = 0;
+ 		rh_set_program();
+ 		printf("SWEET RPMH: sleep and wake sets emptied\n");
+-	} else if (!(error = rh_map()) && !(error = rh_lookup_slave(in, RH_ARC, &address, &aux, &aux_len))) {
+-		unsigned k;
+-		for (k = 0; k < rh_set_n && rh_set[k].address != address; k++) {
++	} else {
++		char shown[sizeof(rh_set[0].name)];
++		strlcpy(shown, in, sizeof(shown));
++		if (plus) {
++			*plus = 0;
+ 		}
+-		if (k == RH_SET_MAX) {
+-			error = ENOSPC;
+-		} else {
+-			rh_set[k].address = address;
+-			rh_set[k].sleep = sl;
+-			rh_set[k].wake = wk;
+-			strlcpy(rh_set[k].name, in, sizeof(rh_set[k].name));
+-			rh_set_n = k == rh_set_n ? k + 1 : rh_set_n;
+-			rh_set_program();
+-			printf("SWEET RPMH: %s (%#x) in the sleep set at level %u, in the wake set at %u\n", in, address, sl, wk);
++		if (!(error = rh_map()) && !(error = rh_lookup_any(in, &address))) {
++			if (off != 0 && (address >> 16) != RH_VRM) {
++				error = EINVAL;
++			}
++			address += off;
++		}
++		if (!error) {
++			unsigned k;
++			for (k = 0; k < rh_set_n && rh_set[k].address != address; k++) {
++			}
++			if (k == RH_SET_MAX) {
++				error = ENOSPC;
++			} else {
++				rh_set[k].address = address;
++				rh_set[k].sleep = sl;
++				rh_set[k].wake = wk;
++				strlcpy(rh_set[k].name, shown, sizeof(rh_set[k].name));
++				rh_set_n = k == rh_set_n ? k + 1 : rh_set_n;
++				rh_set_program();
++				printf("SWEET RPMH: %s (%#x) in the sleep set as %#x, in the wake set as %#x\n", shown, address, sl, wk);
++			}
+ 		}
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmh_sleepset, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_rpmh_sleepset, "A",
+-    "write cx.lvl=S:W (levels for the sleep and the wake set) or clear; read: what the sets hold (3113)");
++    "write NAME=S:W (request values for the sleep and the wake set, NAME+4 for an enable register) or clear; read: what the sets hold (3113, 3116)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
