@@ -1,0 +1,604 @@
+diff --git a/bsd/dev/beryllium_bt_hci.c b/bsd/dev/beryllium_bt_hci.c
+index a4ae760..ad08001 100644
+--- a/bsd/dev/beryllium_bt_hci.c
++++ b/bsd/dev/beryllium_bt_hci.c
+@@ -32,6 +32,7 @@
+ struct bt_hci_ops {
+ 	bool (*tx)(const uint8_t *pkt, unsigned len);   /* one complete H4 packet to the UART (wakes the controller) */
+ 	unsigned (*baud)(unsigned requested);           /* termios speed request: returns the speed in effect */
++	void (*kick)(void);                             /* 3126: userland wrote: the UART's reader looks now */
+ };
+ 
+ void bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_budget);
+@@ -39,6 +40,9 @@ void bt_hci_rx_packet(const uint8_t *pkt, unsigned len);
+ void bt_hci_rx_service(void);
+ void bt_hci_stats_periodic(bool force);
+ bool bt_hci_connected(void);
++bool bt_hci_cmd_pending(void);
++void bt_hci_uart_note(const uint8_t *pkt, unsigned len);
++int bt_hci_stats_fill(char *buf, size_t len);
+ 
+ #define BT_CTL_NAME     "com.apple.uart.bluetooth"
+ #define BT_CTL_NAME_SK  "com.apple.uart.sk.bluetooth"
+@@ -150,6 +154,56 @@ bt_log_pkt(const char *dir, const uint8_t *p, unsigned n)
+ 	}
+ }
+ 
++/*
++ * 3126: packets by kind for kern.sweet_bt_stats: what the controller sends (events by code, LE Meta by subevent,
++ * vendor events by their first byte; ACL, SCO, ISO as 0x1002, 0x1003, 0x1005) and what bluetoothd sends (commands by
++ * opcode). The last slot of a table takes what did not fit (key 0xffff). The controller's table is written under the
++ * UART lock, the commands' by the socket's writer.
++ */
++struct bt_hist { uint16_t key; uint32_t n, bytes; };
++static struct bt_hist bt_ev_hist[24], bt_cmd_hist[96];
++static uint32_t bt_adv_reports, bt_cmd_here;
++
++static void
++bt_hist_note(struct bt_hist *h, unsigned slots, unsigned key, unsigned bytes)
++{
++	unsigned i;
++
++	for (i = 0; i + 1 < slots; i++) {
++		if (h[i].n == 0) {
++			h[i].key = (uint16_t)key;
++		}
++		if (h[i].key == key) {
++			break;
++		}
++	}
++	if (i + 1 == slots) {
++		h[i].key = 0xffff;
++	}
++	h[i].n++;
++	h[i].bytes += bytes;
++}
++
++/* one whole H4 packet off the UART (under the UART lock) */
++void
++bt_hci_uart_note(const uint8_t *pkt, unsigned len)
++{
++	unsigned key = 0x1000u | pkt[0];
++
++	if (pkt[0] == 4 && len >= 3) {
++		key = pkt[1];
++		if (pkt[1] == 0x3e && len >= 4) {
++			key = 0x3e00u | pkt[3];
++			if ((pkt[3] == 0x0d || pkt[3] == 0x02) && len >= 5) {
++				bt_adv_reports += pkt[4];
++			}
++		} else if (pkt[1] == 0xff && len >= 4) {
++			key = 0xff00u | pkt[3];
++		}
++	}
++	bt_hist_note(bt_ev_hist, sizeof(bt_ev_hist) / sizeof(bt_ev_hist[0]), key, len);
++}
++
+ /* ------------------------------------------------------------ RX: UART -> ring -> socket */
+ 
+ bool
+@@ -260,6 +314,14 @@ bt_pend_answered(const uint8_t *p, unsigned len)
+ 	}
+ }
+ 
++/* 3126: a command is with the controller and not answered yet, or the kernel's own scan sequence runs */
++static bool bt_lescan_busy(void);
++bool
++bt_hci_cmd_pending(void)
++{
++	return os_atomic_load(&bt_pend.on, relaxed) || bt_lescan_busy();
++}
++
+ static void
+ bt_pend_check(void)
+ {
+@@ -375,6 +437,12 @@ static struct {
+ 	unsigned starts, stops, failed, timeouts;
+ } bx = { .mode = 1 };
+ 
++static bool
++bt_lescan_busy(void)
++{
++	return bx.busy;
++}
++
+ static unsigned
+ bt_fake_complete(uint8_t *ev, unsigned op, unsigned p0)
+ {
+@@ -801,7 +869,10 @@ bt_tx_feed(const uint8_t *p, size_t n)
+ 		if (bt.txtotal != 0 && bt.txn == bt.txtotal) {
+ 			bt_log_pkt("TX", bt.txb, bt.txn);
+ 			bt_cmd_note(bt.txb, bt.txn);
++			bt_hist_note(bt_cmd_hist, sizeof(bt_cmd_hist) / sizeof(bt_cmd_hist[0]),
++			    bt.txb[0] == 1 ? (unsigned)(bt.txb[1] | (bt.txb[2] << 8)) : 0x1000u | bt.txb[0], bt.txn);
+ 			if (bt_lescan_command(bt.txb, bt.txn) || bt_hci_local_answer(bt.txb, bt.txn)) {
++				bt_cmd_here++;
+ 				bt.tx_pkts++;
+ 			} else if ((bt_pend_set(bt.txb, bt.txn), bt.ops->tx(bt.txb, bt.txn))) {
+ 				bt.tx_pkts++;
+@@ -829,6 +900,9 @@ bt_ctl_send(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, mbuf_t m, int flag
+ 		}
+ 	}
+ 	mbuf_freem(m);
++	if (bt.ops != NULL && bt.ops->kick != NULL) {
++		bt.ops->kick();         /* 3126: an answer made here waits in the ring, the controller's is on its way */
++	}
+ 	return 0;
+ }
+ 
+@@ -958,6 +1032,37 @@ bt_hci_stats_periodic(bool force)
+ 	    bt.enq_fail + bt.enq_ok, bt.tx_pkts, bt.tx_bytes, bt.tx_fail, bt.tx_garbage, bt.connects);
+ }
+ 
++/* 3126: the second half of kern.sweet_bt_stats */
++int
++bt_hci_stats_fill(char *buf, size_t len)
++{
++	size_t off = 0;
++#define BS_CAT(...) do { int n_ = snprintf(buf + off, off < len ? len - off : 0, __VA_ARGS__); if (n_ > 0) { off += (size_t)n_; } if (off >= len) { off = len - 1; } } while (0)
++
++	BS_CAT("hci rx_pkts=%u rx_bytes=%llu ring_peak=%u drop_full=%u drop_nc=%u enq_fail=%u enq_ok=%u tx_pkts=%u tx_bytes=%llu tx_fail=%u "
++	    "here=%u fixed=%u watchdog=%u connects=%u adv_reports=%u\n", bt.rx_pkts, bt.rx_bytes, bt.ring_peak, bt.rx_drop_pkts,
++	    bt.rx_drop_nc, bt.enq_fail, bt.enq_ok, bt.tx_pkts, bt.tx_bytes, bt.tx_fail, bt_cmd_here, bt.compat_fixed,
++	    bt_watchdog_fired, bt.connects, bt_adv_reports);
++	BS_CAT("lescan want=%u cur=%u starts=%u stops=%u failed=%u timeouts=%u core1=%u/%u/%u core2=%u/%u/%u\n", bx.want, bx.cur,
++	    bx.starts, bx.stops, bx.failed, bx.timeouts, bx.core[0].type, bx.core[0].interval, bx.core[0].window,
++	    bx.core[1].type, bx.core[1].interval, bx.core[1].window);
++	BS_CAT("from_controller(key=pkts/bytes)");
++	for (unsigned i = 0; i < sizeof(bt_ev_hist) / sizeof(bt_ev_hist[0]); i++) {
++		if (bt_ev_hist[i].n) {
++			BS_CAT(" %04x=%u/%u", bt_ev_hist[i].key, bt_ev_hist[i].n, bt_ev_hist[i].bytes);
++		}
++	}
++	BS_CAT("\nfrom_bluetoothd(opcode=pkts)");
++	for (unsigned i = 0; i < sizeof(bt_cmd_hist) / sizeof(bt_cmd_hist[0]); i++) {
++		if (bt_cmd_hist[i].n) {
++			BS_CAT(" %04x=%u", bt_cmd_hist[i].key, bt_cmd_hist[i].n);
++		}
++	}
++	BS_CAT("\n");
++#undef BS_CAT
++	return (int)off;
++}
++
+ /* ------------------------------------------------------------ registration */
+ 
+ static errno_t
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 85ed4c0..2089e44 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -76,6 +76,7 @@ void beryllium_wlan_init(void);
+ struct bt_hci_ops {
+ 	bool (*tx)(const uint8_t *pkt, unsigned len);
+ 	unsigned (*baud)(unsigned requested);
++	void (*kick)(void);                             /* 3126: the reader looks now (userland wrote) */
+ };
+ extern void bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_budget);
+ extern void bt_hci_rx_packet(const uint8_t *pkt, unsigned len);
+@@ -83,6 +84,9 @@ extern void bt_hci_rx_service(void);
+ extern void bt_hci_stats_periodic(bool force);
+ extern bool bt_hci_connected(void);
+ extern bool bt_hci_streaming(void);
++extern bool bt_hci_cmd_pending(void);
++extern void bt_hci_uart_note(const uint8_t *pkt, unsigned len);
++extern int bt_hci_stats_fill(char *buf, size_t len);
+ #define WL_PART_READ(p, o, d, l)  sweet_ufs_read_part((p), (o), (d), (l))
+ #endif
+ 
+@@ -8896,7 +8900,6 @@ wl_rx_poll(void)
+ {
+ 	/* qcom_geni_serial_isr(): ack RX events; a completed S command (stale/last) is re-armed */
+ 	uint32_t irq = wl_rd(wl.se, SE_S_IRQ_STATUS);
+-	uint32_t st = wl_rd(wl.se, SE_RX_FIFO_STATUS);
+ 	if (irq & (S_CMD_DONE | S_RX_FIFO_RD_ERR | S_RX_FIFO_WR_ERR | S_RX_FIFO_WATERMARK | S_RX_FIFO_LAST)) {
+ 		if (irq & (S_RX_FIFO_RD_ERR | S_RX_FIFO_WR_ERR)) {
+ 			wl.xs_fifo_err++;
+@@ -8909,6 +8912,12 @@ wl_rx_poll(void)
+ 			wl_wr(wl.se, SE_S_CMD0, UART_START_READ << 27);
+ 		}
+ 	}
++	/*
++	 * 3126: the level is read after the events are acknowledged, as qcom_geni_serial_isr does: what arrives from here
++	 * on raises its event again. (Read before, a byte and its "last" event between the two reads lost the event; a
++	 * polling reader never noticed, one that waits for the interrupt would.)
++	 */
++	uint32_t st = wl_rd(wl.se, SE_RX_FIFO_STATUS);
+ 	uint32_t words = st & 0x1ffffffu;
+ 	wl.xs_polls++;
+ 	if (!words) {
+@@ -9808,6 +9817,22 @@ out:
+ 
+ /* ---------------------------------------------------------------- iOS HCI transport (sweetbt=1) */
+ 
++/*
++ * 3126: what the reader does, counted and read with kern.sweet_bt_stats (the "UART RX" lines on the console stop after
++ * ten minutes). Waits by kind, so that a wake-up count (kern.sweet_wake) can be put down to a branch of the loop; the
++ * controller's in-band sleep, by events and by time; bursts = polls that found bytes after one that found none.
++ */
++enum { BW_BURST, BW_TXGAP, BW_AWAKE, BW_AWAKE_PACED, BW_IDLE_GRID, BW_IDLE, BW_OFF_GRID, BW_OFF_IRQ, BW_N };
++static struct {
++	uint64_t w[BW_N];
++	uint64_t bursts, abs_awake, abs_asleep, last_abs;
++	uint64_t ibs_bytes;             /* in-band sleep bytes among the UART's: not packet data */
++	uint64_t gap[8];                /* silences inside a burst that ended with more bytes, by length (wl_bs_gap_us) */
++	volatile uint32_t kicks;
++	unsigned wake_ind, wake_ack;
++} wl_bs;
++static const uint32_t wl_bs_gap_us[7] = { 100, 200, 500, 1000, 2000, 5000, 10000 };
++
+ #define WL_BD_DEFAULT   { 0x02, 0x00, 0x5e, 0x77, 0xb0, 0x01 }  /* tools/mkadt.py mac-address-bluetooth0 */
+ #define QCA_EDL_WRITE_BD_ADDR_OPCODE    0xfc14u                 /* btqca.h EDL_WRITE_BD_ADDR_OPCODE */
+ 
+@@ -9912,6 +9937,7 @@ wl_xport_feed(uint8_t b)
+ 
+ 	if (wl.xs_st == 0) {
+ 		if (b >= IBS_WAKE_ACK && b <= IBS_SLEEP_IND) {
++			wl_bs.ibs_bytes++;
+ 			if (b == IBS_SLEEP_IND) {
+ 				wl.ibs_asleep = true;
+ 				wl.ibs_sleeps++;
+@@ -9919,6 +9945,9 @@ wl_xport_feed(uint8_t b)
+ 				wl.ibs_asleep = false;
+ 				if (b == IBS_WAKE_IND) {
+ 					wl.ibs_ack_pending = true;
++					wl_bs.wake_ind++;
++				} else {
++					wl_bs.wake_ack++;
+ 				}
+ 			}
+ 			if (wl.ibs_xlog < 24) {
+@@ -9962,6 +9991,7 @@ wl_xport_feed(uint8_t b)
+ 		wl.xs_st = 2;
+ 	}
+ 	if (wl.xs_st == 2 && wl.xs_have == wl.xs_total) {
++		bt_hci_uart_note(wl.xs_pkt, wl.xs_have);        /* 3126: counted by kind */
+ 		/* 3016: QCA's own debug stream, ACL on handle 0x2edc (Linux hci_qca QCA_DEBUG_HANDLE -> hci_recv_diag): not for iOS */
+ 		if (wl.xs_type != 2 || (wl.xs_pkt[1] | (wl.xs_pkt[2] << 8)) != 0x2edc) {
+ 			bt_hci_rx_packet(wl.xs_pkt, wl.xs_have);
+@@ -9994,7 +10024,18 @@ wl_xport_baud(unsigned requested)
+ 	return wl.baud;
+ }
+ 
+-static const struct bt_hci_ops wl_xport_ops = { wl_xport_tx, wl_xport_baud };
++/* 3126: userland wrote to the socket (a command, or one the kernel answered itself): the reader looks now */
++static event_t wl_bt_ev;
++static void
++wl_xport_kick(void)
++{
++	os_atomic_inc(&wl_bs.kicks, relaxed);   /* before the wake-up: a reader about to wait sees it (wl_xport_run) */
++	if (wl_bt_ev != NULL) {
++		thread_wakeup(wl_bt_ev);
++	}
++}
++
++static const struct bt_hci_ops wl_xport_ops = { wl_xport_tx, wl_xport_baud, wl_xport_kick };
+ 
+ static void
+ wl_sleep_us(unsigned us)
+@@ -10035,8 +10076,8 @@ wl_xport_start(void)
+ }
+ 
+ /*
+- * The RX loop, forever on the stage thread. Polled, not interrupt driven (no GENI IRQ plumbing in
+- * this tree): hardware flow control keeps it lossless. The FIFO holds rx_depth words; RFR drops at
++ * The RX loop, forever on the stage thread. Polled (3126: with the display off it waits for the
++ * engine's interrupt, see below): hardware flow control keeps it lossless. The FIFO holds rx_depth words; RFR drops at
+  * rx_depth - 2 words, so after the poll that last drained the FIFO the controller can send
+  * (rx_depth - 2) * 4 bytes before it is held off: about 190 us at 3 Mbaud (10 bits per byte) for
+  * a 16-word FIFO. While traffic flows the loop therefore polls every ~30 us; after 200 empty
+@@ -10049,28 +10090,212 @@ static unsigned wl_bt_idle_us = 20000;
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_bt_idle_us, CTLFLAG_RW | CTLFLAG_LOCKED, &wl_bt_idle_us, 0,
+     "Bluetooth UART poll period while the controller sleeps or nobody is connected, us");
+ 
++/*
++ * 3126: the reader with the display off and nothing streaming. On image 171 (2026-11-23, kern.sweet_wake) this thread's
++ * wait timer was the phone's largest waker: 155-190 expiries a second at home, 381 where many devices advertise.
++ * kern.sweet_bt_stats (below) says which waits they were, at home, in 60 s: 151 a second the "30 us" waits between the
++ * 200 empty polls that follow every burst (delay() blocks on a timer in this kernel, it does not spin: one burst from
++ * the controller, about 1.3 a second, cost up to 200 wake-ups), 33 a second the idle look on the grid, 3 the 2 ms look
++ * while the controller is awake. What the controller sends there: an advertising report a second (iOS scans 30 ms every
++ * 3 s with the display off), its sleep and wake bytes, and the answers to a command of bluetoothd's every 2 s.
++ *
++ * With kern.sweet_bt_off_us (2000..1000000, default 60000; 0: the waits of 3101) the display-off reader works like this:
++ *  - inside a burst it keeps the processor (wl_spin_us) and ends the burst after kern.sweet_bt_off_tail_us of silence
++ *    (default 1000: of the silences inside bursts measured, 60 % were under 1 ms; what comes later is the next look's);
++ *  - quiet, it arms the serial engine's receive interrupt (S_IRQ_EN: FIFO watermark, "last", read done, FIFO errors; GIC
++ *    SPI 607, level, CPU 0) and sleeps until it comes, with a safety look every kern.sweet_bt_irq_safety_ms (1000) in case
++ *    one is lost. sweet_bt_uart_intr() masks both enables at the engine and wakes the reader, which unmasks only when it
++ *    next waits, after asserting the wait;
++ *  - after packets it waits one period on the common grid with the interrupt masked before it arms again: a controller
++ *    that never stops talking costs one wake-up per period, and its bytes wait in the FIFO and, past rx_depth - 2 words,
++ *    in the controller (RFR), exactly as they already did for 20 ms while it slept. The controller's own sleep and wake
++ *    bytes do not count as packets (after its sleep byte it is silent), and a command of bluetoothd's that the controller
++ *    has not answered (bt_hci_cmd_pending) arms at once: its answer is due;
++ *  - a write to the socket wakes it at once (wl_xport_kick): what the kernel answered itself is in the ring.
++ * kern.sweet_bt_irq=0: no interrupt, a look every period on the grid instead (measured: 12 expiries a second, against 2
++ * with the interrupt). 64 interrupts in a row without the reader arming again take the line off at the GIC (a storm on
++ * CPU 0 is a frozen phone) and the reader goes on by the grid. Audio or any other ACL traffic within the last second
++ * (bt_hci_streaming) and the display on keep the waits of 3101. kern.sweet_bt_off_test=1: the display-off reader with
++ * the display on too, to load it (the Bluetooth page of Settings scans all the time).
++ */
++static unsigned wl_bt_off_us = 60000;
++static unsigned wl_bt_off_tail_us = 1000;
++static unsigned wl_bt_off_test = 0;
++static unsigned wl_bt_irq = 1;
++static unsigned wl_bt_irq_safety_ms = 1000;
++static uint32_t wl_bt_irqs, wl_bt_irq_run, wl_bt_irq_storms, wl_bt_irq_gic;
++static volatile bool wl_bt_irq_line;    /* the GIC line is on */
++SYSCTL_UINT(_kern, OID_AUTO, sweet_bt_off_us, CTLFLAG_RW | CTLFLAG_LOCKED, &wl_bt_off_us, 0,
++    "Bluetooth UART: the reader's period with the display off and nothing streaming, us, on the common grid; 0: as 3101 (3126)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_bt_off_tail_us, CTLFLAG_RW | CTLFLAG_LOCKED, &wl_bt_off_tail_us, 0,
++    "Bluetooth UART: the silence that ends a burst with the display off, us (3126)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_bt_off_test, CTLFLAG_RW | CTLFLAG_LOCKED, &wl_bt_off_test, 0,
++    "Bluetooth UART: 1 = the display-off reader with the display on too, a test (3126)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_bt_irq, CTLFLAG_RW | CTLFLAG_LOCKED, &wl_bt_irq, 0,
++    "Bluetooth UART: 1 = with the display off a quiet reader waits for the receive interrupt; 0 = it looks every period (3126)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_bt_irq_safety_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &wl_bt_irq_safety_ms, 0,
++    "Bluetooth UART: a look this often while waiting for the interrupt, ms (3126)");
++
++#define WL_BT_INTID     639u    /* GIC SPI 607: the serial engine at 0x898000 (sdm845; read in the Mi 8's live device tree) */
++
++/* sleh_irq: the serial engine's line. Both enables off at the engine (the line is a level), the reader woken. */
++bool sweet_bt_uart_intr(uint32_t intid);
++bool
++sweet_bt_uart_intr(uint32_t intid)
++{
++	if (intid != WL_BT_INTID) {
++		return false;
++	}
++	wl_bt_irqs++;
++	if (wl.se) {
++		*(volatile uint32_t *)(wl.se + SE_S_IRQ_EN) = 0;
++		*(volatile uint32_t *)(wl.se + SE_M_IRQ_EN) = 0;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	if (!wl.se || ++wl_bt_irq_run > 64) {
++		(void)sweet_gic_spi_setup(intid, 0, false);
++		wl_bt_irq_storms++;
++		wl_bt_irq_line = false;
++	}
++	if (wl_bt_ev != NULL) {
++		thread_wakeup(wl_bt_ev);
++	}
++	return true;
++}
++
++/* the reader: the line on at the GIC, nothing enabled at the engine yet */
++static void
++wl_bt_irq_setup(void)
++{
++	wl_wr(wl.se, SE_S_IRQ_EN, 0);
++	wl_wr(wl.se, SE_M_IRQ_EN, 0);
++	wl_bt_irq_run = 0;
++	wl_bt_irq_gic = sweet_gic_spi_setup(WL_BT_INTID, 0, true);
++	wl_bt_irq_line = (wl_bt_irq_gic & 1) != 0;
++}
++
++static int
++sysctl_sweet_bt_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	static char buf[4096];
++	static int busy;
++	uint64_t aw, as;
++	int n;
++
++	if (__atomic_exchange_n(&busy, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	absolutetime_to_nanoseconds(wl_bs.abs_awake, &aw);
++	absolutetime_to_nanoseconds(wl_bs.abs_asleep, &as);
++	n = snprintf(buf, sizeof(buf), "sweet_bt v1 ms=%u xport=%d paced=%d connected=%d asleep=%d streaming=%d pending=%d off_us=%u tail=%u irq=%u test=%u\n"
++	    "gaps_us <100=%llu <200=%llu <500=%llu <1000=%llu <2000=%llu <5000=%llu <10000=%llu more=%llu\n"
++	    "uart polls=%llu bytes=%llu bursts=%llu maxwords=%u depth=%u fifo_err=%u garbage=%u oversize=%u\n"
++	    "waits burst=%llu txgap=%llu awake=%llu awake_paced=%llu idle_grid=%llu idle=%llu off_grid=%llu off_irq=%llu kicks=%u\n"
++	    "ibs sleep_ind=%u wake_ind=%u wake_ack=%u host_wakes=%u failed=%u awake_ms=%llu asleep_ms=%llu\n"
++	    "irq line=%d gic=0x%x taken=%u storms=%u s_en=0x%x m_en=0x%x\n",
++	    wl_ms(), wl.xport, sweet_paced(), bt_hci_connected(), wl.ibs_asleep, bt_hci_streaming(), bt_hci_cmd_pending(),
++	    wl_bt_off_us, wl_bt_off_tail_us, wl_bt_irq, wl_bt_off_test,
++	    wl_bs.gap[0], wl_bs.gap[1], wl_bs.gap[2], wl_bs.gap[3], wl_bs.gap[4], wl_bs.gap[5], wl_bs.gap[6], wl_bs.gap[7],
++	    wl.xs_polls, wl.xs_bytes, wl_bs.bursts, wl.xs_maxwords, wl.rx_depth, wl.xs_fifo_err, wl.xs_garbage, wl.xs_oversize,
++	    wl_bs.w[BW_BURST], wl_bs.w[BW_TXGAP], wl_bs.w[BW_AWAKE], wl_bs.w[BW_AWAKE_PACED], wl_bs.w[BW_IDLE_GRID],
++	    wl_bs.w[BW_IDLE], wl_bs.w[BW_OFF_GRID], wl_bs.w[BW_OFF_IRQ], wl_bs.kicks,
++	    wl.ibs_sleeps, wl_bs.wake_ind, wl_bs.wake_ack, wl.xs_ibs_wake, wl.xs_ibs_wake_fail, aw / NSEC_PER_MSEC, as / NSEC_PER_MSEC,
++	    wl_bt_irq_line, wl_bt_irq_gic, wl_bt_irqs, wl_bt_irq_storms,
++	    wl.xport && wl.se ? wl_rd(wl.se, SE_S_IRQ_EN) : 0, wl.xport && wl.se ? wl_rd(wl.se, SE_M_IRQ_EN) : 0);
++	if (n > 0 && (size_t)n < sizeof(buf)) {
++		(void)bt_hci_stats_fill(buf + n, sizeof(buf) - (size_t)n);
++	}
++	int error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
++	__atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bt_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_bt_stats, "A",
++    "the Bluetooth UART reader: polls, waits by kind, in-band sleep, the interrupt, packets by kind (3126)");
++
++/* a wait of the display-off reader inside a burst: the processor stays (delay() of 30 us blocks on a timer here) */
++static void
++wl_spin_us(unsigned us)
++{
++	uint64_t end;
++	clock_interval_to_deadline(us, NSEC_PER_USEC, &end);
++	while (mach_absolute_time() < end) {
++		__asm__ volatile ("yield");
++	}
++}
++
++/* the events that wake the display-off reader: bytes (watermark, last), a read that ended, a FIFO error */
++#define WL_BT_IRQ_EVENTS        (S_CMD_DONE | S_RX_FIFO_RD_ERR | S_RX_FIFO_WR_ERR | S_RX_FIFO_WATERMARK | S_RX_FIFO_LAST)
++
+ static void
+ wl_xport_run(void)
+ {
+ 	unsigned idle = 0, last_ms = wl_ms(), lines = 0;
+-	uint64_t last_bytes = 0;
++	uint64_t last_bytes = 0, quiet_abs = 0, last_rx_abs = 0;
++	bool rx_since = false;          /* packet bytes since the last slow wait */
+ 
++	wl_bt_ev = wl_sleep_event();
+ 	for (;;) {
+-		bool got;
+-		uint64_t b0;
++		bool got, was_asleep, off;
++		uint32_t kicks0 = os_atomic_load(&wl_bs.kicks, relaxed);        /* before the look and the socket service */
++		uint64_t b0, d0, now;
+ 
+ 		if (os_atomic_load(&wl.tx_waiters, relaxed) > 0) {
++			wl_bs.w[BW_TXGAP]++;
+ 			wl_sleep_us(50);        /* let a transmitter take the lock */
+ 		}
+ 		lck_mtx_lock(&wl_hw_lock);
+ 		b0 = wl.xs_bytes;
++		d0 = wl.xs_bytes - wl_bs.ibs_bytes;
++		was_asleep = wl.ibs_asleep;
+ 		wl_rx_poll();
+ 		wl_ibs_service();
+ 		got = wl.xs_bytes != b0;
++		if (wl.xs_bytes - wl_bs.ibs_bytes != d0) {
++			rx_since = true;
++		}
+ 		lck_mtx_unlock(&wl_hw_lock);
++		now = mach_absolute_time();
++		if (wl_bs.last_abs != 0) {
++			*(was_asleep ? &wl_bs.abs_asleep : &wl_bs.abs_awake) += now - wl_bs.last_abs;
++		}
++		wl_bs.last_abs = now;
+ 		bt_hci_rx_service();
++		if (got) {
++			if (idle != 0) {
++				wl_bs.bursts++;
++				if (last_rx_abs != 0 && quiet_abs != 0) {
++					/* bytes after a silence inside the same burst: how long it was */
++					uint64_t ns;
++					unsigned g = 0;
++					absolutetime_to_nanoseconds(now - last_rx_abs, &ns);
++					while (g < 7 && ns / NSEC_PER_USEC >= wl_bs_gap_us[g]) {
++						g++;
++					}
++					wl_bs.gap[g]++;
++				}
++			}
++			last_rx_abs = now;
++			quiet_abs = now;        /* inside a burst */
++		}
+ 		idle = got ? 0 : idle + 1;
+-		if (idle < 200) {
++		/* 3126: the display-off reader (see above) */
++		off = wl_bt_off_us >= 2000 && wl_bt_off_us <= 1000000 && (sweet_paced() || wl_bt_off_test != 0) && !bt_hci_streaming();
++		if (off && quiet_abs != 0) {
++			/* inside a burst, the processor kept: until the line has been silent for the tail */
++			uint64_t tail_abs;
++			unsigned tail_us = wl_bt_off_tail_us >= 60 && wl_bt_off_tail_us <= 20000 ? wl_bt_off_tail_us : 1000;
++			nanoseconds_to_absolutetime((uint64_t)tail_us * NSEC_PER_USEC, &tail_abs);
++			if (now - quiet_abs < tail_abs) {
++				wl_bs.w[BW_BURST]++;
++				wl_spin_us(30);
++				goto stats;
++			}
++			quiet_abs = 0;
++			idle = 200;
++		}
++		if (!off && idle < 200) {
++			wl_bs.w[BW_BURST]++;
+ 			delay(30);
+ 		} else {
+ 			/*
+@@ -10084,16 +10309,81 @@ wl_xport_run(void)
+ 			 */
+ 			static bool bt_bound;
+ 			sweet_poll_bind(&bt_bound);
+-			if (bt_hci_connected() && !wl.ibs_asleep) {
++			quiet_abs = 0;
++			if (off) {
++				/*
++				 * A command of bluetoothd's not answered yet: its answer is due, no holding off. Otherwise packets
++				 * since the last slow wait mean one period on the grid before the interrupt is armed again (the
++				 * controller's own sleep and wake bytes do not count: after its sleep byte it is silent).
++				 */
++				bool pending = bt_hci_cmd_pending();
++				bool arm = wl_bt_irq != 0 && (pending || !rx_since);
++				if (arm && !wl_bt_irq_line && wl_bt_irq_storms == 0) {
++					wl_bt_irq_setup();
++					printf("SWEET BT: receive interrupt on (GIC INTID %u, setup %#x)\n", WL_BT_INTID, wl_bt_irq_gic);
++				}
++				if (arm && wl_bt_irq_line) {
++					/* until the interrupt, or the safety look (the command watchdog's pace while one is pending) */
++					unsigned look_ms = pending ? 100 : wl_bt_irq_safety_ms >= 100 && wl_bt_irq_safety_ms <= 60000 ? wl_bt_irq_safety_ms : 1000;
++					uint32_t taken = wl_bt_irqs;
++					(void)assert_wait_deadline(wl_bt_ev, THREAD_UNINT, sweet_poll_deadline_us((uint64_t)look_ms * 1000, !pending));
++					if (kicks0 != os_atomic_load(&wl_bs.kicks, relaxed)) {
++						(void)clear_wait(current_thread(), THREAD_AWAKENED);    /* userland wrote meanwhile */
++					} else {
++						/* armed after the wait is asserted: an interrupt that comes at once finds a waiter */
++						wl_bt_irq_run = 0;
++						wl_wr(wl.se, SE_S_IRQ_EN, WL_BT_IRQ_EVENTS);
++						thread_block(THREAD_CONTINUE_NULL);
++						wl_wr(wl.se, SE_S_IRQ_EN, 0);
++					}
++					wl_bs.w[BW_OFF_IRQ]++;
++					if (!pending && taken == wl_bt_irqs && kicks0 == os_atomic_load(&wl_bs.kicks, relaxed)) {
++						/* the safety look: the line again, in case the distributor lost it (a cluster power-down) */
++						wl_bt_irq_gic = sweet_gic_spi_setup(WL_BT_INTID, 0, true);
++					}
++				} else if (pending) {
++					wl_bs.w[BW_AWAKE_PACED]++;
++					wl_sleep_us(2000);
++				} else {
++					(void)assert_wait_deadline(wl_bt_ev, THREAD_UNINT, sweet_poll_deadline_us(wl_bt_off_us, true));
++					if (kicks0 != os_atomic_load(&wl_bs.kicks, relaxed)) {
++						(void)clear_wait(current_thread(), THREAD_AWAKENED);
++					} else {
++						thread_block(THREAD_CONTINUE_NULL);
++					}
++					wl_bs.w[BW_OFF_GRID]++;
++				}
++				rx_since = false;
++				if (kicks0 != os_atomic_load(&wl_bs.kicks, relaxed) && bt_hci_cmd_pending()) {
++					/* userland wrote a command for the controller: look for the answer as in a burst */
++					quiet_abs = mach_absolute_time();
++					last_rx_abs = 0;
++				}
++			} else if (bt_hci_connected() && !wl.ibs_asleep) {
+ 				/* awake: 300 us with the display on; 2 ms paced (the FIFO and flow control hold what arrives meanwhile) */
+-				wl_sleep_us(sweet_paced() && !bt_hci_streaming() ? 2000 : 300);
++				if (sweet_paced() && !bt_hci_streaming()) {
++					wl_bs.w[BW_AWAKE_PACED]++;
++					wl_sleep_us(2000);
++				} else {
++					wl_bs.w[BW_AWAKE]++;
++					wl_sleep_us(300);
++				}
+ 			} else if (wl_bt_idle_us > 2000 && wl_bt_idle_us <= 200000 && sweet_paced()) {
++				wl_bs.w[BW_IDLE_GRID]++;
+ 				(void)assert_wait_deadline(wl_sleep_event(), THREAD_UNINT, sweet_poll_deadline_us(wl_bt_idle_us, true));
+ 				thread_block(THREAD_CONTINUE_NULL);
+ 			} else {
++				wl_bs.w[BW_IDLE]++;
+ 				wl_sleep_us(2000);
+ 			}
+ 		}
++stats:
++		if (wl_bt_irq_line && wl_bt_irq == 0) {
++			/* switched off by hand: the line off at the GIC */
++			wl_wr(wl.se, SE_S_IRQ_EN, 0);
++			wl_bt_irq_gic = sweet_gic_spi_setup(WL_BT_INTID, 0, false);
++			wl_bt_irq_line = false;
++		}
+ 		if (wl_ms() - last_ms >= 10000) {
+ 			last_ms = wl_ms();
+ 			if (lines < 60 && (wl.xs_bytes != last_bytes || wl.xs_fifo_err)) {
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 23ac83a..5c4b8e4 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3196,7 +3196,8 @@ sleh_irq(arm_saved_state_t *state)
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 		extern bool sweet_qtimer_intr(uint32_t intid);  /* 3100, osfmk/arm64/cpu.c: the wake timer of a sleeping CPU 0 */
+ 		extern bool sweet_wlan_ce_intr(uint32_t intid); /* 3120, bsd/dev/beryllium_wlan.c: a Wi-Fi copy engine's line */
+-		if (!sweet_qtimer_intr(intid) && !sweet_wlan_ce_intr(intid) && cdp->interrupt_handler) {
++		extern bool sweet_bt_uart_intr(uint32_t intid); /* 3126, bsd/dev/beryllium_wlan.c: the Bluetooth UART's line */
++		if (!sweet_qtimer_intr(intid) && !sweet_wlan_ce_intr(intid) && !sweet_bt_uart_intr(intid) && cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
+ 			    cdp->interrupt_refCon,
+ 			    cdp->interrupt_nub,
