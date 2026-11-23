@@ -1,0 +1,20 @@
+diff --git a/bsd/dev/dipper_sensors.c b/bsd/dev/dipper_sensors.c
+index 120979a..0ef1d05 100644
+--- a/bsd/dev/dipper_sensors.c
++++ b/bsd/dev/dipper_sensors.c
+@@ -2537,11 +2537,12 @@ static struct {
+  * are stopped at the sensor DSP and started again when it comes on; light and proximity report on change and stay.
+  * iOS leaves the accelerometer on with the screen off (it would use it to wake on a raise, which this port does not
+  * do), and the DSP then naps 75 times a second instead of sleeping: in the power controller's table it never counts
+- * as asleep (slpi 0 N). 0 by default: a probe for what the stream costs and whether the DSP then sleeps.
++ * as asleep (slpi 0 N). Measured 2026-11-23: the DSP then sleeps for good (slpi 1 in the table), the streams come back
++ * at every wake, and the stream alone costs about 2 mA. 3125: 1 by default.
+  */
+-static int sc_screen_gate;
++static int sc_screen_gate = 1;  /* 3125: on by default (user, 2026-11-23); kern.sweet_ssc_screen_gate=0 for the streams as iOS asks */
+ SYSCTL_INT(_kern, OID_AUTO, sweet_ssc_screen_gate, CTLFLAG_RW | CTLFLAG_LOCKED, &sc_screen_gate, 0,
+-    "1: stop the accelerometer, gyroscope and compass streams at the sensor DSP while the screen is off (3124)");
++    "1: stop the accelerometer, gyroscope and compass streams at the sensor DSP while the screen is off (3124; default 1 since 3125)");
+ 
+ void sweet_ssc_sensor_rate(int kind, uint32_t interval_us);
+ void
