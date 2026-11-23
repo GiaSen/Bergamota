@@ -1,0 +1,32 @@
+diff --git a/bsd/dev/dipper_sensors.c b/bsd/dev/dipper_sensors.c
+index 006ad92..120979a 100644
+--- a/bsd/dev/dipper_sensors.c
++++ b/bsd/dev/dipper_sensors.c
+@@ -2532,6 +2532,17 @@ static struct {
+ 	int64_t ts_skew;                /* mach_absolute_time - SLPI timestamp, first sample */
+ } sc;
+ 
++/*
++ * 3124: kern.sweet_ssc_screen_gate=1: with the screen off the streaming sensors (accelerometer, gyroscope, compass)
++ * are stopped at the sensor DSP and started again when it comes on; light and proximity report on change and stay.
++ * iOS leaves the accelerometer on with the screen off (it would use it to wake on a raise, which this port does not
++ * do), and the DSP then naps 75 times a second instead of sleeping: in the power controller's table it never counts
++ * as asleep (slpi 0 N). 0 by default: a probe for what the stream costs and whether the DSP then sleeps.
++ */
++static int sc_screen_gate;
++SYSCTL_INT(_kern, OID_AUTO, sweet_ssc_screen_gate, CTLFLAG_RW | CTLFLAG_LOCKED, &sc_screen_gate, 0,
++    "1: stop the accelerometer, gyroscope and compass streams at the sensor DSP while the screen is off (3124)");
++
+ void sweet_ssc_sensor_rate(int kind, uint32_t interval_us);
+ void
+ sweet_ssc_sensor_rate(int kind, uint32_t interval_us)
+@@ -2935,6 +2946,9 @@ sc_step(void)
+ 	}
+ 	for (int k = 0; k < SC_N; k++) {
+ 		uint32_t want = __atomic_load_n(&sc.want_us[k], __ATOMIC_ACQUIRE);
++		if (sc_screen_gate && !sc_on_change[k] && sweet_paced()) {
++			want = 0;               /* 3124: the screen is off: no stream, whatever iOS left asked */
++		}
+ 		if (!sc.have[k] || want == sc.have_us[k]) {
+ 			continue;
+ 		}
