@@ -1,12 +1,13 @@
 #!/bin/sh
 # Boot image of the Mi 8 with its current boot-args: tools/dipper-mkboot.sh KERNEL OUT.img [ADT]
-# Default ADT enxerto/out/dipper-n104-2x-wlan-gpu-hap-cam2.adt (dipper-n104-2x-wlan-gpu.adt + /product/haptics,
-# /product/camera "flash" and /arm-io/isp "camera-rear" and "camera-front", made by tools/adt-haptics.py --rear-camera
-# --front-camera; images up to 130f used dipper-n104-2x-wlan-gpu-hap.adt (no isp node), 131-137 -hap-cam.adt (rear only)). Its canvas is the iPhone 11's, 414x896 points at @2x.
-# sweetfb_scale=2 (SWEETFB_SCALE, since image 133): the display scaler stretches that canvas onto the whole 1080x2248
-# panel (1.304 across, 1.254 down: 4 % wider than tall); 1 = fit with bars (~20 px black at each side, up to image 131).
-# A canvas of the panel's own shape (tools/adt-canvas.py --points 414x862, image 132) filled it without the 4 %, but iOS
-# then laid the status bar out for another screen, its icons pushed into the notch (user, 2026-11-09). The boot-args field holds 607 bytes: the default line is 606.
+# Default ADT enxerto/out/dipper-n104-2x-wlan-gpu-hap-cam2-862.adt (since image 174, 2026-11-24): dipper-n104-2x-wlan-gpu-hap-cam2.adt
+# (dipper-n104-2x-wlan-gpu.adt + /product/haptics, /product/camera "flash" and /arm-io/isp "camera-rear" and "camera-front", made by
+# tools/adt-haptics.py --rear-camera --front-camera) with the canvas of the panel's own shape, tools/adt-canvas.py --points 414x862
+# (828x1724 at @2x). sweetfb_scale=2 (SWEETFB_SCALE): the display scaler maps it onto the whole 1080x2248 panel, 1.3043 across and
+# 1.3039 down. iOS then needs the SpringBoard add-on sweetnotch (root_tweaks18.notch, RENEGADE_NOTCH=1) to keep the iPhone 11's
+# status bar; without it the status bar takes the generic layout near the notch (image 132, 2026-11-09). Images 133-173 used
+# -hap-cam2.adt, the iPhone 11's 414x896 canvas, stretched 1.304 across and 1.254 down (4 % wider than tall); images up to 130f
+# -hap.adt (no isp node), 131-137 -hap-cam.adt (rear only); up to image 131 sweetfb_scale=1 (fit, ~20 px black at each side). The boot-args field holds 607 bytes: the default line is 606.
 #   sweetwlan=5 ... sweet80211=3    Wi-Fi service
 #   sweetbt=1 sweetbtfast=1 sweetbtibs=1   Bluetooth next to it (xnu 3011, firmware in /usr/standalone/firmware/sweet)
 #   sweetcharger=2 sweetcharger_fcc=1700   charger control, 0.5 C of 3400 mAh
@@ -22,4 +23,4 @@ CMDLINE="debug=0xc serial=1 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled
 CMDLINE="$CMDLINE${EXTRA_ARGS:+ $EXTRA_ARGS}"
 [ "${#CMDLINE}" -le 607 ] || { echo "boot-args are ${#CMDLINE} bytes, the field holds 607" >&2; exit 1; }
 RENEGADE_TARGET=ios26 BOARD=dipper DTB="$PWD/dtb/dipper/dtb" CMDLINE="$CMDLINE" \
-	exec tools/renegade/mkboot-full.sh "$1" "${3:-enxerto/out/dipper-n104-2x-wlan-gpu-hap-cam2.adt}" "$2"
+	exec tools/renegade/mkboot-full.sh "$1" "${3:-enxerto/out/dipper-n104-2x-wlan-gpu-hap-cam2-862.adt}" "$2"
