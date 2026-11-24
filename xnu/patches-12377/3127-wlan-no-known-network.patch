@@ -1,0 +1,994 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 2089e44..ac3a9b1 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -4549,7 +4549,7 @@ static struct {
+ 	} ev[24];                       /* every WMI event id seen while scanning, with counts */
+ 	unsigned nev, htt;
+ 	uint64_t step_ms;
+-	bool htt_conf, started, completed, vdev;
++	bool htt_conf, started, completed, vdev, vreset;
+ 	uint8_t htt_major, htt_minor;
+ 	uint32_t reason;
+ 	unsigned count;                 /* scans started since WMI READY */
+@@ -4562,7 +4562,14 @@ static struct {
+ 		uint8_t raw_ssid[32];
+ 		uint16_t beacon_int, cap, ie_len;
+ 		unsigned seen;          /* scan.count when last heard */
++		uint8_t missed;         /* 3127: scans in a row that visited its channel and did not hear it */
++		uint64_t heard_abs;     /* 3127: when a scan last visited its channel with the entry alive */
+ 	} bss[SCAN_MAX_BSS];
++	/* 3127: the running scan: its channels (bits of scan_chans), active or passive; what the firmware's channel list allows */
++	uint32_t cover;
++	bool act, chan_act;
++	uint16_t act_dwell;
++	uint64_t visit_ms[SCAN_NCHAN];  /* when a completed scan last visited each channel */
+ } scan;
+ /* the BSS cache's IEs (SCAN_MAX_BSS x SWEET_WLAN_IE_MAX) and the lock between the service thread and ioctls */
+ static uint8_t *scan_ie;
+@@ -4572,6 +4579,88 @@ static LCK_MTX_DECLARE(scan_lock, &scan_grp);
+ static volatile bool scan_req;          /* sweet_80211 asked for a scan (WL2) */
+ static volatile bool scan_notify;       /* tell sweet_80211 when the running scan completes */
+ 
++/*
++ * 3127: what scanning costs. Counters (kern.sweet_wlan_scan), knobs for the scans iOS asks for while the display is
++ * off and no network is joined (kern.sweet_wlan_scan_min_s, 60 by default: no channel is visited again sooner than
++ * that, the cache answers for it; kern.sweet_wlan_scan_hot_s below; kern.sweet_wlan_scan_dwell_ms: the passive dwell),
++ * and a test switch, kern.sweet_wlan_hide=1: the driver stops hearing the network it is joined to (or was last): dropped from the cache,
++ * never cached again, and the link taken down as if the AP had gone, so that "no known network in range" can be had
++ * at a desk; a network iOS joins instead goes the same way (up to 4 names); 0 brings them all back, and the time from
++ * then to the next link is kept (rejoin_ms).
++ */
++static struct {
++	unsigned requests, cached, started, done, active, chans, presp;
++	uint64_t start_ms, total_ms, done_ms;   /* of the running scan; all scans together; when the last one ended */
++	unsigned last_ms;
++	uint64_t hide_clear_ms;
++	unsigned rejoin_ms, rejoin_scans;
++} sstat;
++static unsigned scan_min_s = 60;     /* 3127: on by default (measured 2026-11-24, NOTES) */
++static unsigned scan_dwell_ms = 150;
++/*
++ * 3127: kern.sweet_wlan_vdev_reset. Seen on the phone, 2026-11-24 (image 173c, the power controller's table): the modem
++ * sleeps about eight times a second before the first join of a boot and about ten while joined, but not once after a
++ * link went down, for minutes, with wifid and sweetcelld stopped, no copy engine interrupt at all, and power save and
++ * idle power save sent again. Everything the join set up is undone by then (peer deleted, VDEV_DOWN, VDEV_STOP,
++ * power save on): what is left is a vdev that has run once. 1 = after every teardown the station vdev is deleted and
++ * created again as at the start-up (VDEV_DELETE, then VDEV_CREATE, tx encapsulation, the power save parameters, power
++ * save on, idle power save on), with no scan; writing 2 (or 3) does it once now, as soon as the service is idle.
++ */
++static int vdev_reset = 1;            /* 3127: on by default */
++static volatile bool vdev_reset_kick;
++static unsigned vdev_resets;
++/*
++ * kern.sweet_wlan_scan_follow: 1 = a scan visits only the channels iOS asked for (it read none of the request before:
++ * every request was all 26 channels); 2 = where iOS asks for an active scan, probe requests (wildcard name) on 2.4 GHz
++ * channels 1-11, which every regulatory domain allows, with iOS's dwell; the other channels stay passive; 4 = with
++ * the display off the passive dwell is the request's (iOS asks for 110 ms) instead of kern.sweet_wlan_scan_dwell_ms. With
++ * kern.sweet_wlan_scan_min_s the rule is per channel: display off, no channel is visited again sooner than that.
++ */
++static unsigned scan_follow;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_scan_follow, CTLFLAG_RW | CTLFLAG_LOCKED, &scan_follow, 0,
++    "scans as iOS asks: 1 = only the channels of the request, 2 = active on 2.4 GHz channels 1-11 when the request is active, 4 = display off: the request's passive dwell (3127)");
++#define SCAN_COVER_ALL          ((1u << SCAN_NCHAN) - 1u)
++/*
++ * kern.sweet_wlan_scan_hot_s: the channels where a known network is expected follow this interval instead of
++ * kern.sweet_wlan_scan_min_s: a short look at them at every request keeps the way back onto a known network as quick
++ * as it was, while the full sweeps become rare. They are: every channel the network joined last was heard on at the
++ * join (its name on the other band, on a second access point), the same for the network joined before it, and the
++ * channels iOS names in an active request of up to four channels (it sends one before a full request, with the
++ * channels where it last saw the networks it knows: seen on the Mi 8 as the joined network's two bands).
++ */
++static unsigned scan_hot_s = 10;     /* 3127: on by default */
++SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_scan_hot_s, CTLFLAG_RW | CTLFLAG_LOCKED, &scan_hot_s, 0,
++    "display off, not joined: the channels iOS expects its networks on are visited again after this many s, not after scan_min_s (default 10; 0 = no such exception)");
++#define SCAN_HOT_MAX            4u
++static uint32_t scan_hot_req;           /* channels of iOS's last short active request (bits of scan_chans; scan_lock) */
++static uint32_t scan_hot_join[2];       /* channels of the network joined last and of the one before (service thread writes) */
++static uint32_t scan_pend_cover;        /* channels of the queued request (scan_lock) */
++static bool scan_pend_act;
++static uint16_t scan_pend_dwell;
++static volatile bool scan_req_notify;   /* the queued request waits behind a running scan: notice at its own end */
++#define SCAN_HIDE_MAX           4u
++static struct {
++	uint8_t len, ssid[32];
++} scan_hide[SCAN_HIDE_MAX];             /* the hidden names (never printed) */
++static unsigned scan_hide_n;
++static uint8_t scan_last_ssid[32], scan_last_len;       /* of the last association */
++static volatile bool scan_hide_kick;
++
++static bool
++scan_hidden(const uint8_t *ssid, size_t len)
++{
++	for (unsigned k = 0; k < scan_hide_n && k < SCAN_HIDE_MAX; k++) {
++		if (scan_hide[k].len == len && memcmp(scan_hide[k].ssid, ssid, len) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_scan_min_s, CTLFLAG_RW | CTLFLAG_LOCKED, &scan_min_s, 0,
++    "display off, not joined: no channel is visited again sooner than this many s, the cache answers (default 60; 0 = every request scans all)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_wlan_scan_dwell_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &scan_dwell_ms, 0,
++    "passive dwell per channel of a scan, ms (105..300, default 150)");
++
+ /* one WMI command: u32 id, then one TLV {u16 len, u16 tag} (more TLVs appended by the caller) */
+ static uint32_t
+ scan_cmd(uint8_t *c, uint32_t id, uint16_t tag, const void *v, uint16_t len)
+@@ -4688,6 +4777,7 @@ scan_step(void)
+ 		what = scan.step == 2 ? "pdev tx chain mask 3" : "pdev rx chain mask 3";
+ 		break;
+ 	}
++	case 20:                                /* 3127: the list again, channels 1-11 no longer passive, before an active scan */
+ 	case 4: {                               /* SCAN_CHAN_LIST: num_scan_chans, then ARRAY_STRUCT of CHANNEL TLVs */
+ 		uint32_t num = SCAN_NCHAN;
+ 		n = scan_cmd(c, 0x3003, 79, &num, 4);
+@@ -4701,13 +4791,14 @@ scan_step(void)
+ 			memset(ch, 0, sizeof(ch));
+ 			ch[0] = scan_chans[k];
+ 			ch[1] = scan_chans[k];
++			bool act = scan.step == 20 && scan_chans[k] <= 2462;
+ 			/* mode 11G (1) / 11A (0), flags PASSIVE | ALLOW_HT | ALLOW_VHT (| DFS) */
+-			ch[3] = (g5 ? 0u : 1u) | (1u << 7) | (1u << 11) | (1u << 12) | (dfs ? (1u << 10) : 0);
++			ch[3] = (g5 ? 0u : 1u) | (act ? 0u : 1u << 7) | (1u << 11) | (1u << 12) | (dfs ? (1u << 10) : 0);
+ 			ch[4] = 0u | (40u << 8) | (40u << 16);   /* min 0, max 20 dBm, reg 20 dBm (0.5 dBm units), class 0 */
+ 			ch[5] = 0u | (40u << 8);                 /* antenna_max 0, max_tx_power 20 dBm */
+ 			scan_tlv(c, &n, 80, ch, 24);
+ 		}
+-		what = "scan channel list (all passive)";
++		what = scan.step == 20 ? "scan channel list (2.4 GHz channels 1-11 active)" : "scan channel list (all passive)";
+ 		break;
+ 	}
+ 	case 5: {                               /* PDEV_SET_REGDOMAIN: APL1 (0x52), CTL 2 GHz ETSI 0x30, 5 GHz FCC 0x10 */
+@@ -4716,6 +4807,18 @@ scan_step(void)
+ 		what = "pdev regdomain 0x52";
+ 		break;
+ 	}
++	case 21: {                              /* 3127: VDEV_DELETE vdev 0, for kern.sweet_wlan_vdev_reset */
++		uint32_t v[1] = { 0 };
++		n = scan_cmd(c, 0x5002, 87, v, 4);
++		what = "vdev 0 delete";
++		break;
++	}
++	case 22:                                /* then the start-up's steps from VDEV_CREATE on, 150 ms later */
++		if (ms_now_ms() < scan.step_ms + 150) {
++			return false;
++		}
++		scan.step = 6;
++		return true;
+ 	case 6: {                               /* VDEV_CREATE vdev 0, station (2), no subtype, MAC */
+ 		uint32_t v[5] = { 0, 2, 0, 0, 0 };
+ 		memcpy(&v[3], scan_mac, 6);
+@@ -4762,28 +4865,47 @@ scan_step(void)
+ 		s[2] = 0;                       /* vdev */
+ 		s[3] = 1;                       /* priority low */
+ 		s[4] = 0x11f;                   /* notify: started completed bss foreign dequeued foreign-exit */
+-		s[5] = 50;                      /* dwell active */
+-		s[6] = 150;                     /* dwell passive */
++		s[5] = scan.act && scan.act_dwell >= 20 && scan.act_dwell <= 120 ? scan.act_dwell : 50;   /* dwell active */
++		s[6] = scan_dwell_ms >= 105 && scan_dwell_ms <= 300 ? scan_dwell_ms : 150;     /* dwell passive */
++		if ((scan_follow & 4) && sweet_paced() && scan.act_dwell >= 105 && scan.act_dwell <= 300) {
++			s[6] = scan.act_dwell;  /* the display off: the dwell iOS asks for (110 ms in its passive scans) */
++		}
+ 		s[7] = 50;                      /* min rest */
+ 		s[8] = 500;                     /* max rest */
+ 		s[12] = 20000;                  /* max scan time */
+ 		s[13] = 5;                      /* probe delay */
+-		s[14] = 0x31;                   /* CHAN_STAT_EVENT | PASSIVE, FILTER_PROBE_REQ inverted for TLV */
+-		s[16] = SCAN_NCHAN;
++		/*
++		 * CHAN_STAT_EVENT | PASSIVE, FILTER_PROBE_REQ inverted for TLV. 3127, active: no PASSIVE, and the firmware
++		 * builds the probe request itself: ADD_BCAST_PROBE_REQ | ADD_CCK_RATES | ADD_OFDM_RATES (as qcacld asks)
++		 */
++		s[14] = scan.act ? 0x3e : 0x31;
++		uint32_t f[SCAN_NCHAN], nf = 0;
++		if (!scan.cover) {
++			scan.cover = SCAN_COVER_ALL;    /* the start-up scan */
++		}
++		for (unsigned k = 0; k < SCAN_NCHAN; k++) {
++			if (scan.cover & (1u << k)) {
++				f[nf++] = scan_chans[k];
++			}
++		}
++		s[16] = nf;
+ 		s[17] = 1;                      /* num_bssids: broadcast */
+-		s[18] = 0;                      /* num_ssids: passive */
+-		s[20] = 3;                      /* num_probes */
++		s[18] = scan.act ? 1 : 0;       /* num_ssids: one empty name (wildcard) when active, none when passive */
++		s[20] = scan.act ? 2 : 3;       /* num_probes */
+ 		n = scan_cmd(c, 0x3001, 77, s, 100);
+-		uint32_t f[SCAN_NCHAN];
+-		for (unsigned k = 0; k < SCAN_NCHAN; k++) {
+-			f[k] = scan_chans[k];
++		scan_tlv(c, &n, 16, f, (uint16_t)(nf * 4));    /* channel list, MHz */
++		if (scan.act) {
++			uint8_t wild[36] = { 0 };               /* wmi_ssid {len, ssid[32]}: length 0 */
++			scan_tlv(c, &n, 19, wild, sizeof(wild));
++		} else {
++			scan_tlv(c, &n, 19, NULL, 0);          /* ssids: none */
+ 		}
+-		scan_tlv(c, &n, 16, f, (uint16_t)sizeof(f));   /* channel list, MHz */
+-		scan_tlv(c, &n, 19, NULL, 0);                  /* ssids: none */
+ 		uint8_t bc[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0 };
+ 		scan_tlv(c, &n, 19, bc, 8);                    /* bssids: broadcast */
+ 		scan_tlv(c, &n, 17, NULL, 0);                  /* ie: none */
+-		what = "start scan (passive)";
++		what = scan.act ? "start scan (active)" : "start scan (passive)";
++		sstat.chans += nf;
++		sstat.active += scan.act ? 1 : 0;
+ 		break;
+ 	}
+ 	default:
+@@ -4794,14 +4916,37 @@ scan_step(void)
+ 	}
+ 	if (scan.step == 13) {
+ 		scan.count++;
++		sstat.started++;
++		sstat.start_ms = ms_now_ms();
+ 	}
+-	if (scan.count <= 1) {
++	if (scan.count <= 1 || scan.vreset) {
+ 		printf("SWEET IPC: scan: %s (%u bytes)\n", what, n);
+ 		ipc_note(" scan %s;", what);
+ 	}
++	if (scan.step == 20) {
++		printf("SWEET IPC: scan: %s (%u bytes)\n", what, n);
++		scan.chan_act = true;
++		scan.step = 12;                 /* 3127: then START_SCAN */
++	}
+ 	scan.step++;
+ 	scan.step_ms = ms_now_ms();
+ 	wf.sent_ms = ms_now_ms();               /* each step gets its own 30 s */
++	if (scan.step == 13 && scan.vreset) {   /* 3127: the vdev is new; no scan follows */
++		scan.vreset = false;
++		vdev_resets++;
++		lck_mtx_lock(&scan_lock);
++		if (scan_notify && !scan_req) {
++			/* a request came in meanwhile and waits for "a running scan" to end: give it one */
++			scan_req = true;
++			scan_pend_cover = SCAN_COVER_ALL;
++			scan_pend_act = false;
++			scan_pend_dwell = 0;
++		}
++		wf.state = WS_SCAN_DONE;
++		lck_mtx_unlock(&scan_lock);
++		printf("SWEET IPC: scan: the station vdev created again (%u so far)\n", vdev_resets);
++		return true;
++	}
+ 	if (scan.step == 14) {
+ 		wf.state = WS_SCANNING;
+ 		wf.sent_ms = ms_now_ms();
+@@ -4814,12 +4959,31 @@ scan_step(void)
+  * keeps a network until three scans in a row did not hear it (scan_lock held; IEs move with their entry).
+  */
+ static void
+-scan_age(void)
++scan_age(bool complete)
+ {
+ 	unsigned w = 0;
++	uint64_t now = mach_absolute_time(), now_ms = ms_now_ms();
++	uint32_t cover = scan.cover ? scan.cover : SCAN_COVER_ALL;
++	for (unsigned k = 0; k < SCAN_NCHAN; k++) {
++		if (complete && (cover & (1u << k))) {  /* a scan cut short (a join) has not visited them all */
++			scan.visit_ms[k] = now_ms;
++		}
++	}
+ 	for (unsigned k = 0; k < scan.nbss; k++) {
+-		if (scan.bss[k].seen + 3 <= scan.count) {
+-			continue;
++		/* 3127: a scan that did not visit an entry's channel says nothing about it */
++		bool visited = true;
++		for (unsigned c = 0; c < SCAN_NCHAN; c++) {
++			if (scan_chans[c] == scan.bss[k].mhz) {
++				visited = (cover & (1u << c)) != 0;
++			}
++		}
++		if (visited) {
++			if (scan.bss[k].seen == scan.count) {
++				scan.bss[k].missed = 0;
++			} else if (++scan.bss[k].missed >= 3) {
++				continue;
++			}
++			scan.bss[k].heard_abs = now;
+ 		}
+ 		if (w != k) {
+ 			scan.bss[w] = scan.bss[k];
+@@ -4830,7 +4994,7 @@ scan_age(void)
+ 		w++;
+ 	}
+ 	scan.nbss = w;
+-	sweet_wlan_scan_abs = mach_absolute_time();
++	sweet_wlan_scan_abs = now;
+ }
+ 
+ /* SCAN_EVENT (tag 36: type, reason, freq, req id, scan id, vdev) */
+@@ -4868,7 +5032,14 @@ scan_event(const uint8_t *t, uint32_t len)
+ 		ipc_note(" scan done r%u: %u ch, %u frames, %u bss;", e[1], scan.foreign, scan.beacons, scan.nbss);
+ 		/* state and notice together under the cache lock (sweet_wlan_scan_request reads them under it) */
+ 		lck_mtx_lock(&scan_lock);
+-		scan_age();
++		scan_age(e[1] == 0);
++		sstat.done++;
++		sstat.done_ms = ms_now_ms();
++		sstat.last_ms = sstat.start_ms ? (unsigned)(sstat.done_ms - sstat.start_ms) : 0;
++		sstat.total_ms += sstat.last_ms;
++		if (sstat.hide_clear_ms) {
++			sstat.rejoin_scans++;
++		}
+ 		wf.state = WS_SCAN_DONE;
+ 		bool notify = scan_notify;
+ 		scan_notify = false;
+@@ -4914,6 +5085,17 @@ scan_mgmt_rx(const uint8_t *t, uint32_t len)
+ 		return;
+ 	}
+ 	scan.beacons++;
++	sstat.presp += fc == 0x50 ? 1 : 0;
++	if (scan_hide_n) {                      /* 3127, the test switch: these networks are not heard */
++		for (uint32_t o = 36; o + 2 <= frl && o + 2u + fr[o + 1] <= frl; o += 2u + fr[o + 1]) {
++			if (fr[o] == 0) {
++				if (scan_hidden(fr + o + 2, fr[o + 1])) {
++					return;
++				}
++				break;
++			}
++		}
++	}
+ 	uint16_t mhz = hd[0] > 196 ? (uint16_t)hd[0] : (uint16_t)(hd[0] == 14 ? 2484 : hd[0] <= 13 ? 2407 + 5 * hd[0] :
+ 	    5000 + 5 * hd[0]);
+ 	int rssi = (int)hd[1] - 95;
+@@ -4936,6 +5118,8 @@ scan_mgmt_rx(const uint8_t *t, uint32_t len)
+ 	}
+ 	unsigned k = scan.nbss++;
+ 	scan.bss[k].seen = scan.count;
++	scan.bss[k].missed = 0;
++	scan.bss[k].heard_abs = mach_absolute_time();
+ 	memcpy(scan.bss[k].bssid, bssid, 6);
+ 	scan.bss[k].mhz = mhz;
+ 	scan.bss[k].rssi = (int8_t)MAX(-128, MIN(127, rssi));
+@@ -7022,6 +7206,37 @@ sta_connected(void)
+ 	    sta.bssid[1], sta.bssid[2], sta.bssid[3], sta.bssid[4], sta.bssid[5], sta.aid, sta.rsn ? "WPA2-PSK" : "open",
+ 	    ms_now_ms() - sta.join_ms);
+ 	ipc_note(" sta CONNECTED %llu ms;", ms_now_ms() - sta.join_ms);
++	/* 3127: where this network is heard, for the short looks with the display off (its channels now, and the last one's) */
++	uint32_t hot = 0;
++	unsigned len = MIN(sta.req.ssid_len, 32);
++	for (unsigned k = 0; k < SCAN_NCHAN; k++) {
++		if (scan_chans[k] == sta.mhz) {
++			hot |= 1u << k;
++		}
++		for (unsigned i = 0; i < scan.nbss; i++) {
++			if (scan.bss[i].mhz == scan_chans[k] && scan.bss[i].ssid_len == len && len &&
++			    memcmp(scan.bss[i].raw_ssid, sta.req.ssid, len) == 0) {
++				hot |= 1u << k;
++			}
++		}
++	}
++	if (scan_last_len == len && memcmp(scan_last_ssid, sta.req.ssid, len) == 0) {
++		scan_hot_join[0] |= hot;        /* the same network again: another of its access points, perhaps */
++	} else {
++		scan_hot_join[1] = scan_hot_join[0];
++		scan_hot_join[0] = hot;
++	}
++	scan_last_len = len;
++	memcpy(scan_last_ssid, sta.req.ssid, scan_last_len);
++	if (scan_hide_n) {                      /* 3127: while the test switch is on, whatever iOS joins is hidden as well */
++		scan_hide_kick = true;
++	}
++	if (sstat.hide_clear_ms) {              /* 3127: from the test switch's "heard again" to the link */
++		sstat.rejoin_ms = (unsigned)(ms_now_ms() - sstat.hide_clear_ms);
++		sstat.hide_clear_ms = 0;
++		printf("SWEET WLAN sta: test switch: joined %u ms after the network was heard again (%u scans)\n", sstat.rejoin_ms,
++		    sstat.rejoin_scans);
++	}
+ 	sta_ps_apply();
+ 	sweet80211_link(1, 0, false);           /* link state and events first: wifid reads them once GET 21 says 1 */
+ 	lck_mtx_lock(&sta_lock);
+@@ -7231,6 +7446,9 @@ sta_step(void)
+ 			}
+ 			sta.wq_n = 0;
+ 			sta_ps_mode(1, "power save on (no channel)");   /* 3036: as at VDEV_CREATE */
++			if (vdev_reset & 1) {
++				vdev_reset_kick = true;         /* 3127: and the vdev made new (svc_vdev_reset) */
++			}
+ 			sta.vdev_started = false;
+ 			sta.peer_mapped = false;
+ 			sta.mgmt_busy = false;
+@@ -7736,17 +7954,98 @@ sweet_wlan_scan_time(void)
+  * ---- WL2: scans on request from sweet_80211 (sweet80211=3) and the BSS cache of the last scan. Only the
+  * service thread touches the chip; a request sets a flag the service picks up when the previous scan is done.
+  */
++/* 3127: the channels where a known network is expected (kern.sweet_wlan_scan_hot_s) */
++static uint32_t
++scan_hot_mask(void)
++{
++	return scan_hot_req | scan_hot_join[0] | scan_hot_join[1];
++}
++
++/*
++ * 3127: the channels a request needs visited now (scan_lock held): the display off, not the ones a scan visited less
++ * than kern.sweet_wlan_scan_min_s ago, or kern.sweet_wlan_scan_hot_s for the channels of a known network
++ */
++static uint32_t
++scan_need(uint32_t want)
++{
++	if ((scan_min_s || scan_hot_s) && sweet_paced()) {
++		uint64_t now = ms_now_ms();
++		uint32_t hot = scan_hot_s ? scan_hot_mask() : 0;
++		for (unsigned k = 0; k < SCAN_NCHAN; k++) {
++			unsigned s = (hot & (1u << k)) ? scan_hot_s : scan_min_s;
++			if (s && scan.visit_ms[k] && now < scan.visit_ms[k] + (uint64_t)s * 1000) {
++				want &= ~(1u << k);
++			}
++		}
++	}
++	return want;
++}
++
+ int
+-sweet_wlan_scan_request(void)
++sweet_wlan_scan_request(const struct sweet_wlan_scan_req *r)
+ {
+ 	int err = ENXIO;
++	/* 3127: the channels asked for, when the driver follows the request; else, and for a request it cannot read, all */
++	bool follow = (scan_follow & 1) && r && r->parsed && r->nchan_asked;
++	bool act = (scan_follow & 2) && r && r->parsed && r->scan_type != 2;
++	uint32_t want = SCAN_COVER_ALL;
++	if (follow) {
++		want = 0;
++		for (unsigned i = 0; i < r->nchan && i < SWEET_WLAN_REQ_CHANS; i++) {
++			for (unsigned k = 0; k < SCAN_NCHAN; k++) {
++				if (scan_chans[k] == r->mhz[i]) {
++					want |= 1u << k;
++				}
++			}
++		}
++	}
+ 	lck_mtx_lock(&scan_lock);
++	sstat.requests++;
++	if (r && r->parsed && r->scan_type == 1 && r->nchan_asked && r->nchan_asked <= SCAN_HOT_MAX) {
++		/* a short list in an active request: where iOS looks first for the networks it knows */
++		uint32_t hot = 0;
++		for (unsigned i = 0; i < r->nchan && i < SWEET_WLAN_REQ_CHANS; i++) {
++			for (unsigned k = 0; k < SCAN_NCHAN; k++) {
++				if (scan_chans[k] == r->mhz[i]) {
++					hot |= 1u << k;
++				}
++			}
++		}
++		if (hot) {
++			scan_hot_req = hot;
++		}
++	}
+ 	/* while a join runs or the station is associated the cached list answers (sweet_80211's 300 ms path) */
+ 	if (wl.service && ipc.scan && wce.rings && !mw.fatal && sta.state == ST_IDLE && !sta.req_pending &&
+ 	    (wf.state == WS_SCAN_DONE || wf.state == WS_SCAN_SETUP || wf.state == WS_SCANNING)) {
+-		scan_notify = true;
+-		if (wf.state == WS_SCAN_DONE) {
+-			scan_req = true;        /* a new scan; a running one just reports when it ends */
++		bool idle = wf.state == WS_SCAN_DONE;
++		/*
++		 * 3127: nothing to visit, because none of the channels asked for is this radio's or (display off) all of
++		 * them were visited moments ago: the cache answers too; its entries keep their true age
++		 */
++		if (idle && !scan_req && scan_need(want) == 0) {
++			sstat.cached++;
++			lck_mtx_unlock(&scan_lock);
++			return EALREADY;
++		}
++		if (idle || follow) {
++			/* a new scan; behind a running one when the request names its channels */
++			if (scan_req) {
++				scan_pend_cover |= want;
++				scan_pend_act = scan_pend_act && act;
++			} else {
++				scan_pend_cover = want;
++				scan_pend_act = act;
++				scan_pend_dwell = r ? r->dwell_ms : 0;
++			}
++			scan_req = true;
++			if (idle) {
++				scan_notify = true;
++			} else {
++				scan_req_notify = true;
++			}
++		} else {
++			scan_notify = true;     /* a running scan of everything just reports when it ends */
+ 		}
+ 		err = 0;
+ 	}
+@@ -7759,8 +8058,9 @@ static void
+ scan_flush_notify(const char *why)
+ {
+ 	lck_mtx_lock(&scan_lock);
+-	bool notify = scan_notify;
++	bool notify = scan_notify || scan_req_notify;
+ 	scan_notify = false;
++	scan_req_notify = false;
+ 	scan_req = false;
+ 	lck_mtx_unlock(&scan_lock);
+ 	if (notify) {
+@@ -7785,6 +8085,7 @@ sweet_wlan_bss_get(unsigned i, struct sweet_wlan_bss *out)
+ 		out->ssid_len = scan.bss[i].ssid_len;
+ 		memcpy(out->ssid, scan.bss[i].raw_ssid, scan.bss[i].ssid_len);
+ 		out->ie_len = scan.bss[i].ie_len;
++		out->heard_abs = scan.bss[i].heard_abs;
+ 		memcpy(out->ie, scan_ie + i * SWEET_WLAN_IE_MAX, scan.bss[i].ie_len);
+ 		err = 0;
+ 	}
+@@ -7792,6 +8093,138 @@ sweet_wlan_bss_get(unsigned i, struct sweet_wlan_bss *out)
+ 	return err;
+ }
+ 
++/* 3127: the scan counters, for a logger on the phone */
++static int
++sysctl_sweet_wlan_scan SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char out[480];
++	uint64_t now = ms_now_ms();
++	/* the firmware's services that bear on a search of its own: NLO 17, WOW 13, SCAN_SCH 19, EXTSCAN 61 (ath10k wmi-tlv.h) */
++	(void)snprintf(out, sizeof(out), "sweet_wlan_scan v1 req=%u cached=%u started=%u done=%u scan_ms=%llu last_ms=%u "
++	    "chans=%u active=%u presp=%u since_ms=%llu nbss=%u sta=%s hide=%u rejoin_ms=%u rejoin_scans=%u follow=%u min_s=%u "
++	    "hot_s=%u hot=0x%x hotr=0x%x dwell=%u svc_nlo=%d svc_wow=%d svc_sch=%d svc_ext=%d", sstat.requests,
++	    sstat.cached, sstat.started, sstat.done, sstat.total_ms, sstat.last_ms, sstat.chans, sstat.active, sstat.presp,
++	    sstat.done_ms ? now - sstat.done_ms : 0, scan.nbss, sta.connected ? "joined" : sta.state == ST_IDLE ? "idle" : "busy",
++	    scan_hide_n, sstat.rejoin_ms, sstat.rejoin_scans, scan_follow, scan_min_s, scan_hot_s, scan_hot_mask(), scan_hot_req, scan_dwell_ms,
++	    wmi_svc_on(17), wmi_svc_on(13),
++	    wmi_svc_on(19), wmi_svc_on(61));
++	return SYSCTL_OUT(req, out, strlen(out) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wlan_scan, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_wlan_scan, "A",
++    "Wi-Fi scans: requests from iOS, answered from the cache, started, completed, ms spent scanning (3127)");
++
++/* 3127, the test switch: 1 = stop hearing the network joined now (or last), 0 = hear every network again */
++static int
++sysctl_sweet_wlan_hide SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = scan_hide_n != 0;
++	int error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	lck_mtx_lock(&scan_lock);
++	bool was = scan_hide_n != 0;
++	if (v && !scan_last_len) {
++		lck_mtx_unlock(&scan_lock);
++		return ENOENT;                  /* nothing joined since boot: no name to hide */
++	}
++	if (v) {
++		sstat.hide_clear_ms = 0;
++		sstat.rejoin_ms = sstat.rejoin_scans = 0;
++		scan_hide_kick = true;          /* the service thread adds the name, clears the cache of it, takes the link down */
++	} else {
++		scan_hide_n = 0;
++		if (was) {
++			sstat.hide_clear_ms = ms_now_ms();
++			sstat.rejoin_ms = sstat.rejoin_scans = 0;
++		}
++	}
++	lck_mtx_unlock(&scan_lock);
++	printf("SWEET WLAN: test switch: the joined network is %s\n", v ? "to be hidden from the driver" : "heard again");
++	thread_wakeup(&wl.sleep_chan);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wlan_hide, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_wlan_hide, "I",
++    "test: 1 = the Wi-Fi driver stops hearing the network joined now or last (link down as if the AP had gone), 0 = heard again (3127)");
++
++/*
++ * service thread, the test switch: the last joined name joins the hidden ones, the cache loses their entries, and a
++ * link to one of them goes down as when the firmware loses the AP
++ */
++static void
++scan_hide_pump(void)
++{
++	if (!scan_hide_kick) {
++		return;
++	}
++	scan_hide_kick = false;
++	lck_mtx_lock(&scan_lock);
++	if (scan_last_len && !scan_hidden(scan_last_ssid, scan_last_len) && scan_hide_n < SCAN_HIDE_MAX) {
++		scan_hide[scan_hide_n].len = scan_last_len;
++		memcpy(scan_hide[scan_hide_n].ssid, scan_last_ssid, scan_last_len);
++		scan_hide_n++;
++	}
++	unsigned w = 0;
++	for (unsigned k = 0; k < scan.nbss; k++) {
++		if (scan_hidden(scan.bss[k].raw_ssid, scan.bss[k].ssid_len)) {
++			continue;
++		}
++		if (w != k) {
++			scan.bss[w] = scan.bss[k];
++			if (scan_ie) {
++				memmove(scan_ie + w * SWEET_WLAN_IE_MAX, scan_ie + k * SWEET_WLAN_IE_MAX, SWEET_WLAN_IE_MAX);
++			}
++		}
++		w++;
++	}
++	scan.nbss = w;
++	unsigned n = scan_hide_n;
++	lck_mtx_unlock(&scan_lock);
++	if (n && sta.state == ST_CONNECTED && scan_hidden(sta.req.ssid, sta.req.ssid_len)) {
++		printf("SWEET WLAN sta: test switch: the joined network is hidden (%u hidden now): link down as an AP loss\n", n);
++		sta.by_ap = true;
++		sta_teardown_start(4);
++	}
++}
++
++/* 3127: kern.sweet_wlan_vdev_reset's work, in the service thread: only with the service idle and nothing to send */
++static void
++svc_vdev_reset(void)
++{
++	if (!vdev_reset_kick || wf.state != WS_SCAN_DONE || sta.state != ST_IDLE || sta.req_pending || sta.wq_n ||
++	    !wce.wmi_credits) {
++		return;
++	}
++	vdev_reset_kick = false;
++	scan.vreset = true;
++	scan.step = 21;
++	scan.step_ms = ms_now_ms();
++	wf.sent_ms = ms_now_ms();
++	wf.state = WS_SCAN_SETUP;
++}
++
++static int
++sysctl_sweet_wlan_vdev_reset SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = vdev_reset | (int)(vdev_resets << 4);
++	int error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	vdev_reset = v & 1;
++	if (v & 2) {
++		vdev_reset_kick = true;
++		thread_wakeup(&wl.sleep_chan);
++	}
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wlan_vdev_reset, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_wlan_vdev_reset, "I",
++    "1 (default): after a link went down, delete and create the station vdev again (else the modem never sleeps); 2: once now; reads resets << 4 | mode (3127)");
++
+ /* service thread: start a requested scan once the previous one is done and the WMI credit is back */
+ static void
+ svc_scan(void)
+@@ -7802,13 +8235,33 @@ svc_scan(void)
+ 	}
+ 	lck_mtx_lock(&scan_lock);
+ 	scan_req = false;
++	if (scan_req_notify) {                  /* 3127: the request that waited behind a scan: its notice is due now */
++		scan_req_notify = false;
++		scan_notify = true;
++	}
++	uint32_t cover = scan_need(scan_pend_cover);
++	if (cover == 0) {
++		/* the scan it waited behind has visited its channels meanwhile: answered */
++		bool notify = scan_notify;
++		scan_notify = false;
++		sstat.cached++;
++		lck_mtx_unlock(&scan_lock);
++		if (notify) {
++			sweet80211_scan_done();
++		}
++		return;
++	}
+ 	wf.state = WS_SCAN_SETUP;
+ 	lck_mtx_unlock(&scan_lock);
++	scan.cover = cover;
++	scan.act = scan_pend_act;
++	scan.act_dwell = scan_pend_dwell;
+ 	scan.beacons = 0;
+ 	scan.foreign = 0;
+ 	scan.started = false;
+ 	scan.completed = false;
+-	scan.step = 13;                         /* START_SCAN only: the setup steps are done */
++	/* START_SCAN only: the setup steps are done; once, before the first active scan, the channel list that allows one */
++	scan.step = scan.act && !scan.chan_act ? 20 : 13;
+ 	wf.sent_ms = ms_now_ms();
+ }
+ 
+@@ -7955,8 +8408,10 @@ ms_ipc_run(unsigned hold_s)
+ 			continue;
+ 		}
+ 		svc_tick(t0);
++		svc_vdev_reset();
+ 		svc_scan();
+ 		wdbg_pump();
++		scan_hide_pump();
+ 		if (wf.state == WS_SCAN_DONE || wf.state == WS_SCANNING || wf.state == WS_SCAN_SETUP) {
+ 			sta_step();
+ 		} else {
+diff --git a/bsd/dev/sweet_80211.c b/bsd/dev/sweet_80211.c
+index 3bf79a0..5e538ac 100644
+--- a/bsd/dev/sweet_80211.c
++++ b/bsd/dev/sweet_80211.c
+@@ -195,6 +195,196 @@ s8_scan_done(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
+ 	s8_post_event(M_SCAN_DONE, NULL, 0);
+ }
+ 
++/*
++ * 3127: what iOS asks of the Wi-Fi interface, in numbers. kern.sweet_80211_scan: scan requests by type and by how they were
++ * answered, and the last 128 as ms since boot : type : how : scan type : dwell : channels asked : channels kept : names : flags
++ * (how 0 = a scan by the service, 1 = its cache because the last scan is recent, 2 = no service, joining or joined: the cache
++ * after 300 ms). kern.sweet_80211_scan_dump=N prints a line for each of the next N requests (channels, no names);
++ * kern.sweet_80211_scan_raw=N prints the next N requests' non-zero 32-bit words (they hold network names: for the console
++ * only). kern.sweet_80211_types: every ioctl type seen with its count.
++ */
++#define S8_SCAN_RING 128u
++#define S8_SCAN_REQ_LEN 0x1598u         /* apple80211_scan_data, IO80211 1565.3 (sweet_wlan.h) */
++static struct {
++	uint32_t t10, t86, how[3], ring_n;
++	struct {
++		uint32_t ms;
++		uint16_t dwell, nasked, flags;
++		uint8_t type, how, scan_type, nchan, nssid;
++	} ring[S8_SCAN_RING];
++	uint16_t set_n[IOC_MAX], get_n[IOC_MAX];
++} s8stat;
++static int s8_scan_dump, s8_scan_raw;
++SYSCTL_INT(_kern, OID_AUTO, sweet_80211_scan_dump, CTLFLAG_RW | CTLFLAG_LOCKED, &s8_scan_dump, 0,
++    "print a line for each of the next N scan requests: type, dwell, channels (3127)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_80211_scan_raw, CTLFLAG_RW | CTLFLAG_LOCKED, &s8_scan_raw, 0,
++    "print the next N scan requests' non-zero words to the console; they hold network names (3127)");
++
++/* the request as user space wrote it (whole words, at most S8_SCAN_REQ_LEN), and what the service needs of it */
++static uint32_t *
++s8_scan_parse(const struct sweet80211_req *req, struct sweet_wlan_scan_req *sr, uint32_t *rawn)
++{
++	uint32_t n = MIN(req->len, S8_SCAN_REQ_LEN) & ~3u;
++	*rawn = 0;
++	if (req->data == 0 || n < 0x48) {
++		return NULL;
++	}
++	uint32_t *w = kalloc_data(n, Z_WAITOK | Z_ZERO);
++	if (w == NULL) {
++		return NULL;
++	}
++	if (copyin((user_addr_t)req->data, w, n) != 0) {
++		kfree_data(w, n);
++		return NULL;
++	}
++	*rawn = n;
++	if (req->type != IOC_SCAN_REQ || n < S8_SCAN_REQ_LEN || w[0] != 1) {
++		return w;
++	}
++	const uint8_t *b = (const uint8_t *)w;
++	sr->scan_type = (uint8_t)w[0x34 / 4];
++	memcpy(&sr->dwell_ms, b + 0x3c, 2);
++	sr->nchan_asked = (uint16_t)MIN(w[0x44 / 4], 400u);
++	for (uint32_t k = 0; k < sr->nchan_asked && sr->nchan < SWEET_WLAN_REQ_CHANS; k++) {
++		uint32_t ch = w[(0x48 + 12 * k) / 4 + 1], fl = w[(0x48 + 12 * k) / 4 + 2];
++		if ((fl & 0x2000) || ch == 0 || ch > 196) {
++			continue;                       /* 6 GHz: not this radio */
++		}
++		sr->mhz[sr->nchan++] = (uint16_t)(ch == 14 ? 2484 : (ch < 14 && !(fl & C_FLAG_5GHZ)) ? 2407 + 5 * ch : 5000 + 5 * ch);
++	}
++	sr->flags = w[0x1308 / 4];
++	uint32_t l = w[0x10 / 4];
++	if (l >= 1 && l <= 32) {
++		sr->ssid[0].len = (uint8_t)l;
++		memcpy(sr->ssid[0].ssid, b + 0x14, l);
++		sr->nssid = 1;
++	}
++	uint32_t cnt = MIN(w[0x1314 / 4], 10u);
++	for (uint32_t k = 0; k < cnt; k++) {
++		const uint8_t *e = b + 0x1318 + 56 * k;
++		uint32_t el;
++		memcpy(&el, e + 4, 4);
++		if (el < 1 || el > 32) {
++			continue;
++		}
++		if (sr->nssid < SWEET_WLAN_REQ_SSIDS) {
++			sr->ssid[sr->nssid].len = (uint8_t)el;
++			memcpy(sr->ssid[sr->nssid].ssid, e + 8, el);
++		}
++		sr->nssid++;
++	}
++	sr->parsed = 1;
++	return w;
++}
++
++static void
++s8_scan_note(const struct sweet80211_req *req, const struct sweet_wlan_scan_req *sr, const uint32_t *w, uint32_t n, unsigned how)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	uint32_t ms = (uint32_t)(ns / NSEC_PER_MSEC), i = s8stat.ring_n++ % S8_SCAN_RING;
++	s8stat.ring[i].ms = ms;
++	s8stat.ring[i].type = (uint8_t)req->type;
++	s8stat.ring[i].how = (uint8_t)how;
++	s8stat.ring[i].scan_type = sr ? sr->scan_type : 0;
++	s8stat.ring[i].dwell = sr ? sr->dwell_ms : 0;
++	s8stat.ring[i].nasked = sr && sr->parsed ? sr->nchan_asked : 0xffff;
++	s8stat.ring[i].nchan = sr ? (uint8_t)sr->nchan : 0;
++	s8stat.ring[i].nssid = sr ? sr->nssid : 0;
++	s8stat.ring[i].flags = sr ? (uint16_t)sr->flags : 0;
++	if (req->type == IOC_SCAN_REQ) {
++		s8stat.t10++;
++	} else {
++		s8stat.t86++;
++	}
++	s8stat.how[how < 3 ? how : 2]++;
++	if (s8_scan_dump > 0) {
++		char line[288];
++		size_t l = 0;
++		s8_scan_dump--;
++		for (uint32_t k = 0; sr && k < sr->nchan && l + 8 < sizeof(line); k++) {
++			l += (size_t)snprintf(line + l, sizeof(line) - l, " %u", sr->mhz[k]);
++		}
++		line[l] = 0;
++		printf("SWEET 80211: sreq type %u len %u at %u ms how %u display_off %d: %s scan type %u dwell %u flags %#x names %u "
++		    "channels %u (kept %u):%s\n", req->type, req->len, ms, how, sweet_fb_display_off,
++		    sr && sr->parsed ? "parsed" : "NOT parsed", sr ? sr->scan_type : 0, sr ? sr->dwell_ms : 0, sr ? sr->flags : 0,
++		    sr ? sr->nssid : 0, sr ? sr->nchan_asked : 0, sr ? sr->nchan : 0, line);
++	}
++	if (s8_scan_raw > 0 && w != NULL) {
++		char line[176];
++		size_t l = 0;
++		s8_scan_raw--;
++		printf("SWEET 80211: sraw type %u len %u at %u ms: non-zero words as offset:value\n", req->type, req->len, ms);
++		for (uint32_t o = 0; o < n; o += 4) {
++			if (w[o / 4] == 0) {
++				continue;
++			}
++			l += (size_t)snprintf(line + l, sizeof(line) - l, " %x:%x", o, w[o / 4]);
++			if (l > 150) {
++				printf("SWEET 80211: sraw%s\n", line);
++				l = 0;
++			}
++		}
++		if (l) {
++			printf("SWEET 80211: sraw%s\n", line);
++		}
++		printf("SWEET 80211: sraw end\n");
++	}
++}
++
++static int
++sysctl_sweet_80211_scan SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	size_t cap = 6144, l;
++	char *out = kalloc_data(cap, Z_WAITOK | Z_ZERO);
++	if (out == NULL) {
++		return ENOMEM;
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	l = (size_t)snprintf(out, cap, "sweet_80211_scan v1 now_ms=%llu t10=%u t86=%u scan=%u recent=%u cache=%u last:", ns / NSEC_PER_MSEC,
++	    s8stat.t10, s8stat.t86, s8stat.how[0], s8stat.how[1], s8stat.how[2]);
++	uint32_t n = s8stat.ring_n, first = n > S8_SCAN_RING ? n - S8_SCAN_RING : 0;
++	for (uint32_t k = first; k < n && l + 48 < cap; k++) {
++		uint32_t i = k % S8_SCAN_RING;
++		l += (size_t)snprintf(out + l, cap - l, " %u:%u:%u:%u:%u:%u:%u:%u:%x", s8stat.ring[i].ms, s8stat.ring[i].type,
++		    s8stat.ring[i].how, s8stat.ring[i].scan_type, s8stat.ring[i].dwell, s8stat.ring[i].nasked, s8stat.ring[i].nchan,
++		    s8stat.ring[i].nssid, s8stat.ring[i].flags);
++	}
++	int err = SYSCTL_OUT(req, out, strlen(out) + 1);
++	kfree_data(out, cap);
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_80211_scan, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_80211_scan, "A",
++    "scan requests from iOS: counts by type and answer, the last 128 as ms:type:how:scantype:dwell:asked:kept:names:flags (3127)");
++
++static int
++sysctl_sweet_80211_types SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	size_t cap = 3072, l;
++	char *out = kalloc_data(cap, Z_WAITOK | Z_ZERO);
++	if (out == NULL) {
++		return ENOMEM;
++	}
++	l = (size_t)snprintf(out, cap, "sweet_80211_types v1");
++	for (uint32_t t = 0; t < IOC_MAX && l + 32 < cap; t++) {
++		if (s8stat.set_n[t]) {
++			l += (size_t)snprintf(out + l, cap - l, " s%u=%u", t, s8stat.set_n[t]);
++		}
++		if (s8stat.get_n[t]) {
++			l += (size_t)snprintf(out + l, cap - l, " g%u=%u", t, s8stat.get_n[t]);
++		}
++	}
++	int err = SYSCTL_OUT(req, out, strlen(out) + 1);
++	kfree_data(out, cap);
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_80211_types, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_sweet_80211_types, "A",
++    "Apple80211 ioctl types seen so far with their counts, sN = set, gN = get (saturating at 65535) (3127)");
++
+ /* Copy out a reply: at most req_len bytes, the rest of req_len zero-filled. */
+ static int
+ s8_reply(struct sweet80211_req *req, const void *buf, uint32_t n)
+@@ -363,7 +553,7 @@ s8_fill_result(const struct sweet_wlan_bss *b, struct s8_scan_result *r)
+ 	 * 3030: with no timestamp CoreWiFi took every network's age as the whole uptime ("age=107399ms") and threw the list away wherever it asks for recent
+ 	 * results: auto-join's passes that use the scan just made, so a saved network was "found nearby but not joined" (user 2026-11-01).
+ 	 */
+-	uint64_t seen = sweet_wlan_scan_time(), ns;
++	uint64_t seen = b->heard_abs ? b->heard_abs : sweet_wlan_scan_time(), ns;       /* 3127: of its channel's last visit */
+ 	absolutetime_to_nanoseconds(seen, &ns);
+ 	r->timestamp = ns;
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - seen, &ns);
+@@ -687,7 +877,21 @@ s8_set(struct sweet80211_req *req)
+ 	{
+ 		uint64_t deadline;
+ 		s8.scan_next = 0;
+-		if (s8.stage == 3 && sweet_wlan_scan_request() == 0) {
++		uint32_t rawn = 0, *raw = NULL;
++		struct sweet_wlan_scan_req *sr = kalloc_data(sizeof(*sr), Z_WAITOK | Z_ZERO);
++		if (sr != NULL) {                       /* 3127: what was asked for */
++			sr->ioc = (uint8_t)req->type;
++			raw = s8_scan_parse(req, sr, &rawn);
++		}
++		int serr = s8.stage == 3 ? sweet_wlan_scan_request(sr) : ENXIO;
++		s8_scan_note(req, sr, raw, rawn, serr == 0 ? 0 : serr == EALREADY ? 1 : 2);
++		if (raw != NULL) {
++			kfree_data(raw, rawn);
++		}
++		if (sr != NULL) {
++			kfree_data(sr, sizeof(*sr));
++		}
++		if (serr == 0) {
+ 			return 0;                       /* the WLAN service posts SCAN_DONE when the firmware is done */
+ 		}
+ 		clock_interval_to_deadline(300, NSEC_PER_MSEC, &deadline);    /* "scan" takes 300 ms */
+@@ -729,6 +933,12 @@ sweet80211_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
+ 	case SIOCSA80211: {
+ 		struct sweet80211_req *req = (struct sweet80211_req *)data;
+ 		bool set = cmd == SIOCSA80211;
++		if (req->type < IOC_MAX) {              /* 3127 */
++			uint16_t *n = set ? &s8stat.set_n[req->type] : &s8stat.get_n[req->type];
++			if (*n != UINT16_MAX) {
++				(*n)++;
++			}
++		}
+ 		int err = set ? s8_set(req) : s8_get(req);
+ 		s8_log_once(set, req->type, req->len, err);
+ 		return err;
+diff --git a/bsd/dev/sweet_wlan.h b/bsd/dev/sweet_wlan.h
+index d731aca..bffa3eb 100644
+--- a/bsd/dev/sweet_wlan.h
++++ b/bsd/dev/sweet_wlan.h
+@@ -21,12 +21,39 @@ struct sweet_wlan_bss {
+ 	uint8_t  ssid_len;
+ 	uint8_t  ssid[32];              /* raw bytes */
+ 	uint16_t ie_len;
++	uint64_t heard_abs;             /* 3127: mach_absolute_time of the last scan that visited its channel */
+ 	uint8_t  ie[SWEET_WLAN_IE_MAX]; /* the frame's information elements, from the SSID element on */
+ };
+ 
+-/* beryllium_wlan.c: 0 = scan queued (or already running), ENXIO = the service is not up (yet) */
++/*
++ * 3127: what iOS asked for in a scan request (apple80211_scan_data as IO80211 1565.3 of iOS 26 builds it, 5528 bytes:
++ * version @0, bss type @4, BSSID @8, SSID length @0x10, SSID @0x14, scan type @0x34, PHY mode @0x38, dwell (u16) @0x3c,
++ * rest @0x40, channel count @0x44, {version, channel, flags}[400] @0x48, flags (u64) @0x1308, RSSI threshold @0x1310,
++ * SSID list count @0x1314, {valid, length, SSID[32], 16 more}[10] @0x1318, short SSID @0x1548, UUID @0x154c, minimum
++ * timestamp @0x1590). parsed = 0: a request the stand-in could not read (another type or size): everything is scanned.
++ */
++#define SWEET_WLAN_REQ_CHANS    40u
++#define SWEET_WLAN_REQ_SSIDS    4u
++struct sweet_wlan_scan_req {
++	uint8_t  ioc;                   /* APPLE80211_IOC_SCAN_REQ (10) or _MULTIPLE (86) */
++	uint8_t  parsed;
++	uint8_t  scan_type;             /* 1 active, 2 passive, 3 fast, 4 background */
++	uint8_t  nssid;                 /* names to probe for, the first SWEET_WLAN_REQ_SSIDS kept */
++	uint16_t dwell_ms;              /* 0: the driver's own */
++	uint16_t nchan_asked;           /* as iOS wrote it; 0 = every channel */
++	uint16_t nchan;                 /* of those, the 2.4 and 5 GHz ones kept below */
++	uint16_t mhz[SWEET_WLAN_REQ_CHANS];
++	uint32_t flags;                 /* SCAN_FLAGS, low word: 0x2 low priority, 0x20 low latency, 0x80 throttled, 0x1000 low power core */
++	struct {
++		uint8_t len;
++		uint8_t ssid[32];
++	} ssid[SWEET_WLAN_REQ_SSIDS];
++};
++
++/* beryllium_wlan.c: 0 = scan queued (or already running), EALREADY = the cache answers (a scan ended moments ago,
++ * display off), ENXIO = the service is not up (yet), or joined: the cache answers too. r may be NULL (scan everything). */
+ uint64_t sweet_wlan_scan_time(void);    /* 3030: mach_absolute_time of the last completed scan */
+-int sweet_wlan_scan_request(void);
++int sweet_wlan_scan_request(const struct sweet_wlan_scan_req *r);
+ /* beryllium_wlan.c: network i of the last completed scan; ENOENT past the end */
+ int sweet_wlan_bss_get(unsigned i, struct sweet_wlan_bss *out);
+ /* sweet_80211.c: called by the WLAN service when a requested scan has completed */
