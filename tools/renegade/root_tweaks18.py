@@ -1369,6 +1369,9 @@ def chlorophyll_link(root, rel, add_uc, create_uc):
     if macho_has_dylib(binp, CHL_LINK):
         print('chlorophyll:', name, 'already links', CHL_LINK)
         return True
+    if rel == NOTCH_TARGET and macho_has_dylib(binp, NOTCH_LINK):
+        print('chlorophyll:', name, 'links', NOTCH_LINK, 'which weak-links', CHL_LINK, '(notch())')
+        return True
     mode = os.stat(binp).st_mode & 0o7777
     orig = os.path.join(root, CHL_ORIG, name)
     if not os.path.exists(orig):
@@ -1543,6 +1546,107 @@ def orient(root):
         shutil.rmtree(tmpd, ignore_errors=True)
     print('orient: backboardd weak-links %s (re-signed ad hoc as %s, flags %#x, %d entitlements; original in /%s)' % (
         ORIENT_DYLIB, ident[0], ident[2], len(ents), ORIENT_ORIG))
+    return True
+
+
+# notch (opt-in, RENEGADE_NOTCH=1): the iPhone 11's status bar layout on a canvas of the Mi 8 panel's own shape (414x862
+# points at @2x, tools/adt-canvas.py; NOTES "SCREEN ASPECT", 2026-11-24). SpringBoard tells apps where the notch is from
+# SpringBoardHome's screen type, which needs an exact (414x896 @2x, artwork 1792) match; 414x862 gets the 393x852 phone's
+# type and shape, and UIKit draws the status bar in its generic layout, nearer the Mi 8's notch. The shim
+# tools/sweetnet/sweetnotch.m (tools/sweetnet/build.sh -> research/sweetnet/ios18/sweetnotch.dylib) answers the iPhone 11
+# type's shape instead; with the iPhone 11's canvas the types agree and it changes nothing. /usr/local/lib/sweetnotch.dylib,
+# /usr/local/sbi.dylib -> lib/sweetnotch.dylib, and SpringBoard loads that path: its weak load of /usr/local/bgi.dylib (from
+# chlorophyll(); SpringBoard has no load-command room for one more) is renamed to /usr/local/sbi.dylib, the same length,
+# and sweetnotch.dylib weak-links /usr/local/bgi.dylib, so the GPU shim still loads at launch; without the bgi link it is
+# weak-linked afresh (addlc.py --make-room). Re-signed ad hoc keeping identifier, CS flags and entitlements; the SpringBoard
+# it found goes to /private/var/root/sweetnotch-orig/SpringBoard (once). Runs after chlorophyll(). Off switches:
+# /private/var/tmp/sweetnotch.off (not installed at the next SpringBoard start), boot-arg sweetdenypath=sbi.dylib (also
+# drops the GPU shim from SpringBoard). Log: /private/var/tmp/sweetnotch.log.
+NOTCH_DYLIB = '/usr/local/lib/sweetnotch.dylib'
+NOTCH_LINK = '/usr/local/sbi.dylib'
+NOTCH_ORIG = 'private/var/root/sweetnotch-orig'
+NOTCH_TARGET = 'System/Library/CoreServices/SpringBoard.app/SpringBoard'
+
+
+def rename_dylib_file(src, old, new, out, tag):
+    """A copy of the Mach-O src at out whose load command naming old names new instead (same length: nothing moves),
+    re-signed ad hoc as weak_link_file does, with the same checks. Returns (identity, entitlements)."""
+    import tempfile
+    sys.path.insert(0, HERE)
+    import pacstrip
+    if len(old) != len(new):
+        sys.exit('%s: %s and %s differ in length' % (tag, old, new))
+    tmpd = tempfile.mkdtemp(prefix='renegade-rename-')
+    try:
+        tmp = os.path.join(tmpd, os.path.basename(src))
+        shutil.copyfile(src, tmp)
+        os.chmod(tmp, 0o755)
+        ents, ident = entitlements_of(tmp) or {}, pacstrip.cs_identity(tmp)
+        if not ident:
+            sys.exit('%s: %s has no code signature identity' % (tag, src))
+        d = bytearray(open(tmp, 'rb').read())
+        o, n = old.encode() + b'\0', new.encode() + b'\0'
+        if d.count(o) != 1:
+            sys.exit('%s: %s occurs %d times in %s' % (tag, old, d.count(o), src))
+        i = d.index(o)
+        d[i:i + len(o)] = n
+        with open(tmp, 'wb') as f:
+            f.write(d)
+        rplat.adhoc_sign(tmp, ident[0], ident[2], plistlib.dumps(ents) if ents else None)
+        got = pacstrip.cs_identity(tmp)
+        if not got or got[:2] != ident[:2] or (ident[2] & ~got[2]) & ~pacstrip.CS_FLAG_IGNORED:
+            sys.exit('%s: identity or CS flags changed by the re-sign of %s: %s -> %s' % (tag, src, ident, got))
+        if (entitlements_of(tmp) or {}) != ents:
+            sys.exit('%s: entitlements of %s changed by the re-sign' % (tag, src))
+        if not macho_has_dylib(tmp, new) or macho_has_dylib(tmp, old):
+            sys.exit('%s: the load command still names %s' % (tag, old))
+        shutil.copyfile(tmp, out)
+        return ident, ents
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+
+
+def notch(root):
+    src = find_sweetnet('ios18/sweetnotch.dylib')
+    if not src:
+        print('notch: sweetnotch.dylib not built (tools/sweetnet/build.sh): skipped')
+        note_skip('notch', not_built())
+        return False
+    binp = os.path.join(root, NOTCH_TARGET)
+    if not os.path.exists(binp):
+        print('notch: no', NOTCH_TARGET, 'in the image: skipped')
+        note_skip('notch', 'no ' + NOTCH_TARGET)
+        return False
+    install_file(src, os.path.join(root, NOTCH_DYLIB.lstrip('/')), 0o755)   # first: SpringBoard never names a missing dylib
+    link = os.path.join(root, NOTCH_LINK.lstrip('/'))
+    if os.path.lexists(link):
+        os.remove(link)
+    os.symlink('lib/sweetnotch.dylib', link)
+    os.lchown(link, 0, 0)
+    print('notch: %s installed (%s), %s -> lib/sweetnotch.dylib' % (
+        NOTCH_DYLIB, os.path.relpath(src, REPO) if src.startswith(REPO) else src, NOTCH_LINK))
+    if macho_has_dylib(binp, NOTCH_LINK):
+        print('notch: SpringBoard already links', NOTCH_LINK)
+        return True
+    mode = os.stat(binp).st_mode & 0o7777
+    orig = os.path.join(root, NOTCH_ORIG, 'SpringBoard')
+    if not os.path.exists(orig):
+        install_file(binp, orig, mode)
+    import tempfile
+    tmpd = tempfile.mkdtemp(prefix='renegade-notch-')
+    try:
+        out = os.path.join(tmpd, 'SpringBoard')
+        if macho_has_dylib(binp, CHL_LINK):
+            ident, ents = rename_dylib_file(binp, CHL_LINK, NOTCH_LINK, out, 'notch')
+            how = 'has its %s load renamed to %s' % (CHL_LINK, NOTCH_LINK)
+        else:
+            ident, ents = weak_link_file(binp, NOTCH_LINK, out, 'notch')
+            how = 'weak-links %s' % NOTCH_LINK
+        install_file(out, binp, mode)
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+    print('notch: SpringBoard %s (re-signed ad hoc as %s, flags %#x, %d entitlements; original in /%s)' % (
+        how, ident[0], ident[2], len(ents), NOTCH_ORIG))
     return True
 
 
@@ -2171,6 +2275,8 @@ def auto(root):
         metal = bgmtl(root)
     if os.environ.get('RENEGADE_ORIENT') == '1':         # after chlorophyll(): backboardd keeps its bgi.dylib link
         orient(root)
+    if os.environ.get('RENEGADE_NOTCH') == '1':          # after chlorophyll(): SpringBoard's bgi.dylib load becomes sbi.dylib
+        notch(root)
     if os.environ.get('RENEGADE_CELL') == '1':           # sweetcelld in CommCenter's place, the IPA firmware
         cellular(root)
     firstboot(root, appreg=enabled('appreg'), jb=enabled('jb'), wallpaper=enabled('wallpaper'), metal=metal)

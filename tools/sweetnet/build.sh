@@ -194,6 +194,13 @@ if [ "${IOS18:-1}" = 1 ]; then
 		-framework CoreMotion -install_name /usr/local/lib/sweetorient.dylib "$here/sweetorient-shim.m" -o "$out18/sweetorient.dylib"
 	codesign -s - -f "$out18/sweetorient.dylib"
 	python3 -I "$pacstrip" --sign "$out18/sweetorient.dylib"
+	# sweetnotch.dylib: the iPhone 11's notch for SpringBoard on the panel-shaped canvas (414x862); SpringBoard loads it as
+	# /usr/local/sbi.dylib and it weak-links the GPU shim /usr/local/bgi.dylib (root_tweaks18.notch, RENEGADE_NOTCH=1)
+	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall -fobjc-arc -dynamiclib -Wl,-headerpad,0x200 \
+		-framework Foundation -install_name /usr/local/lib/sweetnotch.dylib "$here/sweetnotch.m" -o "$out18/sweetnotch.dylib"
+	python3 -I "$here/addlc.py" --weak "$out18/sweetnotch.dylib" /usr/local/bgi.dylib
+	codesign -s - -f "$out18/sweetnotch.dylib"
+	python3 -I "$pacstrip" --sign "$out18/sweetnotch.dylib"
 	# sweetssc: the sensors behind the SLPI's SNS service (QMI 400) through the kernel pass-through (xnu 3071)
 	xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -Wall "$here/sweetssc.c" -o "$out18/sweetssc"
 	codesign -s - -f --entitlements "$here/entitlements.plist" "$out18/sweetssc"
